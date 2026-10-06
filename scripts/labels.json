@@ -1,0 +1,47 @@
+[
+  { "name": "area:core",      "color": "1d76db", "description": "aw-core 事件模型与公共类型" },
+  { "name": "area:pipe",      "color": "1d76db", "description": "aw-pipeline 处理管道" },
+  { "name": "area:store",     "color": "1d76db", "description": "aw-store 存储、保留与导出" },
+  { "name": "area:proxy",     "color": "1d76db", "description": "aw-proxy MITM 代理" },
+  { "name": "area:daemon",    "color": "1d76db", "description": "aw-daemon 服务、权限与本地 API" },
+  { "name": "area:cli",       "color": "1d76db", "description": "aw-cli 命令行" },
+  { "name": "area:ui",        "color": "1d76db", "description": "Web UI" },
+  { "name": "area:agent",     "color": "1d76db", "description": "aw-agent-adapters（E3 数据源）" },
+  { "name": "area:lnx",       "color": "0e8a16", "description": "Linux 采集器与 eBPF" },
+  { "name": "area:win",       "color": "0e8a16", "description": "Windows 采集器" },
+  { "name": "area:mac",       "color": "0e8a16", "description": "macOS 采集器与系统扩展" },
+  { "name": "area:poll",      "color": "0e8a16", "description": "轮询兜底采集器" },
+  { "name": "area:sim",       "color": "5319e7", "description": "行为模拟器与测试夹具" },
+  { "name": "area:ci",        "color": "5319e7", "description": "构建、CI、发布、签名" },
+  { "name": "area:sec",       "color": "b60205", "description": "安全、脱敏、威胁模型" },
+  { "name": "area:doc",       "color": "5319e7", "description": "文档" },
+
+  { "name": "platform:linux",   "color": "c2e0c6", "description": "涉及 Linux" },
+  { "name": "platform:windows", "color": "c2e0c6", "description": "涉及 Windows" },
+  { "name": "platform:macos",   "color": "c2e0c6", "description": "涉及 macOS" },
+  { "name": "platform:all",     "color": "c2e0c6", "description": "平台无关或三平台通用" },
+
+  { "name": "type:feature", "color": "a2eeef", "description": "新功能" },
+  { "name": "type:bug",     "color": "d73a4a", "description": "缺陷" },
+  { "name": "type:spike",   "color": "fbca04", "description": "技术验证 / 调研" },
+  { "name": "type:chore",   "color": "ededed", "description": "工程杂项" },
+  { "name": "type:docs",    "color": "0075ca", "description": "文档任务" },
+
+  { "name": "phase:P0", "color": "bfd4f2", "description": "P0 奠基" },
+  { "name": "phase:P1", "color": "bfd4f2", "description": "P1 MVP" },
+  { "name": "phase:P2", "color": "bfd4f2", "description": "P2 文件与 UI" },
+  { "name": "phase:P3", "color": "bfd4f2", "description": "P3 URL 与关联" },
+  { "name": "phase:P4", "color": "bfd4f2", "description": "P4 原生化与打包" },
+  { "name": "phase:P5", "color": "bfd4f2", "description": "P5 Agent 适配" },
+
+  { "name": "size:S", "color": "e4e669", "description": "≤0.5 天" },
+  { "name": "size:M", "color": "e4e669", "description": "≤2 天" },
+  { "name": "size:L", "color": "e4e669", "description": "≤5 天（须拆分后再开工）" },
+
+  { "name": "priority:M", "color": "d93f0b", "description": "必须（Must）" },
+  { "name": "priority:S", "color": "f9d0c4", "description": "应该（Should）" },
+  { "name": "priority:C", "color": "fef2c0", "description": "可选（Could）" },
+
+  { "name": "evidence",       "color": "b60205", "description": "影响证据等级、结论措辞或证据/推测区分" },
+  { "name": "status:blocked", "color": "000000", "description": "被外部条件阻塞（如 Apple 授权）" }
+]

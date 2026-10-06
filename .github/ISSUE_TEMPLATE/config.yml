@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 文档索引
+    url: https://github.com/OWNER/AgentWatch/blob/main/docs/README.md
+    about: 提 Issue 前先看需求、能力矩阵和路线图，确认是否已有计划或已知限制
+  - name: 能力矩阵（各平台能拿到什么、拿不到什么）
+    url: https://github.com/OWNER/AgentWatch/blob/main/docs/02-platforms/capability-matrix.md
+    about: 许多“没记录到”是平台限制，已标为 NA

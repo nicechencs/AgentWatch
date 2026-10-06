@@ -1,0 +1,67 @@
+name: 平台能力调研 / spike
+description: 验证某个平台能力是否可用，或调研一项技术方案。结论要回填到能力矩阵。
+title: "[SPIKE] "
+labels: ["type:spike"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        正式的 spike 记录写在 `docs/06-research/SPIKE-NN-*.md`（模板见 `spike-template.md`）。本 Issue 用于跟踪执行。
+  - type: checkboxes
+    id: platform
+    attributes:
+      label: 平台
+      options:
+        - label: linux
+        - label: windows
+        - label: macos
+  - type: input
+    id: cap
+    attributes:
+      label: 涉及的能力项
+      description: capability-matrix 中的 CAP 编号，或新能力的简述
+      placeholder: "CAP-NET-02, CAP-DNS-02"
+    validations:
+      required: true
+  - type: input
+    id: spike
+    attributes:
+      label: SPIKE 编号
+      placeholder: "SPIKE-02"
+  - type: textarea
+    id: question
+    attributes:
+      label: 要回答的问题
+      description: 一个问题一行，尽量是可以用“是 / 否 / 数值”回答的问题
+    validations:
+      required: true
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: 当前假设（【待验证】的结论）
+  - type: textarea
+    id: method
+    attributes:
+      label: 验证方法
+      description: 环境（系统版本、虚拟机或真机）、工具、步骤。特权操作在虚拟机里做
+    validations:
+      required: true
+  - type: textarea
+    id: pass
+    attributes:
+      label: 通过标准
+      description: 什么结果算“可用”，什么结果触发降级方案
+    validations:
+      required: true
+  - type: input
+    id: timebox
+    attributes:
+      label: 时间盒
+      placeholder: "1 天"
+  - type: textarea
+    id: impact
+    attributes:
+      label: 可能影响的文档
+      placeholder: |
+        - docs/02-platforms/capability-matrix.md
+        - docs/02-platforms/windows.md

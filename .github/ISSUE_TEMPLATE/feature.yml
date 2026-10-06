@@ -1,0 +1,102 @@
+name: 功能 / 开发任务
+description: 新需求或开发任务。已在 docs/04-plan/tasks 中定稿的任务请用 scripts/sync-issues.ps1 同步，不要手工创建。
+title: "[Pn-AREA-NN] "
+labels: ["type:feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        字段与任务卡格式一致（见 `docs/04-plan/tasks/README.md`）。建议先在对应阶段文件中补卡，再用脚本同步。
+        标题格式：`[Pn-AREA-NN] 标题`；还没有编号时可以先用 `[TBD]`。
+  - type: dropdown
+    id: area
+    attributes:
+      label: AREA
+      options:
+        - CORE
+        - PIPE
+        - STORE
+        - PROXY
+        - DAEMON
+        - CLI
+        - UI
+        - AGENT
+        - LNX
+        - WIN
+        - MAC
+        - POLL
+        - SIM
+        - CI
+        - SEC
+        - DOC
+    validations:
+      required: true
+  - type: checkboxes
+    id: platform
+    attributes:
+      label: 平台
+      options:
+        - label: linux
+        - label: windows
+        - label: macos
+        - label: all（平台无关）
+  - type: dropdown
+    id: priority
+    attributes:
+      label: 优先级
+      options:
+        - M（必须）
+        - S（应该）
+        - C（可选）
+    validations:
+      required: true
+  - type: dropdown
+    id: size
+    attributes:
+      label: 规模
+      description: S ≤0.5 天；M ≤2 天；L ≤5 天（L 须拆分后再开工）
+      options:
+        - S
+        - M
+        - L
+  - type: input
+    id: refs
+    attributes:
+      label: 关联编号
+      description: REQ / NFR / CAP 类别 / ADR / SPIKE / RISK，以及依赖的任务编号
+      placeholder: "REQ-04, CAP-NET, ADR-0008；依赖 P1-CORE-01"
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景
+      description: 为什么做、解决什么问题
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 文件范围
+      description: 允许修改的 crate、目录或文件
+      placeholder: "`crates/aw-collector-windows/src/etw/`"
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: 实现要点与限制
+      description: 关键设计点；以及不要做什么
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 可执行的命令或可测断言
+      value: |
+        - [ ]
+    validations:
+      required: true
+  - type: checkboxes
+    id: evidence
+    attributes:
+      label: 证据模型
+      options:
+        - label: 本任务影响证据等级、结论措辞，或证据与推测的区分（会加 evidence 标签）

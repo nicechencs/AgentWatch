@@ -1,0 +1,76 @@
+# ---- Rust ----
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# ---- Node / UI ----
+node_modules/
+ui/dist/
+.pnpm-store/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+coverage/
+
+# ---- Swift / Xcode（macos-ext）----
+macos-ext/build/
+macos-ext/DerivedData/
+*.xcuserstate
+xcuserdata/
+.swiftpm/
+.build/
+
+# ---- 本地数据、导出与录制（可能含敏感信息）----
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+!fixtures/db/
+!fixtures/db/*.db
+/exports/
+*.export.jsonl
+*.export.csv
+/raw-events/
+*.raw.jsonl
+
+# ---- 证书与密钥（代理 CA 等，绝不提交）----
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.crt
+!fixtures/**/test-*.pem
+.env
+.env.*
+
+# ---- 性能与调试产物 ----
+*.etl
+*.trace
+perf.data*
+flamegraph*.svg
+/bench-results/
+
+# ---- OS ----
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ---- IDE / 工具 ----
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.iml
+*.swp
+*~
+.claude/settings.local.json
+.codegraph/

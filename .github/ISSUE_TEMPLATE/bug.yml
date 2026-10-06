@@ -1,0 +1,98 @@
+name: 缺陷报告
+description: 采集错误、漏报、证据等级错误、崩溃或性能问题
+title: "[bug] "
+labels: ["type:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ⚠️ **提交前请先脱敏**。日志、导出和 `aw doctor` 输出里可能含有用户名、主机名、文件路径、域名、IP 或命令行参数。
+        导出时可以加 `--redact-paths --redact-hosts`，录制样本先过 `aw fixtures scrub`。**不要粘贴任何凭证、token 或私钥。**
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 平台
+      options:
+        - linux
+        - windows
+        - macos
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: 系统版本
+      placeholder: "Ubuntu 24.04 / 内核 6.8；Windows 11 23H2；macOS 15.1"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: AgentWatch 版本
+      description: "`aw version` 的输出"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 使用模式
+      multiple: true
+      options:
+        - 启动模式（aw run）
+        - 启动模式 + 代理（aw run --proxy）
+        - 附着模式（aw attach）
+        - 无 daemon（--no-daemon）
+        - UI
+        - 导出 / 查询
+  - type: dropdown
+    id: kind
+    attributes:
+      label: 问题类型
+      options:
+        - 漏报（应该记录但没有记录）
+        - 误报或归属错误
+        - 字节数 / 域名 / URL 不准确
+        - 证据等级或措辞错误（如把推测说成了事实）
+        - 敏感信息未脱敏
+        - 崩溃 / 无法启动
+        - 性能 / 资源占用
+        - 安装 / 卸载残留
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. aw run -- ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望与实际
+      description: 期望看到什么，实际看到什么（包括证据等级和 source 字段）
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`aw doctor --json` 输出（已脱敏）"
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志或导出片段（已脱敏）
+      description: "`aw daemon logs` 或 `aw export ... --redact-paths --redact-hosts` 的相关部分"
+      render: text
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我已确认以上内容不含凭证、token、私钥或不愿公开的路径和主机信息
+          required: true

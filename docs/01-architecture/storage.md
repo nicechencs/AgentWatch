@@ -146,7 +146,7 @@ CREATE TABLE net_flows (
   remote_ip       TEXT NOT NULL,
   remote_port     INTEGER NOT NULL,
   domain          TEXT,                          -- 最佳域名
-  domain_source   TEXT,                          -- sni / dns_self / dns_session / dns_global / proxy_connect
+  domain_source   TEXT,                          -- sni / dns_self / dns_session / dns_global / dns_unattributed（解析器代查、无法归属发起进程，I 级）/ proxy_connect
   domain_alts     TEXT,                          -- JSON 数组，其他候选
   sni             TEXT,
   alpn            TEXT,

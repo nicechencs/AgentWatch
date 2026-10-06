@@ -145,7 +145,32 @@ stdio 处理有两个候选方案：
 | Windows | `%ProgramData%\AgentWatch\config.toml` | `%ProgramData%\AgentWatch\data\` |
 | macOS | `/Library/Application Support/AgentWatch/config.toml` | 同目录 `data/` |
 
-顶层节：`[storage]`、`[retention]`、`[redaction]`、`[sensitive_paths]`、`[proxy]`、`[collectors.<name>]`、`[limits]`、`[correlation]`、`[api]`。默认值分散在各设计文档中给出。
+顶层节：`[storage]`、`[retention]`、`[redaction]`、`[sensitive_paths]`、`[proxy]`、`[collectors.<name>]`、`[limits]`、`[correlation]`、`[api]`、`[debug]`。
+
+### 7.1 配置项登记（跨文档引用的键）
+
+键名为点分 snake_case。完整字段以 `aw-core::config` 和 `aw config schema` 的输出为准；本表只登记各文档和任务卡中引用到的键。新增配置项时要同步更新本表。
+
+| 键 | 默认 | 含义 | 定义处 |
+|---|---|---|---|
+| `retention.max_db_size_mb` / `retention.max_age_days` | 2048 / 30 | 保留上限 | [storage](storage.md) |
+| `proxy.on_tls_reject` | `fail` | 客户端拒绝会话 CA 时的处理方式（`fail` / `tunnel`），对应 `--proxy-on-reject` | [network-attribution](network-attribution.md) |
+| `proxy.max_hash_body` | 50 MB | 请求体超过该大小则不做分块哈希 | [performance-budget](performance-budget.md) |
+| `correlation.max_hash_file_size` | 10 MB | 文件侧做内容哈希的大小上限 | [evidence-model §6](evidence-model.md) |
+| `collectors.windows.sni` | `false` | Windows pktmon SNI 采集（可选） | [windows](../02-platforms/windows.md) |
+| `collectors.linux.tls_uprobe` | `false` | Linux TLS 明文 uprobe（可选，开启时 UI 显著提示） | [network-attribution](network-attribution.md) |
+| `debug.keep_raw_events` | `false` | 另写未聚合的 `raw_events` 表 | [pipeline](pipeline.md) |
+
+### 7.2 环境变量
+
+| 变量 | 使用方 | 含义 | 生产可用 |
+|---|---|---|---|
+| `AW_SESSION` | `aw run` 注入到被监控进程 | 会话 public_id，`aw hook` 用它归属 E3 事件 | 是 |
+| `AW_FORCE_MODE` | aw-collector-linux 测试 | 强制指定采集模式：`ebpf` / `ebpf-lite` / `legacy` | 否，仅测试 |
+| `AW_FORCE_SNI_FALLBACK` | aw-collector-linux 测试 | 模拟读用户内存失败，强制走 AF_PACKET 获取 SNI | 否，仅测试 |
+| `AW_UI_DEV_URL` | aw-daemon（debug 构建） | UI 请求代理到 Vite dev server | 否，release 构建忽略 |
+
+标为“仅测试”的变量在 release 构建中用 `cfg(any(test, debug_assertions, feature = "e2e"))` 整体编译掉。
 
 ## 8. 采集器接口
 

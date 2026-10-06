@@ -34,6 +34,12 @@ AgentWatch/
 │   └── aw-cli/                   aw：命令行与 API 客户端
 ├── xtask/                        cargo xtask：ci、build-ebpf、build-ui、dist、bench、e2e
 ├── ui/                           React + Vite + TypeScript；构建产物 ui/dist 由 aw-daemon 嵌入
+│   └── src/
+│       ├── routes/               TanStack Router 文件路由：index.tsx、new.tsx、search.tsx、settings.tsx、s.$sid.<page>.tsx
+│       ├── features/<page>/      每个页面一个目录（sessions、overview、timeline、processes、files、network、http、findings、gaps、search、settings、compare、self-report）
+│       ├── components/           跨页面组件（EvidenceBadge、DetailPanel、FilterBar…）
+│       ├── api/                  由 daemon OpenAPI 生成的客户端与类型
+│       └── i18n/                 zh / en 文案（受措辞 lint 门禁约束）
 │   └── src/i18n/                 UI 文案（受措辞 lint 检查）
 ├── macos-ext/                    Swift：Network Extension 系统扩展与宿主 App（P4）
 ├── sim/                          行为模拟器（workspace 成员，包名 sim）

@@ -26,11 +26,16 @@
 /s/:sid/processes         → 进程树
 /s/:sid/files             → 文件
 /s/:sid/network           → 网络
+/s/:sid/http              → HTTP 请求（仅代理会话，P3）
 /s/:sid/findings          → 发现
+/s/:sid/self-report       → Agent 自报告与实际观测对照（P5）
 /s/:sid/gaps              → 缺口与采集能力
 /search                   → 跨会话搜索
+/compare?a=&b=            → 多会话对比（P5）
 /settings                 → 设置
 ```
+
+代码中每条路由对应 `ui/src/routes/` 下的一个文件，如 `/s/:sid/timeline` 对应 `s.$sid.timeline.tsx`，页面逻辑在 `ui/src/features/<page>/`，见 [repo-layout](../05-dev/repo-layout.md)。
 
 筛选状态全部编码在 URL query 中（`?f=<filter>&from=&to=`），可以书签或分享给本机的其他用户。
 

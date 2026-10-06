@@ -68,6 +68,11 @@
 | `redacted` | 被脱敏规则移除 | 已按隐私规则移除 |
 | `attribution_break` | 由会话外进程代为执行 | 该操作由会话外的进程（如 dockerd）代为执行，归属链中断 |
 
+| `partial_client_hello` | ClientHello 被拆分或跨多个 iov，未能解析 | TLS 握手首包不完整，域名不可得 |
+| `h2_hpack` | HTTP/2 头部经 HPACK 压缩，uprobe 只拿到片段 | HTTP/2 头部压缩，完整 URL 不可得 |
+| `too_large` | 超过内容哈希的大小上限 | 文件或请求体过大，未做内容比对 |
+| `file_changed` | 哈希时文件已被修改或删除 | 比对时文件已变化，结果不可用 |
+
 新增原因码必须同时更新本表和 `aw_core::NaReason`。
 
 ## 4. 展示样式

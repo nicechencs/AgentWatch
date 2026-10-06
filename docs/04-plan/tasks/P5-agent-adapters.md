@@ -334,7 +334,7 @@ flowchart LR
 - **规模**: M
 - **依赖**: P5-PIPE-01
 - **关联**: REQ-05, REQ-06, REQ-09
-- **文件范围**: `ui/src/pages/session/SelfReport*`、`ui/src/i18n/`、`crates/aw-daemon/src/api/agent.rs`
+- **文件范围**: `ui/src/features/self-report/`、`ui/src/routes/s.$sid.self-report.tsx`、`ui/src/i18n/`、`crates/aw-daemon/src/api/agent.rs`
 - **额外标签**: evidence
 
 **背景**：用户想知道“Agent 说它做了什么”和“系统看到它做了什么”是否一致。两栏并排对照是最直观的呈现方式。
@@ -402,7 +402,7 @@ flowchart LR
 - **规模**: M
 - **依赖**: P5-AGENT-01
 - **关联**: REQ-05, REQ-09
-- **文件范围**: `ui/src/pages/compare/`、`crates/aw-daemon/src/api/compare.rs`、`crates/aw-store/src/query/compare.rs`
+- **文件范围**: `ui/src/features/compare/`、`ui/src/routes/compare.tsx`、`crates/aw-daemon/src/api/compare.rs`、`crates/aw-store/src/query/compare.rs`
 
 **背景**：vision 的场景 3 是比较两个 Agent 完成同一任务时的行为。ui.md 已经把“对比”入口放在了会话列表中，计划在 P3 之后实现。
 

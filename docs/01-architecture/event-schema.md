@@ -81,6 +81,8 @@ pub enum Evidence {
 pub enum NaReason {
     EsNoReadEvent, MmapNotObservable, TlsNoProxy, DirectBypassProxy, CertPinned,
     Quic, Ech, NoDnsObserved, Preexisting, CollectorUnavailable, Redacted, AttributionBreak,
+    PartialClientHello, H2Hpack, TooLarge, FileChanged,
+    #[serde(other)] Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,7 +234,7 @@ pub struct BodyDigestRef { pub chunks: u32, pub digest_set_id: u64 }
 | `FlowDirection` | `outbound`, `inbound`, `unknown` |
 | `L4Proto` | `tcp`, `udp` |
 | `ToolPhase` | `pre`, `post` |
-| `GapKind` | `dropped`（管道内队列满）, `lost_by_os`（ETW EventsLost / ring buffer 丢失）, `restart`, `rate_limited`, `permission`, `attach_window`, `unsupported`, `scope_race`（进程纳入范围前的窗口）, `collector_disconnected`（采集器/扩展连接断开）, `self_report_dropped`（E3 事件丢弃） |
+| `GapKind` | `dropped`（管道内队列满）, `lost_by_os`（ETW EventsLost / ring buffer 丢失）, `restart`, `rate_limited`, `permission`, `attach_window`, `unsupported`, `scope_race`（进程纳入范围前的窗口）, `collector_disconnected`（采集器/扩展连接断开）, `self_report_dropped`（E3 事件丢弃）, `attribution_unknown`（事件无法归属到进程，如 fanotify pid=0）, `cache_evicted`（句柄/路径缓存淘汰）, `parse_error`（外部工具输出无法解析，如 eslogger）, `rule_state_evicted`（关联引擎状态窗口溢出） |
 
 ### 2.1 `source` 采集器前缀登记
 
@@ -241,15 +243,17 @@ pub struct BodyDigestRef { pub chunks: u32, pub digest_set_id: u64 }
 | 前缀 | 含义 | 子源示例 | 定义处 |
 |---|---|---|---|
 | `linux.ebpf` | Linux eBPF 探针 | `tcp_sendmsg`, `lsm_file_open` | [linux](../02-platforms/linux.md) |
+| `linux.afpacket` | Linux AF_PACKET 兜底抓首包 | `sni` | [linux](../02-platforms/linux.md) |
+| `windows.pktmon` | Windows pktmon（可选） | `sni` | [windows](../02-platforms/windows.md) |
 | `linux.legacy` | Linux 降级采集（proc connector / fanotify / sock_diag） | `proc_connector`, `fanotify`, `sock_diag` | [linux](../02-platforms/linux.md) |
-| `linux.uprobe` | Linux TLS uprobe（可选） | `openssl` | [network-attribution](network-attribution.md) |
+| `linux.uprobe` | Linux TLS uprobe（可选） | `openssl`, `go_tls` | [network-attribution](network-attribution.md) |
 | `windows.etw` | Windows ETW | `kernel_process`, `kernel_file`, `kernel_network`, `dns_client` | [windows](../02-platforms/windows.md) |
 | `macos.eslogger` | macOS eslogger 子进程（M1 档） | `exec`, `open` | [macos](../02-platforms/macos.md) |
 | `macos.es` | macOS 原生 Endpoint Security（M2 档） | `exec`, `open` | [macos](../02-platforms/macos.md) |
 | `macos.nettop` / `macos.pktap` | macOS 流量采样 / 抓包 | `flow` / `dns`, `sni` | [macos](../02-platforms/macos.md) |
 | `macos.ne` | macOS Network Extension | `flow` | [macos](../02-platforms/macos.md) |
 | `poll` | 跨平台轮询兜底 | `procs`, `sockets` | [fallback-poll](../02-platforms/fallback-poll.md) |
-| `proxy` | aw-proxy MITM 代理 | `http` | [network-attribution](network-attribution.md) |
+| `proxy` | aw-proxy MITM 代理 | `http`, `mitm` | [network-attribution](network-attribution.md) |
 | `agent.<id>` | Agent 自报告（E3） | `hook`, `otel`, `transcript` | [process-tracking](process-tracking.md) |
 
 ## 3. 各事件的必填与常见证据

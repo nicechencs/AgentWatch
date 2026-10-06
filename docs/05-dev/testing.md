@@ -169,6 +169,18 @@ url = "http://127.0.0.1:{http_port}/download?bytes=1048576"
 | `read_then_send` | 读诱饵文件后上传：三个变体——上传文件原文、上传无关数据、未启用代理 | 内容匹配、哈希未匹配、未启用代理三种结论（evidence-model §8） |
 | `escape` | `daemonize`、通过已有守护进程执行【待定：可用的无特权委托方式】 | 范围追踪与归属中断 |
 
+辅助剧本（不作为阶段退出标准）：`secrets`（在命令行、URL、环境变量中放入假凭证，用于脱敏验证）、`proxy_clients`（用 Node / Python / Go / curl / git 客户端访问本地 HTTPS 服务器，用于代理覆盖矩阵）。剧本文件位于 `sim/scenarios/<name>.toml`。
+
+### 4.4.1 sim 命令
+
+| 命令 | 作用 |
+|---|---|
+| `sim run <scenario.toml> --truth <file>` | 执行剧本，写出真值日志 |
+| `sim eval --truth <file> --session <SESSION> [--thresholds <toml>]` | 把采集结果与真值比对，输出召回率和字节误差，不达标时退出码非 0（xtask 别名 `sim-eval`） |
+| `sim compare <a> <b> [--kinds proc,net,file,http,findings]` | 比较两次采集或两个平台的结果，用于回归和跨平台差异报告 |
+| `sim scan-secrets --db <file> --corpus <secrets.toml>` | 扫描数据库和导出文件，确认剧本中放入的假凭证一个都没有落盘 |
+| `sim gen-db --events <N> -o <file>` | 生成指定规模的合成数据库，用于查询性能基准（如 100 万条事件、筛选 <300 ms） |
+
 ### 4.5 指标计算
 
 对比工具：`cargo xtask sim-eval --truth truth.jsonl --session <SESSION>`（从数据库或导出的 JSONL 读取采集结果）。

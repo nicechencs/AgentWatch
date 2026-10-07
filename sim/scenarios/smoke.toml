@@ -1,0 +1,57 @@
+# Smoke scenario from docs/05-dev/testing.md §4.2.
+# Bait paths are relative to the temp root this run creates. `home/.ssh/id_rsa`
+# is that structure under the temp root, never the real user home.
+# `server` is recorded as a hint only: `sim serve` is P0-SIM-03. HTTP steps
+# target 127.0.0.1 and, with nothing listening, write ok:false instead of
+# failing the process-tree part of the run.
+
+name = "smoke"
+description = "三层派生 + 文件读写 + 已知字节上传"
+
+[setup]
+files = [
+  { path = "home/.ssh/id_rsa", size = 412, content = "random" },
+  # testing.md uses 1_048_576. Smoke keeps this smaller so a local run stays cheap;
+  # the bytes are still a recognizable bait pattern, not file contents from disk.
+  { path = "work/data.bin", size = 4096, content = "random" },
+]
+server = { http = true, https = true, http_port = 18080, https_port = 18443 }
+
+[[step]]
+action = "spawn"
+id = "child"
+steps = [
+  { action = "spawn", id = "grandchild", steps = [
+      { action = "read_file", path = "home/.ssh/id_rsa" },
+      { action = "http_upload", url = "https://127.0.0.1:18443/upload", bytes = 5120 },
+  ]},
+]
+
+[[step]]
+action = "write_file"
+path = "work/out.txt"
+bytes = 4096
+
+[[step]]
+action = "rename"
+from = "work/out.txt"
+to = "work/out2.txt"
+
+[[step]]
+action = "delete"
+path = "work/out2.txt"
+
+[[step]]
+action = "dns_lookup"
+name = "sim.agentwatch.test"
+
+[[step]]
+action = "sleep"
+# testing.md uses 200. 50 ms is enough to exercise the action without slowing tests.
+ms = 50
+
+[[step]]
+action = "http_download"
+# testing.md asks for 1048576 bytes. 1024 keeps the refused connection cheap;
+# P0-SIM-03's server is what makes this transfer succeed.
+url = "http://127.0.0.1:18080/download?bytes=1024"

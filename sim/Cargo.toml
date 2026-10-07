@@ -3,13 +3,26 @@ name = "sim"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Behavior simulator. Independent of every aw-* crate. Stub."
+publish.workspace = true
+description = "Behavior simulator. Independent of every aw-* crate."
 
 [[bin]]
 name = "sim"
 path = "src/main.rs"
 
 [dependencies]
+# Versions live in this crate on purpose (P0-SIM-02). Do not add them to the
+# workspace table from this task: root Cargo.toml is out of scope.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "0.8.23"
+# ureq 3 is rustls-only (no OpenSSL, no tokio). HTTP steps talk to 127.0.0.1
+# and record ok:false when nothing is listening; `sim serve` is P0-SIM-03.
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+serde_json = "1.0.151"
+toml = "0.8.23"
 
 [lints]
 workspace = true

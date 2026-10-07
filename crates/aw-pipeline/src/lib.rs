@@ -22,18 +22,25 @@
 
 pub mod clock;
 pub mod config;
+pub mod enrich;
 pub mod ingress;
 pub mod output;
 pub mod pipeline;
+pub mod scope;
 pub mod stage;
 
 pub use clock::{InstantClock, PipelineClock, ReplayClock};
 pub use config::{
     AggregateConfig, CorrelationConfig, LimitsConfig, PipelineConfig, RateLimit, StoreConfig,
 };
+pub use enrich::{
+    ProcCache, ProcCacheConfig, ProcInfo, DEFAULT_CAPACITY as PROC_CACHE_CAPACITY,
+    DEFAULT_LINGER_SECS,
+};
 pub use ingress::{Ingress, IngressRx, DEFAULT_CAPACITY};
 pub use output::{DnsRec, FlowBucketRec, GapRec, NetFlowRec, Output, ProcessRec};
 pub use pipeline::Pipeline;
+pub use scope::{ScopeConfig, ScopeFilter, ScopeSet, ScopeUpdate, DEFAULT_PENDING_MS};
 pub use stage::{
     AggregateStage, BatcherStage, CorrelateStage, DedupStage, EnrichStage, Forward, RedactStage,
     ScopeStage, Stage, Tail,

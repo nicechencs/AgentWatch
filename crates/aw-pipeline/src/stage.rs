@@ -7,9 +7,12 @@
 //!
 //! Each stage is its own type so a test can swap one impl without touching the others.
 
+use std::collections::VecDeque;
+
 use aw_core::RawEvent;
 
 use crate::output::Output;
+use crate::scope::{ScopeConfig, ScopeFilter};
 
 /// One step in the fixed pipeline order.
 ///
@@ -47,19 +50,96 @@ impl Stage for Forward {
     fn tick(&mut self, _now_ns: u64) {}
 }
 
-/// Scope placeholder. Real filtering is P1-PIPE-02.
-#[derive(Debug, Default)]
+/// Scope filter (P1-PIPE-02).
+///
+/// With no session injected, every event is forwarded. That keeps
+/// [`crate::Pipeline::replay`] on an unscoped fixture identical to the
+/// passthrough skeleton. After [`ScopeStage::apply`] adds a root, events
+/// outside the session are not forwarded.
+///
+/// [`Stage::tick`] only expires a hold that is still unknown. A hold that has
+/// become in-scope is released at the start of the next [`Stage::process`],
+/// where `out` exists, or by [`ScopeStage::drain_ready`] when the chain is idle.
 pub struct ScopeStage {
-    inner: Forward,
+    filter: ScopeFilter,
+    /// Events `tick` released. Forwarded on the next `process`.
+    ready: VecDeque<RawEvent>,
+}
+
+impl Default for ScopeStage {
+    fn default() -> Self {
+        Self::new(ScopeConfig::default())
+    }
+}
+
+impl ScopeStage {
+    /// Filter with explicit pending window, cache limits, and daemon-exe list.
+    pub fn new(cfg: ScopeConfig) -> Self {
+        Self {
+            filter: ScopeFilter::new(cfg),
+            ready: VecDeque::new(),
+        }
+    }
+
+    /// Inject a root or a snapshot. Does not read the host clock.
+    pub fn apply(&mut self, update: crate::scope::ScopeUpdate) {
+        self.filter.apply(update);
+    }
+
+    /// Events dropped because the pending window closed with no matching start.
+    pub fn pending_drops(&self) -> u64 {
+        self.filter.pending_drops()
+    }
+
+    /// Events dropped because their process is outside every watched session.
+    pub fn out_of_scope_drops(&self) -> u64 {
+        self.filter.out_of_scope_drops()
+    }
+
+    /// Child starts refused because the parent is a system daemon outside scope.
+    pub fn attribution_breaks(&self) -> u64 {
+        self.filter.attribution_breaks()
+    }
+
+    /// Process cache, including exited rows still inside the linger window.
+    pub fn cache(&self) -> &crate::enrich::ProcCache {
+        self.filter.cache()
+    }
+
+    /// Membership.
+    pub fn scope(&self) -> &crate::scope::ScopeSet {
+        self.filter.scope()
+    }
+
+    /// Forward events whose hold has already been decided. No-op when nothing is waiting.
+    ///
+    /// [`Stage::tick`] only expires timeouts. This is what releases a hold that
+    /// became in-scope, which needs `out` to update a [`crate::ProcessRec`].
+    pub fn drain_ready(&mut self, out: &mut Output, next: &mut dyn Stage) {
+        self.ready.extend(self.filter.take_ready(out));
+        self.forward_ready(out, next);
+    }
+
+    fn forward_ready(&mut self, out: &mut Output, next: &mut dyn Stage) {
+        while let Some(event) = self.ready.pop_front() {
+            next.process(event, out, &mut Tail);
+        }
+    }
 }
 
 impl Stage for ScopeStage {
     fn process(&mut self, event: RawEvent, out: &mut Output, next: &mut dyn Stage) {
-        self.inner.process(event, out, next);
+        self.ready.extend(self.filter.take_ready(out));
+        self.forward_ready(out, next);
+        for event in self.filter.push(event, out) {
+            next.process(event, out, &mut Tail);
+        }
     }
 
     fn tick(&mut self, now_ns: u64) {
-        self.inner.tick(now_ns);
+        // Counting a timeout does not need `Output`. Releasing an in-scope hold
+        // does, and that happens in `process` via [`ScopeFilter::take_ready`].
+        self.filter.tick(now_ns);
     }
 }
 

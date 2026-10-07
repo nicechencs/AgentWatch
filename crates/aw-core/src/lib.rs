@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod collector;
 pub mod error;
 pub mod event;
 pub mod proc;
@@ -16,6 +17,10 @@ pub mod time;
 
 mod xxh3;
 
+pub use collector::{
+    Capability, CapabilityCategory, CapabilitySet, Collector, CollectorError, EventSink, Health,
+    LaunchToken, MockCollector, Scope, ScopeError, SinkError, SinkFailureKind, VecSink,
+};
 pub use error::{EventError, SchemaError};
 pub use event::{
     AgentRpc, AgentToolCall, BodyDigestRef, DnsAnswer, DnsQuery, DnsRecord, EnvMap, EventKind,

@@ -17,10 +17,12 @@ use std::process::ExitCode;
 use config::{config_schema_pretty, load_selected, ConfigError};
 use runtime::{emit_sensitive_probe, run_foreground, RuntimeError};
 
+mod capabilities;
 mod collectors;
 mod config;
 mod paths;
 mod runtime;
+mod supervisor;
 
 fn main() -> ExitCode {
     // Keeps the collector crates linked. No platform collector is started here.

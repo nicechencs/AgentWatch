@@ -6,14 +6,45 @@ license.workspace = true
 publish.workspace = true
 description = "Windows collector (ETW, Job Object). Stub."
 
+[features]
+# Real ETW sessions. Tests gated on this are also #[ignore]: creating a session
+# needs an elevated token, and a normal `cargo test` must not open one.
+e2e = []
+
 [dependencies]
 aw-core = { workspace = true }
 
 # Pinned here, not in the workspace, so P0-WIN-01 does not touch the root Cargo.toml.
-# ferrisetw is MIT OR Apache-2.0. It pulls windows 0.61; this crate does not depend
-# on windows directly. WinDivert is not a dependency (LGPL/GPL; ADR-0008).
+# ferrisetw is MIT OR Apache-2.0 and pulls windows 0.57. This crate also names
+# windows directly: ferrisetw keeps ControlTraceW(QUERY) and the loss counters
+# private, so the loss poll calls them from etw/ffi.rs. The version is pinned
+# to the one ferrisetw 1.2.0 resolves, otherwise cargo-deny flags two copies.
+# arc-swap is MIT OR Apache-2.0. The scope filter swaps the PID set without a
+# lock on the callback thread.
+# widestring is MIT OR Apache-2.0, already in the tree through ferrisetw. The
+# FFI builds the session name as a wide string with it.
+# WinDivert is not a dependency (LGPL/GPL; ADR-0008).
 [target.'cfg(target_os = "windows")'.dependencies]
 ferrisetw = "=1.2.0"
+windows = { version = "=0.57.0", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+] }
+arc-swap = "=1.7.1"
+widestring = "=1.0.2"
 
-[lints]
-workspace = true
+# Not `workspace = true`. Inheriting the workspace table forces
+# `--forbid=unsafe_code` on the rustc command line, and a command-line forbid
+# cannot be relaxed by `#![allow(unsafe_code)]` in `etw/ffi.rs`. Cargo also
+# refuses a per-lint override next to `workspace = true` (rust-lang/cargo#13157).
+# The workspace lint table is unchanged. This crate restates it and lowers
+# `unsafe_code` from forbid to deny, so the one FFI module can opt back in.
+# Every other unsafe block in the crate is still an error.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

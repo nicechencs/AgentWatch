@@ -1,0 +1,25 @@
+[package]
+name = "aw-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR GPL-2.0"
+publish = false
+description = "Kernel-side eBPF programs (CO-RE). Not a workspace member; built by cargo xtask build-ebpf."
+
+# Not a workspace member. Versions are local on purpose so `cargo check --workspace`
+# never resolves this crate or a nightly/bpf toolchain.
+#
+# Aya is not a dependency yet. SPIKE-01 has not started, and this machine cannot
+# load BPF. Adding aya (even as an optional dep) would make cargo-deny resolve it
+# on Windows. P1-LNX-02/03 add the real programs once that spike lands.
+
+[dependencies]
+
+[[bin]]
+name = "aw-ebpf"
+path = "src/main.rs"
+test = false
+doctest = false
+
+[lints.rust]
+unsafe_code = "forbid"

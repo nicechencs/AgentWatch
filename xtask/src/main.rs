@@ -1,7 +1,8 @@
 //! Repository tasks invoked as `cargo xtask <command>`.
 //!
 //! `ci` runs fmt, clippy, and the workspace tests.
-//! `build-ebpf` is a no-op until the eBPF crate exists.
+//! `build-ebpf` does not compile anything yet. On every host it prints that the
+//! bpf toolchain is not available and exits 0. A real build waits for SPIKE-01.
 
 #![forbid(unsafe_code)]
 
@@ -18,12 +19,7 @@ fn main() -> ExitCode {
             }
             ci()
         }
-        Some("build-ebpf") => {
-            // aw-ebpf is not a workspace member and needs nightly plus bpf-linker.
-            // P0-LNX-01 owns the real build. Exiting 0 keeps CI placeholders green.
-            println!("not implemented");
-            ExitCode::SUCCESS
-        }
+        Some("build-ebpf") => build_ebpf(),
         Some(other) => {
             eprintln!("unknown xtask command: {other}");
             usage();
@@ -38,6 +34,23 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!("usage: cargo xtask <ci|build-ebpf>");
+}
+
+fn build_ebpf() -> ExitCode {
+    // aw-ebpf is not a workspace member. It needs Linux, nightly, rust-src, and
+    // bpf-linker. SPIKE-01 has not started, so this command never invokes that
+    // toolchain. Exit 0 on every host, including Linux, so CI does not go red
+    // for a build this card cannot run.
+    if cfg!(target_os = "linux") {
+        println!(
+            "跳过，需要 Linux：bpf 工具链（nightly + bpf-linker）尚未接入，SPIKE-01 未开始，本次不编译 aw-ebpf。"
+        );
+    } else {
+        println!(
+            "跳过，需要 Linux：当前不是 Linux，不编译 aw-ebpf（nightly + bpf-linker 仅在 Linux 上使用）。"
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 fn ci() -> ExitCode {

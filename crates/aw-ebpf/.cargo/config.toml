@@ -1,0 +1,4 @@
+# Used only when someone builds this crate for the bpf target on Linux.
+# The workspace build never reads this file.
+[build]
+target = "bpfel-unknown-none"

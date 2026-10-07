@@ -1,0 +1,7 @@
+# Nightly is required only when compiling this crate for the bpf target.
+# It is not the workspace toolchain. `cargo xtask build-ebpf` on a non-Linux
+# host does not invoke rustup and does not install this channel.
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]
+targets = ["bpfel-unknown-none"]

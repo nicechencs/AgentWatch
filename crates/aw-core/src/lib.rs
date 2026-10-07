@@ -11,6 +11,10 @@
 
 pub mod error;
 pub mod event;
+pub mod proc;
+pub mod time;
+
+mod xxh3;
 
 pub use error::{EventError, SchemaError};
 pub use event::{

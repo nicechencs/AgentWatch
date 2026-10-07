@@ -20,7 +20,8 @@ use std::collections::BTreeMap;
 use rusqlite::{params_from_iter, Connection, OptionalExtension, Row};
 
 use crate::query::filter::{parse, Expr};
-use crate::query::sql::{compile, Param, Target};
+// `pub(crate)` so `export` can compile a filter without copying the SQL builder.
+pub(crate) use sql::{compile, Param, Target};
 
 pub use error::QueryError;
 #[allow(unused_imports)]
@@ -833,7 +834,7 @@ where
 }
 
 impl Param {
-    fn to_sql(&self) -> rusqlite::types::Value {
+    pub(crate) fn to_sql(&self) -> rusqlite::types::Value {
         match self {
             Param::Text(s) => rusqlite::types::Value::Text(s.clone()),
             Param::Int(n) => rusqlite::types::Value::Integer(*n),

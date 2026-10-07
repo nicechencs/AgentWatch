@@ -1,0 +1,500 @@
+//! Command dispatch (P1-CLI-01).
+//!
+//! This card only routes. A recognised command that is not `version` probes the
+//! daemon with `GET /health` and then reports that the command is not implemented.
+//! Unreachable is exit 3. A 2xx health check followed by "not implemented" is
+//! exit 1, so a live daemon is never a silent success.
+
+mod tree;
+
+use std::io::{self, Write};
+
+use clap::error::ErrorKind;
+use clap::Parser;
+
+use crate::client::{ApiRequest, Client, ClientError, LoopbackHttp, Transport};
+use crate::endpoint::{self, Endpoint, EndpointError, EndpointInput};
+use crate::exit::{self, from_http_status};
+use crate::output::OutputMode;
+
+use self::tree::{command_label, Cli, Command};
+
+/// What one invocation printed and which code it would exit with.
+pub(crate) struct Outcome {
+    /// Process exit code.
+    pub code: i32,
+    /// Bytes for stdout.
+    pub stdout: Vec<u8>,
+    /// Bytes for stderr.
+    pub stderr: Vec<u8>,
+}
+
+/// Open the HTTP transport for one resolved endpoint. Tests substitute a stub.
+pub(crate) trait HttpFactory {
+    /// Build a transport. Called only for an HTTP endpoint, and only when a
+    /// command is about to probe the daemon.
+    fn open(&mut self, endpoint: &Endpoint) -> Result<Box<dyn Transport>, ClientError>;
+}
+
+/// Production factory. Dials inside [`LoopbackHttp::exchange`], not here.
+struct LiveHttp;
+
+impl HttpFactory for LiveHttp {
+    fn open(&mut self, endpoint: &Endpoint) -> Result<Box<dyn Transport>, ClientError> {
+        Ok(Box::new(LoopbackHttp::new(endpoint)?))
+    }
+}
+
+/// Parse `args` (without argv0), read `AW_TOKEN`, and dispatch.
+///
+/// # Errors
+///
+/// Only a failure to write the outcome. The process exit code is [`Outcome::code`].
+pub(crate) fn execute_args(args: &[String]) -> io::Result<Outcome> {
+    let env_token = EndpointInput::from_args(None, None, None).token_env;
+    execute_args_with(args, env_token, &mut LiveHttp)
+}
+
+/// Same as [`execute_args`], with the token and HTTP factory injected.
+///
+/// `env_token` is the value tests would have put in `AW_TOKEN`. Passing it here
+/// keeps tests from mutating the process environment.
+pub(crate) fn execute_args_with(
+    args: &[String],
+    env_token: Option<String>,
+    http: &mut dyn HttpFactory,
+) -> io::Result<Outcome> {
+    match Cli::try_parse_from(std::iter::once("aw".to_owned()).chain(args.iter().cloned())) {
+        Ok(cli) => dispatch(cli, env_token, http),
+        Err(err) => Ok(usage_outcome(err)),
+    }
+}
+
+fn usage_outcome(err: clap::Error) -> Outcome {
+    let code = match err.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => exit::OK,
+        _ => exit::USAGE,
+    };
+    let message = err.render().to_string();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if code == exit::OK {
+        stdout.extend(message.into_bytes());
+    } else {
+        stderr.extend(message.into_bytes());
+    }
+    Outcome {
+        code,
+        stdout,
+        stderr,
+    }
+}
+
+fn dispatch(
+    cli: Cli,
+    env_token: Option<String>,
+    http: &mut dyn HttpFactory,
+) -> io::Result<Outcome> {
+    let json = cli.json;
+    // `--lang`, `-q`, and `-v` are part of the tree. This card does not branch on them.
+    let _lang = cli.lang.as_deref();
+    let _quiet = cli.quiet;
+    let _verbose = cli.verbose;
+
+    if let Command::Version { check } = &cli.command {
+        return Ok(version_outcome(*check, json));
+    }
+    if let Some(detail) = usage_gap(&cli.command) {
+        return Ok(error_outcome(exit::USAGE, "usage", &detail, json));
+    }
+
+    let input = EndpointInput {
+        socket: cli.socket.clone(),
+        http: cli.http.clone(),
+        token: cli.token.clone(),
+        token_env: env_token,
+    };
+    let endpoint = match endpoint::resolve(&input) {
+        Ok(endpoint) => endpoint,
+        Err(err) => return Ok(endpoint_outcome(err, json)),
+    };
+
+    let label = command_label(&cli.command);
+    match probe(&endpoint, http) {
+        Ok(()) => Ok(error_outcome(
+            exit::GENERAL,
+            "not_implemented",
+            &format!("`{label}` is not implemented yet (尚未实现)"),
+            json,
+        )),
+        Err(err) => Ok(client_outcome(err, &endpoint, json)),
+    }
+}
+
+/// Commands whose own arguments are already wrong. These do not contact the daemon.
+fn usage_gap(command: &Command) -> Option<String> {
+    match command {
+        Command::Run { cmd, .. } if cmd.is_empty() => {
+            Some("`aw run` needs a command after the flags".to_owned())
+        }
+        Command::McpTap { cmd, .. } if cmd.is_empty() => {
+            Some("`aw mcp-tap` needs a command to wrap".to_owned())
+        }
+        Command::Dev { args, .. } if args.is_empty() => {
+            Some("`aw dev` needs the arguments of the single-process mode".to_owned())
+        }
+        Command::Attach { pid, name, .. } if pid.is_none() && name.is_none() => {
+            Some("`aw attach` needs --pid or --name".to_owned())
+        }
+        _ => None,
+    }
+}
+
+fn version_outcome(check: bool, json: bool) -> Outcome {
+    if check {
+        return error_outcome(
+            exit::GENERAL,
+            "not_implemented",
+            "`aw version --check` does not contact the network and is not implemented yet (尚未实现)",
+            json,
+        );
+    }
+    let text = if json {
+        "{\"version\":\"0.1.0\"}\n".to_owned()
+    } else {
+        "aw 0.1.0\n".to_owned()
+    };
+    Outcome {
+        code: exit::OK,
+        stdout: text.into_bytes(),
+        stderr: Vec::new(),
+    }
+}
+
+/// `GET /health`. Socket and pipe endpoints fail inside [`Client::call`] and never
+/// call `open`. A 2xx body is discarded: the command itself is still a stub.
+fn probe(endpoint: &Endpoint, http: &mut dyn HttpFactory) -> Result<(), ClientError> {
+    let transport: Box<dyn Transport> = match endpoint {
+        Endpoint::Http { .. } => http.open(endpoint)?,
+        Endpoint::Unix { .. } | Endpoint::Pipe { .. } => {
+            Box::new(crate::client::MemoryTransport::default())
+        }
+    };
+    let mut client = Client::new(endpoint.clone(), transport);
+    let _reply = client.call(&ApiRequest::get("/health"))?;
+    Ok(())
+}
+
+fn endpoint_outcome(err: EndpointError, json: bool) -> Outcome {
+    let (code, machine) = match &err {
+        EndpointError::MissingToken => (exit::GENERAL, "missing_token"),
+        EndpointError::BadHttpUrl { .. } | EndpointError::NoPlatformDefault => {
+            (exit::USAGE, "usage")
+        }
+    };
+    error_outcome(code, machine, &err.to_string(), json)
+}
+
+fn client_outcome(err: ClientError, endpoint: &Endpoint, json: bool) -> Outcome {
+    let code = err.exit_code();
+    let machine = match &err {
+        ClientError::Unreachable { .. } => "unreachable",
+        ClientError::Transport { .. } => "transport",
+        ClientError::Status { status, .. } => match *status {
+            401 => "unauthorized",
+            403 => "forbidden",
+            421 => "misdirected",
+            _ => "status",
+        },
+    };
+    let mut message = err.to_string();
+    if matches!(err, ClientError::Status { .. }) {
+        message.push_str("; ");
+        message.push_str(&endpoint.to_string());
+    }
+    // `from_http_status` is what `ClientError::exit_code` uses. Keep the call so
+    // a status this match does not name still maps.
+    let _ = from_http_status;
+    error_outcome(code, machine, &message, json)
+}
+
+fn error_outcome(code: i32, machine: &str, message: &str, json: bool) -> Outcome {
+    let text = if json {
+        let body = serde_json::json!({
+            "error": { "code": machine, "message": message }
+        });
+        format!("{body}\n")
+    } else {
+        format!("aw: {message}\n")
+    };
+    Outcome {
+        code,
+        stdout: Vec::new(),
+        stderr: text.into_bytes(),
+    }
+}
+
+impl Outcome {
+    /// Write stdout and stderr. The caller exits with [`Outcome::code`].
+    ///
+    /// # Errors
+    ///
+    /// A short write on either stream.
+    pub(crate) fn write_to(
+        &self,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> io::Result<()> {
+        stdout.write_all(&self.stdout)?;
+        stderr.write_all(&self.stderr)?;
+        Ok(())
+    }
+}
+
+/// Render mode selected by `--json`. Commands that print tables use this later.
+#[must_use]
+#[allow(dead_code)]
+pub(crate) fn output_mode(json: bool) -> OutputMode {
+    OutputMode::from_json_flag(json)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{execute_args_with, output_mode, HttpFactory, Outcome};
+    use crate::client::{ApiReply, ClientError, MemoryTransport, Transport};
+    use crate::endpoint::Endpoint;
+    use crate::exit;
+    use crate::output::OutputMode;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const TOKEN: &str = "cli-test-token-WXYZ";
+
+    struct Script {
+        status: u16,
+        body: Vec<u8>,
+        opened: u32,
+        seen: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl HttpFactory for Script {
+        fn open(&mut self, endpoint: &Endpoint) -> Result<Box<dyn Transport>, ClientError> {
+            let shown = endpoint.to_string();
+            assert!(
+                !shown.contains(TOKEN),
+                "factory must not observe the full token: {shown}"
+            );
+            let paths = Rc::clone(&self.seen);
+            self.opened += 1;
+            let status = self.status;
+            let body = self.body.clone();
+            Ok(Box::new(Recording {
+                inner: MemoryTransport::replying(status, body),
+                paths,
+            }))
+        }
+    }
+
+    struct Recording {
+        inner: MemoryTransport,
+        paths: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Transport for Recording {
+        fn exchange(
+            &mut self,
+            request: &crate::client::ApiRequest,
+        ) -> Result<ApiReply, ClientError> {
+            self.paths.borrow_mut().push(request.path.clone());
+            self.inner.exchange(request)
+        }
+    }
+
+    fn script(status: u16, body: &str) -> Script {
+        Script {
+            status,
+            body: body.as_bytes().to_vec(),
+            opened: 0,
+            seen: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    fn paths(http: &Script) -> Vec<String> {
+        http.seen.borrow().clone()
+    }
+
+    fn run(args: &[&str], env_token: Option<&str>, http: &mut Script) -> Outcome {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        execute_args_with(&owned, env_token.map(str::to_owned), http).expect("dispatch")
+    }
+
+    fn text(bytes: &[u8]) -> String {
+        String::from_utf8(bytes.to_vec()).expect("utf8")
+    }
+
+    #[test]
+    fn health_200_then_unimplemented_is_exit_1() {
+        let mut http = script(200, r#"{"status":"ok"}"#);
+        let outcome = run(
+            &["--http", "http://127.0.0.1:7456", "--token", TOKEN, "ps"],
+            None,
+            &mut http,
+        );
+        assert_eq!(outcome.code, exit::GENERAL);
+        let err = text(&outcome.stderr);
+        assert!(err.contains("not implemented"), "{err}");
+        assert!(err.contains("尚未实现"), "{err}");
+        assert!(!err.contains(TOKEN), "{err}");
+        assert_eq!(http.opened, 1);
+        assert_eq!(paths(&http), vec!["/health".to_owned()]);
+    }
+
+    #[test]
+    fn health_401_is_exit_4_and_shows_only_the_hint() {
+        let mut http = script(
+            401,
+            r#"{"error":{"code":"unauthorized","message":"bearer token required"}}"#,
+        );
+        let outcome = run(
+            &["--http", "http://127.0.0.1:7456", "--token", TOKEN, "ps"],
+            None,
+            &mut http,
+        );
+        assert_eq!(outcome.code, exit::PERMISSION);
+        let err = text(&outcome.stderr);
+        assert!(err.contains("401"), "{err}");
+        assert!(err.contains("len=19"), "{err}");
+        assert!(err.contains("WXYZ"), "{err}");
+        assert!(!err.contains(TOKEN), "{err}");
+        assert_eq!(paths(&http), vec!["/health".to_owned()]);
+    }
+
+    #[test]
+    fn missing_token_does_not_open_a_transport() {
+        let mut http = script(200, r#"{"status":"ok"}"#);
+        let outcome = run(&["--http", "http://127.0.0.1:7456", "ps"], None, &mut http);
+        assert_eq!(outcome.code, exit::GENERAL);
+        let err = text(&outcome.stderr);
+        assert!(err.contains("AW_TOKEN") || err.contains("missing"), "{err}");
+        assert!(err.contains("token"), "{err}");
+        assert_eq!(http.opened, 0);
+        assert!(paths(&http).is_empty());
+    }
+
+    #[test]
+    fn env_token_is_accepted_and_still_hidden() {
+        let mut http = script(200, r#"{"status":"ok"}"#);
+        let outcome = run(
+            &["--http", "http://localhost:7456", "sessions", "list"],
+            Some(TOKEN),
+            &mut http,
+        );
+        assert_eq!(outcome.code, exit::GENERAL);
+        let err = text(&outcome.stderr);
+        assert!(err.contains("sessions list"), "{err}");
+        assert!(!err.contains(TOKEN), "{err}");
+        assert_eq!(http.opened, 1);
+    }
+
+    #[test]
+    fn default_socket_is_unreachable_and_does_not_open() {
+        let mut http = script(200, r#"{"status":"ok"}"#);
+        let outcome = run(&["ps"], None, &mut http);
+        assert_eq!(outcome.code, exit::UNREACHABLE);
+        let err = text(&outcome.stderr);
+        assert!(err.contains("aw daemon start"), "{err}");
+        assert!(err.contains("--no-daemon"), "{err}");
+        assert_eq!(http.opened, 0);
+    }
+
+    #[test]
+    fn version_does_not_contact_the_daemon() {
+        let mut http = script(200, r#"{"status":"ok"}"#);
+        let outcome = run(&["version"], None, &mut http);
+        assert_eq!(outcome.code, exit::OK);
+        assert_eq!(text(&outcome.stdout), "aw 0.1.0\n");
+        assert_eq!(http.opened, 0);
+
+        let check = run(&["version", "--check"], None, &mut http);
+        assert_eq!(check.code, exit::GENERAL);
+        let err = text(&check.stderr);
+        assert!(err.contains("does not contact the network"), "{err}");
+        assert!(err.contains("尚未实现"), "{err}");
+        assert_eq!(http.opened, 0);
+    }
+
+    #[test]
+    fn empty_run_is_usage_and_does_not_open() {
+        let mut http = script(200, "{}");
+        let outcome = run(&["run"], None, &mut http);
+        assert_eq!(outcome.code, exit::USAGE);
+        assert_eq!(http.opened, 0);
+        let attach = run(&["attach"], None, &mut http);
+        assert_eq!(attach.code, exit::USAGE);
+        assert_eq!(http.opened, 0);
+    }
+
+    #[test]
+    fn port_zero_is_usage() {
+        let mut http = script(200, "{}");
+        let outcome = run(
+            &["--http", "http://127.0.0.1:0", "--token", TOKEN, "ps"],
+            None,
+            &mut http,
+        );
+        assert_eq!(outcome.code, exit::USAGE);
+        assert!(
+            text(&outcome.stderr).contains("port 0"),
+            "{}",
+            text(&outcome.stderr)
+        );
+        assert!(!text(&outcome.stderr).contains(TOKEN));
+        assert_eq!(http.opened, 0);
+    }
+
+    #[test]
+    fn json_errors_use_the_machine_code() {
+        let mut http = script(200, r#"{"status":"ok"}"#);
+        let outcome = run(
+            &[
+                "--json",
+                "--http",
+                "http://127.0.0.1:7456",
+                "--token",
+                TOKEN,
+                "doctor",
+            ],
+            None,
+            &mut http,
+        );
+        assert_eq!(outcome.code, exit::GENERAL);
+        let err = text(&outcome.stderr);
+        assert!(err.contains("\"not_implemented\""), "{err}");
+        assert!(!err.contains(TOKEN), "{err}");
+        assert_eq!(output_mode(true), OutputMode::Json);
+    }
+
+    #[test]
+    fn help_lists_the_tree_and_exits_0() {
+        let mut http = script(200, "{}");
+        let outcome = run(&["--help"], None, &mut http);
+        assert_eq!(outcome.code, exit::OK, "{}", text(&outcome.stderr));
+        assert_eq!(http.opened, 0);
+        let help = text(&outcome.stdout);
+        assert!(!help.contains('\u{1b}'), "help must be plain text");
+        for name in [
+            "run", "attach", "stop", "ps", "sessions", "timeline", "procs", "files", "flows",
+            "http", "findings", "gaps", "around", "search", "export", "ui", "doctor", "daemon",
+            "config", "proxy", "db", "fixtures", "group", "agents", "links", "rpc", "chain",
+            "merge", "hook", "mcp-tap", "dev", "version",
+        ] {
+            assert!(
+                help.lines()
+                    .any(|line| line.split_whitespace().next() == Some(name)),
+                "missing subcommand `{name}` in:\n{help}"
+            );
+        }
+        insta::assert_snapshot!(help);
+    }
+}

@@ -1,0 +1,23 @@
+# P1-SIM-02 thresholds.
+# recall_min is inclusive. byte_error_max is exclusive: 6% fails a 5% budget.
+# tier = "S" reports short-lived processes and does not fail the run.
+# macos-m1 (the `--platform macos-m1` alias) uses m1_byte_error_max.
+
+[[platform]]
+name = "linux"
+tier = "E1"
+recall_min = 0.95
+byte_error_max = 0.05
+
+[[platform]]
+name = "windows"
+tier = "E1"
+recall_min = 0.95
+byte_error_max = 0.05
+
+[[platform]]
+name = "macos"
+tier = "E1"
+recall_min = 0.95
+byte_error_max = 0.05
+m1_byte_error_max = 0.15

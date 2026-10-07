@@ -1,0 +1,5 @@
+{"kind":"process_start","pid":20,"exe":"sim.exe","ts_wall_ns":1000000000000,"evidence":"E1","source":"linux/ebpf"}
+{"kind":"process_start","pid":21,"exe":"sim.exe","ts_wall_ns":1000000001000,"evidence":"E1","source":"linux/ebpf"}
+{"kind":"net_close","local_port":40000,"remote_port":8080,"bytes_sent":1060,"bytes_recv":0,"evidence":"E1","source":"linux/ebpf"}
+{"kind":"net_close","local_port":40001,"remote_port":8443,"bytes_sent":0,"bytes_recv":2000,"evidence":"E1","source":"linux/ebpf"}
+{"kind":"dns_query","qname":"API.agentwatch.test","evidence":"E1","source":"linux/ebpf"}

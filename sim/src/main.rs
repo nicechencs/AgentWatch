@@ -6,6 +6,7 @@
 //!
 #![forbid(unsafe_code)]
 
+mod eval;
 mod exec;
 mod http_step;
 mod paths;
@@ -37,15 +38,25 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         "serve" => server::serve(args.collect()),
-        "eval" | "compare" | "scan-secrets" | "gen-db" => Err(format!(
-            "`sim {cmd}` is not part of P0-SIM-02 (see later SIM tasks)"
+        "eval" => cmd_eval(args.collect()),
+        "compare" | "scan-secrets" | "gen-db" => Err(format!(
+            "`sim {cmd}` is not part of this build (see later SIM tasks)"
         )),
         other => Err(format!("unknown command `{other}`\n{}\n", usage())),
     }
 }
 
 fn usage() -> String {
-    "usage:\n  sim run <scenario.toml> --truth <file> [--root <dir>] [--duration <ms>]\n  sim spawn --payload <file> --truth <file> --ppid <pid>\n  sim serve --http 127.0.0.1:0 --https 127.0.0.1:0 --truth <file> --cert-out <dir>\n    (`sim serve --help` for the byte server)\n\n  --duration <ms> shortens steps that declare duration_ms (and long_conn).\n  SIM_DURATION_MS does the same when --duration is omitted.\n".to_string()
+    "usage:\n  sim run <scenario.toml> --truth <file> [--root <dir>] [--duration <ms>]\n  sim spawn --payload <file> --truth <file> --ppid <pid>\n  sim serve --http 127.0.0.1:0 --https 127.0.0.1:0 --truth <file> --cert-out <dir>\n    (`sim serve --help` for the byte server)\n  sim eval --truth <file> --export <file.jsonl> --thresholds <toml> [--platform linux|windows|macos|macos-m1]\n\n  --duration <ms> shortens steps that declare duration_ms (and long_conn).\n  SIM_DURATION_MS does the same when --duration is omitted.\n  sim eval reads files only. --session is refused: it would need a daemon.\n".to_string()
+}
+
+fn cmd_eval(args: Vec<String>) -> Result<(), String> {
+    match eval::run(args)? {
+        eval::EvalStatus::Pass => Ok(()),
+        eval::EvalStatus::Fail => {
+            std::process::exit(1);
+        }
+    }
 }
 
 fn cmd_run(args: Vec<String>) -> Result<(), String> {

@@ -1,0 +1,9 @@
+{"t_wall_ns":1000000000000,"pid":10,"action":"spawn","id":"child","spawned_pid":20,"ok":true,"lifetime_ms":5000}
+{"t_wall_ns":1000000000000,"pid":20,"ppid":10,"action":"spawn_enter","id":"child","ok":true,"exe":"C:\\sim\\sim.exe"}
+{"t_wall_ns":1000000001000,"pid":10,"action":"spawn","id":"short","spawned_pid":21,"ok":true,"lifetime_ms":20}
+{"t_wall_ns":1000000001000,"pid":21,"ppid":10,"action":"spawn_enter","id":"short","ok":true,"exe":"C:\\sim\\sim.exe"}
+{"t_wall_ns":1000000002000,"pid":20,"action":"http_upload","local":"127.0.0.1:40000","remote":"127.0.0.1:8080","app_bytes":1000,"bytes":1000,"ok":true}
+{"t_wall_ns":1000000003000,"pid":20,"action":"http_download","local":"127.0.0.1:40001","remote":"127.0.0.1:8443","app_bytes":2000,"bytes":2000,"ok":true}
+{"t_wall_ns":1000000004000,"pid":20,"action":"dns_lookup","name":"api.agentwatch.test","ok":true,"answers":1}
+{"t_wall_ns":1000000005000,"pid":20,"action":"dns_lookup","name":"nx-missing.agentwatch.test","ok":true,"skip":true,"reason":"dns stub unavailable"}
+{"t_wall_ns":1000000006000,"pid":20,"action":"http_upload","local":"127.0.0.1:40002","remote":"127.0.0.1:8080","app_bytes":500,"ok":false,"error":"connection refused"}

@@ -1,0 +1,5 @@
+{"kind":"process_start","pid":20,"exe":"C:\\AgentWatch\\sim.exe","ts_wall_ns":1000000000500,"evidence":"E1","source":"windows/etw"}
+{"kind":"net_close","local_port":40000,"remote_port":8080,"bytes_sent":1000,"bytes_recv":0,"evidence":"E1","source":"windows/etw"}
+{"kind":"net_close","local_port":40001,"remote_port":8443,"bytes_sent":0,"bytes_recv":2000,"evidence":"E1","source":"windows/etw"}
+{"kind":"dns_query","qname":"api.agentwatch.test.","evidence":"E1","source":"windows/etw"}
+{"kind":"gap","gap_kind":"lost","affects":["net"],"detail":"1 event lost","evidence":"E1","source":"windows/etw"}

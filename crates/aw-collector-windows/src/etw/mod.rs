@@ -4,8 +4,11 @@
 //! and the QPC / FILETIME conversion. It does not open a session.
 //! [`trace`] opens one, through ferrisetw, and only on Windows.
 //! [`ffi`] is the only module that calls `ControlTraceW` directly.
+//! [`process`] decodes Kernel-Process events. It does not open a session.
+//! Process back-fill (`NtQueryInformationProcess`, PEB) lives in [`crate::peb`].
 
 mod ffi;
+pub mod process;
 pub mod session;
 pub mod trace;
 
@@ -19,6 +22,12 @@ pub use session::{
     SessionConfig, SessionError, BUFFER_SIZE_KB, DNS_CLIENT_GUID, KERNEL_FILE_GUID,
     KERNEL_NETWORK_GUID, KERNEL_PROCESS_GUID, LOSS_POLL_INTERVAL, MAXIMUM_BUFFERS, MINIMUM_BUFFERS,
     NT_KERNEL_LOGGER, SESSION_PREFIX, SESSION_SOURCE,
+};
+pub use process::{
+    apply_backfill, apply_report, decode_process, resolve_parent, split_command_line, BackfillJob,
+    BackfillMiss, BackfillPool, BackfillReport, CachedProcess, DecodeClock, DecodedProcess,
+    DecodedStart, DecodedStop, ParentLink, ProcessCache, ProcessProperties, Undecodable,
+    EVENT_PROCESS_START, EVENT_PROCESS_STOP, SOURCE_PROCESS_START, SOURCE_PROCESS_STOP,
 };
 pub use trace::{
     gap_from_delta, probe, stop_leftover, CallbackAction, HeaderEvent, ProviderId, Session,

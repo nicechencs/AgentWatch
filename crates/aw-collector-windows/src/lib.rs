@@ -6,16 +6,18 @@
 //! crate, and it is Windows-only.
 //!
 //! `unsafe_code` is `deny` here, not `forbid`. A `forbid` cannot be relaxed in
-//! a child module, and `ControlTraceW(QUERY)` is not exposed by ferrisetw, so
-//! `etw::ffi` is the one module that opts in with `allow`. Every `unsafe`
-//! block there carries a `SAFETY` comment. The workspace lint stays `forbid`;
-//! this crate overrides it for itself.
+//! a child module. Two modules opt in with `allow`: `etw::ffi` (`ControlTraceW`,
+//! which ferrisetw does not expose) and `peb` (`NtQueryInformationProcess` and
+//! `ReadProcessMemory`). Every `unsafe` block in both carries a `SAFETY`
+//! comment. The workspace lint stays `forbid`; this crate overrides it for itself.
 
 #![deny(unsafe_code)]
 #![cfg_attr(not(target_os = "windows"), allow(unused))]
 
 #[cfg(target_os = "windows")]
 pub mod etw;
+#[cfg(target_os = "windows")]
+pub mod peb;
 
 #[cfg(target_os = "windows")]
 pub use etw::trace::Session as WindowsCollector;

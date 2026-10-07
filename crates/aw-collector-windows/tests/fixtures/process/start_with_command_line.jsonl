@@ -1,0 +1,1 @@
+{"event_id":1,"boot_id":"11111111-1111-1111-1111-111111111111","seq":1,"ts_mono_ns":1000,"ts_wall_ns":2000,"process_id":100,"create_time":132225984000000000,"parent_process_id":4,"parent_create_time":132225983000000000,"session_id":1,"image_name":"C:\\Windows\\System32\\cmd.exe","command_line":"cmd /c \"echo a b\"","tid":7}

@@ -1,0 +1,1 @@
+{"event_id":3008,"seq":2,"ts_mono_ns":2000,"ts_wall_ns":1700000000000000001,"header_pid":100,"query_name":"sim.agentwatch.test","query_type":1,"query_status":0,"query_results":"93.184.216.34;2001:db8::10;not-an-ip"}

@@ -6,8 +6,12 @@
 //! [`ffi`] is the only module that calls `ControlTraceW` directly.
 //! [`process`] decodes Kernel-Process events. It does not open a session.
 //! Process back-fill (`NtQueryInformationProcess`, PEB) lives in [`crate::peb`].
+//! [`network`] decodes Kernel-Network events and pre-aggregates send/recv for 1 s.
+//! [`dns`] decodes DNS-Client 3006/3008. Neither opens a session.
 
 mod ffi;
+pub mod dns;
+pub mod network;
 pub mod process;
 pub mod session;
 pub mod trace;
@@ -22,6 +26,15 @@ pub use session::{
     SessionConfig, SessionError, BUFFER_SIZE_KB, DNS_CLIENT_GUID, KERNEL_FILE_GUID,
     KERNEL_NETWORK_GUID, KERNEL_PROCESS_GUID, LOSS_POLL_INTERVAL, MAXIMUM_BUFFERS, MINIMUM_BUFFERS,
     NT_KERNEL_LOGGER, SESSION_PREFIX, SESSION_SOURCE,
+};
+pub use dns::{
+    decode_dns, parse_query_results, DecodedDns, DnsAnswerCache, DnsCacheRow, DnsProperties,
+    EVENT_DNS_QUERY, EVENT_DNS_QUERY_COMPLETED, PID_ATTRIBUTION_NOTE, PID_FIELD,
+    SOURCE_DNS_CLIENT,
+};
+pub use network::{
+    decode_network, flush_due, normalize_ip, ConnectionKey, DecodedNetwork, FlowPreAgg,
+    NetworkProperties, AGGREGATE_WINDOW_NS, DNS_PORT, SOURCE_KERNEL_NETWORK,
 };
 pub use process::{
     apply_backfill, apply_report, decode_process, resolve_parent, split_command_line, BackfillJob,

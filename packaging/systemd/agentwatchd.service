@@ -1,0 +1,33 @@
+# Rendered by aw-daemon (P1-DAEMON-05). Do not edit by hand.
+# Install creates the `agentwatch` group (groupadd --system). The daemon runs as
+# root (linux.md §5). AmbientCapabilities documents the reduced set; fanotify
+# and cgroup setup still need CAP_SYS_ADMIN.
+# Startup describes cleanup of leftover children under agentwatch.slice. This
+# unit does not perform that cleanup. Applying this file is an administrator
+# action; this repository does not call systemctl.
+
+[Unit]
+Description=AgentWatch process-behavior audit daemon
+Documentation=https://github.com/agentwatch/agentwatch
+After=network.target
+AssertGroup=agentwatch
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/agentwatchd --foreground
+Restart=on-failure
+RestartSec=5s
+# root, per linux.md §5. The agentwatch group is supplementary so local readers
+# of the audit socket can be members without the daemon dropping to that user.
+User=root
+Group=agentwatch
+SupplementaryGroups=agentwatch
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SYS_ADMIN CAP_SYS_PTRACE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/agentwatch
+Slice=agentwatch.slice
+
+[Install]
+WantedBy=multi-user.target

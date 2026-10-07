@@ -1,0 +1,21 @@
+# Windows service definition (P1-DAEMON-05).
+# A description only. Nothing in this repository calls sc.exe, net.exe, or the
+# Service Control Manager. An administrator applies it by hand or from CI.
+service_name=AgentWatch
+account=LocalSystem
+obj=LocalSystem
+start=delayed-auto
+bin_path=C:\Program Files\AgentWatch\agentwatchd.exe --foreground
+users_group=AgentWatch Users
+failure_reset_sec=86400
+etw_session_prefix=AgentWatch-
+failure.0.action=restart
+failure.0.delay_ms=5000
+failure.1.action=restart
+failure.1.delay_ms=10000
+failure.2.action=restart
+failure.2.delay_ms=30000
+# sc failure AgentWatch reset= 86400 actions= restart/5000/restart/10000/restart/30000
+# Startup describes stopping leftover ETW sessions named AgentWatch-* (ControlTrace STOP by name).
+# Install describes creating the local group "AgentWatch Users".
+# --purge describes deleting %ProgramData%\AgentWatch. P1 has no proxy CA.

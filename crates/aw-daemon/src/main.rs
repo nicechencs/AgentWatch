@@ -23,6 +23,7 @@ mod collectors;
 mod config;
 mod paths;
 mod runtime;
+mod service;
 mod session;
 mod supervisor;
 

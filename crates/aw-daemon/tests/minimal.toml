@@ -1,0 +1,21 @@
+# Known keys only. Integration tests copy this and set storage.data_dir to a temp path.
+[retention]
+max_db_size_mb = 2048
+max_age_days = 30
+
+[proxy]
+on_tls_reject = "fail"
+max_hash_body = 52428800
+
+[collectors.windows]
+sni = false
+
+[collectors.linux]
+tls_uprobe = false
+ipc_payload_peek = false
+
+[correlation]
+max_hash_file_size = 10485760
+
+[debug]
+keep_raw_events = false

@@ -1,7 +1,7 @@
 # 风险登记册
 
 > 状态：草案
-> 最后更新：2026-10-06
+> 最后更新：2026-10-07
 > 关联：[roadmap](roadmap.md)、[capability-matrix](../02-platforms/capability-matrix.md)、[security-privacy](../01-architecture/security-privacy.md)
 
 评分：可能性 / 影响各取 **高 / 中 / 低**。每个阶段结束时复核一次：更新状态（开放 / 监控中 / 已发生 / 已关闭），已关闭的条目保留不删。
@@ -25,6 +25,7 @@
 | RISK-13 | 许可证污染（参考 GPL 项目时照抄代码、WinDivert LGPL/GPL） | 低 | 中 | 开放 |
 | RISK-14 | SQLite 写入吞吐不足，高峰时积压 | 低 | 中 | 开放 |
 | RISK-15 | 被监控 Agent 在启动模式下行为变化（代理、环境变量、cgroup 影响兼容性） | 中 | 中 | 开放 |
+| RISK-16 | `mcp-tap` 与 Agent 的 MCP 配置方式不兼容，或 IPC 计字节开销超出预算 | 中 | 中 | 开放 |
 
 ## 明细
 
@@ -104,3 +105,9 @@
 ### RISK-15 启动模式影响被监控程序
 - **应对**：代理默认关闭（`--proxy` 显式开启）；注入的环境变量在会话元数据中记录；提供 `--no-scope-isolation` 选项。
 - **负责任务**：SPIKE-05、P1-DAEMON-03。
+
+### RISK-16 mcp-tap 兼容性与 IPC 开销
+- **影响**：Agent 不支持外部指定 MCP 配置时，工具名只能依赖 E3 自报告；管道与 Unix socket 流量大，计字节可能超出 CPU 预算。
+- **应对**：SPIKE-09 先验证；包装器 fail-open；只对跨 AgentInstance 的通道计字节，过滤在内核侧完成；不兼容的 Agent 降级为 E3，并在 UI 中标注。
+- **触发信号**：SPIKE-09 中支持外部 MCP 配置的 Agent 少于 2 个；`typical_agent` 剧本开启 IPC 采集后 CPU 增量 ≥1%。
+- **负责任务**：P6-DOC-01、P6-AGENT-01、P6-LNX-01。

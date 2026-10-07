@@ -15,7 +15,7 @@
 | `area:` | core、pipe、store、proxy、daemon、cli、ui、agent、lnx、win、mac、poll、sim、ci、sec、doc | 对应 [docs/README §2](../README.md#2-编号规则) 的 AREA |
 | `platform:` | linux、windows、macos、all | 涉及的平台 |
 | `type:` | feature、bug、spike、chore、docs | 工作类型 |
-| `phase:` | P0–P5 | 所属阶段 |
+| `phase:` | P0–P6 | 所属阶段 |
 | `size:` | S（≤0.5d）、M（≤2d）、L（≤5d，须拆分） | 规模 |
 | `priority:` | M、S、C | 必须 / 应该 / 可选 |
 | 单独标签 | `evidence` | 影响证据等级、结论措辞或证据/推测区分，**评审时必须对照 evidence-model** |
@@ -43,7 +43,7 @@ bug 表单在提交前提醒：不要粘贴未脱敏的日志、命令行或数�
 | 字段 | 类型 | 取值 | 来源 |
 |---|---|---|---|
 | Status | 单选 | Todo / In Progress / In Review / Done / Blocked | 手工 + 内置自动化（PR 合并 → Done） |
-| Phase | 单选 | P0–P5 | 同步脚本按 `phase:*` 标签填写 |
+| Phase | 单选 | P0–P6 | 同步脚本按 `phase:*` 标签填写 |
 | Platform | 单选 | linux / windows / macos / all | 同步脚本（多平台取 all） |
 | Area | 单选 | AREA 列表 | 同步脚本 |
 | Size | 单选 | S / M / L | 同步脚本 |
@@ -68,6 +68,7 @@ Milestone 与阶段一一对应，名称必须与 [roadmap §1](../04-plan/roadm
 | `P3 URL 与关联` | `docs/04-plan/tasks/P3-url-correlation.md` |
 | `P4 原生化与打包` | `docs/04-plan/tasks/P4-native-packaging.md` |
 | `P5 Agent 适配` | `docs/04-plan/tasks/P5-agent-adapters.md` |
+| `P6 Agent 间通信` | `docs/04-plan/tasks/P6-inter-agent.md` |
 
 截止日期由同步脚本从任务文件头的 `截止` 字段写入。阶段结束时关闭 Milestone，并在 roadmap §6 写复盘。
 
@@ -156,7 +157,7 @@ pwsh scripts/sync-labels.ps1
 # 4. Projects v2
 gh auth refresh -s project
 gh project create --owner '@me' --title AgentWatch        # 记录返回的项目编号
-gh project field-create <N> --owner '@me' --name Phase --data-type SINGLE_SELECT --single-select-options "P0,P1,P2,P3,P4,P5"
+gh project field-create <N> --owner '@me' --name Phase --data-type SINGLE_SELECT --single-select-options "P0,P1,P2,P3,P4,P5,P6"
 gh project field-create <N> --owner '@me' --name Platform --data-type SINGLE_SELECT --single-select-options "linux,windows,macos,all"
 gh project field-create <N> --owner '@me' --name Area --data-type SINGLE_SELECT --single-select-options "CORE,PIPE,STORE,PROXY,DAEMON,CLI,UI,AGENT,LNX,WIN,MAC,POLL,SIM,CI,SEC,DOC"
 gh project field-create <N> --owner '@me' --name Size --data-type SINGLE_SELECT --single-select-options "S,M,L"

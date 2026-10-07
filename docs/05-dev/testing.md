@@ -1,8 +1,8 @@
 # 测试策略
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：REQ-02~06、NFR-01~08、[evidence-model §8](../01-architecture/evidence-model.md#8-测试要求)、[performance-budget](../01-architecture/performance-budget.md)、[security-privacy §3.3](../01-architecture/security-privacy.md#33-测试)、[repo-layout §5](repo-layout.md#5-fixtures-目录)
+> 最后更新：2026-10-07
+> 关联：REQ-02~06、REQ-11、NFR-01~08、[evidence-model §8](../01-architecture/evidence-model.md#8-测试要求)、[performance-budget](../01-architecture/performance-budget.md)、[security-privacy §3.3](../01-architecture/security-privacy.md#33-测试)、[repo-layout §5](repo-layout.md#5-fixtures-目录)、[inter-agent-communication](../01-architecture/inter-agent-communication.md)
 
 ## 1. 测试分层
 
@@ -86,6 +86,8 @@ fn read_ssh_key_then_https() {
 | `etw-lost-events` | Gap 生成与时间线展示 |
 | `daemon-delegation` | 归属中断标注 |
 | `secrets-in-argv` | 命令行脱敏 |
+| `mcp-chain` | MCP stdio 调用 → server 读文件；启用 / 未启用 tap 两个变体（P6） |
+| `multi-agent-ipc` | 跨 Agent 管道 / Unix socket / 回环配对与共享文件（P6） |
 
 ## 4. 行为模拟器
 
@@ -143,7 +145,7 @@ action = "http_download"
 url = "http://127.0.0.1:{http_port}/download?bytes=1048576"
 ```
 
-支持的 `action`：`spawn`、`exec`（执行外部命令，如 `git --version`）、`read_file`（可选 `mode = "read" | "mmap"`）、`write_file`、`create`、`delete`、`rename`、`http_upload`、`http_download`、`dns_lookup`、`udp_send`、`sleep`、`repeat`（`times` + 嵌套 steps，用于压力剧本）、`daemonize`（双 fork 脱离父进程，验证范围追踪）。
+支持的 `action`：`spawn`、`exec`（执行外部命令，如 `git --version`）、`read_file`（可选 `mode = "read" | "mmap"`）、`write_file`、`create`、`delete`、`rename`、`http_upload`、`http_download`、`dns_lookup`、`udp_send`、`sleep`、`repeat`（`times` + 嵌套 steps，用于压力剧本）、`daemonize`（双 fork 脱离父进程，验证范围追踪）、`ipc_pipe` / `ipc_unix` / `ipc_named_pipe` / `ipc_loopback`（P6：两端交换已知字节）、`mcp_stdio`（P6：假 MCP server 的 `tools/call`）。
 
 ### 4.3 真值日志
 
@@ -168,6 +170,8 @@ url = "http://127.0.0.1:{http_port}/download?bytes=1048576"
 | `storm` | 每秒 5 万次 open（模拟编译），大量短命进程 | 降级阶梯、丢失计数与 Gap |
 | `read_then_send` | 读诱饵文件后上传：三个变体——上传文件原文、上传无关数据、未启用代理 | 内容匹配、哈希未匹配、未启用代理三种结论（evidence-model §8） |
 | `escape` | `daemonize`、通过已有守护进程执行【待定：可用的无特权委托方式】 | 范围追踪与归属中断 |
+| `multi_agent` | 假主 Agent 经管道拉起子 Agent 与 MCP server；独立会话经 Unix socket / 命名管道 / 回环交换已知字节；共享目录交换文件 | P6 退出标准：通道配对召回率、字节误差 |
+| `mcp_chain` | 假 Agent 经 MCP stdio 调用 `read_file`，server 读诱饵文件并联网；启用 / 未启用 `--mcp-tap` 两个变体 | P6 退出标准：委托链路各跳等级与措辞 |
 
 辅助剧本（不作为阶段退出标准）：`secrets`（在命令行、URL、环境变量中放入假凭证，用于脱敏验证）、`proxy_clients`（用 Node / Python / Go / curl / git 客户端访问本地 HTTPS 服务器，用于代理覆盖矩阵）。剧本文件位于 `sim/scenarios/<name>.toml`。
 
@@ -202,6 +206,7 @@ url = "http://127.0.0.1:{http_port}/download?bytes=1048576"
   真值字节按 [network-attribution §2](../01-architecture/network-attribution.md) 的口径选取：socket 层载荷用服务端“含 TLS”字节；代理模式的 HTTP body 用客户端 `app_bytes`。
 - **误报**：采集到但不属于剧本进程树的记录数（验证范围过滤）。
 - **通过门槛**（E1 平台）：各类 recall ≥ 95%；会话合计字节误差 < 5%；范围外误报 = 0。S 级（轮询）平台只报告不设门槛。
+- **IPC 配对召回率**（P6）：跨 Agent 通道的两端进程与真值一致的比例。Linux ≥ 95%，字节误差 < 5%；Windows 命名管道与回环 TCP ≥ 95%；macOS 只断言两端可见，字节按能力矩阵标 NA。
 
 ### 4.6 报告格式
 

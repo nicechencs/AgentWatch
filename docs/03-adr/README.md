@@ -28,6 +28,7 @@
 | [ADR-0010](0010-linux-ebpf-with-fallback.md) | Linux 用 Aya eBPF，并提供非 eBPF 降级 | 已接受 |
 | [ADR-0011](0011-aggregate-first.md) | 采集端先聚合再存储 | 已接受 |
 | [ADR-0012](0012-no-content-redact-before-write.md) | 不存内容，写入前脱敏 | 已接受 |
+| [ADR-0013](0013-inter-agent-observation.md) | 以通道为事实、协议为增强的 Agent 间通信观测 | 提议 |
 
 ## 待写的 ADR（候选）
 

@@ -1,8 +1,8 @@
 # 本地 API 与 CLI
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：REQ-02、REQ-05、REQ-07.6、[ADR-0005](../03-adr/0005-privileged-daemon-split.md)、[storage](storage.md)、[ui](ui.md)
+> 最后更新：2026-10-07
+> 关联：REQ-02、REQ-05、REQ-07.6、REQ-11、[ADR-0005](../03-adr/0005-privileged-daemon-split.md)、[storage](storage.md)、[ui](ui.md)、[inter-agent-communication](inter-agent-communication.md)
 
 ## 1. 通信与鉴权
 
@@ -50,6 +50,8 @@ aw
 │     --cwd <dir>  --env K=V...            覆盖工作目录 / 追加环境变量
 │     --summary <none|short|full>          结束时打印摘要（默认 short）
 │     --pin                                会话不参与自动清理
+│     --group <name>                       加入监控组（独立启动的多 Agent 组合，REQ-11）
+│     --mcp-tap                            启动模式下注入 stdio 包装器，记录 MCP method / 工具名（E2）
 │     --no-daemon                          不连 daemon，在 CLI 进程内跑轮询采集器（全部 S 级，ADR-0005）
 │     --raw <file>                         调试：另写未聚合原始事件 JSONL（有大小上限，ADR-0011）
 │     --unsafe-no-redact                   （管理员）关闭内置脱敏；会话被永久标记（ADR-0012）
@@ -57,7 +59,7 @@ aw
 │     --no-follow-children
 │     --no-existing-children               不纳入附着时已有的子进程
 │     --move-to-cgroup                     （Linux）把子树移入会话 cgroup
-│     --agent / --name / --pin             同 run
+│     --agent / --name / --pin / --group   同 run（附着模式不支持 --mcp-tap）
 │     --until-exit | --duration <dur>      结束条件（默认：根进程退出或 Ctrl-C）
 ├── stop <SESSION>                         停止监控（不杀进程）
 ├── ps [--agents-only] [--filter <text>]   列出可附着的进程（树状）
@@ -77,6 +79,7 @@ aw
 ├── around <SESSION> <TABLE>:<ID> [--window 10s]   查看某条记录前后的事件（REQ-05.4）
 ├── search <TEXT> [--since <time>] [--kind file|proc|url]   跨会话搜索
 ├── export <SESSION> [--format jsonl|csv|md] [-o <file>] [--filter <expr>]
+│     [--include agents,links,rpc]
 │     [--redact-paths] [--redact-hosts] [--lang zh|en]
 ├── ui [--no-open] [--port N]              打开本地 Web UI
 ├── doctor [--json] [--perf]               自检：权限、内核/系统版本、采集器可用性、能力矩阵实测；--perf 输出资源占用与降级级别
@@ -102,7 +105,16 @@ aw
 │   ├── replay <file> [--expect <snap>]    离线跑管道
 │   ├── scrub <file>                       替换用户名/主机名/IP
 │   └── upgrade <file>                     升级到当前 schema
+├── group                                  监控组（独立启动的多个会话，REQ-11）
+│   ├── create|list|show|delete <name>
+│   └── graph <name> [--format dot|mermaid|json]
+├── agents <SESSION|--group NAME>          Agent 实例列表与角色
+├── links <SESSION|--group NAME> [--kind ...] [--min-evidence E1]
+├── rpc <SESSION> [--method tools/call] [--target <glob>]
+├── chain <SESSION> <TABLE>:<ID>           从某条记录回溯委托链路
+├── merge <A.jsonl> <B.jsonl> -o <db>      跨主机离线合并（可选，P6-STORE-02）
 ├── hook <AGENT> [--session <SESSION>]      由 Agent hooks 调用：从 stdin 读事件 JSON，转发为 AgentToolCall（E3，SPIKE-07）
+├── mcp-tap -- <CMD> [ARGS...]             （内部）stdio 透明包装器；fail-open，不存参数内容
 ├── dev [--] <subcommand>                  单进程模式（daemon+CLI，需 sudo）
 └── version [--check]                      --check：用户确认后手动检查新版本（唯一主动联网处，默认不联网）
 ```
@@ -136,7 +148,7 @@ $ aw run --proxy -- claude
 | GET | `/compare?a=<SESSION>&b=<SESSION>` | 两个会话对比：进程/文件/域名/流量差异（P5） |
 | GET | `/doctor` | 自检报告（采集器 `probe()` 与 `capabilities()`） |
 | GET | `/processes` | 当前系统进程树（进程选择器）。参数：`?agents_only&q=` |
-| POST | `/sessions` | 创建会话。body：`{mode:"launch"\|"attach", argv?, cwd?, env?, pid?, follow_children, proxy, agent, name, include_procs, self_report, pin}` |
+| POST | `/sessions` | 创建会话。body：`{mode:"launch"\|"attach", argv?, cwd?, env?, pid?, follow_children, proxy, agent, name, include_procs, self_report, pin, group?, mcp_tap?}` |
 | GET | `/sessions` | 列表。参数：`?since&until&agent&active&q&cursor&limit` |
 | GET | `/sessions/{sid}` | 会话详情 + `stats` |
 | PATCH | `/sessions/{sid}` | `{name?, pinned?}` |
@@ -155,6 +167,16 @@ $ aw run --proxy -- claude
 | GET | `/sessions/{sid}/dns` | |
 | GET | `/sessions/{sid}/http` | |
 | GET | `/sessions/{sid}/agent-events` | E3 |
+| GET | `/sessions/{sid}/agents` | AgentInstance 列表与角色 |
+| PATCH | `/agents/{id}` | `{role?, label?}` 手工标注 |
+| GET | `/sessions/{sid}/links` | 参数：`?kind&min_evidence` |
+| GET | `/sessions/{sid}/rpc` | 参数：`?method&target`。MCP / A2A 调用列表 |
+| GET | `/chain` | 参数：`?ref=<table>:<id>`。委托链路 |
+| GET | `/groups` | 监控组列表 |
+| POST | `/groups` | `{name}` 创建监控组 |
+| GET | `/groups/{gid}` | 组详情与成员会话 |
+| DELETE | `/groups/{gid}` | 删除组（不删会话） |
+| GET | `/groups/{gid}/graph` | Agent 通信图（节点 + 边） |
 | GET | `/sessions/{sid}/findings` | 参数：`?lang`。返回的发现已按语言渲染 |
 | GET | `/sessions/{sid}/gaps` | |
 | GET | `/sessions/{sid}/around` | 参数：`?ref=file_access:123&window=10s` |
@@ -227,7 +249,7 @@ exe:"/usr/bin/curl" argv~"-d @"                # argv 子串匹配
 
 | 字段 | 适用 | 说明 |
 |---|---|---|
-| `kind` | 全部 | `proc` `file` `net` `dns` `http` `agent` `finding` `gap` |
+| `kind` | 全部 | `proc` `file` `net` `dns` `http` `agent` `ipc` `rpc` `finding` `gap` |
 | `time` | 全部 | 记录时间 |
 | `evidence` | 全部 | `E1` … `NA` |
 | `source` | 全部 | 采集器来源 |
@@ -241,6 +263,8 @@ exe:"/usr/bin/curl" argv~"-d @"                # argv 子串匹配
 | `qname` `qtype` `rcode` | dns | |
 | `method` `url` `host` `status` `req_bytes` `resp_bytes` | http | |
 | `tool` `agent` | agent | |
+| `ipc_kind` `peer` `channel` | ipc | `pipe` / `unix_stream` / `named_pipe` 等 |
+| `method` `target` | rpc | MCP / A2A 的 method 与工具名 |
 | `rule` `severity` | finding | |
 
 未知字段报错，并给出建议（编辑距离）。字段与 `kind` 不匹配时，例如 `kind:file domain:x`，结果为空，并返回警告。

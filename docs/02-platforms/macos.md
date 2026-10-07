@@ -1,8 +1,8 @@
 # macOS 采集器
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：REQ-01~04、ADR-0009、SPIKE-03、SPIKE-05、SPIKE-08、[capability-matrix](capability-matrix.md)
+> 最后更新：2026-10-07
+> 关联：REQ-01~04、REQ-11、ADR-0009、ADR-0013、SPIKE-03、SPIKE-05、SPIKE-08、SPIKE-09、[capability-matrix](capability-matrix.md)、[inter-agent-communication](../01-architecture/inter-agent-communication.md)
 
 涉及 crate 和目录：`aw-collector-macos`（Rust）、`macos-ext/`（Swift 编写的 Network Extension 系统扩展，第二步才用）。
 
@@ -117,6 +117,8 @@ macOS 是三平台中**风险最高**的一个：原生能力依赖 Apple 审批
 | DnsQuery / DnsAnswer | pktap（归属于 mDNSResponder） | 同左 | E1（但发起进程为 I） |
 | TlsSni | pktap | NE `remoteHostname` + pktap | E1 |
 | HttpRequest / HttpResponse | aw-proxy | aw-proxy | E2 |
+| IpcOpen / IpcClose | ES `uipc_connect` / `uipc_bind`；管道用进程树 + libproc `PROC_PIDFDPIPEINFO` 采样（CAP-IPC，P6） | 同左 | 连接 E1 / 配对 S / 字节 NA；机制待 SPIKE-09 |
+| AgentRpc | `mcp-tap` / `proxy/mcp` | 同左 | E2 |
 | Gap | seq_num 跳号、eslogger/nettop 退出 | seq_num 跳号、扩展断连 | — |
 
 ## 4. 范围追踪

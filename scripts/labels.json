@@ -33,6 +33,7 @@
   { "name": "phase:P3", "color": "bfd4f2", "description": "P3 URL 与关联" },
   { "name": "phase:P4", "color": "bfd4f2", "description": "P4 原生化与打包" },
   { "name": "phase:P5", "color": "bfd4f2", "description": "P5 Agent 适配" },
+  { "name": "phase:P6", "color": "bfd4f2", "description": "P6 Agent 间通信" },
 
   { "name": "size:S", "color": "e4e669", "description": "≤0.5 天" },
   { "name": "size:M", "color": "e4e669", "description": "≤2 天" },

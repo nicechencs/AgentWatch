@@ -1,8 +1,8 @@
 # 统一事件模型
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：REQ-02~06、[ADR-0004](../03-adr/0004-evidence-levels.md)、[ADR-0007](../03-adr/0007-process-identity.md)、[storage](storage.md)、[pipeline](pipeline.md)
+> 最后更新：2026-10-07
+> 关联：REQ-02~06、REQ-11、[ADR-0004](../03-adr/0004-evidence-levels.md)、[ADR-0007](../03-adr/0007-process-identity.md)、[ADR-0013](../03-adr/0013-inter-agent-observation.md)、[storage](storage.md)、[pipeline](pipeline.md)、[inter-agent-communication](inter-agent-communication.md)
 
 `RawEvent` 是采集层与管道之间**唯一的契约**，定义在 `aw-core::event`。采集器不得绕过它直接写存储。聚合后的记录（`Record`）见 [storage](storage.md)。
 
@@ -192,6 +192,35 @@ pub enum EventKind {
         call_id: Option<String>,
     },
 
+    // ---------- 本机 IPC（P6，CAP-IPC；兼容变更，不升 v） ----------
+    /// 一条本机通道打开。`peer` 未知时填 None，并在 field_evidence 写 NA(peer_unknown)。
+    IpcOpen {
+        kind: IpcKind,             // pipe / unix_stream / unix_dgram / named_pipe / loopback_tcp / loopback_udp
+        peer: Option<ProcRef>,     // 对端进程；未知则为 None
+        name: Option<String>,      // socket 路径 / 管道名 / 回环端口（已脱敏）
+    },
+    IpcTransfer {
+        /// 采集器内的通道标识，与 IpcOpen / IpcClose 配对。
+        channel: u64,
+        direction: IpcDirection,   // a_to_b / b_to_a
+        bytes: u64,
+    },
+    IpcClose {
+        channel: u64,
+        total_a_to_b: Option<u64>,
+        total_b_to_a: Option<u64>,
+    },
+    /// 协议层元数据（mcp-tap 或代理）。不得携带参数或结果内容。
+    AgentRpc {
+        method: String,            // tools/call / resources/read / ...
+        target: Option<String>,    // 工具名 / 资源 URI（已脱敏）
+        arg_shape: Option<serde_json::Value>,  // 键名 → {type, len}，无内容
+        req_bytes: Option<u64>,
+        resp_bytes: Option<u64>,
+        is_error: Option<bool>,
+        duration_ns: Option<u64>,
+    },
+
     // ---------- 采集缺口 ----------
     Gap {
         collector: SmolStr,
@@ -234,6 +263,8 @@ pub struct BodyDigestRef { pub chunks: u32, pub digest_set_id: u64 }
 | `FlowDirection` | `outbound`, `inbound`, `unknown` |
 | `L4Proto` | `tcp`, `udp` |
 | `ToolPhase` | `pre`, `post` |
+| `IpcKind` | `pipe`, `unix_stream`, `unix_dgram`, `named_pipe`, `loopback_tcp`, `loopback_udp`，带 `#[serde(other)] Unknown` |
+| `IpcDirection` | `a_to_b`, `b_to_a` |
 | `GapKind` | `dropped`（管道内队列满）, `lost_by_os`（ETW EventsLost / ring buffer 丢失）, `restart`, `rate_limited`, `permission`, `attach_window`, `unsupported`, `scope_race`（进程纳入范围前的窗口）, `collector_disconnected`（采集器/扩展连接断开）, `self_report_dropped`（E3 事件丢弃）, `attribution_unknown`（事件无法归属到进程，如 fanotify pid=0）, `cache_evicted`（句柄/路径缓存淘汰）, `parse_error`（外部工具输出无法解析，如 eslogger）, `rule_state_evicted`（关联引擎状态窗口溢出） |
 
 ### 2.1 `source` 采集器前缀登记
@@ -253,8 +284,9 @@ pub struct BodyDigestRef { pub chunks: u32, pub digest_set_id: u64 }
 | `macos.nettop` / `macos.pktap` | macOS 流量采样 / 抓包 | `flow` / `dns`, `sni` | [macos](../02-platforms/macos.md) |
 | `macos.ne` | macOS Network Extension | `flow` | [macos](../02-platforms/macos.md) |
 | `poll` | 跨平台轮询兜底 | `procs`, `sockets` | [fallback-poll](../02-platforms/fallback-poll.md) |
-| `proxy` | aw-proxy MITM 代理 | `http`, `mitm` | [network-attribution](network-attribution.md) |
+| `proxy` | aw-proxy MITM 代理 | `http`, `mitm`, `mcp`, `a2a` | [network-attribution](network-attribution.md)、[inter-agent-communication §5](inter-agent-communication.md#5-协议层e2mcp-与常见-agent-协议) |
 | `agent.<id>` | Agent 自报告（E3） | `hook`, `otel`, `transcript` | [process-tracking](process-tracking.md) |
+| `mcp-tap` | 启动模式下的 stdio 包装器 | `jsonrpc` | [inter-agent-communication §5](inter-agent-communication.md#5-协议层e2mcp-与常见-agent-协议) |
 
 ## 3. 各事件的必填与常见证据
 
@@ -271,6 +303,10 @@ pub struct BodyDigestRef { pub chunks: u32, pub digest_set_id: u64 }
 | `TlsSni` | flow, sni | E1 | |
 | `HttpRequest`/`HttpResponse` | req_id, method, url | E2 | proc 由管道按 client 端口反查 |
 | `AgentToolCall` | agent, tool, phase | E3 | |
+| `IpcOpen` | kind | E1 / S / I | `peer` 不可得时为 NA(`peer_unknown`)；平台机制见 [CAP-IPC](../02-platforms/capability-matrix.md#10-agent-间通信cap-ipc) |
+| `IpcTransfer` | channel, direction, bytes | E1 / S / NA | 只对跨 AgentInstance 的通道计字节；macOS 字节常为 NA |
+| `IpcClose` | channel | E1 / S | |
+| `AgentRpc` | method | E2 | 不得有参数或结果内容字段；未启用 tap 时不产生，工具名为 NA(`protocol_not_observed`) |
 | `Gap` | collector, gap_kind, 时间范围 | —（固定为 E1：缺口本身是事实） | |
 
 ## 4. 时钟域
@@ -316,6 +352,7 @@ macOS 上字段级 NA 的示例：
 - **兼容变更（不升版本）**：新增可选字段、新增 `NaReason` / `GapKind` 取值、新增 `source` 子源名。反序列化侧必须容忍未知字段和未知枚举值，枚举用 `#[serde(other)] Unknown` 兜底。
 - **不兼容变更（升版本）**：删除字段、字段改名、改变语义或单位、新增 `EventKind` 变体。
   - 新增变体算不兼容，是因为旧管道不应静默丢弃未知事件。
+  - P6 的 `IpcOpen` / `IpcTransfer` / `IpcClose` / `AgentRpc` 在本草案冻结前一并登记，按 [P6-CORE-01](../04-plan/tasks/P6-inter-agent.md#p6-core-01-ipc-与-agentrpc-事件类型) **不升 `v`**；落地后的旧 fixtures 回放必须忽略未知变体并写 `Gap{parse_error}`，不得静默丢弃。
   - 升版本时在 `aw-core::event::migrate` 中提供 `v(n-1) → v(n)` 的 JSON 转换。`fixtures/` 中的旧文件在加载时自动迁移；也可以用 `aw fixtures upgrade` 重写。
 - 存储 schema 版本独立管理，见 [storage §6](storage.md#6-迁移策略)。
 - 任何 schema 变更都必须同时：更新本文档；在 `fixtures/` 增加或更新样例；通过 `cargo test -p aw-core schema_roundtrip`。

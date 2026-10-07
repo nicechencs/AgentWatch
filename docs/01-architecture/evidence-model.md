@@ -1,8 +1,8 @@
 # 证据模型
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：REQ-06、[ADR-0004](../03-adr/0004-evidence-levels.md)、[pipeline](pipeline.md)、[ui](ui.md)
+> 最后更新：2026-10-07
+> 关联：REQ-06、[ADR-0004](../03-adr/0004-evidence-levels.md)、[pipeline](pipeline.md)、[ui](ui.md)、[inter-agent-communication](inter-agent-communication.md)
 
 本文件是证据等级的**唯一定义处**。代码中对应 `aw_core::Evidence`，措辞模板对应 `aw_pipeline::wording`。
 
@@ -72,6 +72,8 @@
 | `h2_hpack` | HTTP/2 头部经 HPACK 压缩，uprobe 只拿到片段 | HTTP/2 头部压缩，完整 URL 不可得 |
 | `too_large` | 超过内容哈希的大小上限 | 文件或请求体过大，未做内容比对 |
 | `file_changed` | 哈希时文件已被修改或删除 | 比对时文件已变化，结果不可用 |
+| `peer_unknown` | IPC 对端进程无法确定 | 无法确定通信通道另一端的进程 |
+| `protocol_not_observed` | 未启用 mcp-tap 或代理，协议层不可见 | 未启用 mcp-tap 或代理，调用的方法和工具名不可得 |
 
 新增原因码必须同时更新本表和 `aw_core::NaReason`。
 
@@ -107,6 +109,10 @@
 | `fact.self_report_mismatch` | 【E1】系统观测到 {proc} 访问了 `{path}`，但 Agent 自报告中没有对应记录。 | [E1] {proc} accessed `{path}`, but no matching entry exists in the agent's self-report. |
 | `gap.generic` | 【采集缺口】{from}–{to} 期间 {collector} 的 {kinds} 数据可能不完整：{reason}。 | [Gap] {kinds} from {collector} may be incomplete between {from} and {to}: {reason}. |
 | `attr.break` | 【归属中断】{proc} 通过 {via} 委托了操作，后续行为发生在会话之外，未纳入统计。 | [Attribution break] {proc} delegated work via {via}; subsequent activity is outside this session and not counted. |
+| `ipc.channel` | 【{ev}】{proc_a} 与 {proc_b} 之间存在 {ipc_kind} 通道 `{name}`：{proc_a} 发送了 {bytes_a_to_b}，接收了 {bytes_b_to_a}。 | [{ev}] A {ipc_kind} channel `{name}` exists between {proc_a} and {proc_b}: {proc_a} sent {bytes_a_to_b} and received {bytes_b_to_a}. |
+| `delegation.chain` | 【委托链路·{ev_min}】{target_event} 之前依次观测到：{hops}。链路等级取各跳中最弱的一级（{ev_min}）；这只说明这些通道与调用在时间和进程上相连，不说明 {agent_a} 的意图。 | [Delegation chain · {ev_min}] Observed before {target_event}: {hops}. The chain takes its weakest hop ({ev_min}); this shows the channels and calls are linked in time and process, not what {agent_a} intended. |
+| `delegation.ambiguous` | 【委托链路·无法区分】{target_event} 发生时，{server} 有 {n} 次调用同时在进行，无法区分它属于哪一次调用。 | [Delegation chain · ambiguous] {n} calls to {server} overlapped when {target_event} occurred; it cannot be attributed to a single call. |
+| `infer.shared_artifact` | 【推测·共享文件】{agent_a} 在 {t_a} 修改了 `{path}`，{agent_b} 在 {t_b} 读取了该文件。这说明两者可能通过该文件交换信息；**没有证据表明 {agent_b} 的后续行为由此触发。** | [Inferred · shared file] {agent_a} modified `{path}` at {t_a}; {agent_b} read it at {t_b}. They may have exchanged information through this file; **no evidence that {agent_b}'s later activity was triggered by it.** |
 
 ## 6. 内容哈希匹配（I → 内容匹配证据的唯一升级路径）
 
@@ -147,6 +153,8 @@
 | “没有上传任何文件”“安全”“no data leaked” | 无法证明否定 | “在已观测范围内未发现 …”，并列出缺口 |
 | “读取了 0 字节”（实际是 NA） | 把不可得当成 0 | “读取字节数不可得” |
 | “所有流量” | 忽略未观测通道 | “已观测的流量” |
+| “A 让 B 窃取了 …” / “A instructed B to steal …” | 含有意图判断，且把委托链路当作因果 | 使用 `delegation.chain`：逐跳陈述通道、调用与字节 |
+| “A 通过 B 上传了 …” / “A uploaded … via B” | 没有内容级证据，且链路只说明相连 | 使用 `ipc.channel` + `fact.net_send`，或 `delegation.chain` |
 
 实现上，`aw-pipeline` 提供 `wording::lint(text) -> Vec<Violation>`，按上表关键词表检查。覆盖范围包括：
 - 单元测试对所有模板的渲染结果；
@@ -158,3 +166,4 @@ CI 中运行。
 
 - 每条关联规则至少有一个回放夹具。断言内容包括输出的 `evidence`、模板 ID，以及不含禁用词。
 - 模拟器剧本 `read_then_send` 覆盖三种结果：内容匹配、哈希未匹配、未启用代理。
+- P6 剧本 `mcp_chain` 断言委托链路各跳等级与 `delegation.chain` / `delegation.ambiguous` 措辞；`multi_agent` 断言 `ipc.channel` 与 `infer.shared_artifact`。未启用 tap 时工具名为 NA(`protocol_not_observed`)。

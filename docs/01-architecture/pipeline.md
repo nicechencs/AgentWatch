@@ -1,8 +1,8 @@
 # 事件处理管道
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：REQ-03~07、NFR-01~06、[ADR-0011](../03-adr/0011-aggregate-first.md)、[ADR-0012](../03-adr/0012-no-content-redact-before-write.md)、[event-schema](event-schema.md)、[storage](storage.md)
+> 最后更新：2026-10-07
+> 关联：REQ-03~07、REQ-11、NFR-01~06、[ADR-0011](../03-adr/0011-aggregate-first.md)、[ADR-0012](../03-adr/0012-no-content-redact-before-write.md)、[ADR-0013](../03-adr/0013-inter-agent-observation.md)、[event-schema](event-schema.md)、[storage](storage.md)、[inter-agent-communication](inter-agent-communication.md)
 
 `aw-pipeline` 把 `RawEvent` 流变成可存储的 `Record` 和 `Finding`。它不依赖任何平台 crate，所有逻辑都可以通过回放 JSONL 测试。
 
@@ -98,6 +98,10 @@ flowchart LR
 - 流结束时更新 `net_flows` 总量。如果平台在 `NetClose` 里给了累计值，就和我们自己的累加值对比：差异超过 5% 时记录差异，并把字节字段的证据标为“有偏差”。
 - UDP：同一五元组 60 秒内无报文即视为结束。
 
+**本机 IPC（P6）**
+- 状态表：`(kind, a_proc_uid, b_proc_uid, name) → IpcAcc`，按 `aggregate.bucket_secs`（默认 5 秒）累加各方向字节，输出 `ipc_channels`。
+- 两端映射到 AgentInstance 后生成 `agent_links`（`ipc` / `rpc`）；同一 Agent 内部的管道只累加总数，不生成边。详见 [inter-agent-communication §3.2](inter-agent-communication.md#32-通信通道channel与通信边agentlink)。
+
 **单事件保留**：`debug.keep_raw_events = true` 时，另写一份 `raw_events` 表。只用于调试，写入前同样要脱敏。
 
 ### 3.6 Correlate（关联规则引擎）
@@ -154,8 +158,11 @@ upgrade_if = "content_match(a.path, b.flow)"   # 若成立，改用 evidence.con
 | `self_report_mismatch` | E1 | E3 与 E1 不一致 |
 | `mass_delete` | E1 | 10 秒内删除的文件超过 N 个（默认 50） |
 | `new_executable_written_then_run` | E1 | 写入文件后又 exec 了该文件。两步均为 E1 且路径相同，可以直接作为事实陈述，算作“事实汇总”类规则，允许声明 E1 |
+| `agent_shared_artifact` | I | AgentInstance A 修改文件后、另一 AgentInstance B 读取同一文件（P6）。排除构建产物、缓存和锁文件；措辞 `infer.shared_artifact` |
 
 > 注：“事实汇总”类多步规则的条件是：每一步都是 E1，而且规则只陈述各步的合取，不推断因果。它们用 `kind = "fact_conjunction"` 声明，允许输出 E1，并须通过专门的评审。
+
+P6 另有委托链路引擎（只读已有记录，不生成新事实）：从任一记录往上追溯所属进程 → AgentInstance → 入边。每跳带等级，整条链取最弱一跳。见 [inter-agent-communication §6](inter-agent-communication.md#6-间接通信t4与委托链路)。
 
 ### 3.7 Batcher（批量写入）
 - 触发条件：满 `store.batch_max_rows`（默认 1000 行）或 `store.batch_max_ms`（默认 100 ms），先到先触发。
@@ -199,6 +206,8 @@ upgrade_if = "content_match(a.path, b.flow)"   # 若成立，改用 evidence.con
 | `process_start` | 200/s | 1000 |
 | `net_connect` | 500/s | 2000 |
 | `dns` | 500/s | 2000 |
+| `ipc_transfer` | 不限（只累加计数器；内核侧已按跨 Agent 过滤） | — |
+| `agent_rpc` | 200/s | 1000 |
 
 - **全局限流**：管道 CPU 使用超过预算时进入降级阶梯，见 [performance-budget](performance-budget.md)。
 

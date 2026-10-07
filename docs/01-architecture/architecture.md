@@ -1,8 +1,8 @@
 # 总体架构
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：REQ-01~07、[ADR-0001](../03-adr/0001-rust-workspace.md)、[ADR-0002](../03-adr/0002-embedded-web-ui.md)、[ADR-0005](../03-adr/0005-privileged-daemon-split.md)、[ADR-0011](../03-adr/0011-aggregate-first.md)
+> 最后更新：2026-10-07
+> 关联：REQ-01~07、REQ-11、[ADR-0001](../03-adr/0001-rust-workspace.md)、[ADR-0002](../03-adr/0002-embedded-web-ui.md)、[ADR-0005](../03-adr/0005-privileged-daemon-split.md)、[ADR-0011](../03-adr/0011-aggregate-first.md)、[ADR-0013](../03-adr/0013-inter-agent-observation.md)、[inter-agent-communication](inter-agent-communication.md)
 
 ## 1. 设计原则
 
@@ -47,6 +47,7 @@ flowchart TB
   UI -->|HTTP + token| API
   CLI -.->|aw run 由 daemon 代为创建| Target
   Target -.->|HTTPS_PROXY| PROXY
+  Target -.->|mcp-tap stdio| ADP
 ```
 
 ## 3. crate 划分与依赖方向
@@ -62,7 +63,7 @@ flowchart TB
 | `aw-collector-windows` | ETW 会话、Job Object | core | 是 |
 | `aw-collector-macos` | ES（或 eslogger 子进程）、nettop/pktap、与 NE 的 XPC | core | 是 |
 | `aw-collector-poll` | 跨平台轮询：进程表与 socket 表 | core | 否 |
-| `aw-agent-adapters` | Agent 画像、hooks 接收、日志/OTEL 解析（E3） | core | 否 |
+| `aw-agent-adapters` | Agent 画像、hooks 接收、日志/OTEL 解析（E3）、`mcp-tap` 包装器 | core | 否 |
 | `aw-daemon` | 进程入口、组装采集器与管道、会话管理、HTTP API、嵌入 UI | 全部 | 部分 |
 | `aw-cli` | `aw` 命令行，API 客户端 | core | 否 |
 
@@ -159,6 +160,7 @@ stdio 处理有两个候选方案：
 | `correlation.max_hash_file_size` | 10 MB | 文件侧做内容哈希的大小上限 | [evidence-model §6](evidence-model.md) |
 | `collectors.windows.sni` | `false` | Windows pktmon SNI 采集（可选） | [windows](../02-platforms/windows.md) |
 | `collectors.linux.tls_uprobe` | `false` | Linux TLS 明文 uprobe（可选，开启时 UI 显著提示） | [network-attribution](network-attribution.md) |
+| `collectors.linux.ipc_payload_peek` | `false` | Linux eBPF 读取 IPC 缓冲区做协议解析（可选，默认关闭；与 tls_uprobe 同级审批） | [inter-agent-communication §5](inter-agent-communication.md#5-协议层e2mcp-与常见-agent-协议) |
 | `debug.keep_raw_events` | `false` | 另写未聚合的 `raw_events` 表 | [pipeline](pipeline.md) |
 
 ### 7.2 环境变量

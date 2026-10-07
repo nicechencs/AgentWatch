@@ -1,7 +1,7 @@
 # 路线图
 
 > 状态：草案
-> 最后更新：2026-10-06
+> 最后更新：2026-10-07
 > 关联：[requirements](../00-overview/requirements.md)、[tasks](tasks/README.md)、[risks](risks.md)
 
 估算基准：**1 名开发者 + AI 辅助**，每周约 5 个有效工作日。起始日 2026-10-12（周一）。日期是规划值，每个阶段结束时按实际速度重排。
@@ -16,6 +16,7 @@
 | P3 | `P3 URL 与关联` | 2026-12-28 → 2027-01-17（3 周） | [P3-url-correlation](tasks/P3-url-correlation.md) | 代理拿完整 URL、SNI、推测关联与内容哈希匹配 |
 | P4 | `P4 原生化与打包` | 2027-01-18 → 2027-02-14（4 周） | [P4-native-packaging](tasks/P4-native-packaging.md) | macOS 原生 ES/NE、三平台签名安装包、干净卸载 |
 | P5 | `P5 Agent 适配` | 2027-02-15 → 2027-03-07（首批 3 周，之后持续） | [P5-agent-adapters](tasks/P5-agent-adapters.md) | 识别主流 Agent、接入 E3 自报告、规则告警 |
+| P6 | `P6 Agent 间通信` | 2027-03-08 → 2027-04-04（4 周） | [P6-inter-agent](tasks/P6-inter-agent.md) | 识别多个 Agent 实例、配对 IPC 两端、MCP 调用可见、委托链路可回溯 |
 
 ## 2. 甘特图
 
@@ -56,6 +57,12 @@ gantt
 
     section P5 Agent 适配
     首批适配与规则            :p5a, 2027-02-15, 15d
+
+    section P6 Agent 间通信
+    SPIKE-09 与事件/存储      :p6a, 2027-03-08, 5d
+    三平台 IPC 配对与 mcp-tap :p6b, after p6a, 8d
+    链路/监控组/CLI/UI        :p6c, after p6b, 7d
+    验收                       :milestone, m6, 2027-04-04, 0d
 ```
 
 ## 3. 阶段详情
@@ -122,6 +129,13 @@ gantt
 - **退出标准（首批）**：至少 2 个 Agent 的工具调用能与系统观测对齐；E3 与 E1 矛盾时以 E1 为准并提示。
 - **依赖**：P3。
 
+### P6 Agent 间通信
+
+- **目标**：同时监控多个 Agent 之间的通信，回答“谁和谁通信了、通过什么通道、传了多少”，并能回溯委托链路。
+- **范围**：SPIKE-09；IPC 事件类型与存储；三平台 IPC 两端配对；AgentInstance 识别；`aw mcp-tap`；共享工件规则与委托链路；监控组；CLI 与 UI 通信图；可选的 `aw merge`。设计见 [inter-agent-communication](../01-architecture/inter-agent-communication.md)、[ADR-0013](../03-adr/0013-inter-agent-observation.md)。
+- **退出标准**：`multi_agent` 剧本在 Linux / Windows 上通道配对召回率 ≥95%；`mcp_chain` 链路断言通过；新增措辞通过 lint；开启 IPC 采集后 CPU 增量 <1%。
+- **依赖**：P5（Agent 识别）、P3（代理与关联引擎）。
+
 ## 4. 关键路径与外部依赖
 
 ```mermaid
@@ -131,8 +145,10 @@ flowchart LR
     P2 --> P3[P3 URL 与关联]
     P2 --> P4[P4 原生化与打包]
     P3 --> P5[P5 Agent 适配]
+    P5 --> P6[P6 Agent 间通信]
     APPLE{{Apple ES/NE 授权}} -.-> P4
     SPK[SPIKE-01~08] --> P1
+    SPK9[SPIKE-09] --> P6
 ```
 
 - **Apple 授权**是唯一不可控的外部依赖。P0 第一天提交申请；若 P4 开始时仍未获批，P4-MAC 任务标 `status:blocked`，macOS 继续使用 eslogger/nettop 方案发布，并在发布说明中标注能力降级。
@@ -147,6 +163,7 @@ flowchart LR
 | 0.3.0 | P3 结束 | 预发布，含代理与关联 |
 | 1.0.0 | P4 结束 | 正式发布，签名安装包 |
 | 1.x | P5 | 按适配器增量发布 |
+| 1.1.0 | P6 结束 | Agent 间通信 |
 
 ## 6. 阶段复盘
 

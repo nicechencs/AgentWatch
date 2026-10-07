@@ -1,8 +1,8 @@
 # 进程身份与范围追踪
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：REQ-02、[ADR-0007](../03-adr/0007-process-identity.md)、[SPIKE-05](../06-research/SPIKE-05-launch-scoping.md)、[event-schema](event-schema.md)
+> 最后更新：2026-10-07
+> 关联：REQ-02、REQ-11、[ADR-0007](../03-adr/0007-process-identity.md)、[ADR-0013](../03-adr/0013-inter-agent-observation.md)、[SPIKE-05](../06-research/SPIKE-05-launch-scoping.md)、[event-schema](event-schema.md)、[inter-agent-communication](inter-agent-communication.md)
 
 ## 1. 问题
 
@@ -120,7 +120,8 @@ self_report = ["hooks", "otel"]                           # 见 SPIKE-07
 用途如下：
 - `aw run --agent auto` 时自动标注会话的 Agent 类型；
 - 在进程选择器中置顶显示 Agent 进程；
-- 决定接入哪种 E3 数据源。
+- 决定接入哪种 E3 数据源；
+- P6 在 Enrich 阶段对每个 `ProcessStart` 再跑一次匹配器，在会话内标出多个 [AgentInstance](inter-agent-communication.md#31-agent-实例agentinstance)（主 Agent / 子 Agent / MCP server）。识别结果本身带证据等级，规则匹配为 I。独立启动的多个根进程通过监控组组合，而不是让单个会话包含多个根。
 
 【待验证】各 Agent 的实际进程形态见 [SPIKE-07](../06-research/SPIKE-07-agent-hooks.md)。
 

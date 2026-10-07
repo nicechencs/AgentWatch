@@ -1,8 +1,8 @@
 # 安全与隐私
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：REQ-07、NFR-09、[ADR-0005](../03-adr/0005-privileged-daemon-split.md)、[ADR-0006](../03-adr/0006-explicit-mitm-proxy-for-url.md)、[ADR-0012](../03-adr/0012-no-content-redact-before-write.md)
+> 最后更新：2026-10-07
+> 关联：REQ-07、REQ-11、NFR-09、[ADR-0005](../03-adr/0005-privileged-daemon-split.md)、[ADR-0006](../03-adr/0006-explicit-mitm-proxy-for-url.md)、[ADR-0012](../03-adr/0012-no-content-redact-before-write.md)、[ADR-0013](../03-adr/0013-inter-agent-observation.md)、[inter-agent-communication](inter-agent-communication.md)
 
 AgentWatch 本身就是一个**高权限、能看到大量敏感信息**的程序。它的安全性与审计能力同等重要。
 
@@ -53,6 +53,8 @@ flowchart LR
 | **I 信息泄露** | 普通用户 A 读取用户 B 的会话 | API 按 `user_id` 授权 | 设计 |
 | I | 凭证进入数据库（argv 中的 token、URL 查询参数、请求头） | 先脱敏再写入（§3）；请求头使用白名单 | 设计 |
 | I | 文件内容和 body 泄露 | 默认不存；哈希比对只在内存中进行 | 设计 |
+| I | Agent 间通信内容（提示词、工具参数、凭证）泄露 | 默认不存内容，只存 method、工具名、参数形状和字节数（ADR-0013） | 设计 |
+| S | 被监控进程伪造 MCP 元数据或劫持 `mcp-tap` | 伪造只影响 E2；通道与字节仍是 E1。包装器 fail-open，解析失败原样透传并写缺口 | 设计 |
 | I | CA 私钥泄露 | §5 | 设计 |
 | I | 日志泄露敏感信息 | daemon 日志只记录自身状态，不记录事件内容；在 `tracing` 层用类型包装禁止打印 `RawEvent` 内容 | 设计 |
 | I | 导出文件被随意传播 | 导出内容同样是已脱敏数据；提供 `--redact-paths` / `--redact-hosts` | 设计 |
@@ -130,7 +132,7 @@ flowchart LR
 ## 4. 敏感路径规则
 
 - 命中敏感路径规则只会打上标签并触发 `sensitive_access` 发现，**不会**读取文件内容。
-- 例外是代理会话中的哈希比对，见 evidence-model §6。
+- 例外是代理会话中的哈希比对，见 evidence-model §6。启用 `--mcp-tap` 时，可以对 MCP `arguments` 做同样的分块哈希，只用于内容匹配，不落盘。
 - glob 语法与筛选语法一致；`~` 指会话用户的家目录。
 
 | 规则 ID | Linux | macOS | Windows |
@@ -184,3 +186,4 @@ flowchart LR
   - `ReadWritePaths=/var/lib/agentwatch /run/agentwatch /sys/fs/cgroup/agentwatch.slice`。
   - 【待验证】哪些能力是确实必须的，见 [SPIKE-01](../06-research/SPIKE-01-linux-aya-poc.md)。
 - **自身可见性**：监控进行时，`aw run` 在终端中显示提示，UI 显示录制中标记。本工具不提供隐藏运行模式。
+- **mcp-tap 与 IPC 窥探**：包装器以用户权限运行，经本地 socket 把元数据发给 daemon；解析失败必须原样透传（fail-open）并写缺口。使用 eBPF 读取管道缓冲区（仅 Linux）与 TLS uprobe 同级审批：需要显式配置 `collectors.linux.ipc_payload_peek`，UI 显著提示。详见 [inter-agent-communication §10](inter-agent-communication.md#10-隐私与安全)。

@@ -20,6 +20,7 @@ AgentWatch 是跨平台进程行为审计工具。它的底线是**如实**：�
 | daemon / CLI / API | [architecture](docs/01-architecture/architecture.md)、[api-and-cli](docs/01-architecture/api-and-cli.md)、[ADR-0005](docs/03-adr/0005-privileged-daemon-split.md) |
 | UI | [ui](docs/01-architecture/ui.md)、[api-and-cli](docs/01-architecture/api-and-cli.md)、[evidence-model 展示样式与措辞](docs/01-architecture/evidence-model.md) |
 | Agent 适配（AGENT） | [process-tracking](docs/01-architecture/process-tracking.md)、[SPIKE-07](docs/06-research/SPIKE-07-agent-hooks.md) |
+| Agent 间通信（P6） | [inter-agent-communication](docs/01-architecture/inter-agent-communication.md)、[ADR-0013](docs/03-adr/0013-inter-agent-observation.md)、[capability-matrix §10](docs/02-platforms/capability-matrix.md)、[P6 任务卡](docs/04-plan/tasks/P6-inter-agent.md) |
 | 技术验证（spike） | 对应 `docs/06-research/SPIKE-NN-*.md`、[spike-template](docs/06-research/spike-template.md) |
 | CI / 发布 | `docs/05-dev/ci-release.md`、`docs/05-dev/github-workflow.md` |
 

@@ -1,8 +1,8 @@
 # Linux 采集器
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：REQ-01~04、ADR-0010、ADR-0007、SPIKE-01、SPIKE-05、[capability-matrix](capability-matrix.md)
+> 最后更新：2026-10-07
+> 关联：REQ-01~04、REQ-11、ADR-0010、ADR-0007、ADR-0013、SPIKE-01、SPIKE-05、SPIKE-09、[capability-matrix](capability-matrix.md)、[inter-agent-communication](../01-architecture/inter-agent-communication.md)
 
 本文涵盖 crate：`aw-collector-linux`（用户态）和 `aw-ebpf`（内核态 eBPF 程序，用 Aya 编写）。
 
@@ -95,6 +95,8 @@
 | DnsQuery / DnsAnswer | udp kprobe 载荷 | `AF_PACKET` 抓 53 端口 | legacy 模式下用本地端口反查进程（S） |
 | TlsSni | tcp_sendmsg 首包 | `AF_PACKET` | |
 | HttpRequest / HttpResponse | aw-proxy（通用）、uprobe（可选） | — | E2 |
+| IpcOpen / IpcTransfer / IpcClose | eBPF `unix_stream_connect` / `unix_stream_sendmsg` / `pipe_write`（CAP-IPC，P6） | `sock_diag` UNIX_DIAG_PEER 采样配对，字节 NA | E1 / S；机制待 SPIKE-09 |
+| AgentRpc | `mcp-tap` / `proxy/mcp` | — | E2 |
 | Gap | ringbuf 丢失计数、探针挂载失败、cgroup 逃逸 | — | |
 
 ## 4. 范围追踪

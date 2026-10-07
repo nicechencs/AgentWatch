@@ -23,6 +23,7 @@
 | [SPIKE-06](SPIKE-06-sqlite-throughput.md) | SQLite 写入吞吐与查询延迟 | 全部 | P0 | 1 人天 | 未开始 |
 | [SPIKE-07](SPIKE-07-agent-hooks.md) | Agent 自报告接入方式 | 全部 | P1–P5 | 2 人天 | 未开始 |
 | [SPIKE-08](SPIKE-08-apple-entitlements.md) | Apple ES/NE 授权申请与原生原型 | macOS | P0 申请 / P4 实施 | 申请 0.5 人天 + 原型 3 人天 | 未开始 |
+| [SPIKE-09](SPIKE-09-ipc-peer-attribution.md) | 本机 IPC 两端配对与 MCP stdio 拦截 | 全部 | P6 | 5 人天 | 未开始 |
 
 ## 关键路径
 

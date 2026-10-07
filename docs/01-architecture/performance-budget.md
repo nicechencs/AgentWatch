@@ -1,8 +1,8 @@
 # 性能与资源预算
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：NFR-01~08、[pipeline](pipeline.md)、[storage](storage.md)、[SPIKE-06](../06-research/SPIKE-06-sqlite-throughput.md)
+> 最后更新：2026-10-07
+> 关联：NFR-01~08、[pipeline](pipeline.md)、[storage](storage.md)、[SPIKE-06](../06-research/SPIKE-06-sqlite-throughput.md)、[inter-agent-communication](inter-agent-communication.md)
 
 ## 1. 预算表
 
@@ -10,6 +10,7 @@
 |---|---|---|---|
 | daemon 空闲 CPU | < 0.5%（单核占比，60 秒平均） | 无活动会话 | NFR-01 |
 | 典型会话 CPU | < 3% | `sim/` 剧本 `typical_agent`：每秒约 200 次 open、20 次 exec、10 个连接 | NFR-01 |
+| 开启跨 Agent IPC 后的 CPU 增量 | < 1% | 对比 `typical_agent` 开启 / 关闭 IPC 采集 | NFR-01、REQ-11 |
 | 压力会话 CPU | < 15%，且不影响被监控进程的正常运行 | `sim/` 剧本 `storm`：每秒 5 万次 open（编译场景） | NFR-01 |
 | 被监控进程减速 | `typical_agent` < 3%；`storm` < 15% | 对比不开监控时的剧本耗时 | — |
 | daemon RSS | 空闲 < 30 MB；会话中 < 60 MB | 同上 | NFR-02 |
@@ -34,6 +35,7 @@
 | 代理 | TLS 加解密与哈希计算 | 叶证书缓存；分块哈希只对请求体计算；请求体超过 `proxy.max_hash_body`（默认 50 MB）时只统计字节数 |
 | SQLite | 写放大、fsync | WAL + `synchronous=NORMAL`；批量写入；先聚合再存储 |
 | 进程补查 | 系统调用开销 | 缓存；对同一 PID 做频率限制 |
+| Linux 管道 / Unix socket 探针 | 编译器、shell 管道流量极大 | 只对跨 AgentInstance 的通道按字节计数，过滤在内核侧完成（BPF map `agent_roots`）；同一 Agent 内部只累加总数；5 秒桶聚合后再写 ring buffer |
 
 ## 3. 度量方法
 

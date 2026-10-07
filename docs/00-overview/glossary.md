@@ -1,8 +1,8 @@
 # 术语表
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：[event-schema](../01-architecture/event-schema.md)、[evidence-model](../01-architecture/evidence-model.md)
+> 最后更新：2026-10-07
+> 关联：[event-schema](../01-architecture/event-schema.md)、[evidence-model](../01-architecture/evidence-model.md)、[inter-agent-communication](../01-architecture/inter-agent-communication.md)
 
 按类别排列。代码中的名称用反引号标出，文档和代码必须保持一致。
 
@@ -16,6 +16,12 @@
 | 范围 | `Scope` | 判定“某进程是否属于当前会话”的集合与规则 |
 | 根进程 | `root_proc` | 会话的起始进程 |
 | Agent 画像 | `AgentProfile` | 对某类 Agent 的识别规则（可执行名、参数特征、自报告接入方式） |
+| Agent 实例 | `AgentInstance` | 会话内被识别为 Agent 的进程子树（主 Agent / 子 Agent / MCP server）；识别本身带证据等级 |
+| 通信通道 | `Channel` / `ipc_channels` | 一条可以确定两端进程的本机 IPC（管道、Unix socket、命名管道、回环） |
+| 通信边 | `AgentLink` | Agent 实例之间的汇总边（`spawned` / `ipc` / `rpc` / `self_reported` / `shared_artifact` / `remote`） |
+| 监控组 | `WatchGroup` | 把独立启动的多个会话组合在一起，配对组内会话之间的通道 |
+| 委托链路 | `DelegationChain` | 从一条记录回溯到触发它的 Agent；每一跳标注等级，整条链取最弱一跳 |
+| mcp-tap | `mcp-tap` | 启动模式下的 stdio 透明包装器，只解析 JSON-RPC 元数据，不存参数和结果内容 |
 | 发现 | `Finding` | 由规则生成的结论条目，如“读取敏感文件”“时序相关的外发”；只能是 E1 事实的汇总或 I 级推测 |
 | 缺口 | `Gap` | 一段时间内某类数据可能不完整的记录（丢事件、采集器重启、权限不足、限流） |
 | 敏感路径规则 | `SensitivePathRule` | 标记凭证类文件的 glob 规则；命中只用于高亮，不触发额外读取 |

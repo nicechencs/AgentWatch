@@ -1,7 +1,7 @@
 # 任务卡规范
 
 > 状态：草案
-> 最后更新：2026-10-06
+> 最后更新：2026-10-07
 > 关联：[roadmap](../roadmap.md)、[github-workflow](../../05-dev/github-workflow.md)、[AGENTS.md](../../../AGENTS.md)
 
 本目录是开发任务的**规格源**。每个阶段一个文件；每张任务卡都能单独交给一个 AI Agent（或一个 subagent）完成，并通过 [`scripts/sync-issues.ps1`](../../../scripts/sync-issues.ps1) 同步为 GitHub Issue。
@@ -14,6 +14,7 @@
 | [P3-url-correlation.md](P3-url-correlation.md) | P3 URL 与关联 | `P3 URL 与关联` |
 | [P4-native-packaging.md](P4-native-packaging.md) | P4 原生化与打包 | `P4 原生化与打包` |
 | [P5-agent-adapters.md](P5-agent-adapters.md) | P5 Agent 适配 | `P5 Agent 适配` |
+| [P6-inter-agent.md](P6-inter-agent.md) | P6 Agent 间通信 | `P6 Agent 间通信` |
 
 ## 1. 阶段文件结构
 

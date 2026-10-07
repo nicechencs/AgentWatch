@@ -1,8 +1,8 @@
 # 存储设计
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：REQ-05、REQ-07、NFR-03、[ADR-0003](../03-adr/0003-sqlite-storage.md)、[ADR-0011](../03-adr/0011-aggregate-first.md)、[SPIKE-06](../06-research/SPIKE-06-sqlite-throughput.md)
+> 最后更新：2026-10-07
+> 关联：REQ-05、REQ-07、REQ-11、NFR-03、[ADR-0003](../03-adr/0003-sqlite-storage.md)、[ADR-0011](../03-adr/0011-aggregate-first.md)、[ADR-0013](../03-adr/0013-inter-agent-observation.md)、[SPIKE-06](../06-research/SPIKE-06-sqlite-throughput.md)、[inter-agent-communication](inter-agent-communication.md)
 
 ## 1. 总体
 
@@ -19,7 +19,8 @@
 - 时间：`*_ns` 为 Unix 纪元纳秒（墙钟，INTEGER）。单调时间不入库；入库前管道已经换算完毕，并保证同一会话内单调不减。
 - 证据：`evidence TEXT`，取值为 `E1|E2|E3|S|I|NA`；`na_reason TEXT` 可以为空。字段级证据存在 `field_evidence TEXT`（JSON）中，空即 NULL。
 - 进程引用：`proc_uid INTEGER`，以有符号 64 位存储 `ProcUid`。
-- 外键只在 `session_id` 上声明并级联删除。`proc_uid` 不声明外键，因为事件可能先于进程记录到达。
+- 外键默认只在 `session_id` 上声明并级联删除。`proc_uid` 不声明外键，因为事件可能先于进程记录到达。
+- P6 例外（与 [inter-agent-communication §7](inter-agent-communication.md#7-存储) 一致，不要删）：`agent_rpc.channel_id` → `ipc_channels`（级联）、`agent_instances.parent_id` → `agent_instances`、`agent_links.from_agent` / `to_agent` → `agent_instances`、`sessions.group_id` → `watch_groups`。`agent_links.session_id` 与 `group_id` 不加外键：边可以跨会话，且监控组与会话的删除顺序不由这两列约束。`agent_rpc` 没有 `session_id`，会话经 `channel_id` → `ipc_channels.session_id` 取得。
 - 所有文本都是已脱敏的内容。
 
 ## 3. DDL
@@ -31,6 +32,15 @@ CREATE TABLE schema_meta (
   value TEXT NOT NULL
 );
 -- 初始行：('schema_version','1'), ('created_ns', ...), ('app_version', ...), ('host_id', <随机 UUID>)
+
+-- ============ 监控组（P6-STORE-01；必须先于 sessions.group_id 的外键） ============
+-- 迁移顺序：先 CREATE TABLE watch_groups，再 ALTER TABLE sessions ADD COLUMN group_id。
+-- foreign_keys=ON 时，不能在 watch_groups 尚不存在时引用它。
+CREATE TABLE watch_groups (
+  id            INTEGER PRIMARY KEY,
+  name          TEXT NOT NULL UNIQUE,
+  created_ns    INTEGER NOT NULL
+);
 
 -- ============ 会话 ============
 CREATE TABLE sessions (
@@ -55,7 +65,9 @@ CREATE TABLE sessions (
   collector_profile TEXT,                        -- 采集档位，如 macOS M1(eslogger)/M2(原生 ES+NE)；见 P4-MAC-06
   config_digest   TEXT,                          -- 生效配置的哈希，便于复现
   pinned          INTEGER NOT NULL DEFAULT 0,    -- 1 = 不参与自动清理
-  stats           TEXT                           -- JSON 汇总缓存（会话结束时写入）
+  stats           TEXT,                          -- JSON 汇总缓存（会话结束时写入）
+  -- 以下列由 P6-STORE-01 迁移加入
+  group_id        INTEGER REFERENCES watch_groups(id)  -- 监控组；独立启动的多 Agent 组合，见 inter-agent-communication §3.3
 );
 CREATE INDEX idx_sessions_started ON sessions(started_ns);
 
@@ -288,6 +300,69 @@ CREATE TABLE raw_events (
   json            TEXT NOT NULL,                 -- RawEvent JSON（已脱敏）
   PRIMARY KEY (session_id, seq)
 ) WITHOUT ROWID;
+
+-- ============ Agent 间通信（P6-STORE-01；完整语义见 inter-agent-communication §7） ============
+-- watch_groups 已在本段 DDL 开头建表（sessions.group_id 引用它）。
+CREATE TABLE agent_instances (
+  id            INTEGER PRIMARY KEY,
+  session_id    INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  root_proc_uid INTEGER NOT NULL,
+  profile       TEXT,
+  role          TEXT NOT NULL,             -- primary / sub_agent / mcp_server / tool / unknown
+  parent_id     INTEGER REFERENCES agent_instances(id),
+  evidence      TEXT NOT NULL,
+  label         TEXT                       -- 用户标注的名称
+);
+
+CREATE TABLE ipc_channels (
+  id            INTEGER PRIMARY KEY,
+  session_id    INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  kind          TEXT NOT NULL,             -- pipe / unix_stream / unix_dgram / named_pipe / loopback_tcp / loopback_udp
+  a_proc_uid    INTEGER NOT NULL,
+  b_proc_uid    INTEGER,                   -- NULL = 对端未知（见 field_evidence）
+  b_session_id  INTEGER,                   -- 对端在同组另一个会话中时填写
+  name          TEXT,                      -- socket 路径 / 管道名 / 端口（已脱敏）
+  a_to_b_bytes  INTEGER,
+  b_to_a_bytes  INTEGER,
+  protocol      TEXT,                      -- mcp / a2a / lsp / http / unknown
+  first_ns      INTEGER NOT NULL,
+  last_ns       INTEGER NOT NULL,
+  evidence      TEXT NOT NULL,
+  field_evidence TEXT,
+  source        TEXT NOT NULL
+);
+CREATE INDEX idx_ipc_session ON ipc_channels(session_id, first_ns);
+
+CREATE TABLE agent_rpc (
+  id            INTEGER PRIMARY KEY,
+  channel_id    INTEGER NOT NULL REFERENCES ipc_channels(id) ON DELETE CASCADE,
+  ts_ns         INTEGER NOT NULL,
+  duration_ns   INTEGER,
+  method        TEXT NOT NULL,             -- tools/call / resources/read / ...
+  target        TEXT,                      -- 工具名 / 资源 URI（已脱敏）
+  arg_shape     TEXT,                      -- JSON：键名 → {type, len}
+  req_bytes     INTEGER,
+  resp_bytes    INTEGER,
+  is_error      INTEGER,
+  content_match TEXT,                      -- 内容哈希命中的文件引用（可选）
+  evidence      TEXT NOT NULL              -- E2
+);
+
+CREATE TABLE agent_links (
+  id            INTEGER PRIMARY KEY,
+  group_id      INTEGER,                   -- 监控组；单会话时为 NULL
+  session_id    INTEGER NOT NULL,
+  from_agent    INTEGER NOT NULL REFERENCES agent_instances(id),
+  to_agent      INTEGER REFERENCES agent_instances(id),
+  to_external   TEXT,                      -- 对端不在监控范围内时的描述（exe / 主机）
+  kind          TEXT NOT NULL,             -- spawned / ipc / rpc / self_reported / shared_artifact / remote
+  bytes         INTEGER,
+  count         INTEGER NOT NULL DEFAULT 1,
+  first_ns      INTEGER NOT NULL,
+  last_ns       INTEGER NOT NULL,
+  evidence      TEXT NOT NULL,
+  refs          TEXT NOT NULL              -- JSON：依据记录
+);
 ```
 
 ### 3.1 时间线视图
@@ -302,11 +377,17 @@ CREATE VIEW timeline AS
   UNION ALL SELECT session_id, ts_ns,    'http',    id, proc_uid, evidence FROM http
   UNION ALL SELECT session_id, ts_ns,    'proc',    id, proc_uid, evidence FROM process_images
   UNION ALL SELECT session_id, ts_ns,    'agent',   id, proc_uid, evidence FROM agent_events
+  UNION ALL SELECT session_id, first_ns, 'ipc',     id, a_proc_uid, evidence FROM ipc_channels
+  -- agent_rpc 没有 session_id（与 inter-agent-communication §7 一致）；会话从所属通道继承。
+  UNION ALL
+  SELECT c.session_id, r.ts_ns, 'rpc', r.id, NULL, r.evidence
+  FROM agent_rpc r
+  JOIN ipc_channels c ON c.id = r.channel_id
   UNION ALL SELECT session_id, first_ns, 'finding', id, NULL,     evidence FROM findings
   UNION ALL SELECT session_id, from_ns,  'gap',     id, NULL,     'E1'     FROM gaps;
 ```
 
-查询时必须带 `session_id` 和时间范围条件。各表都有 `(session_id, ts)` 索引，SQLite 会把条件下推到每个分支。时间线分页采用 keyset 分页：`(ts_ns, cat, id) > (?, ?, ?)`。
+查询时必须带 `session_id` 和时间范围条件。各表都有 `(session_id, ts)` 索引，SQLite 会把条件下推到每个分支。`rpc` 分支的 `session_id` 来自 `ipc_channels`，条件下推到 `idx_ipc_session`，再按 `channel_id` 取 `agent_rpc`。时间线分页采用 keyset 分页：`(ts_ns, cat, id) > (?, ?, ?)`。
 
 ### 3.2 全文搜索（S，P2）
 对路径、argv、URL 建 FTS5 索引 `fts_text(table, id, text)`，采用 trigram tokenizer，支持子串搜索。这会增加约 30% 的体积【待验证】，默认开启，可以关闭。
@@ -314,7 +395,7 @@ CREATE VIEW timeline AS
 ## 4. 写入路径
 
 - Batcher 每批执行 `BEGIN IMMEDIATE ... COMMIT`。
-- 重复更新的记录使用 UPSERT，包括 `net_flows` 的字节数、`file_access` 中的 partial 记录，以及 `findings` 的 count 累加：
+- 重复更新的记录使用 UPSERT，包括 `net_flows` 的字节数、`file_access` 中的 partial 记录、`ipc_channels` 按 `(session_id, kind, a_proc_uid, b_proc_uid, name)` 累加字节，以及 `findings` 的 count 累加：
   ```sql
   INSERT INTO findings (...) VALUES (...)
   ON CONFLICT (session_id, rule_id, dedup_key)
@@ -368,7 +449,7 @@ loop every check_interval:
 | 格式 | 内容 | 用途 |
 |---|---|---|
 | JSONL（默认） | 开头一行 `{"type":"header","export_version":1,"session":{...},"collectors":[...],"gaps_summary":{...}}`；之后每行一条记录 `{"type":"file_access", ...表字段}`，按时间排序 | 程序处理、归档 |
-| CSV | 每类记录一个文件，打包为 zip：`processes.csv`、`file_access.csv`、`net_flows.csv`、`dns.csv`、`http.csv`、`findings.csv`、`gaps.csv`、`README.txt`（字段说明与字节口径） | 表格分析 |
+| CSV | 每类记录一个文件，打包为 zip：`processes.csv`、`file_access.csv`、`net_flows.csv`、`dns.csv`、`http.csv`、`findings.csv`、`gaps.csv`、`watch_groups.csv`、`agent_instances.csv`、`ipc_channels.csv`、`agent_rpc.csv`、`agent_links.csv`、`README.txt`（字段说明与字节口径）。`agent_rpc.csv` 额外带上所属通道的 `session_id`（表本身没有这列） | 表格分析 |
 | Markdown 报告（S，P3） | 会话概览、发现列表、敏感访问、外联域名 Top N、缺口列表 | 人工评审、附到 Issue |
 | SQLite 子集（C） | 只含单个会话的独立 .db | 跨机器打开 |
 

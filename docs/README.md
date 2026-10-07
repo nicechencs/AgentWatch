@@ -22,7 +22,8 @@ docs/
 │   ├── api-and-cli.md                daemon 本地 API、CLI 命令、查询/筛选语法
 │   ├── ui.md                         Web UI 信息架构与页面
 │   ├── security-privacy.md           威胁模型、敏感信息保护、自身安全
-│   └── performance-budget.md         资源预算、限流降级、度量方法
+│   ├── performance-budget.md         资源预算、限流降级、度量方法
+│   └── inter-agent-communication.md  Agent 间通信监控（AgentInstance、IPC 配对、MCP、委托链路）
 ├── 02-platforms/                     平台层：各 OS 能做什么、怎么做
 │   ├── capability-matrix.md          能力矩阵（CAP 编号，权威来源）
 │   ├── linux.md
@@ -42,7 +43,8 @@ docs/
 │   │   ├── P2-files-ui.md
 │   │   ├── P3-url-correlation.md
 │   │   ├── P4-native-packaging.md
-│   │   └── P5-agent-adapters.md
+│   │   ├── P5-agent-adapters.md
+│   │   └── P6-inter-agent.md
 │   └── risks.md                      风险登记册（RISK 编号）
 ├── 05-dev/                           工程层：怎么协作开发
 │   ├── repo-layout.md                仓库与 crate 结构、依赖方向
@@ -66,6 +68,7 @@ docs/
 | 第一次了解项目 | vision → requirements → architecture → evidence-model → roadmap |
 | 开发某平台采集器 | capability-matrix → 对应平台文档 → event-schema → 对应阶段任务卡 |
 | 开发管道/存储/UI | event-schema → pipeline → storage → api-and-cli → ui |
+| 开发 Agent 间通信 | inter-agent-communication → ADR-0013 → capability-matrix §10 → P6 任务卡 |
 | AI Agent 接任务 | AGENTS.md → 任务卡 → 任务卡中“参考文档”列出的文件 |
 
 ## 2. 编号规则

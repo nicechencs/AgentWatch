@@ -1,8 +1,8 @@
 # 网络归属、流量统计与 URL
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：REQ-04、REQ-06、[ADR-0006](../03-adr/0006-explicit-mitm-proxy-for-url.md)、[SPIKE-04](../06-research/SPIKE-04-proxy-trust-injection.md)、[evidence-model](evidence-model.md)、[capability-matrix](../02-platforms/capability-matrix.md)
+> 最后更新：2026-10-07
+> 关联：REQ-04、REQ-06、REQ-11、[ADR-0006](../03-adr/0006-explicit-mitm-proxy-for-url.md)、[ADR-0013](../03-adr/0013-inter-agent-observation.md)、[SPIKE-04](../06-research/SPIKE-04-proxy-trust-injection.md)、[evidence-model](evidence-model.md)、[capability-matrix](../02-platforms/capability-matrix.md)、[inter-agent-communication](inter-agent-communication.md)
 
 ## 1. 要回答的问题与信息来源
 
@@ -35,8 +35,8 @@
 - E1 采集器在事件中直接给出 PID，由 Enrich 阶段转为 `ProcUid`。
 - **继承的 socket**：父进程创建 socket 后 fork，子进程继续使用。Linux eBPF 按实际调用 send 的进程归属，Windows/macOS 按平台提供的 PID 归属。【待验证】三者可能不一致，写入各平台文档。
 - **回环连接**：会话内进程连接本机服务时，去查监听该端口的进程：
-  - 监听者在会话内：这是内部通信，不计入“外发”；
-  - 监听者在会话外：视为委托，见 process-tracking §6。
+  - 监听者在会话内：这是内部通信，不计入“外发”；两端配对与字节计入 [CAP-IPC](../02-platforms/capability-matrix.md#10-agent-间通信cap-ipc) 的 `loopback_tcp` / `loopback_udp` 通道；
+  - 监听者在会话外：视为委托，见 process-tracking §6。对端被识别为 Agent 时，UI 提示加入监控组；
   - 代理端口特殊处理，见 §5.3。
 
 ## 4. IP → 域名映射
@@ -108,6 +108,7 @@
 - 代理按 [evidence-model §6](evidence-model.md#6-内容哈希匹配i--内容匹配证据的唯一升级路径) 对请求体做分块哈希。
 - WebSocket：记录升级请求和每个方向的帧数、字节数；帧内容只做哈希。
 - SSE / 流式响应：响应结束时记录总字节。
+- MCP over HTTP / A2A：`--mcp-tap` 时对已知 MCP 回环端口做反向代理，识别 JSON-RPC method 与 `params.name`，输出 `AgentRpc`（source `proxy/mcp`、`proxy/a2a`）。不存 body。见 [inter-agent-communication §5](inter-agent-communication.md#5-协议层e2mcp-与常见-agent-协议)。
 
 ### 5.5 失败处理
 | 情况 | 行为 |

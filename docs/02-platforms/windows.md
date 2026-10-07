@@ -1,8 +1,8 @@
 # Windows 采集器
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：REQ-01~04、ADR-0008、SPIKE-02、SPIKE-05、[capability-matrix](capability-matrix.md)
+> 最后更新：2026-10-07
+> 关联：REQ-01~04、REQ-11、ADR-0008、ADR-0013、SPIKE-02、SPIKE-05、SPIKE-09、[capability-matrix](capability-matrix.md)、[inter-agent-communication](../01-architecture/inter-agent-communication.md)
 
 涉及 crate：`aw-collector-windows`，依赖 `ferrisetw` 和 `windows` crate。
 
@@ -115,7 +115,9 @@ ETW 不提供 TLS 载荷。可选方案：
 | NetConnect / NetClose / NetSend / NetRecv | Kernel-Network | E1 | |
 | DnsQuery / DnsAnswer | DNS-Client 3006/3008 | E1 | |
 | TlsSni | pktmon / WinDivert（可选） | E1 | |
-| HttpRequest / HttpResponse | aw-proxy | E2 | |
+| HttpRequest / HttpResponse | aw-proxy | E2 |
+| IpcOpen / IpcTransfer / IpcClose | Kernel-File 对 NamedPipe 的 Create / Read / Write；回环 TCP 复用 Kernel-Network（CAP-IPC，P6） | E1 / I / NA；机制待 SPIKE-09 |
+| AgentRpc | `mcp-tap` / `proxy/mcp` | E2 |
 | Gap | EventsLost、会话被停止、provider 启用失败 | — | |
 
 ## 4. 范围追踪

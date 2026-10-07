@@ -1,8 +1,8 @@
 # 平台能力矩阵
 
 > 状态：草案
-> 最后更新：2026-10-06
-> 关联：REQ-01~07、ADR-0008、ADR-0009、ADR-0010、SPIKE-01~08
+> 最后更新：2026-10-07
+> 关联：REQ-01~07、ADR-0008、ADR-0009、ADR-0010、SPIKE-01~09
 
 本文件是**平台能力的唯一事实来源**。平台文档、UI 的“能力说明”和 `aw doctor` 的输出都以这里为准。
 
@@ -90,7 +90,7 @@
 | | | W | Kernel-Network disconnect | E1 | Win10 | 管理员 | ⏳ SPIKE-02 |
 | | | M1 / M2 | 快照里消失（S）/ NE 流关闭（E1） | S / E1 | — | — | ⏳ SPIKE-03 |
 | CAP-NET-05 | 进程级字节总量（不区分连接） | 全部 | 由 CAP-NET-02/03 汇总而来；兜底方案见 [fallback-poll](fallback-poll.md) | 随来源 | — | — | — |
-| CAP-NET-06 | 本机回环与 Unix socket / 命名管道 | 全部 | 回环 TCP 和其他 TCP 走同一机制；Unix socket 和命名管道**只记录连接动作，不计字节**（P3 以后再评估） | E1（连接动作） | — | — | — |
+| CAP-NET-06 | 本机回环与 Unix socket / 命名管道 | 全部 | 回环 TCP 和其他 TCP 走同一机制；Unix socket 和命名管道**只记录连接动作，不计字节**；两端配对与字节数由 [CAP-IPC](#10-agent-间通信cap-ipc) 补充（P6） | E1（连接动作） | — | — | — |
 
 ## 4. 域名解析（CAP-DNS）
 
@@ -168,3 +168,22 @@
 1. 每完成一个 SPIKE，就更新本表“验证”列和受影响的“机制”“等级”列，并在 SPIKE 文档的“对文档的影响”一节注明改了哪些行。
 2. 新增 CAP 时编号顺延，不复用；废弃时把整行加删除线，并注明原因。
 3. `aw-core` 中的 `Capability` 枚举与本表编号一一对应。`aw doctor` 按本表输出当前机器的能力报告。
+
+## 10. Agent 间通信（CAP-IPC）
+
+设计见 [inter-agent-communication](../01-architecture/inter-agent-communication.md)。本节全部待 SPIKE-09 验证。只对跨 AgentInstance 的通道按字节计数，过滤在内核侧完成。
+
+| 编号 | 能力 | 平台 | 机制 | 等级 | 最低版本 | 权限 | 验证 |
+|---|---|---|---|---|---|---|---|
+| CAP-IPC-01 | 匿名管道两端配对与字节数 | L | fork 继承链 + pipe inode 配对；eBPF `pipe_write` / `pipe_read` 计字节 | E1 | 5.8 | root | ⏳ SPIKE-09 |
+| | | W | 用进程创建时的句柄继承近似配对；字节数【待验证】 | I / NA | Win10 | 管理员 | ⏳ SPIKE-09 |
+| | | M1 / M2 | 进程树（E1）；libproc `PROC_PIDFDPIPEINFO` 采样配对；字节数 NA | S / NA | 13.0 | root | ⏳ SPIKE-09 |
+| CAP-IPC-02 | Unix socket / 命名管道两端配对与字节数 | L | eBPF `unix_stream_connect` 配对，`unix_stream_sendmsg` / `unix_dgram_sendmsg` 计字节 → `sock_diag`（UNIX_DIAG_PEER）采样配对，字节 NA | E1 / S | 5.8 / 3.3 | root | ⏳ SPIKE-09 |
+| | | W | Kernel-File 中 `\Device\NamedPipe\` 的 Create / Read / Write；服务端 PID 用快照补充 | E1【待验证】 / I | Win10 | 管理员 | ⏳ SPIKE-09 |
+| | | M1 / M2 | ES `uipc_connect` / `uipc_bind`，取得两端路径与进程；字节数 NA | E1（连接）/ NA（字节） | 13.0 / 11.0 | root / ES 授权 | ⏳ SPIKE-09 |
+| CAP-IPC-03 | 回环 TCP/UDP 两端配对 | L / W | 复用现有 TCP/UDP 采集，按镜像五元组配对 | E1 | 同 CAP-NET-01 | 同 CAP-NET-01 | ⏳ SPIKE-09 |
+| | | M1 / M2 | nettop + libproc 快照配对 | S | 13.0 | root | ⏳ SPIKE-09 |
+| CAP-IPC-04 | 协议元数据（MCP / A2A 的 method、工具名） | 全部 | 启动模式下用 `--mcp-tap` stdio 包装器；HTTP 走 aw-proxy；未启用时为 NA(`protocol_not_observed`) | E2 | — | 用户权限 | ⏳ SPIKE-09 |
+| | | L | 可选 `collectors.linux.ipc_payload_peek`（eBPF 读取缓冲区，默认关闭） | E2 | 5.8 | root | ⏳ SPIKE-09 |
+| CAP-IPC-05 | 共享工件（A 写、B 读同一文件） | 全部 | 从 CAP-FILE 的记录出发，经关联规则 `agent_shared_artifact` 推得 | I | — | — | — |
+| CAP-IPC-06 | 同一进程内的多个 Agent 角色 | 全部 | 框架的 OTEL span / hooks 自报告；OS 层不可见 | E3 | — | — | — |

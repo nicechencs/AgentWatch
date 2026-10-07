@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use config::{config_schema_pretty, load_selected, ConfigError};
 use runtime::{emit_sensitive_probe, run_foreground, RuntimeError};
 
+mod api;
 mod capabilities;
 mod collectors;
 mod config;

@@ -23,6 +23,7 @@ mod collectors;
 mod config;
 mod paths;
 mod runtime;
+mod session;
 mod supervisor;
 
 fn main() -> ExitCode {

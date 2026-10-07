@@ -2,8 +2,7 @@
 //!
 //! [`RecordSink`] is the trait P1-PIPE-05 should use. Do not declare another
 //! one in `aw-pipeline`. That crate cannot depend on `rusqlite`; the SQL stays
-//! in this crate. Queries live in [`query`]. Retention is a later task and is
-//! not implemented here.
+//! in this crate. Queries live in [`query`]. Retention lives in the `retention` module.
 //!
 //! Windows file ACLs are not set. See [`migrate`] for why.
 
@@ -12,7 +11,13 @@
 mod error;
 mod migrate;
 mod query;
+mod retention;
 mod sink;
+
+pub use retention::{
+    ApplyReport, DiskCheck, OldestSession, PurgeReason, PurgeReport, PurgeScope, Retention,
+    RetentionConfig, Stats, TableCount, WriteMode,
+};
 
 pub use error::StoreError;
 pub use migrate::{OpenStatus, Store, SCHEMA_VERSION};

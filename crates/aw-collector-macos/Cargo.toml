@@ -4,12 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "macOS collector (eslogger, nettop, Network Extension). Stub."
+description = "macOS collector (eslogger process events). JSON decode is host-independent."
 
 [dependencies]
 aw-core = { workspace = true }
+# serde_json is MIT OR Apache-2.0. Pinned in this crate so P1-MAC-01 does not
+# edit the workspace manifest. The decoder runs in unit tests on every host,
+# so the dep is not cfg'd to macOS. endpoint-sec is intentionally absent (P4).
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+# memchr is Unlicense OR MIT (both on the cargo-deny allow list). Pinned to the
+# copy serde_json already resolves so the PID prefilter does not add a second
+# version. Used before JSON parse, as macos.md §1.1 requires.
+memchr = "=2.8.3"
 
-# Platform crates go here when a later task needs them (endpoint-sec, serde_json).
+# Live eslogger spawn would go here. Nothing in P1-MAC-01 links a macOS framework.
 [target.'cfg(target_os = "macos")'.dependencies]
 
 [lints]

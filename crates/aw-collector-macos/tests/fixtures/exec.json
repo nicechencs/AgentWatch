@@ -1,0 +1,1 @@
+{"version":8,"seq_num":1,"global_seq_num":10,"event_type":"exec","process":{"ppid":100,"audit_token":{"pid":200},"responsible_audit_token":{"pid":100}},"event":{"exec":{"target":{"executable":{"path":"/opt/fixture/bin/echo"}},"args":["echo","a b"],"cwd":{"path":"/opt/fixture"}},"extra_unknown":true}}

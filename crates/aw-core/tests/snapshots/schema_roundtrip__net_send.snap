@@ -1,0 +1,29 @@
+---
+source: crates/aw-core/tests/schema_roundtrip.rs
+expression: json_of(event)
+---
+{
+  "bytes": 5240,
+  "evidence": {
+    "level": "E1"
+  },
+  "flow": {
+    "local": "10.0.0.5:51544",
+    "proto": "tcp",
+    "remote": "203.0.113.10:443",
+    "sock_id": 88123
+  },
+  "kind": "net_send",
+  "proc": {
+    "pid": 5120,
+    "tid": 5120,
+    "uid": "0x9f3a11c2d4e5f601"
+  },
+  "seq": 122,
+  "session_id": 7,
+  "source": "linux.ebpf/tcp_sendmsg",
+  "ts_mono_ns": 5021000122,
+  "ts_wall_ns": 1791273662000000000,
+  "v": 1,
+  "via": null
+}

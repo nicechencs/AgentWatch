@@ -1,0 +1,27 @@
+---
+source: crates/aw-core/tests/schema_roundtrip.rs
+expression: json_of(event)
+---
+{
+  "affects": [
+    "file",
+    "net"
+  ],
+  "collector": "linux.ebpf",
+  "count": 3,
+  "detail": "ring buffer overrun",
+  "evidence": {
+    "level": "E1"
+  },
+  "from_mono_ns": 1000,
+  "gap_kind": "lost_by_os",
+  "kind": "gap",
+  "proc": null,
+  "seq": 180,
+  "session_id": 7,
+  "source": "linux.ebpf/ringbuf",
+  "to_mono_ns": 2000,
+  "ts_mono_ns": 9000,
+  "ts_wall_ns": 1791273662000000000,
+  "v": 1
+}

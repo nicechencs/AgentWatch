@@ -1,0 +1,23 @@
+---
+source: crates/aw-core/tests/schema_roundtrip.rs
+expression: json_of(event)
+---
+{
+  "evidence": {
+    "level": "E1"
+  },
+  "from": "/tmp/a.txt",
+  "kind": "file_rename",
+  "proc": {
+    "pid": 5120,
+    "tid": 5120,
+    "uid": "0x9f3a11c2d4e5f601"
+  },
+  "seq": 109,
+  "session_id": 7,
+  "source": "linux.ebpf/lsm_path_rename",
+  "to": "/tmp/b.txt",
+  "ts_mono_ns": 5021000109,
+  "ts_wall_ns": 1791273662000000000,
+  "v": 1
+}

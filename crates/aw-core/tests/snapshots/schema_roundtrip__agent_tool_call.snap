@@ -1,0 +1,29 @@
+---
+source: crates/aw-core/tests/schema_roundtrip.rs
+expression: json_of(event)
+---
+{
+  "agent": "example-agent",
+  "agent_session": "session-placeholder",
+  "call_id": "call-1",
+  "evidence": {
+    "level": "E3"
+  },
+  "kind": "agent_tool_call",
+  "phase": "pre",
+  "proc": {
+    "pid": 5120,
+    "tid": 5120,
+    "uid": "0x9f3a11c2d4e5f601"
+  },
+  "seq": 150,
+  "session_id": 7,
+  "source": "agent.example/hook",
+  "summary": {
+    "path_len": 16
+  },
+  "tool": "Read",
+  "ts_mono_ns": 5021000150,
+  "ts_wall_ns": 1791273662000000000,
+  "v": 1
+}

@@ -1,0 +1,25 @@
+---
+source: crates/aw-core/tests/schema_roundtrip.rs
+expression: json_of(event)
+---
+{
+  "bytes": 16,
+  "evidence": {
+    "level": "E1"
+  },
+  "handle": 7,
+  "kind": "file_write",
+  "offset": 0,
+  "path": "/tmp/out.txt",
+  "proc": {
+    "pid": 5120,
+    "tid": 5120,
+    "uid": "0x9f3a11c2d4e5f601"
+  },
+  "seq": 105,
+  "session_id": 7,
+  "source": "linux.ebpf/sys_exit_write",
+  "ts_mono_ns": 5021000105,
+  "ts_wall_ns": 1791273662000000000,
+  "v": 1
+}

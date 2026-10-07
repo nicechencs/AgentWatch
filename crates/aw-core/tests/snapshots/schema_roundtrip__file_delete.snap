@@ -1,0 +1,23 @@
+---
+source: crates/aw-core/tests/schema_roundtrip.rs
+expression: json_of(event)
+---
+{
+  "evidence": {
+    "level": "E1"
+  },
+  "is_dir": false,
+  "kind": "file_delete",
+  "path": "/tmp/placeholder.txt",
+  "proc": {
+    "pid": 5120,
+    "tid": 5120,
+    "uid": "0x9f3a11c2d4e5f601"
+  },
+  "seq": 108,
+  "session_id": 7,
+  "source": "linux.ebpf/lsm_path_unlink",
+  "ts_mono_ns": 5021000108,
+  "ts_wall_ns": 1791273662000000000,
+  "v": 1
+}

@@ -1,0 +1,24 @@
+---
+source: crates/aw-core/tests/schema_roundtrip.rs
+expression: json_of(event)
+---
+{
+  "channel": 7,
+  "evidence": {
+    "level": "E1"
+  },
+  "kind": "ipc_close",
+  "proc": {
+    "pid": 5120,
+    "tid": 5120,
+    "uid": "0x9f3a11c2d4e5f601"
+  },
+  "seq": 162,
+  "session_id": 7,
+  "source": "linux.ebpf/unix_stream",
+  "total_a_to_b": 128,
+  "total_b_to_a": 64,
+  "ts_mono_ns": 5021000162,
+  "ts_wall_ns": 1791273662000000000,
+  "v": 1
+}

@@ -1,0 +1,33 @@
+---
+source: crates/aw-core/tests/schema_roundtrip.rs
+expression: json_of(event)
+---
+{
+  "arg_shape": {
+    "text": {
+      "len": 4,
+      "type": "string"
+    }
+  },
+  "duration_ns": 1500000,
+  "evidence": {
+    "level": "E2"
+  },
+  "is_error": false,
+  "kind": "agent_rpc",
+  "method": "tools/call",
+  "proc": {
+    "pid": 5120,
+    "tid": 5120,
+    "uid": "0x9f3a11c2d4e5f601"
+  },
+  "req_bytes": 48,
+  "resp_bytes": 20,
+  "seq": 170,
+  "session_id": 7,
+  "source": "mcp-tap/jsonrpc",
+  "target": "echo",
+  "ts_mono_ns": 5021000170,
+  "ts_wall_ns": 1791273662000000000,
+  "v": 1
+}

@@ -1,0 +1,43 @@
+---
+source: crates/aw-core/tests/schema_roundtrip.rs
+expression: json_of(event)
+---
+{
+  "body_bytes": 0,
+  "body_digest": {
+    "chunks": 1,
+    "digest_set_id": 42
+  },
+  "client": "10.0.0.5:51544",
+  "evidence": {
+    "level": "E2"
+  },
+  "headers": [
+    [
+      "accept",
+      "application/json"
+    ]
+  ],
+  "http_version": "HTTP/1.1",
+  "kind": "http_request",
+  "method": "GET",
+  "proc": {
+    "pid": 5120,
+    "tid": 5120,
+    "uid": "0x9f3a11c2d4e5f601"
+  },
+  "req_id": 9,
+  "seq": 140,
+  "session_id": 7,
+  "source": "proxy/http",
+  "ts_mono_ns": 5021000140,
+  "ts_wall_ns": 1791273662000000000,
+  "upstream": {
+    "local": "10.0.0.5:51544",
+    "proto": "tcp",
+    "remote": "203.0.113.10:443",
+    "sock_id": 88123
+  },
+  "url": "https://api.example.test/v1/item",
+  "v": 1
+}

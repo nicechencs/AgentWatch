@@ -6,7 +6,8 @@ pub fn wired() -> bool {
     // Referencing each crate keeps the dependency graph honest without calling
     // into platform code. Non-target collector crates export nothing yet.
     let _ = (
-        std::any::type_name::<aw_core::Placeholder>(),
+        // P0-CORE-01 replaced the aw-core stub type with the event model.
+        std::any::type_name::<aw_core::RawEvent>(),
         std::any::type_name::<aw_pipeline::Placeholder>(),
         std::any::type_name::<aw_store::Placeholder>(),
         std::any::type_name::<aw_proxy::Placeholder>(),

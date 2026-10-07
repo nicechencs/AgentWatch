@@ -1,0 +1,31 @@
+---
+source: crates/aw-core/tests/schema_roundtrip.rs
+expression: json_of(event)
+---
+{
+  "body_bytes": 32,
+  "duration_ms": 12,
+  "evidence": {
+    "level": "E2"
+  },
+  "headers": [
+    [
+      "content-type",
+      "application/json"
+    ]
+  ],
+  "kind": "http_response",
+  "proc": {
+    "pid": 5120,
+    "tid": 5120,
+    "uid": "0x9f3a11c2d4e5f601"
+  },
+  "req_id": 9,
+  "seq": 141,
+  "session_id": 7,
+  "source": "proxy/http",
+  "status": 200,
+  "ts_mono_ns": 5021000141,
+  "ts_wall_ns": 1791273662000000000,
+  "v": 1
+}

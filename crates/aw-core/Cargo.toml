@@ -3,9 +3,21 @@ name = "aw-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "Shared event model and types. No runtime, platform, or database deps."
 
+# P0-CORE-01: pin versions here (not workspace = true) so this crate does not
+# race on the root manifest. serde/serde_json/thiserror are MIT OR Apache-2.0;
+# insta and proptest are the same. default-features are off where the crate
+# offers them, so we do not pull chrono, colored diffs, or a regex engine.
 [dependencies]
+serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive", "std"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+thiserror = { version = "2.0.20", default-features = false }
+
+[dev-dependencies]
+insta = { version = "1.49.0", default-features = false }
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

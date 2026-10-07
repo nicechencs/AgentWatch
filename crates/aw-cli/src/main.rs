@@ -3,7 +3,9 @@
 #![forbid(unsafe_code)]
 
 fn main() {
-    let _ = aw_core::Placeholder;
+    // P0-CORE-01 replaced the stub type. Touch the event model so the
+    // dependency stays live until real commands exist.
+    let _ = std::any::type_name::<aw_core::RawEvent>();
 }
 
 #[cfg(test)]

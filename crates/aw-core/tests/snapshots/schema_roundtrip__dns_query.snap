@@ -1,0 +1,25 @@
+---
+source: crates/aw-core/tests/schema_roundtrip.rs
+expression: json_of(event)
+---
+{
+  "evidence": {
+    "level": "E1"
+  },
+  "kind": "dns_query",
+  "proc": {
+    "pid": 5120,
+    "tid": 5120,
+    "uid": "0x9f3a11c2d4e5f601"
+  },
+  "qname": "api.example.test",
+  "qtype": 1,
+  "seq": 130,
+  "server": "1.1.1.1",
+  "session_id": 7,
+  "source": "linux.ebpf/udp_dns",
+  "ts_mono_ns": 5021000130,
+  "ts_wall_ns": 1791273662000000000,
+  "txid": 6699,
+  "v": 1
+}

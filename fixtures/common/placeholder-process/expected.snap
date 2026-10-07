@@ -1,0 +1,37 @@
+Handwritten process_start. Compared by aw-core fixture tests; not an insta snapshot.
+
+{
+  "argv": [
+    "placeholder",
+    "/tmp/placeholder"
+  ],
+  "cwd": "/tmp/placeholder",
+  "env": {
+    "LANG": "C"
+  },
+  "evidence": {
+    "level": "E1"
+  },
+  "exe": "/tmp/placeholder",
+  "how": "exec",
+  "kind": "process_start",
+  "parent_uid": "0x0000000000000002",
+  "ppid": 1,
+  "proc": {
+    "pid": 100,
+    "tid": 100,
+    "uid": "0x0000000000000001"
+  },
+  "seq": 1,
+  "session_id": 1,
+  "signer": null,
+  "source": "handwritten/placeholder",
+  "start_time_ns": 1759795200000000000,
+  "ts_mono_ns": 1000,
+  "ts_wall_ns": 1759795200000000000,
+  "user": {
+    "id": "1000",
+    "name": "placeholder"
+  },
+  "v": 1
+}

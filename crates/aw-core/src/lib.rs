@@ -12,6 +12,7 @@
 pub mod collector;
 pub mod error;
 pub mod event;
+pub mod fixture;
 pub mod proc;
 pub mod time;
 
@@ -30,3 +31,4 @@ pub use event::{
     NetRecv, NetSend, ProcRef, ProcUid, ProcessExit, ProcessStart, RawEvent, RawEventParts,
     Redacted, SessionId, SocketAddr, Source, StartHow, TlsSni, ToolPhase, UserRef, SCHEMA_VERSION,
 };
+pub use fixture::{FixtureError, FixtureHeader, FixtureReader, FixtureWriter};

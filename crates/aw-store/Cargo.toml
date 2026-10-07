@@ -9,5 +9,14 @@ description = "SQLite schema, migrations, and queries. Stub."
 [dependencies]
 aw-core = { workspace = true }
 
+[dev-dependencies]
+# Pinned here on purpose (P0-STORE-01). Do not add to the workspace table:
+# root Cargo.toml is out of scope. `bundled` only — no sqlcipher, no OpenSSL.
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+
+[[bench]]
+name = "sqlite_throughput"
+harness = false
+
 [lints]
 workspace = true

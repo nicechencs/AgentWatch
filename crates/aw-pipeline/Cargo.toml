@@ -4,10 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Scope, enrich, redact, aggregate, and correlate. Stub."
+description = "Scope, enrich, redact, aggregate, and correlate. Passthrough skeleton."
 
 [dependencies]
 aw-core = { workspace = true }
+
+[[bench]]
+name = "passthrough"
+harness = false
 
 [lints]
 workspace = true

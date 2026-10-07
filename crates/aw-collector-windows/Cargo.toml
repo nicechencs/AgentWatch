@@ -3,13 +3,17 @@ name = "aw-collector-windows"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "Windows collector (ETW, Job Object). Stub."
 
 [dependencies]
 aw-core = { workspace = true }
 
-# Platform crates go here when a later task needs them (ferrisetw, windows).
+# Pinned here, not in the workspace, so P0-WIN-01 does not touch the root Cargo.toml.
+# ferrisetw is MIT OR Apache-2.0. It pulls windows 0.61; this crate does not depend
+# on windows directly. WinDivert is not a dependency (LGPL/GPL; ADR-0008).
 [target.'cfg(target_os = "windows")'.dependencies]
+ferrisetw = "=1.2.0"
 
 [lints]
 workspace = true

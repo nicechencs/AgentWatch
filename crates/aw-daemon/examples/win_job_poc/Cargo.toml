@@ -1,0 +1,26 @@
+[package]
+name = "win_job_poc"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.0.0"
+publish = false
+description = "Windows Job Object scope PoC. Not a workspace member, so it can call Win32."
+
+# Empty workspace table keeps this crate out of the AgentWatch workspace.
+# Root Cargo.toml is out of scope for this spike, and the workspace forbids
+# unsafe_code in every member, including examples.
+[workspace]
+
+[[bin]]
+name = "win_job_poc"
+path = "src/main.rs"
+
+[dependencies]
+# MIT OR Apache-2.0. Kept out of the workspace table: this binary is not a member.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

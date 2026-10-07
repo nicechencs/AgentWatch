@@ -1,0 +1,12 @@
+[package]
+name = "aw-pipeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Scope, enrich, redact, aggregate, and correlate. Stub."
+
+[dependencies]
+aw-core = { workspace = true }
+
+[lints]
+workspace = true

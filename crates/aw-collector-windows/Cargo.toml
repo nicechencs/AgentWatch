@@ -1,0 +1,15 @@
+[package]
+name = "aw-collector-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Windows collector (ETW, Job Object). Stub."
+
+[dependencies]
+aw-core = { workspace = true }
+
+# Platform crates go here when a later task needs them (ferrisetw, windows).
+[target.'cfg(target_os = "windows")'.dependencies]
+
+[lints]
+workspace = true

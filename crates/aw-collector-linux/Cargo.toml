@@ -1,0 +1,16 @@
+[package]
+name = "aw-collector-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Linux collector (eBPF, cgroup, fanotify, sock_diag). Stub."
+
+[dependencies]
+aw-core = { workspace = true }
+
+# Platform crates go here when a later task needs them (aya, nix). They must
+# not be unconditional dependencies, or `cargo check --workspace` fails off Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+
+[lints]
+workspace = true

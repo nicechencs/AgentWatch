@@ -1,0 +1,12 @@
+[package]
+name = "aw-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite schema, migrations, and queries. Stub."
+
+[dependencies]
+aw-core = { workspace = true }
+
+[lints]
+workspace = true

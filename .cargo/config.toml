@@ -1,0 +1,24 @@
+# `cargo xtask <cmd>` → `cargo run --package xtask -- <cmd>`
+[alias]
+xtask = "run --package xtask --"
+
+# Linux linker: mold, via clang. Uncomment only on a machine that has both
+# `clang` and `mold` installed (`apt install clang mold` or equivalent).
+# Leaving this active when mold is missing makes every link fail with
+# "cannot find -fuse-ld=mold", so it stays commented by default.
+#
+# [target.x86_64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+#
+# Windows: do not set `linker = "rust-lld.exe"` here. rust-lld is not guaranteed
+# to be on PATH, and a missing linker breaks `cargo check`/`cargo test` for the
+# whole workspace. Install `llvm-tools` and point rustflags at it locally if
+# you want lld-link; the MSVC linker from VS 2022 Build Tools is the default.
+
+# sccache (optional, recommended): install sccache, then either uncomment the
+# line below or export RUSTC_WRAPPER=sccache. Do not enable it in this file
+# unless sccache is installed — cargo fails the build if the wrapper is missing.
+#
+# [build]
+# rustc-wrapper = "sccache"

@@ -1,0 +1,12 @@
+[package]
+name = "aw-collector-poll"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cross-platform polling fallback. Stub."
+
+[dependencies]
+aw-core = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Repository tasks: ci, build-ebpf. Uses std::process only."
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "aw-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "aw: command-line client. Talks to the daemon over its API. Stub."
+
+[[bin]]
+name = "aw"
+path = "src/main.rs"
+
+[dependencies]
+aw-core = { workspace = true }
+
+[lints]
+workspace = true

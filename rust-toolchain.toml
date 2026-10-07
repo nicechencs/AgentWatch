@@ -1,0 +1,5 @@
+# Stable for every default workspace member.
+# crates/aw-ebpf pins its own nightly toolchain and is not a default member.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

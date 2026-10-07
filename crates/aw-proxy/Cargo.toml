@@ -1,0 +1,12 @@
+[package]
+name = "aw-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Explicit MITM proxy. Stub."
+
+[dependencies]
+aw-core = { workspace = true }
+
+[lints]
+workspace = true

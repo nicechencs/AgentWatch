@@ -1,0 +1,24 @@
+[package]
+name = "aw-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "agentwatchd: wires collectors, pipeline, store, and the HTTP API. Stub."
+
+[[bin]]
+name = "agentwatchd"
+path = "src/main.rs"
+
+[dependencies]
+aw-core = { workspace = true }
+aw-pipeline = { workspace = true }
+aw-store = { workspace = true }
+aw-proxy = { workspace = true }
+aw-agent-adapters = { workspace = true }
+aw-collector-poll = { workspace = true }
+aw-collector-linux = { workspace = true }
+aw-collector-windows = { workspace = true }
+aw-collector-macos = { workspace = true }
+
+[lints]
+workspace = true

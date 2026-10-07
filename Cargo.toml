@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aw-core",
+    "crates/aw-pipeline",
+    "crates/aw-store",
+    "crates/aw-proxy",
+    "crates/aw-collector-linux",
+    "crates/aw-collector-windows",
+    "crates/aw-collector-macos",
+    "crates/aw-collector-poll",
+    "crates/aw-agent-adapters",
+    "crates/aw-daemon",
+    "crates/aw-cli",
+    "sim",
+    "xtask",
+]
+# aw-ebpf is not a default member: it needs a nightly toolchain and the bpf target.
+# `cargo xtask build-ebpf` is a no-op until P0-LNX-01 adds that crate.
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+# Placeholder until the published version is decided. Keep crates in lockstep.
+version = "0.1.0"
+
+# Versions live here. Member crates use `dep = { workspace = true }`.
+# Stubs intentionally depend on none of these yet (P0-CI-01). Add a dep only
+# when a later task needs it, and only if ADR-0001 or repo-layout already names it.
+[workspace.dependencies]
+aw-core = { path = "crates/aw-core" }
+aw-pipeline = { path = "crates/aw-pipeline" }
+aw-store = { path = "crates/aw-store" }
+aw-proxy = { path = "crates/aw-proxy" }
+aw-collector-linux = { path = "crates/aw-collector-linux" }
+aw-collector-windows = { path = "crates/aw-collector-windows" }
+aw-collector-macos = { path = "crates/aw-collector-macos" }
+aw-collector-poll = { path = "crates/aw-collector-poll" }
+aw-agent-adapters = { path = "crates/aw-agent-adapters" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+# panic = "abort" is deferred: daemon may need unwind to isolate a collector thread.

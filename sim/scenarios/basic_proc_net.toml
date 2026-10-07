@@ -1,0 +1,65 @@
+# P1-SIM-01. Process tree plus network, no file actions.
+# Every address is 127.0.0.1. `{http_port}`, `{https_port}`, and `{udp_port}`
+# are filled with the listeners `sim run` starts for this scenario.
+# DNS names stay under agentwatch.test and are answered by the local stub.
+# A name whose first label starts with `nx-` is the one NXDOMAIN.
+
+name = "basic_proc_net"
+description = "三层派生、短命进程、空格与 Unicode argv、DNS、已知字节传输、长连接、UDP"
+
+[setup]
+server = { http = true, https = true, udp = true, dns = true }
+
+[[step]]
+action = "spawn"
+id = "child"
+steps = [
+  { action = "exec", id = "spaced", argv = ["git", "status", "--", "my file.txt"] },
+  { action = "spawn", id = "grandchild", steps = [
+      { action = "exec", id = "unicode", argv = ["tool", "--name", "文档 β", "--path", "work/数据.bin"] },
+      { action = "http_upload", url = "http://127.0.0.1:{http_port}/upload", bytes = 1048576 },
+      { action = "http_upload", url = "http://127.0.0.1:{http_port}/upload", bytes = 10485760 },
+      { action = "http_download", url = "https://127.0.0.1:{https_port}/download?bytes=5242880" },
+  ]},
+]
+
+# One process that exits in well under 100 ms. It does no other work.
+[[step]]
+action = "spawn"
+id = "short"
+steps = [
+  { action = "short_lived", lifetime_ms = 20 },
+]
+
+[[step]]
+action = "dns_lookup"
+name = "api.agentwatch.test"
+
+[[step]]
+action = "dns_lookup"
+name = "files.agentwatch.test"
+
+[[step]]
+action = "dns_lookup"
+name = "cdn.agentwatch.test"
+
+[[step]]
+action = "dns_lookup"
+name = "logs.agentwatch.test"
+
+# The one name the stub answers with zero records.
+[[step]]
+action = "dns_lookup"
+name = "nx-missing.agentwatch.test"
+
+# Held open against the local listener. Default 30 s; --duration <ms> scales it
+# by `<ms> / 30000`, so acceptance runs do not have to wait the full half minute.
+[[step]]
+action = "long_conn"
+url = "http://127.0.0.1:{http_port}/hold"
+hold_ms = 30000
+
+[[step]]
+action = "udp_send"
+dest = "127.0.0.1:{udp_port}"
+bytes = 64

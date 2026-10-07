@@ -35,6 +35,8 @@ xcuserdata/
 *.export.jsonl
 *.export.csv
 /raw-events/
+# sim run 的真值与服务端字节日志（P1-SIM-01），含本机路径与临时端口
+/out/
 *.raw.jsonl
 
 # ---- 证书与密钥（代理 CA 等，绝不提交）----

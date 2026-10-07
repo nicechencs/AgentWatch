@@ -70,9 +70,18 @@ impl Preface {
             if buf.len() > MAX_HEADER_BYTES {
                 return Err("request headers exceed 16 KiB".to_string());
             }
-            let n = stream
-                .read(&mut tmp)
-                .map_err(|err| format!("read headers: {err}"))?;
+            let n = match stream.read(&mut tmp) {
+                Ok(n) => n,
+                // A socket that stays open without a request (the long-connection
+                // step) is not a failed exchange and writes no truth line.
+                Err(err)
+                    if err.kind() == io::ErrorKind::WouldBlock
+                        || err.kind() == io::ErrorKind::TimedOut =>
+                {
+                    return Err("idle".to_string());
+                }
+                Err(err) => return Err(format!("read headers: {err}")),
+            };
             if n == 0 {
                 return Err("connection closed before HTTP headers".to_string());
             }
@@ -261,6 +270,10 @@ fn response_for(exchange: &Exchange) -> Vec<u8> {
             .into_bytes();
             out.extend_from_slice(body.as_bytes());
             out
+        }
+        Direction::Udp | Direction::Dns => {
+            // UDP and DNS never reach this HTTP writer.
+            Vec::new()
         }
         Direction::Download => {
             let len = exchange.app_bytes;

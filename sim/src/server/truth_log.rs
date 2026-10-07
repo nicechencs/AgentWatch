@@ -14,6 +14,8 @@ use serde::Serialize;
 pub enum Direction {
     Upload,
     Download,
+    Udp,
+    Dns,
 }
 
 impl Direction {
@@ -21,6 +23,8 @@ impl Direction {
         match self {
             Self::Upload => "upload",
             Self::Download => "download",
+            Self::Udp => "udp",
+            Self::Dns => "dns",
         }
     }
 }

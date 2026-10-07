@@ -29,6 +29,9 @@ fn run() -> Result<(), String> {
     match cmd.as_str() {
         "run" => cmd_run(args.collect()),
         "spawn" => cmd_spawn(args.collect()),
+        // `exec` steps re-enter here. The process exists so the OS sees argv
+        // (including spaces and non-ASCII) and then exits. Nothing is printed.
+        "argv-echo" => Ok(()),
         "-h" | "--help" | "help" => {
             println!("{}", usage());
             Ok(())
@@ -42,13 +45,14 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage:\n  sim run <scenario.toml> --truth <file>\n  sim spawn --payload <file> --truth <file> --ppid <pid>\n  sim serve --http 127.0.0.1:0 --https 127.0.0.1:0 --truth <file> --cert-out <dir>\n    (`sim serve --help` for the byte server)\n".to_string()
+    "usage:\n  sim run <scenario.toml> --truth <file> [--root <dir>] [--duration <ms>]\n  sim spawn --payload <file> --truth <file> --ppid <pid>\n  sim serve --http 127.0.0.1:0 --https 127.0.0.1:0 --truth <file> --cert-out <dir>\n    (`sim serve --help` for the byte server)\n\n  --duration <ms> shortens steps that declare duration_ms (and long_conn).\n  SIM_DURATION_MS does the same when --duration is omitted.\n".to_string()
 }
 
 fn cmd_run(args: Vec<String>) -> Result<(), String> {
     let mut scenario_path: Option<PathBuf> = None;
     let mut truth: Option<PathBuf> = None;
     let mut sim_root: Option<PathBuf> = None;
+    let mut duration_override_ms: Option<u64> = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -63,6 +67,15 @@ fn cmd_run(args: Vec<String>) -> Result<(), String> {
                     iter.next()
                         .ok_or_else(|| "--root needs a path".to_string())?,
                 ));
+            }
+            "--duration" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| "--duration needs milliseconds".to_string())?;
+                duration_override_ms = Some(
+                    raw.parse::<u64>()
+                        .map_err(|_| format!("--duration is not an integer: {raw}"))?,
+                );
             }
             "-h" | "--help" => {
                 println!("{}", usage());
@@ -85,7 +98,19 @@ fn cmd_run(args: Vec<String>) -> Result<(), String> {
         .map_err(|err| format!("read {}: {err}", scenario_path.display()))?;
     let scenario =
         scenario::Scenario::parse(&text).map_err(|err| format!("parse scenario: {err}"))?;
-    exec::run_scenario(&scenario, &exec::RunOpts { truth, sim_root })
+    let duration_override_ms = duration_override_ms.or_else(duration_from_env);
+    exec::run_scenario(
+        &scenario,
+        &exec::RunOpts {
+            truth,
+            sim_root,
+            duration_override_ms,
+        },
+    )
+}
+
+fn duration_from_env() -> Option<u64> {
+    env::var("SIM_DURATION_MS").ok()?.parse().ok()
 }
 
 fn cmd_spawn(args: Vec<String>) -> Result<(), String> {

@@ -1,0 +1,46 @@
+# P1-SIM-01. Process and network half of the typical_agent load from
+# performance-budget: about 20 execs and about 10 connections per second
+# for 10 minutes. File activity is P2 and is not in this file.
+#
+# `duration_ms` is the nominal length. `sim run --duration <ms>` (or
+# SIM_DURATION_MS) scales `times` by `<ms> / duration_ms`, so a test can
+# run one second of the same shape instead of the full 10 minutes.
+# The default, with no override, is the full 10 minutes.
+
+name = "typical_agent"
+description = "每秒约 20 次 exec、约 10 个连接，持续 10 分钟（可用 --duration 缩短）"
+
+[setup]
+server = { http = true, https = true, dns = true }
+
+# 20 exec/s * 600 s = 12000. One `sim argv-echo` process per iteration.
+[[step]]
+action = "repeat"
+id = "execs"
+times = 12000
+duration_ms = 600000
+steps = [
+  { action = "exec", argv = ["git", "--version"] },
+]
+
+# 10 connections/s * 600 s = 6000. Each iteration is one short HTTP exchange
+# against the local listener, so one TCP connection. DNS is separate and does
+# not count toward the connection rate.
+[[step]]
+action = "repeat"
+id = "connections"
+times = 6000
+duration_ms = 600000
+steps = [
+  { action = "http_download", url = "http://127.0.0.1:{http_port}/download?bytes=128" },
+]
+
+# A steady name lookup against the stub. Not part of the 10 connections/s.
+[[step]]
+action = "repeat"
+id = "dns"
+times = 600
+duration_ms = 600000
+steps = [
+  { action = "dns_lookup", name = "api.agentwatch.test" },
+]

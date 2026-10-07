@@ -14,16 +14,19 @@
 //! response is written, so the response records themselves are not included.
 //! `0` is never written to mean unknown.
 //!
-//! There is no DNS stub. `sim.agentwatch.test` is not served.
+//! Optional UDP and DNS stubs also bind `127.0.0.1` only. The DNS stub answers
+//! `*.agentwatch.test` except names that start with `nx-`. It is not a recursive
+//! resolver and never queries the public network. A platform that cannot bind it
+//! is reported; the scenario runner then marks DNS steps `skip`.
 
 mod cert;
 mod http;
 mod truth_log;
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,6 +55,8 @@ Options:
   --truth <file>        JSONL byte-count log (required)
   --cert-out <dir>      Where to write cert.pem and key.pem (default: a new
                         directory under the system temp dir)
+  --udp <ip:port>       UDP echo on 127.0.0.1 (default: off)
+  --dns <ip:port>       DNS stub for *.agentwatch.test (default: off)
   -h, --help            Show this text
 
 Routes:
@@ -67,12 +72,16 @@ It does not record bodies, URLs, or request headers.
 The certificate is self-signed and written only under --cert-out. It is not
 installed into any trust store. Clients must be given cert.pem explicitly.
 
-No DNS server is included.
+UDP echoes the datagram and records its length, never its payload.
+The DNS stub answers only *.agentwatch.test with 127.0.0.1. A name whose first
+label starts with nx- is NXDOMAIN. It never forwards a query.
 ";
 
 struct ServeOpts {
     http: SocketAddr,
     https: SocketAddr,
+    udp: Option<SocketAddr>,
+    dns: Option<SocketAddr>,
     truth: PathBuf,
     cert_out: PathBuf,
 }
@@ -101,6 +110,29 @@ pub fn serve(args: Vec<String>) -> Result<(), String> {
     println!("http://{http_addr}");
     println!("https://{https_addr}");
     println!("cert {}", opts.cert_out.join("cert.pem").display());
+    let stop = Arc::new(AtomicBool::new(false));
+    let udp_socket = match opts.udp {
+        Some(addr) => Some(bind_udp(addr).map_err(|err| format!("bind udp: {err}"))?),
+        None => None,
+    };
+    let dns_socket = match opts.dns {
+        Some(addr) => Some(bind_udp(addr).map_err(|err| format!("bind dns: {err}"))?),
+        None => None,
+    };
+    if let Some(sock) = &udp_socket {
+        println!(
+            "udp://{}",
+            sock.local_addr()
+                .map_err(|err| format!("udp local address: {err}"))?
+        );
+    }
+    if let Some(sock) = &dns_socket {
+        println!(
+            "dns://{}",
+            sock.local_addr()
+                .map_err(|err| format!("dns local address: {err}"))?
+        );
+    }
     let _ = std::io::stdout().flush();
 
     let log = Arc::new(TruthLog::create(&opts.truth).map_err(|err| format!("truth log: {err}"))?);
@@ -109,31 +141,64 @@ pub fn serve(args: Vec<String>) -> Result<(), String> {
 
     let http_log = Arc::clone(&log);
     let http_ids = Arc::clone(&next_id);
+    let http_stop = Arc::clone(&stop);
     let http_thread = std::thread::Builder::new()
         .name("sim-serve-http".to_string())
-        .spawn(move || accept_loop(http_listener, http_log, http_ids, None))
+        .spawn(move || accept_loop(http_listener, http_log, http_ids, None, http_stop))
         .map_err(|err| format!("spawn http: {err}"))?;
 
     let https_log = Arc::clone(&log);
     let https_ids = Arc::clone(&next_id);
+    let https_stop = Arc::clone(&stop);
     let https_thread = std::thread::Builder::new()
         .name("sim-serve-https".to_string())
-        .spawn(move || accept_loop(https_listener, https_log, https_ids, Some(tls)))
+        .spawn(move || accept_loop(https_listener, https_log, https_ids, Some(tls), https_stop))
         .map_err(|err| format!("spawn https: {err}"))?;
 
-    // Run until the process is killed. A join error is a thread panic.
+    let mut extras = Vec::new();
+    if let Some(sock) = udp_socket {
+        let log = Arc::clone(&log);
+        let ids = Arc::clone(&next_id);
+        let stop = Arc::clone(&stop);
+        extras.push(
+            std::thread::Builder::new()
+                .name("sim-serve-udp".to_string())
+                .spawn(move || udp_loop(sock, log, ids, stop))
+                .map_err(|err| format!("spawn udp: {err}"))?,
+        );
+    }
+    if let Some(sock) = dns_socket {
+        let log = Arc::clone(&log);
+        let ids = Arc::clone(&next_id);
+        let stop = Arc::clone(&stop);
+        extras.push(
+            std::thread::Builder::new()
+                .name("sim-serve-dns".to_string())
+                .spawn(move || dns_loop(sock, log, ids, stop))
+                .map_err(|err| format!("spawn dns: {err}"))?,
+        );
+    }
+
+    // HTTP and HTTPS run until the process is killed. UDP and DNS are optional
+    // and stop with them. A join error is a thread panic.
     http_thread
         .join()
         .map_err(|_| "http accept thread stopped".to_string())?;
+    stop.store(true, Ordering::Relaxed);
     https_thread
         .join()
         .map_err(|_| "https accept thread stopped".to_string())?;
+    for thread in extras {
+        let _ = thread.join();
+    }
     Ok(())
 }
 
 fn parse_args(args: Vec<String>) -> Result<ServeOpts, String> {
     let mut http: Option<SocketAddr> = None;
     let mut https: Option<SocketAddr> = None;
+    let mut udp: Option<SocketAddr> = None;
+    let mut dns: Option<SocketAddr> = None;
     let mut truth: Option<PathBuf> = None;
     let mut cert_out: Option<PathBuf> = None;
     let mut iter = args.into_iter();
@@ -150,6 +215,18 @@ fn parse_args(args: Vec<String>) -> Result<ServeOpts, String> {
                     .next()
                     .ok_or_else(|| "--https needs ip:port".to_string())?;
                 https = Some(parse_listen("--https", &raw)?);
+            }
+            "--udp" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| "--udp needs ip:port".to_string())?;
+                udp = Some(parse_listen("--udp", &raw)?);
+            }
+            "--dns" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| "--dns needs ip:port".to_string())?;
+                dns = Some(parse_listen("--dns", &raw)?);
             }
             "--truth" => {
                 truth = Some(PathBuf::from(
@@ -177,6 +254,8 @@ fn parse_args(args: Vec<String>) -> Result<ServeOpts, String> {
     Ok(ServeOpts {
         http: http.unwrap_or(SocketAddr::from(([127, 0, 0, 1], 0))),
         https: https.unwrap_or(SocketAddr::from(([127, 0, 0, 1], 0))),
+        udp,
+        dns,
         truth: truth.ok_or_else(|| "missing --truth <file>".to_string())?,
         cert_out,
     })
@@ -199,7 +278,22 @@ fn bind_loopback(addr: SocketAddr) -> Result<TcpListener, String> {
     if addr.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
         return Err(format!("refusing to bind {addr}"));
     }
-    TcpListener::bind(addr).map_err(|err| format!("{addr}: {err}"))
+    let listener = TcpListener::bind(addr).map_err(|err| format!("{addr}: {err}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| format!("http nonblocking: {err}"))?;
+    Ok(listener)
+}
+
+fn bind_udp(addr: SocketAddr) -> Result<UdpSocket, String> {
+    if addr.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+        return Err(format!("refusing to bind {addr}"));
+    }
+    let socket = UdpSocket::bind(addr).map_err(|err| format!("{addr}: {err}"))?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(|err| format!("udp timeout: {err}"))?;
+    Ok(socket)
 }
 
 fn server_config(material: &cert::Material) -> Result<Arc<ServerConfig>, String> {
@@ -222,10 +316,16 @@ fn accept_loop(
     log: Arc<TruthLog>,
     next_id: Arc<AtomicU64>,
     tls: Option<Arc<ServerConfig>>,
+    stop: Arc<AtomicBool>,
 ) {
-    loop {
+    while !stop.load(Ordering::Relaxed) {
         let (stream, peer) = match listener.accept() {
             Ok(pair) => pair,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(err) => {
                 eprintln!("sim serve: accept: {err}");
                 continue;
@@ -243,7 +343,9 @@ fn accept_loop(
             .name(format!("sim-serve-{id}"))
             .spawn(move || {
                 if let Err(err) = handle_connection(id, stream, &log, tls.as_deref()) {
-                    eprintln!("sim serve: connection {id}: {err}");
+                    if err != "idle" {
+                        eprintln!("sim serve: connection {id}: {err}");
+                    }
                 }
             })
             .is_err()
@@ -259,7 +361,17 @@ fn handle_connection(
     log: &TruthLog,
     tls: Option<&ServerConfig>,
 ) -> Result<(), String> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    // `accept` on a nonblocking listener returns a nonblocking socket. Put it
+    // back into blocking mode so a TLS handshake can wait for the whole record.
+    stream
+        .set_nonblocking(false)
+        .map_err(|err| format!("blocking: {err}"))?;
+    // A `long_conn` step holds the socket and never sends a request. The timeout
+    // lets that handler return instead of pinning a thread for the whole hold,
+    // and the accept loop is already concurrent so other transfers still proceed.
+    // Longer than basic_proc_net's 30 s hold, so that step is not closed first.
+    // A client that goes away still unblocks the handler instead of pinning it.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(45)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
     match tls {
         None => {
@@ -339,4 +451,166 @@ impl Write for CountingSocket {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
+}
+
+/// Echo each datagram and record its length. The payload is not written anywhere.
+fn udp_loop(socket: UdpSocket, log: Arc<TruthLog>, next_id: Arc<AtomicU64>, stop: Arc<AtomicBool>) {
+    let mut buf = [0u8; 2048];
+    while !stop.load(Ordering::Relaxed) {
+        match socket.recv_from(&mut buf) {
+            Ok((n, peer)) => {
+                if !peer.ip().is_loopback() {
+                    continue;
+                }
+                let id = next_id.fetch_add(1, Ordering::Relaxed);
+                let _ = socket.send_to(&buf[..n], peer);
+                let _ = log.append(&TruthRecord {
+                    connection_id: id,
+                    direction: truth_log::Direction::Udp,
+                    app_bytes: n as u64,
+                    tls_bytes: None,
+                    ok: true,
+                    error: None,
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => eprintln!("sim serve: udp: {err}"),
+        }
+    }
+}
+
+/// Answer `*.agentwatch.test` with `127.0.0.1`. A first label starting with `nx-`
+/// is NXDOMAIN. Any other name is refused. Nothing is forwarded.
+fn dns_loop(socket: UdpSocket, log: Arc<TruthLog>, next_id: Arc<AtomicU64>, stop: Arc<AtomicBool>) {
+    let mut buf = [0u8; 512];
+    while !stop.load(Ordering::Relaxed) {
+        match socket.recv_from(&mut buf) {
+            Ok((n, peer)) => {
+                if !peer.ip().is_loopback() {
+                    continue;
+                }
+                let id = next_id.fetch_add(1, Ordering::Relaxed);
+                match dns_reply(&buf[..n]) {
+                    Some(reply) => {
+                        let _ = socket.send_to(&reply, peer);
+                        let _ = log.append(&TruthRecord {
+                            connection_id: id,
+                            direction: truth_log::Direction::Dns,
+                            app_bytes: n as u64,
+                            tls_bytes: None,
+                            ok: true,
+                            error: None,
+                        });
+                    }
+                    None => {
+                        let _ = log.append(&TruthRecord {
+                            connection_id: id,
+                            direction: truth_log::Direction::Dns,
+                            app_bytes: n as u64,
+                            tls_bytes: None,
+                            ok: false,
+                            error: Some("dns query rejected".to_string()),
+                        });
+                    }
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => eprintln!("sim serve: dns: {err}"),
+        }
+    }
+}
+
+/// Build a response for one question. Returns `None` when the packet is not a
+/// single-question query this stub is willing to answer.
+fn dns_reply(query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
+    let qd = u16::from_be_bytes([query[4], query[5]]);
+    if qd != 1 {
+        return None;
+    }
+    let (name, next) = read_name(query, 12)?;
+    if next + 4 > query.len() {
+        return None;
+    }
+    let qtype = u16::from_be_bytes([query[next], query[next + 1]]);
+    let qclass = u16::from_be_bytes([query[next + 2], query[next + 3]]);
+    let question_end = next + 4;
+    if qclass != 1 || (qtype != 1 && qtype != 255) {
+        return None;
+    }
+    let nx = name_is_nxdomain(&name);
+    let allowed = name_is_test_zone(&name);
+    if !nx && !allowed {
+        return None;
+    }
+    let mut out = query[..question_end].to_vec();
+    // QR=1, RD copied, RA=0, RCODE 0 or 3.
+    out[2] = 0x80 | (query[2] & 0x01);
+    out[3] = if nx { 0x03 } else { 0x00 };
+    if nx {
+        out[6] = 0;
+        out[7] = 0;
+        return Some(out);
+    }
+    out[6] = 0;
+    out[7] = 1; // one answer
+                // Compression pointer back to the question name.
+    out.extend_from_slice(&[0xC0, 0x0C]);
+    out.extend_from_slice(&1u16.to_be_bytes()); // A
+    out.extend_from_slice(&1u16.to_be_bytes()); // IN
+    out.extend_from_slice(&60u32.to_be_bytes());
+    out.extend_from_slice(&4u16.to_be_bytes());
+    out.extend_from_slice(&[127, 0, 0, 1]);
+    Some(out)
+}
+
+fn name_is_test_zone(name: &str) -> bool {
+    let name = name.trim_end_matches('.');
+    name.eq_ignore_ascii_case("agentwatch.test")
+        || name.to_ascii_lowercase().ends_with(".agentwatch.test")
+}
+
+fn name_is_nxdomain(name: &str) -> bool {
+    let first = name.split('.').next().unwrap_or("");
+    first.to_ascii_lowercase().starts_with("nx-") && name_is_test_zone(name)
+}
+
+/// Read one uncompressed DNS name. Pointers are rejected: this stub only sees
+/// queries it just received, which a normal client sends uncompressed.
+fn read_name(packet: &[u8], mut at: usize) -> Option<(String, usize)> {
+    let mut labels = Vec::new();
+    for _ in 0..32 {
+        if at >= packet.len() {
+            return None;
+        }
+        let len = packet[at] as usize;
+        at += 1;
+        if len == 0 {
+            let name = if labels.is_empty() {
+                ".".to_string()
+            } else {
+                labels.join(".")
+            };
+            return Some((name, at));
+        }
+        if len > 63 || at + len > packet.len() {
+            return None;
+        }
+        let label = std::str::from_utf8(&packet[at..at + len]).ok()?;
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return None;
+        }
+        labels.push(label.to_string());
+        at += len;
+    }
+    None
 }

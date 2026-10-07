@@ -229,18 +229,110 @@ impl Stage for CorrelateStage {
     }
 }
 
-/// Batcher placeholder. Does not write. Real batching is a later card.
-#[derive(Debug, Default)]
+/// Batcher (P1-PIPE-05). Rate-limits, and writes when a sink is attached.
+///
+/// [`crate::Pipeline::replay`] builds this with [`Self::default`], which has no
+/// sink and does not open a database. Events that pass the per-process limiter
+/// are forwarded. A `process_start` over the bucket is not forwarded; the
+/// limiter records [`aw_core::GapKind::RateLimited`] on `out`.
+///
+/// [`Self::set_degrade`] turns on L1: individual `NetSend` / `NetRecv` events
+/// are not forwarded and are counted. Other kinds still go through.
+///
+/// [`Self::set_sink`] attaches an [`aw_store::RecordSink`]. Gap events are
+/// handed to the batcher so they merge. Flush timing uses `event.ts_mono_ns`
+/// and [`Stage::tick`]'s `now_ns`, not the host clock.
 pub struct BatcherStage {
-    inner: Forward,
+    limiter: crate::limits::Limiter,
+    batch: Option<crate::batcher::Batcher<crate::batcher::DynSink>>,
+    store: crate::config::StoreConfig,
+    /// L1. Replay leaves this false: it has no queue to measure.
+    degrade: bool,
+    now_ns: u64,
+}
+
+impl Default for BatcherStage {
+    fn default() -> Self {
+        Self::new(crate::config::PipelineConfig::default())
+    }
+}
+
+impl BatcherStage {
+    /// Limiter from `cfg.limits`. No sink until [`Self::set_sink`].
+    pub fn new(cfg: crate::config::PipelineConfig) -> Self {
+        Self {
+            limiter: crate::limits::Limiter::new(cfg.limits),
+            batch: None,
+            store: cfg.store,
+            degrade: false,
+            now_ns: 0,
+        }
+    }
+
+    /// Attach a sink. Call this before records arrive; an open batch is not kept.
+    pub fn set_sink(&mut self, sink: Box<dyn aw_store::RecordSink + Send>) {
+        self.batch = Some(crate::batcher::Batcher::with_defaults(
+            crate::batcher::DynSink::new(sink),
+            self.store.clone(),
+        ));
+    }
+
+    /// L1 switch. `true` drops individual `NetSend` / `NetRecv` events.
+    pub fn set_degrade(&mut self, degrade: bool) {
+        self.degrade = degrade;
+    }
+
+    /// `NetSend` events L1 did not forward. Not a byte count.
+    pub fn net_send_dropped(&self) -> u64 {
+        self.limiter.net_send_dropped()
+    }
+
+    /// `NetRecv` events L1 did not forward. Not a byte count.
+    pub fn net_recv_dropped(&self) -> u64 {
+        self.limiter.net_recv_dropped()
+    }
 }
 
 impl Stage for BatcherStage {
     fn process(&mut self, event: RawEvent, out: &mut Output, next: &mut dyn Stage) {
-        self.inner.process(event, out, next);
+        self.now_ns = event.ts_mono_ns;
+        match self.limiter.admit(&event, self.degrade) {
+            Err(crate::limits::Hold::RateLimited) => {
+                // Not forwarded. `take_gaps` closes the merge bucket so the
+                // count is visible on `out` without waiting out the 5 s window.
+                // Tests that want the window kept open call `Limiter` directly.
+                out.gaps.extend(self.limiter.take_gaps());
+            }
+            Err(crate::limits::Hold::Degraded) => {
+                // Counted on the limiter. Not forwarded. No gap per event:
+                // L1 is a counter, and a per-event gap would be the storm §4
+                // tells us to avoid.
+            }
+            Ok(()) => {
+                if let Some(batch) = self.batch.as_mut() {
+                    if let aw_core::EventKind::Gap(gap) = &event.kind {
+                        let mut only = Output::empty();
+                        only.gaps
+                            .push(crate::output::GapRec::from_event(&event, gap));
+                        out.gaps.extend(batch.push_output(&only, self.now_ns));
+                    }
+                }
+                next.process(event, out, &mut Tail);
+            }
+        }
     }
 
     fn tick(&mut self, now_ns: u64) {
-        self.inner.tick(now_ns);
+        self.now_ns = now_ns;
+        if let Some(batch) = self.batch.as_mut() {
+            // No `Output` on tick. Gaps a time flush created are ingested
+            // back so the next successful write can store them.
+            let emitted = batch.tick(now_ns);
+            if !emitted.is_empty() {
+                let mut only = Output::empty();
+                only.gaps = emitted;
+                batch.ingest(&only, now_ns);
+            }
+        }
     }
 }

@@ -8,6 +8,8 @@ description = "Scope, enrich, redact, aggregate, and correlate. Passthrough skel
 
 [dependencies]
 aw-core = { workspace = true }
+# RecordSink and row types only. SQL stays in aw-store (P1-PIPE-05).
+aw-store = { workspace = true }
 
 [[bench]]
 name = "passthrough"

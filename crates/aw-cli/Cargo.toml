@@ -3,6 +3,7 @@ name = "aw-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "aw: command-line client. Talks to the daemon over its API. Stub."
 
 [[bin]]

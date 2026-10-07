@@ -3,6 +3,7 @@ name = "aw-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "agentwatchd: wires collectors, pipeline, store, and the HTTP API. Stub."
 
 [[bin]]

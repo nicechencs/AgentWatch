@@ -3,6 +3,7 @@ name = "xtask"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "Repository tasks: ci, build-ebpf. Uses std::process only."
 
 [[bin]]

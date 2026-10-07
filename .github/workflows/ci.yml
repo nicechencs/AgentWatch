@@ -1,0 +1,147 @@
+# P0-CI-02: three-OS compile/test gate plus license, advisory, and doc-link jobs.
+# No repository secrets. Signing stays out of this workflow (P4).
+# wording-lint, ui, and size-check are later jobs; they are not stubs here.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Drop the previous run on the same ref so a new push does not queue behind it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # Save the cache from main only so PR branches do not fill the cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+          command-arguments: licenses bans advisories sources
+
+  # cargo-audit is a separate gate from `cargo deny advisories`.
+  # rustsec/audit-check needs a token to download the advisory DB and is not
+  # used here. No secrets of any kind.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cargo-audit
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: cargo audit
+
+  # Enabled by P0-LNX-01 once `cargo xtask build-ebpf` is a real build.
+  # `if: false` skips the job entirely, including its steps.
+  build-ebpf:
+    name: build-ebpf
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo xtask build-ebpf
+        run: cargo xtask build-ebpf
+
+  # Repo-relative file targets only. A #fragment is not checked: anchors in
+  # this repo are hand-shortened and do not match GitHub heading slugs, and
+  # correcting them means editing docs, which this task does not allow.
+  # Remote URLs, bare #anchors, and directory links are ignored. A missing
+  # target file fails the job, including when the URL also has a #fragment.
+  docs:
+    name: docs links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check relative markdown links
+        shell: python
+        run: |
+          import pathlib, re, sys
+
+          root = pathlib.Path('.').resolve()
+          skip = {'.git', 'target', 'node_modules'}
+          link_re = re.compile(r'!?\[([^\]]*)\]\(([^)]+)\)')
+          ref_re = re.compile(r'^\s*\[([^\]]+)\]:\s*(\S+)', re.M)
+          broken = []
+          checked = 0
+
+          for path in root.rglob('*.md'):
+              if skip.intersection(path.parts):
+                  continue
+              text = path.read_text(encoding='utf-8')
+              # Fenced blocks are examples, not links this job should fail on.
+              # Fences may be indented inside a list item.
+              text = re.sub(r'^[ \t]*```.*?^[ \t]*```', '', text, flags=re.S | re.M)
+              urls = [m.group(2) for m in link_re.finditer(text)]
+              urls += [m.group(2) for m in ref_re.finditer(text)]
+              for raw in urls:
+                  url = raw.strip().split()[0].strip('<>')
+                  if not url or '://' in url or url.startswith('#'):
+                      continue
+                  # docs/README.md §3 item 5 shows a link one directory too high
+                  # as a writing example. docs/ is outside this task's file
+                  # scope, so that one example is skipped and left for a docs fix.
+                  if (
+                      path.name == 'README.md'
+                      and path.parent.name == 'docs'
+                      and url == '../01-architecture/evidence-model.md#2-证据等级'
+                  ):
+                      continue
+                  rel, _, _anchor = url.partition('#')
+                  # Directory links (docs/05-dev/) are not a file check.
+                  if not rel or rel.endswith('/'):
+                      continue
+                  target = (path.parent / rel).resolve()
+                  try:
+                      target.relative_to(root)
+                  except ValueError:
+                      broken.append(f'{path}: escapes repo: {url}')
+                      continue
+                  checked += 1
+                  if not target.is_file():
+                      broken.append(f'{path}: missing file: {url}')
+
+          print(f'checked {checked} relative links')
+          if broken:
+              print(f'{len(broken)} broken relative link(s):', file=sys.stderr)
+              for item in broken:
+                  print(item, file=sys.stderr)
+              sys.exit(1)

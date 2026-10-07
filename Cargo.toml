@@ -21,7 +21,11 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-# Placeholder until the published version is decided. Keep crates in lockstep.
+# Not published to crates.io (ci-release: one version, distributed as binaries).
+# `publish = false` also keeps cargo-deny from treating `{ workspace = true }`
+# as a crates.io wildcard (EmbarkStudios/cargo-deny#639).
+publish = false
+# Placeholder until the released version is decided. Keep crates in lockstep.
 version = "0.1.0"
 
 # Versions live here. Member crates use `dep = { workspace = true }`.

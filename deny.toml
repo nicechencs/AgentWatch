@@ -1,0 +1,47 @@
+# License, ban, advisory, and source checks for `cargo deny check`.
+# Policy details (wording lint, SBOM, exceptions) land in P4-SEC-01.
+# There is no license deny list in current cargo-deny: anything not in
+# `allow` is rejected, which covers GPL-2.0, GPL-3.0, AGPL-3.0, LGPL-2.0,
+# LGPL-2.1, and LGPL-3.0 (including -only / -or-later) for every link type,
+# static included. MPL-2.0 is not pre-approved.
+# The allow list is the permissive set already pulled in by P0-CORE-01
+# (serde, thiserror, insta, proptest) and P0-SIM-02 (toml, ureq/rustls).
+# CDLA-Permissive-2.0 is Unicode data inside the `unicode-ident` crate.
+# OpenSSL is the license exception rustls declares, not a linked library.
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+exceptions = []
+
+# Path-only workspace members are not published. Ignore them so the empty
+# allow list does not reject "MIT OR Apache-2.0" on our own crates.
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# cargo-deny 0.18 treats `{ workspace = true }` as a wildcard even though the
+# version is pinned by the workspace table (EmbarkStudios/cargo-deny#639).
+# Real `*` requirements are still denied; only the workspace form is skipped.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

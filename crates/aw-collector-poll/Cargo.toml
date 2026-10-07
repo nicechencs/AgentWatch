@@ -4,10 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Cross-platform polling fallback. Stub."
+description = "Cross-platform polling fallback. Process and connection snapshots at evidence S."
 
 [dependencies]
 aw-core = { workspace = true }
+# MIT. Pinned here, not in [workspace.dependencies], because only this crate lists processes.
+# 0.36.1 is edition 2021 (rust-version 1.75). 0.39+ needs Rust 1.95 and edition 2024.
+sysinfo = "=0.36.1"
 
 [lints]
 workspace = true

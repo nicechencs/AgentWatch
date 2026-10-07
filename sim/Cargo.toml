@@ -19,10 +19,24 @@ toml = "0.8.23"
 # ureq 3 is rustls-only (no OpenSSL, no tokio). HTTP steps talk to 127.0.0.1
 # and record ok:false when nothing is listening; `sim serve` is P0-SIM-03.
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+# P0-SIM-03: blocking localhost HTTP (httparse) plus a self-signed rustls
+# listener. rustls defaults to aws-lc-rs; pin ring so the server shares the
+# crypto stack ureq already locked. rcgen 0.13.2's default features are
+# crypto + ring + pem (aws-lc is a separate feature and stays off). The
+# published feature table does not expose `pem` as a name Cargo will select,
+# so the defaults are required for Certificate::pem. No tokio, no OpenSSL.
+httparse = "1.10.1"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1.15.1"
+rcgen = "0.13.2"
 
 [dev-dependencies]
 serde_json = "1.0.151"
 toml = "0.8.23"
+# The integration test builds its own rustls client and trusts only the cert
+# `sim serve` wrote. These pins match the server; they are not a second stack.
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1.15.1"
 
 [lints]
 workspace = true

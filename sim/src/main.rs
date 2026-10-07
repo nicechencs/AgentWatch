@@ -1,8 +1,8 @@
 //! Behavior simulator. Reads a TOML scenario, performs the steps, and writes
 //! a ground-truth JSONL log. This package must not depend on any `aw-*` crate.
 //!
-//! `sim serve` (the local byte server) belongs to P0-SIM-03. HTTP steps here
-//! record `ok: false` when nothing is listening instead of failing the run.
+//! `sim serve` (P0-SIM-03) is a localhost byte sink/source. `sim run` does not
+//! start it; HTTP steps still record `ok: false` when nothing is listening.
 //!
 #![forbid(unsafe_code)]
 
@@ -10,6 +10,7 @@ mod exec;
 mod http_step;
 mod paths;
 mod scenario;
+mod server;
 mod truth;
 
 use std::env;
@@ -32,7 +33,8 @@ fn run() -> Result<(), String> {
             println!("{}", usage());
             Ok(())
         }
-        "serve" | "eval" | "compare" | "scan-secrets" | "gen-db" => Err(format!(
+        "serve" => server::serve(args.collect()),
+        "eval" | "compare" | "scan-secrets" | "gen-db" => Err(format!(
             "`sim {cmd}` is not part of P0-SIM-02 (see later SIM tasks)"
         )),
         other => Err(format!("unknown command `{other}`\n{}\n", usage())),
@@ -40,7 +42,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage:\n  sim run <scenario.toml> --truth <file>\n  sim spawn --payload <file> --truth <file> --ppid <pid>\n".to_string()
+    "usage:\n  sim run <scenario.toml> --truth <file>\n  sim spawn --payload <file> --truth <file> --ppid <pid>\n  sim serve --http 127.0.0.1:0 --https 127.0.0.1:0 --truth <file> --cert-out <dir>\n    (`sim serve --help` for the byte server)\n".to_string()
 }
 
 fn cmd_run(args: Vec<String>) -> Result<(), String> {

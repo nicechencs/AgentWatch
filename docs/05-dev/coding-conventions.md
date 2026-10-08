@@ -76,6 +76,12 @@
   - “所有流量”
 - 这条规则同样适用于 UI 文案（`ui/src/i18n/`）、CLI 输出和导出内容，CI 中由 `cargo xtask wording-lint` 检查。
 
+### 6.1 措辞门禁（wording-lint）
+
+- 命令：`cargo xtask wording-lint [paths...]`。不带参数时扫描 `ui/src/i18n/**/*.json`（逐行）、`crates/aw-cli/src/**/*.rs`（只扫字符串字面量）、`crates/aw-pipeline/rules/*.toml`（跳过 `#` 注释）。不扫描 `docs/`。
+- CI 的 `wording-lint` job 运行该命令。失败时输出 `文件:行:列`、违规词和建议改写，并给出 GitHub 注解；最后一行汇总违规数和豁免数。
+- 豁免：在同一行或紧邻的上一行写 `// wording-lint: allow <原因>`（TOML 用 `#`）。必须写原因，缺少原因的豁免本身算失败。JSON 不能写注释，i18n 文案没有豁免，只能改文案。
+
 ## 7. 代码风格
 
 - `rustfmt` 默认配置；`clippy` 在 CI 中 `-D warnings`，另开启 `clippy::pedantic` 的少数规则（在根 `Cargo.toml` 的 `[workspace.lints]` 中统一配置）。

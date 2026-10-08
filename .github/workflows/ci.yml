@@ -1,6 +1,6 @@
 # P0-CI-02: three-OS compile/test gate plus license, advisory, and doc-link jobs.
 # No repository secrets. Signing stays out of this workflow (P4).
-# wording-lint, ui, and size-check are later jobs; they are not stubs here.
+# wording-lint added by P3-CI-01. ui and size-check are later jobs; they are not stubs here.
 name: ci
 
 on:
@@ -65,6 +65,23 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: cargo audit
         run: cargo audit
+
+  # P3-CI-01: evidence-model §7 banned phrases in ui/src/i18n, aw-cli string
+  # literals, and aw-pipeline/rules. docs/ is not scanned. On failure the log
+  # lists file:line:col, the banned phrase, and the rewrite, plus ::error
+  # annotations; the last line always summarizes exemption counts.
+  wording-lint:
+    name: wording-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: xtask
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: cargo xtask wording-lint
+        run: cargo xtask wording-lint
 
   # Enabled by P0-LNX-01 once `cargo xtask build-ebpf` is a real build.
   # `if: false` skips the job entirely, including its steps.

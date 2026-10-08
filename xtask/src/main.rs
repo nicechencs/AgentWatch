@@ -3,11 +3,14 @@
 //! `ci` runs fmt, clippy, and the workspace tests.
 //! `build-ebpf` does not compile anything yet. On every host it prints that the
 //! bpf toolchain is not available and exits 0. A real build waits for SPIKE-01.
+//! `wording-lint [paths...]` runs the evidence-model §7 lint (P3-CI-01).
 
 #![forbid(unsafe_code)]
 
 use std::env;
 use std::process::{Command, ExitCode};
+
+mod wording_lint;
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -20,6 +23,7 @@ fn main() -> ExitCode {
             ci()
         }
         Some("build-ebpf") => build_ebpf(),
+        Some("wording-lint") => wording_lint::run(&args.collect::<Vec<_>>()),
         Some(other) => {
             eprintln!("unknown xtask command: {other}");
             usage();
@@ -33,7 +37,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() {
-    eprintln!("usage: cargo xtask <ci|build-ebpf>");
+    eprintln!("usage: cargo xtask <ci|build-ebpf|wording-lint [paths...]>");
 }
 
 fn build_ebpf() -> ExitCode {

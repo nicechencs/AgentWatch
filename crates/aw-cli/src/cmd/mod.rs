@@ -5,6 +5,7 @@
 //! Unreachable is exit 3. A 2xx health check followed by "not implemented" is
 //! exit 1, so a live daemon is never a silent success.
 
+mod attach;
 mod daemon;
 mod db;
 mod doctor;
@@ -12,9 +13,12 @@ mod export;
 mod flows;
 mod gaps;
 mod procs;
+mod ps;
 mod query;
 mod render;
+mod run;
 mod sessions;
+mod stop;
 mod timeline;
 mod tree;
 
@@ -124,6 +128,9 @@ fn dispatch(
     if let Command::Version { check } = &cli.command {
         return Ok(version_outcome(*check, json));
     }
+    if let Some(outcome) = launch_command(&cli, json) {
+        return Ok(outcome);
+    }
     if let Some(outcome) = query_command(&cli.command, json, source)? {
         return Ok(outcome);
     }
@@ -154,6 +161,112 @@ fn dispatch(
             json,
         )),
         Err(err) => Ok(client_outcome(err, &endpoint, json)),
+    }
+}
+
+/// `run`, `attach`, `stop`, and `ps` (P1-CLI-02).
+///
+/// These do not probe `/health`. Each one calls an injected trait; the
+/// production values start no process and open no daemon session. `None` for
+/// every other command.
+///
+/// `usage_gap` still runs first for an empty `run` or an `attach` with neither
+/// `--pid` nor `--name`, via the check below this function's caller. An empty
+/// command never reaches here: `usage_gap` is checked before the health probe,
+/// and this branch returns only when the command is one of the four.
+fn launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
+    // Argument errors stay on the usage path so they do not look like a launch.
+    if usage_gap(&cli.command).is_some() {
+        return None;
+    }
+    match &cli.command {
+        Command::Run {
+            agent,
+            name,
+            proxy,
+            proxy_on_reject,
+            no_follow_children,
+            include_proc,
+            self_report,
+            cwd,
+            env_vars,
+            summary,
+            pin,
+            group,
+            mcp_tap,
+            no_daemon,
+            raw,
+            unsafe_no_redact,
+            cmd,
+        } => {
+            let args = run::RunArgs {
+                agent: agent.as_deref(),
+                name: name.as_deref(),
+                no_follow_children: *no_follow_children,
+                cwd: cwd.as_deref(),
+                env: env_vars,
+                summary: summary.as_deref(),
+                pin: *pin,
+                no_daemon: *no_daemon,
+                raw: raw.as_deref(),
+                command: cmd,
+                json,
+                quiet: cli.quiet,
+            };
+            let deferred = run::DeferredFlags {
+                proxy: *proxy,
+                proxy_on_reject: proxy_on_reject.is_some(),
+                self_report: self_report.is_some(),
+                mcp_tap: *mcp_tap,
+                unsafe_no_redact: *unsafe_no_redact,
+                include_proc: !include_proc.is_empty(),
+                group: group.is_some(),
+            };
+            Some(run::run(
+                &args,
+                deferred,
+                &mut run::PlatformLauncher,
+                &mut run::EmptySummary,
+            ))
+        }
+        Command::Attach {
+            pid,
+            name,
+            no_follow_children,
+            no_existing_children,
+            move_to_cgroup,
+            agent,
+            pin,
+            group,
+            until_exit,
+            duration,
+        } => {
+            let args = attach::AttachArgs {
+                pid: *pid,
+                name: name.as_deref(),
+                no_follow_children: *no_follow_children,
+                no_existing_children: *no_existing_children,
+                move_to_cgroup: *move_to_cgroup,
+                until_exit: *until_exit,
+                duration: duration.as_deref(),
+                agent: agent.as_deref(),
+                pin: *pin,
+                group: group.as_deref(),
+                json,
+            };
+            Some(attach::run(&args, &mut attach::UnwiredControl))
+        }
+        Command::Stop { session } => Some(stop::run(session, json, &mut attach::UnwiredControl)),
+        Command::Ps {
+            agents_only,
+            filter,
+        } => Some(ps::run(
+            *agents_only,
+            filter.as_deref(),
+            json,
+            &mut ps::UnwiredTable,
+        )),
+        _ => None,
     }
 }
 
@@ -371,7 +484,7 @@ fn client_outcome(err: ClientError, endpoint: &Endpoint, json: bool) -> Outcome 
     error_outcome(code, machine, &message, json)
 }
 
-fn error_outcome(code: i32, machine: &str, message: &str, json: bool) -> Outcome {
+pub(crate) fn error_outcome(code: i32, machine: &str, message: &str, json: bool) -> Outcome {
     let text = if json {
         let body = serde_json::json!({
             "error": { "code": machine, "message": message }
@@ -491,8 +604,10 @@ mod tests {
     #[test]
     fn health_200_then_unimplemented_is_exit_1() {
         let mut http = script(200, r#"{"status":"ok"}"#);
+        // `ps` is implemented (P1-CLI-02) and does not probe `/health`.
+        // `ui` is still a stub, so a live daemon stays exit 1.
         let outcome = run(
-            &["--http", "http://127.0.0.1:7456", "--token", TOKEN, "ps"],
+            &["--http", "http://127.0.0.1:7456", "--token", TOKEN, "ui"],
             None,
             &mut http,
         );
@@ -512,7 +627,7 @@ mod tests {
             r#"{"error":{"code":"unauthorized","message":"bearer token required"}}"#,
         );
         let outcome = run(
-            &["--http", "http://127.0.0.1:7456", "--token", TOKEN, "ps"],
+            &["--http", "http://127.0.0.1:7456", "--token", TOKEN, "ui"],
             None,
             &mut http,
         );
@@ -528,7 +643,7 @@ mod tests {
     #[test]
     fn missing_token_does_not_open_a_transport() {
         let mut http = script(200, r#"{"status":"ok"}"#);
-        let outcome = run(&["--http", "http://127.0.0.1:7456", "ps"], None, &mut http);
+        let outcome = run(&["--http", "http://127.0.0.1:7456", "ui"], None, &mut http);
         assert_eq!(outcome.code, exit::GENERAL);
         let err = text(&outcome.stderr);
         assert!(err.contains("AW_TOKEN") || err.contains("missing"), "{err}");
@@ -560,7 +675,7 @@ mod tests {
     #[test]
     fn default_socket_is_unreachable_and_does_not_open() {
         let mut http = script(200, r#"{"status":"ok"}"#);
-        let outcome = run(&["ps"], None, &mut http);
+        let outcome = run(&["ui"], None, &mut http);
         assert_eq!(outcome.code, exit::UNREACHABLE);
         let err = text(&outcome.stderr);
         assert!(err.contains("aw daemon start"), "{err}");
@@ -599,7 +714,7 @@ mod tests {
     fn port_zero_is_usage() {
         let mut http = script(200, "{}");
         let outcome = run(
-            &["--http", "http://127.0.0.1:0", "--token", TOKEN, "ps"],
+            &["--http", "http://127.0.0.1:0", "--token", TOKEN, "ui"],
             None,
             &mut http,
         );
@@ -625,7 +740,7 @@ mod tests {
                 "http://127.0.0.1:7456",
                 "--token",
                 TOKEN,
-                "ps",
+                "ui",
             ],
             None,
             &mut http,
@@ -658,5 +773,57 @@ mod tests {
             );
         }
         insta::assert_snapshot!(help);
+    }
+
+    #[test]
+    fn run_proxy_is_refused_before_any_launch() {
+        let mut http = script(200, "{}");
+        let outcome = run(&["run", "--proxy", "--", "tool"], None, &mut http);
+        assert_eq!(outcome.code, exit::GENERAL);
+        let err = text(&outcome.stderr);
+        assert!(err.contains("P3/P5"), "{err}");
+        assert!(err.contains("--proxy"), "{err}");
+        assert!(!err.contains("tool"), "{err}");
+        assert_eq!(http.opened, 0);
+    }
+
+    #[test]
+    fn attach_and_ps_stubs_are_exit_3_and_do_not_open_http() {
+        let mut http = script(200, "{}");
+        let attach = run(&["attach", "--pid", "100"], None, &mut http);
+        assert_eq!(attach.code, exit::UNREACHABLE, "{}", text(&attach.stderr));
+        let err = text(&attach.stderr);
+        assert!(err.contains("not connected"), "{err}");
+        assert!(
+            err.contains("aw daemon start") || err.contains("--no-daemon"),
+            "{err}"
+        );
+
+        let stop = run(&["stop", "s-1"], None, &mut http);
+        assert_eq!(stop.code, exit::UNREACHABLE, "{}", text(&stop.stderr));
+
+        let ps = run(&["ps", "--agents-only"], None, &mut http);
+        assert_eq!(ps.code, exit::UNREACHABLE, "{}", text(&ps.stderr));
+        let ps_err = text(&ps.stderr);
+        assert!(
+            ps_err.contains("不可用") || ps_err.contains("not available"),
+            "{ps_err}"
+        );
+        assert_eq!(http.opened, 0);
+    }
+
+    #[test]
+    fn run_platform_stub_does_not_echo_the_command() {
+        let mut http = script(200, "{}");
+        let outcome = run(
+            &["run", "--", "tool", "--token", "super-secret-value"],
+            None,
+            &mut http,
+        );
+        // Windows: unverified Job API, exit 1. Other targets: no Unix launcher, exit 1.
+        assert_eq!(outcome.code, exit::GENERAL, "{}", text(&outcome.stderr));
+        let err = text(&outcome.stderr);
+        assert!(!err.contains("super-secret-value"), "{err}");
+        assert_eq!(http.opened, 0);
     }
 }

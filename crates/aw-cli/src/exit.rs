@@ -1,7 +1,7 @@
 //! Process exit codes from api-and-cli §2.
 //!
 //! `0` success, `1` general error, `2` bad arguments, `3` daemon unreachable,
-//! `4` permission denied. `aw run` forwarding the target's status is a later card.
+//! `4` permission denied. `aw run` adds the target's own status on top of these.
 
 /// Success.
 pub const OK: i32 = 0;

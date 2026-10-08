@@ -10,6 +10,9 @@ mod client;
 mod cmd;
 mod endpoint;
 mod exit;
+// Not called from `main` until a later card wires `aw run`. The state machine is tested.
+#[allow(dead_code)]
+mod launch;
 mod output;
 
 use std::io::{self, Write};

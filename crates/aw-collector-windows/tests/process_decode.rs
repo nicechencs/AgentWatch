@@ -64,7 +64,10 @@ fn i64_key(line: &str, key: &str) -> Option<i64> {
     if raw == "null" {
         return None;
     }
-    Some(raw.parse().unwrap_or_else(|_| panic!("{key} is not an integer")))
+    Some(
+        raw.parse()
+            .unwrap_or_else(|_| panic!("{key} is not an integer")),
+    )
 }
 
 fn string_key(line: &str, key: &str) -> Option<String> {
@@ -183,7 +186,13 @@ fn replay_start_with_command_line_is_e1() {
     assert_eq!(start.event.proc.as_ref().map(|p| p.pid), Some(100));
     match &start.event.kind {
         EventKind::ProcessStart(body) => {
-            let words: Vec<&str> = body.argv.as_ref().unwrap().iter().map(|a| a.as_str()).collect();
+            let words: Vec<&str> = body
+                .argv
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|a| a.as_str())
+                .collect();
             assert_eq!(words, vec!["cmd", "/c", "echo a b"]);
             assert!(body.cwd.is_none());
             assert_eq!(body.ppid, 4);
@@ -203,7 +212,10 @@ fn replay_start_with_command_line_is_e1() {
 fn replay_absent_command_line_is_na_and_backfill_can_raise_it_to_s() {
     let line = fixture("start_command_line_absent.jsonl");
     let (props, clock, boot, seq, parent_create) = props_from_line(line.trim());
-    assert!(parent_create.is_none(), "this fixture does not know the parent");
+    assert!(
+        parent_create.is_none(),
+        "this fixture does not know the parent"
+    );
     assert!(props.command_line.is_none());
     let cache = ProcessCache::new();
     let decoded = decode_process(&props, &boot, seq, clock, &cache);
@@ -244,7 +256,13 @@ fn replay_absent_command_line_is_na_and_backfill_can_raise_it_to_s() {
     assert_eq!(start.event.field_evidence.get("cwd"), Some(&Evidence::S));
     match &start.event.kind {
         EventKind::ProcessStart(body) => {
-            let words: Vec<&str> = body.argv.as_ref().unwrap().iter().map(|a| a.as_str()).collect();
+            let words: Vec<&str> = body
+                .argv
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|a| a.as_str())
+                .collect();
             assert_eq!(words, vec!["ping", "-n", "1", "127.0.0.1"]);
             assert_eq!(body.cwd.as_deref(), Some("C:\\work"));
         }
@@ -262,7 +280,10 @@ fn replay_stop_keeps_the_exit_code_and_marks_signal_na() {
     let DecodedProcess::Stop(stop) = decoded else {
         panic!("fixture is a stop");
     };
-    assert_eq!(stop.event.source.as_str(), "windows.etw/kernel_process_stop");
+    assert_eq!(
+        stop.event.source.as_str(),
+        "windows.etw/kernel_process_stop"
+    );
     assert_eq!(stop.event.evidence, Evidence::E1);
     assert_eq!(stop.event.seq, 3);
     match &stop.event.kind {

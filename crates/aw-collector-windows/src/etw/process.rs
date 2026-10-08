@@ -838,7 +838,7 @@ fn result_to_outcome(result: &Result<String, BackfillMiss>) -> ReadOutcome {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::peb::{UnavailableReader, BackfillRequest as Req};
+    use crate::peb::{BackfillRequest as Req, UnavailableReader};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Boot id used by the unit tests. Not a host name.
@@ -903,8 +903,13 @@ mod tests {
         props.command_line = Some("cmd /c \"echo a b\" ping".to_owned());
         let mut cache = ProcessCache::new();
         let parent_time = filetime_2020() - 10_000_000;
-        let parent = ProcessIdentity::from_parts(BOOT, 4, parent_time as u64, StartTimeUnit::HundredNanoseconds)
-            .expect("boot id fits");
+        let parent = ProcessIdentity::from_parts(
+            BOOT,
+            4,
+            parent_time as u64,
+            StartTimeUnit::HundredNanoseconds,
+        )
+        .expect("boot id fits");
         cache.insert(
             4,
             CachedProcess {
@@ -1031,8 +1036,9 @@ mod tests {
         let props = start_props();
         let child = filetime_2020();
         let mut cache = ProcessCache::new();
-        let same = ProcessIdentity::from_parts(BOOT, 4, child as u64, StartTimeUnit::HundredNanoseconds)
-            .expect("boot");
+        let same =
+            ProcessIdentity::from_parts(BOOT, 4, child as u64, StartTimeUnit::HundredNanoseconds)
+                .expect("boot");
         cache.insert(
             4,
             CachedProcess {
@@ -1109,7 +1115,10 @@ mod tests {
         };
         assert_eq!(decoded.event.source.as_str(), SOURCE_PROCESS_STOP);
         assert_eq!(decoded.event.evidence, Evidence::E1);
-        assert_eq!(decoded.event.proc.as_ref().map(|p| p.uid), Some(expected.uid));
+        assert_eq!(
+            decoded.event.proc.as_ref().map(|p| p.uid),
+            Some(expected.uid)
+        );
         match &decoded.event.kind {
             EventKind::ProcessExit(body) => {
                 assert_eq!(body.exit_code, Some(7));

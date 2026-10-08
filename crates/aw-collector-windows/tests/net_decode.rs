@@ -66,7 +66,10 @@ fn dns_from_line(line: &str) -> (DnsProperties, DecodeClock, u64) {
 
 fn ip_key(line: &str, key: &str) -> Option<IpAddr> {
     let text = string_key(line, key)?;
-    Some(text.parse().unwrap_or_else(|_| panic!("{key} is not an ip")))
+    Some(
+        text.parse()
+            .unwrap_or_else(|_| panic!("{key} is not an ip")),
+    )
 }
 
 fn u64_key(line: &str, key: &str) -> Option<u64> {
@@ -78,7 +81,10 @@ fn i64_key(line: &str, key: &str) -> Option<i64> {
     if raw == "null" {
         return None;
     }
-    Some(raw.parse().unwrap_or_else(|_| panic!("{key} is not an integer")))
+    Some(
+        raw.parse()
+            .unwrap_or_else(|_| panic!("{key} is not an integer")),
+    )
 }
 
 fn string_key(line: &str, key: &str) -> Option<String> {
@@ -141,7 +147,10 @@ fn tcp_send(size: u64, mono: u64) -> NetworkProperties {
 #[test]
 fn normalize_mapped_ipv6_to_ipv4() {
     let mapped: IpAddr = "::ffff:93.184.216.34".parse().unwrap();
-    assert_eq!(normalize_ip(mapped), "93.184.216.34".parse::<IpAddr>().unwrap());
+    assert_eq!(
+        normalize_ip(mapped),
+        "93.184.216.34".parse::<IpAddr>().unwrap()
+    );
     let real: IpAddr = "2001:db8::2".parse().unwrap();
     assert_eq!(normalize_ip(real), real);
     let v4: IpAddr = "10.0.0.2".parse().unwrap();
@@ -526,7 +535,10 @@ fn dns_3008_parses_results_and_keeps_unparsed_pieces() {
     // Process-independent: the header pid is stored beside the row, not as the key.
     assert_eq!(cache.rows().len(), 1);
     assert_eq!(cache.rows()[0].header_pid, Some(100));
-    assert_eq!(cache.rows()[0].qname.as_deref(), Some("sim.agentwatch.test"));
+    assert_eq!(
+        cache.rows()[0].qname.as_deref(),
+        Some("sim.agentwatch.test")
+    );
 }
 
 #[test]

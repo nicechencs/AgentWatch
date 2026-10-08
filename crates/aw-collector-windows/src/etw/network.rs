@@ -145,7 +145,9 @@ impl NetworkProperties {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NetOp {
     /// TCP connect. `inbound` distinguishes accept (15/31) from connect (12/28).
-    Connect { inbound: bool },
+    Connect {
+        inbound: bool,
+    },
     /// TCP disconnect. Emitted immediately. Pending send/recv for the same
     /// connection are flushed first so their bytes are not lost.
     Disconnect,
@@ -510,7 +512,8 @@ fn flow_from_key(key: &ConnectionKey) -> (FlowKey, Vec<(&'static str, NaReason)>
 }
 
 fn dns_unresolved(key: &ConnectionKey) -> bool {
-    key.proto == L4Proto::Udp && (key.local_port == Some(DNS_PORT) || key.remote_port == Some(DNS_PORT))
+    key.proto == L4Proto::Udp
+        && (key.local_port == Some(DNS_PORT) || key.remote_port == Some(DNS_PORT))
 }
 
 fn emit_bytes(key: &ConnectionKey, direction: Direction, bucket: &Bucket) -> RawEvent {

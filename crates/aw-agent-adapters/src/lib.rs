@@ -5,8 +5,9 @@
 //! name, argv, the immediate parent's name, and whether an environment
 //! variable name exists. It does not read files, process memory, or env values.
 //!
-//! Concrete E3 adapters (`src/agents/<id>/`) are later tasks. This crate only
-//! declares [`SelfReportSource`].
+//! Concrete E3 adapters (`src/agents/<id>/`) are later tasks. This crate
+//! declares [`SelfReportSource`] and the [`parse_hook`] registry. No adapter
+//! is registered yet, so every agent id parses to an empty list.
 
 #![forbid(unsafe_code)]
 
@@ -14,7 +15,10 @@ mod channel;
 mod identify;
 mod profile;
 
-pub use channel::{ChannelError, SelfReportSource, SessionHandle};
+pub use channel::{
+    bound_tool_call, parse_hook, register_hook, ChannelError, HookParser, HookRegistry,
+    SelfReportSource, SessionHandle, MAX_CALL_BYTES,
+};
 pub use identify::{identify, identify_with, AgentMatch, Inference, MatchHit, ProcInfo};
 pub use profile::{
     load_profiles, AgentProfile, ChildRole, ChildrenRules, MatchRules, ProfileError, ProfileSet,

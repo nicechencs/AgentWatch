@@ -35,7 +35,7 @@ use tracing::{Event, Level, Subscriber};
 use tracing_core::span::{Attributes, Id, Record};
 use tracing_core::Metadata;
 
-use crate::api::{ApiState, HttpServer, StoreQuery, DEFAULT_HTTP_PORT};
+use crate::api::{ApiState, HttpServer, OtlpRegistry, StoreQuery, DEFAULT_HTTP_PORT};
 use crate::config::{resolve_data_dir, ConfigWarning, DaemonConfig};
 use crate::paths::ensure_data_dir;
 
@@ -465,6 +465,10 @@ pub fn run_foreground(
 
     let stop = StopFlag::new();
     let batcher = Batcher::spawn(Arc::clone(&stop));
+    // Per-session OTLP receivers bind 127.0.0.1:0 when a session asks. Holding
+    // the registry here is what keeps that API in the binary. No session is
+    // open at startup, so nothing listens yet and nothing is forwarded.
+    let otlp = OtlpRegistry::new();
 
     // Loopback only. `HttpServer::bind` refuses anything else. A port that is
     // already taken is a warning: the daemon keeps running without HTTP.
@@ -499,6 +503,7 @@ pub fn run_foreground(
     batcher.join();
     tracing::info!("{}", SHUTDOWN_FLUSH);
     tracing::info!("{}", SHUTDOWN_CLOSE_STORE);
+    drop(otlp);
     drop(lock);
     Ok(())
 }

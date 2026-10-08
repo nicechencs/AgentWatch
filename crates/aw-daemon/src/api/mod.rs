@@ -11,6 +11,7 @@
 
 #![allow(dead_code)]
 
+mod agent;
 mod auth;
 mod http;
 mod openapi;
@@ -20,6 +21,7 @@ mod routes;
 mod http_events;
 mod findings;
 
+pub(crate) use agent::OtlpRegistry;
 pub(crate) use findings::share;
 
 pub(crate) use http::{HttpServer, DEFAULT_HTTP_PORT};

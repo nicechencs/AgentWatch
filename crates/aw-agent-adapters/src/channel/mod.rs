@@ -1,6 +1,20 @@
-//! E3 source trait. Adapters implement this later. This module has no I/O.
+//! E3 source trait and the hook dispatch registry (P5-AGENT-01, P5-AGENT-02).
+//!
+//! This module has no I/O. Concrete adapters (`src/agents/<id>/`) are later tasks.
+//! They register a [`HookParser`]; until then [`parse_hook`] returns an empty list
+//! for every agent id, including ones this build has never heard of.
+
+mod registry;
+mod summary;
 
 use std::fmt;
+
+use serde_json::Value;
+
+pub use registry::{parse_hook, register_hook, HookRegistry};
+pub use summary::{bound_tool_call, MAX_CALL_BYTES};
+
+use aw_core::AgentToolCall;
 
 /// Session the daemon hands to a self-report source.
 ///
@@ -67,4 +81,21 @@ pub trait SelfReportSource {
 
     /// Stop receiving. Must be safe to call after a failed `start`.
     fn stop(&mut self) -> Result<(), ChannelError>;
+}
+
+/// Map one hook JSON value into zero or more tool calls.
+///
+/// An unknown agent, a payload this parser does not understand, or a payload
+/// that is not a tool call all return an empty `Vec`. They do not return an
+/// error: `aw hook` must not fail just because the agent id is not registered.
+///
+/// The returned calls are not yet redacted. The daemon applies the redact
+/// boundary before anything is retained. A parser must still avoid copying
+/// prompt text, model output, or file contents into `summary`.
+pub trait HookParser: Send + Sync {
+    /// Agent id this parser claims, for example `claude-code`.
+    fn agent_id(&self) -> &str;
+
+    /// Translate `payload`. Empty means "nothing to record", not "reject the hook".
+    fn parse_hook(&self, payload: &Value) -> Vec<AgentToolCall>;
 }

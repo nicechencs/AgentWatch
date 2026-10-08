@@ -25,8 +25,13 @@ pub struct Output {
     pub flow_buckets: Vec<FlowBucketRec>,
     /// `dns` rows. Empty in this card.
     pub dns: Vec<DnsRec>,
+    /// `file_access` rows. Empty until the file aggregator emits one.
+    pub file_access: Vec<FileAccessRec>,
     /// Gaps that arrived as events, copied unchanged.
     pub gaps: Vec<GapRec>,
+    /// Session flags. `unsafe_no_redact` is the only value this crate writes,
+    /// and only when the caller switched the built-in rules off for the run.
+    pub flags: Vec<String>,
 }
 
 impl Output {
@@ -38,7 +43,9 @@ impl Output {
             net_flows: Vec::new(),
             flow_buckets: Vec::new(),
             dns: Vec::new(),
+            file_access: Vec::new(),
             gaps: Vec::new(),
+            flags: Vec::new(),
         }
     }
 }
@@ -172,6 +179,71 @@ pub struct FlowBucketRec {
     pub evidence: Evidence,
     /// Field-level evidence. A sampled bucket marks `bytes_up` and `bytes_down`.
     pub field_evidence: BTreeMap<String, Evidence>,
+}
+
+/// One `file_access` row. Produced by the file aggregator (P2-PIPE-01).
+///
+/// Byte counters stay [`None`] until a read or write event actually reported a
+/// count. A platform that has no read event (macOS ES) keeps the field `None`
+/// and records `NA` in [`Self::field_evidence`]. This struct does not invent `0`.
+///
+/// `path` is a filesystem path, not argv or a URL. `Debug` is derived because
+/// the aggregator never puts a secret into these fields; redaction of argv and
+/// URLs happens in an earlier stage and is not stored here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileAccessRec {
+    /// Owning session, when known.
+    pub session_id: Option<SessionId>,
+    /// Subject process. `None` only when the source event had no process.
+    pub proc_uid: Option<ProcUid>,
+    /// `access`, `create`, `delete`, `rename`, or `exec`.
+    pub op: String,
+    /// Path as the event reported it. Not resolved and not read from disk.
+    pub path: String,
+    /// Rename target. `None` for every op other than `rename`.
+    pub path_to: Option<String>,
+    /// `read` / `write` / `read_write` / `exec` / `unknown`. `None` when `op` is
+    /// not `access` or `exec`.
+    pub access: Option<String>,
+    /// First observation, monotonic nanoseconds.
+    pub first_ns: u64,
+    /// Latest observation, monotonic nanoseconds.
+    pub last_ns: u64,
+    /// How many opens this row covers. A single open is `1`, not `None`.
+    pub opens: u64,
+    /// Read syscalls observed. `None` when no read event was seen.
+    pub reads: Option<u64>,
+    /// Bytes reported by read events. `None` when no byte count was observed.
+    pub bytes_read: Option<u64>,
+    /// Write syscalls observed. `None` when no write event was seen.
+    pub writes: Option<u64>,
+    /// Bytes reported by write events. `None` when no byte count was observed.
+    pub bytes_written: Option<u64>,
+    /// `Some(true)` when an open reported the file was created.
+    pub created: Option<bool>,
+    /// `Some(true)` when an open reported truncation.
+    pub truncated: Option<bool>,
+    /// `Some(true)` when a close reported the file was modified.
+    pub modified: Option<bool>,
+    /// Platform error from a failed open. `None` when the open succeeded or no
+    /// result was reported. `0` is not written here.
+    pub result: Option<i32>,
+    /// `true` for a flush of a handle that is still open.
+    pub partial: bool,
+    /// Sensitive-path rule id, when a later stage labelled this path.
+    pub sensitive_rule: Option<String>,
+    /// `sensitive.<rule>` or `sensitive.<rule>.info`. Empty when unlabelled.
+    pub tags: Vec<String>,
+    /// Directory-fold marker. `None` on an ordinary per-path row.
+    pub folded_dir: Option<String>,
+    /// Paths kept as samples of a folded directory. Empty on an ordinary row.
+    pub sample_paths: Vec<String>,
+    /// Record evidence. The weakest level among the events that built the row.
+    pub evidence: Evidence,
+    /// Field-level evidence, copied from the source events. Not raised.
+    pub field_evidence: BTreeMap<String, Evidence>,
+    /// Collector source of the first event.
+    pub source: Source,
 }
 
 /// One `dns` row. Not produced by the passthrough aggregate.

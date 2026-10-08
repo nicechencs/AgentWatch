@@ -27,26 +27,36 @@ pub mod config;
 pub mod enrich;
 pub mod gaps;
 pub mod ingress;
+pub mod limit;
 pub mod limits;
 pub mod output;
+pub mod degrade;
 pub mod pipeline;
+pub mod redact;
 pub mod scope;
+pub mod sensitive;
 pub mod stage;
 
 pub use aggregate::{summarize, FlowAcc, FlowGroupBy, FlowGroupKey, FlowSummary, NetAggregator};
 pub use batcher::{Batcher, ScriptedSink};
 pub use clock::{InstantClock, PipelineClock, ReplayClock};
 pub use config::{
-    AggregateConfig, CorrelationConfig, LimitsConfig, PipelineConfig, RateLimit, StoreConfig,
+    AggregateConfig, CorrelationConfig, DegradeConfig, LimitsConfig, PipelineConfig, RateLimit,
+    RedactionConfig, SensitiveConfig, SensitiveRuleConfig, StoreConfig,
 };
 pub use enrich::{
     ProcCache, ProcCacheConfig, ProcInfo, DEFAULT_CAPACITY as PROC_CACHE_CAPACITY,
     DEFAULT_LINGER_SECS,
 };
 pub use gaps::{dropped_from_failures, record_drops, GapMerger, DEFAULT_RETRY_BATCHES};
+pub use degrade::{DegradeLadder, DegradeSample};
 pub use ingress::{Ingress, IngressRx, DEFAULT_CAPACITY};
 pub use limits::Limiter;
-pub use output::{DnsRec, FlowBucketRec, GapRec, NetFlowRec, Output, ProcessRec};
+pub use redact::{Redactor, UNSAFE_NO_REDACT_FLAG};
+pub use output::{
+    DnsRec, FileAccessRec, FlowBucketRec, GapRec, NetFlowRec, Output, ProcessRec,
+};
+pub use sensitive::{PathGlob, Rules as SensitiveRules};
 pub use pipeline::Pipeline;
 pub use scope::{ScopeConfig, ScopeFilter, ScopeSet, ScopeUpdate, DEFAULT_PENDING_MS};
 pub use stage::{

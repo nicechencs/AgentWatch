@@ -10,6 +10,15 @@ description = "Scope, enrich, redact, aggregate, and correlate. Passthrough skel
 aw-core = { workspace = true }
 # RecordSink and row types only. SQL stays in aw-store (P1-PIPE-05).
 aw-store = { workspace = true }
+# sensitive/rules.rs calls `toml::from_str` but this crate did not declare it,
+# so `cargo check -p aw-daemon` (which builds aw-pipeline) failed. Same pin as
+# aw-daemon. MIT OR Apache-2.0. Out of the P2-DAEMON file scope; drop this line
+# once the pipeline card declares the dependency itself.
+toml = { version = "0.8.23", default-features = false, features = ["parse"] }
+# Redaction rules (P2-PIPE-03). `regex` is linear time, so a value cannot stall
+# the pipeline. MIT OR Apache-2.0. serde_json renders AgentToolCall summaries.
+regex = "1.11.1"
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 
 [[bench]]
 name = "passthrough"

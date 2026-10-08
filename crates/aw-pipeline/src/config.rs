@@ -17,6 +17,12 @@ pub struct PipelineConfig {
     pub limits: LimitsConfig,
     /// `[correlation]` window cap. Correlation itself is a later card.
     pub correlation: CorrelationConfig,
+    /// `[sensitive_paths]` extras and the session home used to expand `~`.
+    pub sensitive: SensitiveConfig,
+    /// `[redaction]` session salt and the unsafe whole-engine switch.
+    pub redaction: RedactionConfig,
+    /// Resource readings the degrade ladder consumes. Replay leaves them idle.
+    pub degrade: DegradeConfig,
 }
 
 /// `[aggregate]`.
@@ -28,6 +34,19 @@ pub struct AggregateConfig {
     pub file_flush_secs: u64,
     /// `aggregate.coalesce_window_ms`. pipeline.md §3.5 describes a 1 second window. Default 1000.
     pub coalesce_window_ms: u64,
+    /// Open file-access rows kept per session. Default 100_000.
+    ///
+    /// Past this the oldest open row is emitted early and counted. `0` is not a
+    /// cap; it becomes the default rather than "keep nothing".
+    pub file_state_cap: u64,
+    /// Directory prefixes folded into one counted row. Empty uses the built-in
+    /// list (`/proc`, `/sys`, `/dev`, dynamic-library and locale directories).
+    pub noise_prefixes: Vec<String>,
+    /// Path suffixes treated as noise even outside those prefixes
+    /// (`.so`, `.dylib`, locale catalogs). Empty uses the built-in list.
+    pub noise_suffixes: Vec<String>,
+    /// Sample paths kept on a folded directory row. Default 8.
+    pub noise_sample_cap: u64,
 }
 
 /// `[store]` batch bounds. Writing is not this card.
@@ -58,6 +77,75 @@ pub struct LimitsConfig {
     pub agent_rpc: RateLimit,
 }
 
+/// `[sensitive_paths]`. Built-in rules stay on. This only adds rules and names
+/// the home directory `~` expands to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SensitiveConfig {
+    /// Session user's home. `None` leaves a leading `~` unmatched rather than
+    /// expanding it to the daemon user's home.
+    pub home: Option<String>,
+    /// `true` on Windows: path compare ignores ASCII case. Replay of a Windows
+    /// fixture sets this; the host OS is not consulted.
+    pub case_insensitive: bool,
+    /// Extra rules from configuration. Built-in rules are not in this list and
+    /// cannot be removed through it.
+    pub extra: Vec<SensitiveRuleConfig>,
+}
+
+/// One user-supplied sensitive-path rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SensitiveRuleConfig {
+    /// Rule id. A duplicate of a built-in id is ignored.
+    pub id: String,
+    /// `linux`, `macos`, `windows`, or `any`.
+    pub platform: String,
+    /// Glob. `~` is the session home. `*` does not cross a separator; `**` does.
+    pub glob: String,
+    /// Paths that match `glob` but must not be labelled.
+    pub exclude: Vec<String>,
+}
+
+/// `[redaction]`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RedactionConfig {
+    /// Per-session salt mixed into the optional 8-hex suffix.
+    ///
+    /// Default is empty: replacements are `«redacted:<rule_id>»` with no hash.
+    /// A live session fills this from an OS random source and does not persist it.
+    pub salt: Vec<u8>,
+    /// `true` only for `--unsafe-no-redact`. Turns every built-in rule off and
+    /// sets [`Self::unsafe_no_redact`], which the session row must keep.
+    pub unsafe_no_redact: bool,
+    /// Also replace the user-name segment of a path (security-privacy §3.2 F).
+    /// Off unless the caller asked. Export-time redaction is a separate path.
+    pub redact_paths: bool,
+    /// User-name segment replaced when [`Self::redact_paths`] is on.
+    /// `None` replaces nothing: there is no name to look for.
+    pub path_user: Option<String>,
+}
+
+/// Resource readings for the degrade ladder (P2-PIPE-04).
+///
+/// Replay does not sample the host. A caller that has a queue depth, a CPU
+/// sample, a session size, or a free-disk reading sets the matching field.
+/// `None` means "not observed", and that signal does not by itself enter a level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegradeConfig {
+    /// `limits.hard_rss_bytes`. Default 512 MiB. `None` disables the RSS stop.
+    pub hard_rss_bytes: Option<u64>,
+    /// Pipeline CPU budget, millicores of one core (1000 = one full core).
+    /// The ladder enters when a sample stays over twice this for 10 s.
+    /// Default 150, which is the 15% pressure budget in performance-budget §1.
+    pub cpu_budget_millicores: u64,
+    /// `max_session_bytes`. `None` means the volume signal is not configured.
+    pub max_session_bytes: Option<u64>,
+    /// How many detail records one process keeps at L3. Default 64.
+    pub l3_keep_per_proc: u64,
+    /// Seconds a triggering condition must stay clear before one level is left.
+    /// performance-budget §4 says 30.
+    pub recover_secs: u64,
+}
+
 /// `[correlation]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CorrelationConfig {
@@ -80,6 +168,22 @@ impl Default for AggregateConfig {
             bucket_secs: 5,
             file_flush_secs: 30,
             coalesce_window_ms: 1000,
+            file_state_cap: 100_000,
+            noise_prefixes: Vec::new(),
+            noise_suffixes: Vec::new(),
+            noise_sample_cap: 8,
+        }
+    }
+}
+
+impl Default for DegradeConfig {
+    fn default() -> Self {
+        Self {
+            hard_rss_bytes: Some(512 * 1024 * 1024),
+            cpu_budget_millicores: 150,
+            max_session_bytes: None,
+            l3_keep_per_proc: 64,
+            recover_secs: 30,
         }
     }
 }

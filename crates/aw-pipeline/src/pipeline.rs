@@ -31,24 +31,50 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    /// Passthrough pipeline with explicit defaults.
+    /// Pipeline with the stages that read `cfg`: redact, aggregate, and the
+    /// degrade ladder. Scope, dedup, enrich, and correlate stay passthrough.
     pub fn new(cfg: PipelineConfig) -> Self {
-        let aggregate = AggregateStage::new(cfg.aggregate.clone());
+        let redact = RedactStage::new(&cfg.redaction);
+        let aggregate = AggregateStage::with_degrade(
+            cfg.aggregate.clone(),
+            cfg.sensitive.clone(),
+            cfg.degrade.clone(),
+        );
+        let batcher = BatcherStage::new(cfg.clone());
         Self {
             cfg,
             scope: ScopeStage::default(),
             dedup: DedupStage::default(),
             enrich: EnrichStage::default(),
-            redact: RedactStage::default(),
+            redact,
             aggregate,
             correlate: CorrelateStage::default(),
-            batcher: BatcherStage::default(),
+            batcher,
         }
     }
 
-    /// Config this pipeline was built with. Stages in this card do not read it.
+    /// Config this pipeline was built with.
     pub fn config(&self) -> &PipelineConfig {
         &self.cfg
+    }
+
+    /// Current degrade level, 0 through 4. Replay stays at 0 because it feeds no
+    /// resource samples.
+    pub fn degrade_level(&self) -> u8 {
+        self.aggregate.degrade_level()
+    }
+
+    /// `true` after a sample put RSS over `hard_rss_bytes`, until a later sample
+    /// is under it. The daemon reads this and stops the collectors; this crate
+    /// does not.
+    pub fn emergency_stop(&self) -> bool {
+        self.aggregate.emergency_stop()
+    }
+
+    /// Apply one resource sample and, if the level changes, widen the file
+    /// coalesce window and the network bucket. The step's gap lands on `out`.
+    pub fn observe_degrade(&mut self, sample: crate::degrade::DegradeSample, out: &mut Output) {
+        self.aggregate.observe_degrade(sample, out);
     }
 
     /// Run `events` through Scope → Dedup → Enrich → Redact → Aggregate → Correlate → Batcher.
@@ -66,7 +92,12 @@ impl Pipeline {
             pipeline.tick(now, &mut out);
             pipeline.process(event, &mut out);
         }
+        pipeline.finish(&mut out);
         out
+    }
+
+    fn finish(&mut self, out: &mut Output) {
+        self.aggregate.finish(out);
     }
 
     fn tick(&mut self, now_ns: u64, out: &mut Output) {

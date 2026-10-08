@@ -173,6 +173,14 @@ impl NetAggregator {
         self.advance(now_ns, out);
     }
 
+    /// Change the bucket width. The degrade ladder calls this when it changes
+    /// level (5 s at L0, 30 s above). Buckets already started keep their start
+    /// time; only later events fall into the new width.
+    pub fn set_bucket_secs(&mut self, bucket_secs: u64) {
+        let secs = if bucket_secs == 0 { 5 } else { bucket_secs };
+        self.bucket_ns = secs.saturating_mul(1_000_000_000);
+    }
+
     /// Group every flow this aggregator has seen, open and closed.
     pub fn summarize(&self, by: FlowGroupBy) -> Vec<FlowSummary> {
         // A closed flow stays in `open` and is also copied into `closed`.

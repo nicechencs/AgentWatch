@@ -180,20 +180,54 @@ impl Stage for EnrichStage {
     }
 }
 
-/// Redact placeholder. Passthrough in P1. Does not rewrite evidence.
-#[derive(Debug, Default)]
+/// Redaction (P2-PIPE-03). Rewrites argv, env, URLs, and headers before aggregate.
+///
+/// Evidence is not touched: a redacted value is still the value the collector
+/// saw, with the sensitive part replaced. The text before replacement is not
+/// logged and not put on `out`. With `--unsafe-no-redact` the stage forwards
+/// unchanged and records [`crate::redact::UNSAFE_NO_REDACT_FLAG`] once.
 pub struct RedactStage {
-    inner: Forward,
+    redactor: crate::redact::Redactor,
+    noted: bool,
+}
+
+impl Default for RedactStage {
+    fn default() -> Self {
+        Self::new(&crate::config::RedactionConfig::default())
+    }
+}
+
+impl RedactStage {
+    /// One redactor for the session, from `[redaction]`.
+    pub fn new(cfg: &crate::config::RedactionConfig) -> Self {
+        Self {
+            redactor: crate::redact::Redactor::new(cfg),
+            noted: false,
+        }
+    }
+
+    /// Whether this session runs with the built-in rules switched off.
+    pub fn disabled(&self) -> bool {
+        self.redactor.disabled()
+    }
 }
 
 impl Stage for RedactStage {
-    fn process(&mut self, event: RawEvent, out: &mut Output, next: &mut dyn Stage) {
-        self.inner.process(event, out, next);
+    fn process(&mut self, mut event: RawEvent, out: &mut Output, next: &mut dyn Stage) {
+        if self.redactor.disabled() {
+            if !self.noted {
+                out.flags
+                    .push(crate::redact::UNSAFE_NO_REDACT_FLAG.to_owned());
+                self.noted = true;
+            }
+        } else {
+            let exe = event.kind.exe_base();
+            self.redactor.apply(&mut event, exe.as_deref());
+        }
+        next.process(event, out, &mut Tail);
     }
 
-    fn tick(&mut self, now_ns: u64, out: &mut Output) {
-        self.inner.tick(now_ns, out);
-    }
+    fn tick(&mut self, _now_ns: u64, _out: &mut Output) {}
 }
 
 /// Network aggregate (P1-PIPE-04).
@@ -206,6 +240,16 @@ impl Stage for RedactStage {
 /// not raised. The event is still forwarded. File aggregation is not this card.
 pub struct AggregateStage {
     net: crate::aggregate::NetAggregator,
+    /// File open→close rows (P2-PIPE-01). Independent of the network table.
+    file: crate::aggregate::FileAggregator,
+    /// Sensitive-path labels (P2-PIPE-02). Applied to rows as they are emitted.
+    sensitive: crate::sensitive::Rules,
+    /// Agent profile id for the `agent-config` info exception. `None` until a
+    /// `ProcessStart` or a caller sets one.
+    agent: Option<String>,
+    /// L0–L4 (P2-PIPE-04). Replay feeds it no samples, so it stays at L0 and
+    /// keeps every row.
+    degrade: crate::degrade::DegradeLadder,
 }
 
 impl Default for AggregateStage {
@@ -217,9 +261,66 @@ impl Default for AggregateStage {
 impl AggregateStage {
     /// Bucket width from `cfg`. A zero width is treated as the documented 5 s.
     pub fn new(cfg: crate::config::AggregateConfig) -> Self {
+        Self::with_sensitive(cfg, crate::config::SensitiveConfig::default())
+    }
+
+    /// Aggregate plus the sensitive-path table. Built-in rules stay on; `sensitive`
+    /// only supplies the session home, case folding, and extra rules.
+    pub fn with_sensitive(
+        cfg: crate::config::AggregateConfig,
+        sensitive: crate::config::SensitiveConfig,
+    ) -> Self {
         Self {
             net: crate::aggregate::NetAggregator::new(cfg.bucket_secs),
+            file: crate::aggregate::FileAggregator::new(&cfg),
+            sensitive: crate::sensitive::Rules::load(&sensitive),
+            agent: None,
+            degrade: crate::degrade::DegradeLadder::default(),
         }
+    }
+
+    /// Aggregate plus the degrade ladder's thresholds. Replay uses the defaults
+    /// and never calls [`Self::observe_degrade`], so the level stays 0.
+    pub fn with_degrade(
+        cfg: crate::config::AggregateConfig,
+        sensitive: crate::config::SensitiveConfig,
+        degrade: crate::config::DegradeConfig,
+    ) -> Self {
+        let mut stage = Self::with_sensitive(cfg, sensitive);
+        stage.degrade = crate::degrade::DegradeLadder::new(degrade);
+        stage
+    }
+
+    /// Accessor profile for the `agent-config` info exception.
+    pub fn set_agent(&mut self, agent: Option<String>) {
+        self.agent = agent;
+    }
+
+    /// Current degrade level, 0 through 4.
+    pub fn degrade_level(&self) -> u8 {
+        self.degrade.level()
+    }
+
+    /// `true` after RSS crossed the hard limit, until a later sample is under it.
+    pub fn emergency_stop(&self) -> bool {
+        self.degrade.emergency()
+    }
+
+    /// Apply one resource sample. At most one ladder step. A level change widens
+    /// the file coalesce window and the network bucket; the gaps for the step are
+    /// appended to `out`.
+    pub fn observe_degrade(&mut self, sample: crate::degrade::DegradeSample, out: &mut Output) {
+        if self.degrade.observe(sample, out) {
+            self.file.set_coalesce_ms(self.degrade.coalesce_ms());
+            self.net.set_bucket_secs(self.degrade.bucket_secs());
+        }
+    }
+
+    /// Emit file rows a close finished but the coalesce window was still holding.
+    pub fn finish(&mut self, out: &mut Output) {
+        let before = out.file_access.len();
+        self.file.finish(out);
+        self.label_and_thin(before, out);
     }
 
     /// In-memory group of the flows still open plus the ones already emitted.
@@ -241,11 +342,30 @@ impl Stage for AggregateStage {
                 .push(crate::output::GapRec::from_event(&event, gap));
         }
         self.net.observe(&event, out);
+        let before = out.file_access.len();
+        self.file.observe(&event, out);
+        self.label_and_thin(before, out);
         next.process(event, out, &mut Tail);
     }
 
     fn tick(&mut self, now_ns: u64, out: &mut Output) {
         self.net.tick(now_ns, out);
+        let before = out.file_access.len();
+        self.file.tick(now_ns, out);
+        self.label_and_thin(before, out);
+    }
+}
+
+impl AggregateStage {
+    /// Label the rows emitted since `before`, then drop the ones the current
+    /// degrade level does not keep. Labelling runs first so a protected row is
+    /// recognized by its `sensitive_rule`.
+    fn label_and_thin(&mut self, before: usize, out: &mut Output) {
+        let agent = self.agent.as_deref();
+        for row in &mut out.file_access[before..] {
+            self.sensitive.label(row, agent);
+        }
+        self.degrade.retain_new_files(&mut out.file_access, before);
     }
 }
 

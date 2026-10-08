@@ -1,0 +1,448 @@
+# Built-in sensitive-path rules. security-privacy.md §4.
+#
+# `~` is the session user's home, expanded by the pipeline, not by this file.
+# `exclude` globs are matched against the same path and suppress the hit.
+# A rule with `platform = "any"` applies on every platform. Platform-specific
+# rows of the same id are additional shapes, not replacements.
+#
+# This file is data. The pipeline does not read a file at runtime from a
+# configurable path; `include_str!` compiles it in. User rules arrive through
+# `[sensitive_paths]` config and cannot remove a rule listed here.
+
+[[rule]]
+id = "ssh-keys"
+platform = "any"
+glob = "~/.ssh/**"
+exclude = ["~/.ssh/**/*.pub", "~/.ssh/known_hosts", "~/.ssh/known_hosts.*"]
+
+[[rule]]
+id = "ssh-keys"
+platform = "windows"
+glob = "~\\.ssh\\**"
+exclude = ["~\\.ssh\\**\\*.pub", "~\\.ssh\\known_hosts", "~\\.ssh\\known_hosts.*"]
+
+[[rule]]
+id = "gpg"
+platform = "any"
+glob = "~/.gnupg/**"
+exclude = []
+
+[[rule]]
+id = "gpg"
+platform = "windows"
+glob = "~\\AppData\\Roaming\\gnupg\\**"
+exclude = []
+
+[[rule]]
+id = "cloud-aws"
+platform = "any"
+glob = "~/.aws/credentials"
+exclude = []
+
+[[rule]]
+id = "cloud-aws"
+platform = "any"
+glob = "~/.aws/config"
+exclude = []
+
+[[rule]]
+id = "cloud-aws"
+platform = "any"
+glob = "~/.aws/sso/cache/**"
+exclude = []
+
+[[rule]]
+id = "cloud-aws"
+platform = "windows"
+glob = "~\\.aws\\**"
+exclude = []
+
+[[rule]]
+id = "cloud-gcp"
+platform = "any"
+glob = "~/.config/gcloud/**"
+exclude = []
+
+[[rule]]
+id = "cloud-gcp"
+platform = "windows"
+glob = "~\\AppData\\Roaming\\gcloud\\**"
+exclude = []
+
+[[rule]]
+id = "cloud-azure"
+platform = "any"
+glob = "~/.azure/**"
+exclude = []
+
+[[rule]]
+id = "cloud-azure"
+platform = "windows"
+glob = "~\\.azure\\**"
+exclude = []
+
+[[rule]]
+id = "kube"
+platform = "any"
+glob = "~/.kube/**"
+exclude = []
+
+[[rule]]
+id = "kube"
+platform = "windows"
+glob = "~\\.kube\\**"
+exclude = []
+
+[[rule]]
+id = "docker-auth"
+platform = "any"
+glob = "~/.docker/config.json"
+exclude = []
+
+[[rule]]
+id = "docker-auth"
+platform = "windows"
+glob = "~\\.docker\\config.json"
+exclude = []
+
+[[rule]]
+id = "git-cred"
+platform = "any"
+glob = "~/.git-credentials"
+exclude = []
+
+[[rule]]
+id = "git-cred"
+platform = "any"
+glob = "~/.config/git/credentials"
+exclude = []
+
+[[rule]]
+id = "git-cred"
+platform = "windows"
+glob = "~\\.git-credentials"
+exclude = []
+
+[[rule]]
+id = "pkg-tokens"
+platform = "any"
+glob = "~/.npmrc"
+exclude = []
+
+[[rule]]
+id = "pkg-tokens"
+platform = "any"
+glob = "~/.pypirc"
+exclude = []
+
+[[rule]]
+id = "pkg-tokens"
+platform = "any"
+glob = "~/.cargo/credentials*"
+exclude = []
+
+[[rule]]
+id = "pkg-tokens"
+platform = "any"
+glob = "~/.gem/credentials"
+exclude = []
+
+[[rule]]
+id = "pkg-tokens"
+platform = "any"
+glob = "~/.config/gh/hosts.yml"
+exclude = []
+
+[[rule]]
+id = "pkg-tokens"
+platform = "windows"
+glob = "~\\.npmrc"
+exclude = []
+
+[[rule]]
+id = "pkg-tokens"
+platform = "windows"
+glob = "~\\.pypirc"
+exclude = []
+
+[[rule]]
+id = "pkg-tokens"
+platform = "windows"
+glob = "~\\.cargo\\credentials*"
+exclude = []
+
+[[rule]]
+id = "pkg-tokens"
+platform = "windows"
+glob = "~\\AppData\\Roaming\\GitHub CLI\\hosts.yml"
+exclude = []
+
+[[rule]]
+id = "netrc"
+platform = "any"
+glob = "~/.netrc"
+exclude = []
+
+[[rule]]
+id = "netrc"
+platform = "windows"
+glob = "~\\_netrc"
+exclude = []
+
+[[rule]]
+id = "dotenv"
+platform = "any"
+glob = "**/.env"
+exclude = []
+
+[[rule]]
+id = "dotenv"
+platform = "any"
+glob = "**/.env.*"
+exclude = ["**/.env.example", "**/.env.sample"]
+
+[[rule]]
+id = "key-files"
+platform = "any"
+glob = "**/*.pem"
+exclude = []
+
+[[rule]]
+id = "key-files"
+platform = "any"
+glob = "**/*.key"
+exclude = []
+
+[[rule]]
+id = "key-files"
+platform = "any"
+glob = "**/*.p12"
+exclude = []
+
+[[rule]]
+id = "key-files"
+platform = "any"
+glob = "**/*.pfx"
+exclude = []
+
+[[rule]]
+id = "key-files"
+platform = "any"
+glob = "**/id_rsa*"
+exclude = ["**/*.pub"]
+
+[[rule]]
+id = "key-files"
+platform = "any"
+glob = "**/id_ed25519*"
+exclude = ["**/*.pub"]
+
+[[rule]]
+id = "browser-profile"
+platform = "linux"
+glob = "~/.mozilla/**"
+exclude = []
+
+[[rule]]
+id = "browser-profile"
+platform = "linux"
+glob = "~/.config/google-chrome/**"
+exclude = []
+
+[[rule]]
+id = "browser-profile"
+platform = "linux"
+glob = "~/.config/chromium/**"
+exclude = []
+
+[[rule]]
+id = "browser-profile"
+platform = "linux"
+glob = "~/.config/BraveSoftware/**"
+exclude = []
+
+[[rule]]
+id = "browser-profile"
+platform = "macos"
+glob = "~/Library/Application Support/Google/Chrome/**"
+exclude = []
+
+[[rule]]
+id = "browser-profile"
+platform = "macos"
+glob = "~/Library/Application Support/Firefox/**"
+exclude = []
+
+[[rule]]
+id = "browser-profile"
+platform = "macos"
+glob = "~/Library/Safari/**"
+exclude = []
+
+[[rule]]
+id = "browser-profile"
+platform = "macos"
+glob = "~/Library/Cookies/**"
+exclude = []
+
+[[rule]]
+id = "browser-profile"
+platform = "windows"
+glob = "~\\AppData\\Local\\Google\\Chrome\\User Data\\**"
+exclude = []
+
+[[rule]]
+id = "browser-profile"
+platform = "windows"
+glob = "~\\AppData\\Roaming\\Mozilla\\Firefox\\**"
+exclude = []
+
+[[rule]]
+id = "browser-profile"
+platform = "windows"
+glob = "~\\AppData\\Local\\Microsoft\\Edge\\User Data\\**"
+exclude = []
+
+[[rule]]
+id = "os-keystore"
+platform = "linux"
+glob = "~/.local/share/keyrings/**"
+exclude = []
+
+[[rule]]
+id = "os-keystore"
+platform = "macos"
+glob = "~/Library/Keychains/**"
+exclude = []
+
+[[rule]]
+id = "os-keystore"
+platform = "windows"
+glob = "~\\AppData\\Roaming\\Microsoft\\Credentials\\**"
+exclude = []
+
+[[rule]]
+id = "os-keystore"
+platform = "windows"
+glob = "~\\AppData\\Local\\Microsoft\\Credentials\\**"
+exclude = []
+
+[[rule]]
+id = "os-keystore"
+platform = "windows"
+glob = "~\\AppData\\Roaming\\Microsoft\\Protect\\**"
+exclude = []
+
+[[rule]]
+id = "shell-history"
+platform = "any"
+glob = "~/.bash_history"
+exclude = []
+
+[[rule]]
+id = "shell-history"
+platform = "any"
+glob = "~/.zsh_history"
+exclude = []
+
+[[rule]]
+id = "shell-history"
+platform = "any"
+glob = "~/.local/share/fish/fish_history"
+exclude = []
+
+[[rule]]
+id = "shell-history"
+platform = "windows"
+glob = "~\\AppData\\Roaming\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt"
+exclude = []
+
+[[rule]]
+id = "agent-config"
+platform = "any"
+glob = "~/.claude/**"
+exclude = []
+
+[[rule]]
+id = "agent-config"
+platform = "any"
+glob = "~/.codex/**"
+exclude = []
+
+[[rule]]
+id = "agent-config"
+platform = "any"
+glob = "~/.config/github-copilot/**"
+exclude = []
+
+[[rule]]
+id = "agent-config"
+platform = "any"
+glob = "~/.cursor/**"
+exclude = []
+
+[[rule]]
+id = "agent-config"
+platform = "windows"
+glob = "~\\.claude\\**"
+exclude = []
+
+[[rule]]
+id = "agent-config"
+platform = "windows"
+glob = "~\\.codex\\**"
+exclude = []
+
+[[rule]]
+id = "agent-config"
+platform = "windows"
+glob = "~\\.cursor\\**"
+exclude = []
+
+[[rule]]
+id = "system-secrets"
+platform = "linux"
+glob = "/etc/shadow"
+exclude = []
+
+[[rule]]
+id = "system-secrets"
+platform = "linux"
+glob = "/etc/sudoers"
+exclude = []
+
+[[rule]]
+id = "system-secrets"
+platform = "linux"
+glob = "/etc/sudoers.d/**"
+exclude = []
+
+[[rule]]
+id = "system-secrets"
+platform = "linux"
+glob = "/etc/ssh/ssh_host_*_key"
+exclude = ["**/*.pub"]
+
+[[rule]]
+id = "system-secrets"
+platform = "macos"
+glob = "/etc/master.passwd"
+exclude = []
+
+[[rule]]
+id = "system-secrets"
+platform = "macos"
+glob = "/Library/Keychains/**"
+exclude = []
+
+[[rule]]
+id = "system-secrets"
+platform = "windows"
+glob = "C:\\Windows\\System32\\config\\SAM"
+exclude = []
+
+[[rule]]
+id = "system-secrets"
+platform = "windows"
+glob = "C:\\Windows\\System32\\config\\SECURITY"
+exclude = []

@@ -11,6 +11,9 @@ pub const UI_TICKET_TTL: u64 = 60;
 /// In-memory UI token lifetime. api-and-cli §1: 12 hours.
 pub const UI_TOKEN_TTL: u64 = 12 * 60 * 60;
 
+/// Page size ceiling. api-and-cli cursor paging, P2-DAEMON-02.
+pub const MAX_PAGE: i64 = 2000;
+
 /// Operations that require an administrator.
 ///
 /// Ordinary users may list and mutate only their own sessions. Attaching to

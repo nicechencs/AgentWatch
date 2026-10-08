@@ -18,6 +18,10 @@ use config::{config_schema_pretty, load_selected, ConfigError};
 use runtime::{emit_sensitive_probe, run_foreground, RuntimeError};
 
 mod api;
+// Embedded UI. `main` does not serve it yet; `api` looks assets up. Naming the
+// module here keeps `assets.rs` in the binary without a dead_code warning when
+// nothing in `main` calls it.
+mod assets;
 mod capabilities;
 mod collectors;
 mod config;
@@ -30,6 +34,8 @@ mod supervisor;
 fn main() -> ExitCode {
     // Keeps the collector crates linked. No platform collector is started here.
     let _ = collectors::wired();
+    // Keeps the UI embed linked. `false` when `ui/dist` was absent at build time.
+    let _ = assets::dist_was_present();
 
     match dispatch(std::env::args().skip(1)) {
         Ok(code) => code,

@@ -32,6 +32,18 @@ tracing = { version = "0.1.44", default-features = false, features = ["std", "at
 # Re-exported by tracing, but this crate names tracing_core types in its subscriber.
 # MIT. Pinned here, not in [workspace.dependencies].
 tracing-core = { version = "0.1.36", default-features = false, features = ["std"] }
+# P2-DAEMON-01. Pinned here, not in workspace Cargo.toml (out of scope).
+# rust-embed 8: MIT OR Apache-2.0. Embeds ui/dist only when build.rs sees the
+# directory; a missing ui/dist still compiles (empty asset set).
+# flate2 1.1: MIT OR Apache-2.0. Gzip for embedded assets. rust_backend avoids
+# a C toolchain.
+# ureq 3: MIT OR Apache-2.0. Dev-only reverse proxy for AW_UI_DEV_URL.
+# TLS stays off so ring/webpki are not pulled; the dev server is loopback HTTP.
+# rusqlite is not a direct dependency: naming Connection would duplicate the
+# copy aw-store already links.
+rust-embed = { version = "8.7.2", default-features = false, features = ["include-exclude"] }
+flate2 = { version = "1.1.2", default-features = false, features = ["rust_backend"] }
+ureq = { version = "3.3.0", default-features = false }
 
 [lints]
 workspace = true

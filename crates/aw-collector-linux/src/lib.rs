@@ -14,6 +14,7 @@
 
 mod decode;
 mod dns_parse;
+mod file;
 mod legacy;
 mod loader;
 mod lost;
@@ -36,6 +37,19 @@ pub use decode::proc::{
     SOURCE_EXIT as SOURCE_EBPF_EXIT, SOURCE_FORK,
 };
 pub use dns_parse::{parse_dns, DnsParse, DnsParseInput, ParsedAnswer, ParsedDns};
+pub use file::{
+    decode_file, encode_flush, encode_open, encode_pending, encode_transfer, join_cwd, pending_gap,
+    pre_existing_fd, CwdLookup as FileCwdLookup, DecodeOutcome as FileDecodeOutcome, FdPath,
+    FdPathRead, FileDecode, FileDecodeError, FlushIn, OpenIn, PathJoin as FilePathJoin, PendingIn,
+    ProcIdentity as FileProcIdentity, ScopeView as FileScopeView, TransferFlow, TransferIn,
+    FIELD_BYTES as FILE_FIELD_BYTES, SOURCE_FEXIT_OPEN, SOURCE_LSM_FILE_OPEN, SOURCE_TP_CLOSE,
+    SOURCE_TP_OPENAT, SOURCE_TP_UNLINKAT,
+};
+pub use legacy::fanotify::{
+    decode_fanotify, flush_count, in_scope as fanotify_in_scope, init_flags as fanotify_init_flags,
+    FanCount, FanEvent, FanKernel, FanotifyConfig, FanotifyError, INIT_FLAGS, MARK_ALWAYS,
+    SOURCE_FANOTIFY,
+};
 pub use legacy::{
     attribute_dns, counter_evidence, decode_proc, decode_sock_delta, diff_sock, inode_na,
     lookup_inode, open_legacy, pid_for_inode, CounterStep, DnsPacket, InodeLookup, InodeOwner,

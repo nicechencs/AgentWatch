@@ -12,6 +12,7 @@
 //! be compiled or checked. It stays behind the trait until a Linux tree lands it.
 
 mod decode;
+pub mod fanotify;
 
 pub use decode::{
     attribute_dns, counter_evidence, decode_proc, decode_sock_delta, diff_sock, inode_na,

@@ -17,18 +17,33 @@
 //! cgroup attach). P1-LNX-03 adds `net`: the TCP/UDP record layout. Both are
 //! description only. No probe is attached from here.
 //!
-//! P1-LNX-02 adds `proc`: the process-probe record layout (fork, exec, exit,
-//! cgroup attach). P1-LNX-03 adds `net`: the TCP/UDP record layout. Both are
-//! description only. No probe is attached from here.
+//! P2-LNX-01 / P2-LNX-02 add `file`: the open/create/delete/rename record, the
+//! `fd_kind` and `fd_io` maps, and the close/mmap/sendfile records. Same rule:
+//! layout only, nothing is attached from here.
 
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
 
-mod proc;
-
+mod file;
 mod net;
 mod proc;
+
+/// Names the file-probe layouts so a bpf-target build keeps them. The value
+/// is the open-record header size; a reader uses the constants in `file`.
+#[no_mangle]
+#[allow(dead_code)]
+pub static FILE_OPEN_HEADER_LEN: usize = file::OPEN_HEADER_LEN;
+
+/// Flush-record size. See `file::FLUSH_HEADER_LEN`.
+#[no_mangle]
+#[allow(dead_code)]
+pub static FILE_FLUSH_HEADER_LEN: usize = file::FLUSH_HEADER_LEN;
+
+/// Transfer-record size. `bytes` is at offset 40 inside it.
+#[no_mangle]
+#[allow(dead_code)]
+pub static FILE_TRANSFER_HEADER_LEN: usize = file::TRANSFER_HEADER_LEN;
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {

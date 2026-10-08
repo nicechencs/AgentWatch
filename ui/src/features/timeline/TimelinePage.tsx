@@ -244,8 +244,30 @@ function TimelineRow({
           {expanded ? t("common.less") : t("timeline.collapsed", { dir: item.collapsed.dir, count: item.collapsed.count })}
         </span>
       ) : null}
-      {item.kind === "finding" ? <span className="shrink-0 text-ink-faint">{t("timeline.findingLater")}</span> : null}
+      {item.kind === "finding" ? <FindingBadge evidence={item.evidence} t={t} /> : null}
     </button>
+  );
+}
+
+/**
+ * Badge shown on `kind = "finding"` timeline rows (ui §3.4).
+ * Inferred rows (I) get amber dashed styling + "推测" label (evidence-model §4).
+ * Fact / content_match rows get a plain pill.
+ * No red / danger palette — evidence-model §4 hard rule.
+ */
+function FindingBadge({ evidence, t }: { evidence: string; t: (key: string) => string }) {
+  const isInferred = evidence === "I";
+  if (isInferred) {
+    return (
+      <span className="shrink-0 rounded border border-dashed border-amber-600 px-1 text-[10px] italic text-amber-700 dark:border-amber-500 dark:text-amber-400">
+        {t("timeline.findingInferred")}
+      </span>
+    );
+  }
+  return (
+    <span className="shrink-0 rounded border border-line px-1 text-[10px] text-ink-faint">
+      {t("timeline.findingFact")}
+    </span>
   );
 }
 

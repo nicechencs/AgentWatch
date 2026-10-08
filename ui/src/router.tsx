@@ -11,6 +11,7 @@ import { ProcessesPage } from "@/features/processes/ProcessesPage";
 import { FilesPage } from "@/features/files/FilesPage";
 import { NetworkPage } from "@/features/network/NetworkPage";
 import { GapsPage } from "@/features/gaps/GapsPage";
+import { FindingsPage } from "@/features/findings/FindingsPage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
 import { SearchPage } from "@/features/search/SearchPage";
 
@@ -103,6 +104,12 @@ const gapsRoute = createRoute({
   component: GapsPage,
 });
 
+const findingsRoute = createRoute({
+  getParentRoute: () => sessionRoute,
+  path: "/findings",
+  component: FindingsPage,
+});
+
 // Pages owned by later phases: present in the information architecture, but
 // not built here. They redirect to the overview so a shared link still lands.
 const laterRoute = createRoute({
@@ -122,6 +129,7 @@ const routeTree = RootRoute.addChildren([
       processesRoute,
       filesRoute,
       networkRoute,
+      findingsRoute,
       gapsRoute,
       laterRoute,
     ]),

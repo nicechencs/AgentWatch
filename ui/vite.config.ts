@@ -37,4 +37,11 @@ export default defineConfig({
       "/api": { target: "http://127.0.0.1:7456", changeOrigin: false },
     },
   },
+  test: {
+    environment: "jsdom",
+    globals: true,
+    setupFiles: ["./src/test-setup.ts"],
+    include: ["src/**/*.test.{ts,tsx}"],
+    alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
+  },
 });

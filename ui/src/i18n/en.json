@@ -16,7 +16,6 @@
   "common.none": "none",
   "common.more": "Expand",
   "common.less": "Collapse",
-
   "evidence.E1": "E1 system",
   "evidence.E2": "E2 protocol",
   "evidence.E3": "E3 self-report",
@@ -29,7 +28,6 @@
   "evidence.tip.S": "Sampled; short-lived events may be missing",
   "evidence.tip.I": "Inferred by a correlation rule; not a fact",
   "evidence.tip.NA": "This field cannot be obtained on the current platform or mode",
-
   "na.es_no_read_event": "macOS provides no per-read events; only the open-for-read is known",
   "na.mmap_not_observable": "File was accessed through a memory mapping; byte counts are unavailable",
   "na.tls_no_proxy": "TLS without a proxy; URL unavailable",
@@ -48,12 +46,10 @@
   "na.file_changed": "File changed before comparison; result unusable",
   "na.peer_unknown": "The process at the other end of the channel could not be determined",
   "na.protocol_not_observed": "mcp-tap or proxy not enabled; method and tool name unavailable",
-
   "auth.title": "Sign-in required",
   "auth.body": "Open this page with aw ui. The ticket is single use; refreshing requires signing in again.",
   "auth.exchanging": "Checking ticket…",
   "auth.failed": "Ticket is invalid or expired",
-
   "nav.overview": "Overview",
   "nav.timeline": "Timeline",
   "nav.processes": "Processes",
@@ -65,7 +61,6 @@
   "nav.search": "Search",
   "nav.settings": "Settings",
   "nav.sessions": "Sessions",
-
   "session.recording": "recording",
   "session.stopped": "stopped",
   "session.stop": "Stop",
@@ -74,16 +69,13 @@
   "session.export.jsonl": "JSONL",
   "session.export.csv": "CSV",
   "session.export.md": "Markdown",
-
   "filter.placeholder": "Filter, e.g. kind:file path:~/.ssh/**",
   "filter.errorAt": "Column {column}: {message}",
   "filter.suggestion": "Did you mean {field}?",
   "filter.copy": "Copy as filter",
-
   "density.aria": "Time density bar; drag to select a range",
   "density.clear": "Clear time range",
   "density.gap": "A collection gap falls in this span",
-
   "detail.title": "Record detail",
   "detail.source": "Source",
   "detail.corroborated": "Corroborated by",
@@ -94,9 +86,7 @@
   "detail.onlySubtree": "Only this subtree",
   "detail.copyFilter": "Copy as filter",
   "detail.empty": "Select a record to see its fields and evidence",
-
   "bytes.approx": "Partly sampled or covering a gap window: {reason}",
-
   "sessions.title": "Sessions",
   "sessions.new": "New session",
   "sessions.search": "Search name or command",
@@ -132,7 +122,6 @@
   "sessions.compare": "Compare",
   "sessions.compareDisabled": "Comparison comes in a later phase",
   "sessions.empty": "No sessions yet",
-
   "new.title": "New session",
   "new.launch": "Launch a program",
   "new.attach": "Attach to a process",
@@ -153,7 +142,6 @@
   "new.capabilities": "Collection capabilities on this platform",
   "new.capAvailable": "available",
   "new.capMissing": "unavailable",
-
   "overview.procs": "Processes",
   "overview.commands": "Commands",
   "overview.files": "Files",
@@ -173,7 +161,6 @@
   "overview.topDirs": "Most accessed directories",
   "overview.topCommands": "Most executed commands",
   "overview.writes": "{count} writes",
-
   "timeline.cats.proc": "Process",
   "timeline.cats.file": "File",
   "timeline.cats.net": "Network",
@@ -195,7 +182,6 @@
   "timeline.findingLater": "Inference and finding evidence are shown in a later phase",
   "timeline.empty": "No records in this range",
   "timeline.loadMore": "Load more",
-
   "procs.col.process": "Process",
   "procs.col.files": "Files",
   "procs.col.writeDelete": "Write / delete",
@@ -211,7 +197,6 @@
   "procs.menu.timeline": "Show in timeline",
   "procs.loadChildren": "Load child processes",
   "procs.empty": "No process records",
-
   "files.view.list": "List",
   "files.view.tree": "Directory tree",
   "files.col.time": "Time",
@@ -239,7 +224,6 @@
   "files.sensitiveHit": "rule {rule}",
   "files.failed": "open failed",
   "files.empty": "No file access records",
-
   "net.chart": "Traffic",
   "net.chartUp": "Upload",
   "net.chartDown": "Download",
@@ -263,7 +247,6 @@
   "net.httpLater": "HTTP request detail arrives in a later phase",
   "net.empty": "No network records",
   "net.noPtr": "Only domain mappings observed inside the session are shown; no reverse lookup is done",
-
   "gaps.collectors": "Collectors",
   "gaps.provides": "Events provided",
   "gaps.unavailable": "Unavailable on this platform",
@@ -276,7 +259,6 @@
   "gaps.degraded": "degraded",
   "gaps.empty": "No collection gaps",
   "gaps.jump": "Show this span in the timeline",
-
   "settings.title": "Settings",
   "settings.storage": "Storage",
   "settings.privacy": "Privacy",
@@ -312,7 +294,6 @@
   "settings.time.utc": "UTC",
   "settings.saved": "Saved",
   "settings.forbidden": "This identity cannot change this setting",
-
   "search.title": "Search across sessions",
   "search.placeholder": "Free text or a filter, e.g. ~/.aws/credentials",
   "search.submit": "Search",
@@ -324,5 +305,34 @@
   "search.more": "First 5 shown",
   "search.slow": "Substring search is slow: full-text index is off",
   "search.empty": "No hits",
-  "search.hint": "For example: which sessions touched ~/.aws/credentials"
+  "search.hint": "For example: which sessions touched ~/.aws/credentials",
+  "findings.group.content": "Content-match evidence",
+  "findings.group.contentInfo": "Request body chunk-matched a file read in this session — the strongest correlation evidence. No match does not mean no upload.",
+  "findings.group.fact": "Facts (E1)",
+  "findings.group.factInfo": "Directly observed by the kernel or confirmed via the protocol layer (E2).",
+  "findings.group.inferred": "Inferred (I)",
+  "findings.group.inferredInfo": "Derived by a correlation rule, not directly observed. A caveat is always shown.",
+  "findings.count": "{count}x",
+  "findings.first": "First",
+  "findings.last": "Last",
+  "findings.inferredCaveat": "Temporal proximity does not mean file content was sent.",
+  "findings.contentMatchCaveat": "Encrypted, re-encoded, or hashed content cannot be matched; no match does not mean no transmission.",
+  "findings.gapCaveat": "A collection gap exists during this window (gap ID: {id}); findings may be incomplete.",
+  "findings.textCaveat": "{id}",
+  "findings.refsShow": "Show evidence",
+  "findings.refsHide": "Hide evidence",
+  "findings.goTimeline": "View in timeline",
+  "findings.refMissing": "Record no longer exists ({table}:{id})",
+  "findings.refUnsupported": "Unsupported record type: {table}",
+  "findings.actionConfirm": "Confirm",
+  "findings.actionIgnore": "Ignore",
+  "findings.actionClear": "Clear mark",
+  "findings.showIgnored": "Show ignored ({count})",
+  "findings.hideIgnored": "Hide ignored",
+  "findings.empty": "No rule-matching activity found within the observed scope",
+  "findings.severity.info": "Info",
+  "findings.severity.notice": "Notice",
+  "findings.severity.warn": "Warn",
+  "timeline.findingInferred": "Inferred",
+  "timeline.findingFact": "Finding"
 }

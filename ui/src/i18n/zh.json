@@ -16,7 +16,6 @@
   "common.none": "无",
   "common.more": "展开",
   "common.less": "收起",
-
   "evidence.E1": "E1 系统",
   "evidence.E2": "E2 协议",
   "evidence.E3": "E3 自报",
@@ -29,7 +28,6 @@
   "evidence.tip.S": "采样得到，可能遗漏短事件",
   "evidence.tip.I": "由关联规则推理得出，不是事实",
   "evidence.tip.NA": "该字段在当前平台或模式下无法获取",
-
   "na.es_no_read_event": "macOS 不提供逐次读取事件，只知道“以读方式打开”",
   "na.mmap_not_observable": "文件通过内存映射访问，字节数不可得",
   "na.tls_no_proxy": "TLS 加密且未启用代理，URL 不可得",
@@ -48,12 +46,10 @@
   "na.file_changed": "比对时文件已变化，结果不可用",
   "na.peer_unknown": "无法确定通信通道另一端的进程",
   "na.protocol_not_observed": "未启用 mcp-tap 或代理，调用的方法和工具名不可得",
-
   "auth.title": "需要登录",
   "auth.body": "请用 aw ui 打开本页。ticket 只使用一次，刷新后需要重新登录。",
   "auth.exchanging": "正在验证 ticket…",
   "auth.failed": "ticket 无效或已过期",
-
   "nav.overview": "概览",
   "nav.timeline": "时间线",
   "nav.processes": "进程",
@@ -65,7 +61,6 @@
   "nav.search": "搜索",
   "nav.settings": "设置",
   "nav.sessions": "会话",
-
   "session.recording": "录制中",
   "session.stopped": "已停止",
   "session.stop": "停止",
@@ -74,16 +69,13 @@
   "session.export.jsonl": "JSONL",
   "session.export.csv": "CSV",
   "session.export.md": "Markdown",
-
   "filter.placeholder": "筛选表达式，如 kind:file path:~/.ssh/**",
   "filter.errorAt": "第 {column} 列：{message}",
   "filter.suggestion": "是否想写 {field}？",
   "filter.copy": "复制为筛选",
-
   "density.aria": "时间密度条，可拖选时间范围",
   "density.clear": "清除时间范围",
   "density.gap": "该区段存在采集缺口",
-
   "detail.title": "记录详情",
   "detail.source": "来源",
   "detail.corroborated": "佐证来源",
@@ -94,9 +86,7 @@
   "detail.onlySubtree": "只看此子树",
   "detail.copyFilter": "复制为筛选",
   "detail.empty": "选择一条记录查看字段与证据",
-
   "bytes.approx": "部分来自采样或覆盖了缺口时段：{reason}",
-
   "sessions.title": "会话",
   "sessions.new": "新建会话",
   "sessions.search": "搜索名称或命令",
@@ -132,7 +122,6 @@
   "sessions.compare": "对比",
   "sessions.compareDisabled": "对比在后续阶段提供",
   "sessions.empty": "还没有会话",
-
   "new.title": "新建会话",
   "new.launch": "启动程序",
   "new.attach": "附着到进程",
@@ -153,7 +142,6 @@
   "new.capabilities": "当前平台的采集能力",
   "new.capAvailable": "可得",
   "new.capMissing": "不可得",
-
   "overview.procs": "进程",
   "overview.commands": "命令",
   "overview.files": "文件",
@@ -173,7 +161,6 @@
   "overview.topDirs": "访问最多的目录",
   "overview.topCommands": "执行最多的命令",
   "overview.writes": "写 {count}",
-
   "timeline.cats.proc": "进程",
   "timeline.cats.file": "文件",
   "timeline.cats.net": "网络",
@@ -195,7 +182,6 @@
   "timeline.findingLater": "推测与发现的依据在后续阶段展示",
   "timeline.empty": "该时间范围内没有记录",
   "timeline.loadMore": "继续加载",
-
   "procs.col.process": "进程",
   "procs.col.files": "文件",
   "procs.col.writeDelete": "写 / 删",
@@ -211,7 +197,6 @@
   "procs.menu.timeline": "在时间线中定位",
   "procs.loadChildren": "加载子进程",
   "procs.empty": "没有进程记录",
-
   "files.view.list": "列表",
   "files.view.tree": "目录树",
   "files.col.time": "时间",
@@ -239,7 +224,6 @@
   "files.sensitiveHit": "规则 {rule}",
   "files.failed": "打开失败",
   "files.empty": "没有文件访问记录",
-
   "net.chart": "流量",
   "net.chartUp": "上行",
   "net.chartDown": "下行",
@@ -263,7 +247,6 @@
   "net.httpLater": "HTTP 请求明细在后续阶段展示",
   "net.empty": "没有网络记录",
   "net.noPtr": "只显示会话内观测到的域名映射，不做反向查询",
-
   "gaps.collectors": "采集器",
   "gaps.provides": "提供的事件",
   "gaps.unavailable": "本平台不可得的能力",
@@ -276,7 +259,6 @@
   "gaps.degraded": "降级",
   "gaps.empty": "没有采集缺口",
   "gaps.jump": "在时间线中查看该时段",
-
   "settings.title": "设置",
   "settings.storage": "存储",
   "settings.privacy": "隐私",
@@ -312,7 +294,6 @@
   "settings.time.utc": "UTC",
   "settings.saved": "已保存",
   "settings.forbidden": "当前身份不能修改此项",
-
   "search.title": "跨会话搜索",
   "search.placeholder": "自由文本或筛选表达式，如 ~/.aws/credentials",
   "search.submit": "搜索",
@@ -324,5 +305,34 @@
   "search.more": "仅显示前 5 条",
   "search.slow": "子串搜索较慢：未开启全文索引",
   "search.empty": "没有命中",
-  "search.hint": "例如：哪些会话碰过 ~/.aws/credentials"
+  "search.hint": "例如：哪些会话碰过 ~/.aws/credentials",
+  "findings.group.content": "内容匹配证据",
+  "findings.group.contentInfo": "请求体与会话内读取的文件有分块级匹配，是本会话最强的相关性证据。未匹配不等于未上传。",
+  "findings.group.fact": "事实汇总（E1）",
+  "findings.group.factInfo": "来自系统层采集（E1），或经过协议层确认（E2）的已发生事件。",
+  "findings.group.inferred": "推测（I）",
+  "findings.group.inferredInfo": "由关联规则推理得出，不是系统层可直接观测的事实。每条推测均附说明。",
+  "findings.count": "{count} 次",
+  "findings.first": "首次",
+  "findings.last": "末次",
+  "findings.inferredCaveat": "时间上相邻，不代表文件内容被发送。",
+  "findings.contentMatchCaveat": "内容经过加密、重新编码或摘要后无法匹配；未匹配不等于未发送。",
+  "findings.gapCaveat": "此时间段存在采集缺口（缺口 ID：{id}），结论可能不完整。",
+  "findings.textCaveat": "{id}",
+  "findings.refsShow": "查看依据",
+  "findings.refsHide": "收起依据",
+  "findings.goTimeline": "在时间线中查看",
+  "findings.refMissing": "记录已不存在（{table}:{id}）",
+  "findings.refUnsupported": "不支持的记录类型：{table}",
+  "findings.actionConfirm": "确认",
+  "findings.actionIgnore": "忽略",
+  "findings.actionClear": "清除标记",
+  "findings.showIgnored": "显示已忽略（{count} 条）",
+  "findings.hideIgnored": "隐藏已忽略",
+  "findings.empty": "在已观测范围内未发现满足规则的活动",
+  "findings.severity.info": "信息",
+  "findings.severity.notice": "注意",
+  "findings.severity.warn": "警告",
+  "timeline.findingInferred": "推测",
+  "timeline.findingFact": "发现"
 }

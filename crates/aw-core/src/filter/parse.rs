@@ -118,7 +118,12 @@ impl<'a> Parser<'a> {
             return Err(self.syntax("a value"));
         }
         self.check_operator(start, field.name(), self.field_type(&field), op)?;
-        Ok(Expr::Term(Term { field, op, values, offset: start }))
+        Ok(Expr::Term(Term {
+            field,
+            op,
+            values,
+            offset: start,
+        }))
     }
 
     fn field_type(&self, field: &FieldRef) -> FieldType {
@@ -128,11 +133,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_value_list(
-        &mut self,
-        field: &str,
-        ty: FieldType,
-    ) -> Result<Vec<Value>, FilterError> {
+    fn parse_value_list(&mut self, field: &str, ty: FieldType) -> Result<Vec<Value>, FilterError> {
         let bracketed = self.eat("[");
         let mut values = Vec::new();
         loop {
@@ -166,7 +167,10 @@ impl<'a> Parser<'a> {
             // sign check already proved one is here, so consume it for real.
             self.pos = start;
             let _ = self.read_duration();
-            return Ok(Value::RelativeTime { from_session_start: sign, nanos });
+            return Ok(Value::RelativeTime {
+                from_session_start: sign,
+                nanos,
+            });
         }
         let token = self.read_value_token()?;
         match ty {
@@ -175,9 +179,7 @@ impl<'a> Parser<'a> {
                 "false" => Ok(Value::Bool(false)),
                 _ => Err(self.bad_value(start, field, "bool", &token)),
             },
-            FieldType::Number => self
-                .finish_number(start, field, &token)
-                .map(Value::Number),
+            FieldType::Number => self.finish_number(start, field, &token).map(Value::Number),
             FieldType::Bytes => Ok(Value::Number(self.finish_bytes(start, field, &token)?)),
             FieldType::Duration => Ok(Value::Number(self.finish_duration(start, field, &token)?)),
             FieldType::Time => self.finish_time(start, field, &token),
@@ -191,8 +193,8 @@ impl<'a> Parser<'a> {
 
     fn finish_bytes(&self, start: usize, field: &str, token: &str) -> Result<i64, FilterError> {
         let (number, unit) = split_unit(token);
-        let base = parse_f64(number)
-            .ok_or_else(|| self.bad_value(start, field, "byte count", token))?;
+        let base =
+            parse_f64(number).ok_or_else(|| self.bad_value(start, field, "byte count", token))?;
         let factor: i64 = match unit {
             "" | "B" => 1,
             "KB" => 1_000,
@@ -212,7 +214,10 @@ impl<'a> Parser<'a> {
 
     fn finish_time(&self, start: usize, field: &str, token: &str) -> Result<Value, FilterError> {
         if let Some(nanos) = duration_nanos(token) {
-            return Ok(Value::RelativeTime { from_session_start: true, nanos });
+            return Ok(Value::RelativeTime {
+                from_session_start: true,
+                nanos,
+            });
         }
         parse_i64(token)
             .map(Value::Number)
@@ -427,18 +432,25 @@ impl<'a> Parser<'a> {
     }
 
     fn syntax(&self, expected: &'static str) -> FilterError {
-        let found = self.input[self.pos..]
-            .chars()
-            .take(16)
-            .collect::<String>();
+        let found = self.input[self.pos..].chars().take(16).collect::<String>();
         FilterError::Syntax {
             offset: self.pos,
             expected,
-            found: if found.is_empty() { "end of input".to_owned() } else { found },
+            found: if found.is_empty() {
+                "end of input".to_owned()
+            } else {
+                found
+            },
         }
     }
 
-    fn bad_value(&self, offset: usize, field: &str, expected: &'static str, value: &str) -> FilterError {
+    fn bad_value(
+        &self,
+        offset: usize,
+        field: &str,
+        expected: &'static str,
+        value: &str,
+    ) -> FilterError {
         FilterError::BadValue {
             offset,
             field: field.to_owned(),
@@ -478,7 +490,13 @@ fn split_unit(token: &str) -> (&str, &str) {
 }
 
 fn duration_nanos(token: &str) -> Option<i64> {
-    for (suffix, factor) in [("ms", 1_000_000_i64), ("s", 1_000_000_000), ("m", 60_000_000_000), ("h", 3_600_000_000_000), ("d", 86_400_000_000_000)] {
+    for (suffix, factor) in [
+        ("ms", 1_000_000_i64),
+        ("s", 1_000_000_000),
+        ("m", 60_000_000_000),
+        ("h", 3_600_000_000_000),
+        ("d", 86_400_000_000_000),
+    ] {
         if let Some(number) = token.strip_suffix(suffix) {
             let value = parse_f64(number)?;
             return Some((value * factor as f64) as i64);

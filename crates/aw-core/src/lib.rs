@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod chunk;
 pub mod collector;
 pub mod error;
 pub mod event;
@@ -16,21 +17,26 @@ pub mod filter;
 pub mod fixture;
 pub mod proc;
 pub mod time;
+pub mod tls;
 
-mod xxh3;
+pub mod xxh3;
 
+pub use chunk::{chunk_bytes, chunk_reader, sha256, ChunkDigest, ChunkSet, Chunked, Chunker};
 pub use collector::{
     Capability, CapabilityCategory, CapabilitySet, Collector, CollectorError, EventSink, Health,
     LaunchToken, MockCollector, Scope, ScopeError, SinkError, SinkFailureKind, VecSink,
 };
 pub use error::{EventError, SchemaError};
 pub use event::{
-    AgentRpc, AgentToolCall, BodyDigestRef, DnsAnswer, DnsQuery, DnsRecord, EnvMap, EventKind,
+    AgentRpc, AgentToolCall, Arg, BodyDigestRef, DnsAnswer, DnsQuery, DnsRecord, EnvMap, EventKind,
     Evidence, FileAccessMode, FileClose, FileCreate, FileDelete, FileOpen, FileRead, FileRename,
     FileWrite, FlowDirection, FlowKey, Gap, GapKind, HeaderList, HttpRequest, HttpResponse, IoVia,
     IpcClose, IpcDirection, IpcKind, IpcOpen, IpcTransfer, L4Proto, NaReason, NetClose, NetConnect,
     NetRecv, NetSend, ProcRef, ProcUid, ProcessExit, ProcessStart, RawEvent, RawEventParts,
-    Redacted, Arg, SessionId, SocketAddr, Source, StartHow, TlsSni, ToolPhase, UserRef, SCHEMA_VERSION,
+    Redacted, SessionId, SocketAddr, Source, StartHow, TlsSni, ToolPhase, UserRef, SCHEMA_VERSION,
 };
-pub use filter::{parse as parse_filter, EvalCtx, Expr, FieldRef, FilterError, Op, RecordView, Term, Value};
+pub use filter::{
+    parse as parse_filter, EvalCtx, Expr, FieldRef, FilterError, Op, RecordView, Term, Value,
+};
 pub use fixture::{FixtureError, FixtureHeader, FixtureReader, FixtureWriter};
+pub use tls::{parse_client_hello, ClientHelloInfo, EchInfo, ParseError};

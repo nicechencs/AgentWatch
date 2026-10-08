@@ -270,7 +270,10 @@ fn text_of(value: &Value) -> Option<&str> {
 fn number_of(value: &Value, ctx: &EvalCtx) -> Option<i64> {
     match value {
         Value::Number(n) => Some(*n),
-        Value::RelativeTime { from_session_start, nanos } => Some(if *from_session_start {
+        Value::RelativeTime {
+            from_session_start,
+            nanos,
+        } => Some(if *from_session_start {
             ctx.session_start_ns.saturating_add(*nanos)
         } else {
             ctx.now_ns.saturating_sub(*nanos)
@@ -303,7 +306,11 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         }
         if pattern[0] == b'*' {
             let crossing = pattern.len() > 1 && pattern[1] == b'*';
-            let rest = if crossing { &pattern[2..] } else { &pattern[1..] };
+            let rest = if crossing {
+                &pattern[2..]
+            } else {
+                &pattern[1..]
+            };
             if rec(rest, text) {
                 return true;
             }
@@ -316,7 +323,9 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         }
         match text.split_first() {
             Some((first, tail)) if pattern[0] == *first => rec(&pattern[1..], tail),
-            Some((first, tail)) if pattern[0] == b'?' && !is_sep(*first) => rec(&pattern[1..], tail),
+            Some((first, tail)) if pattern[0] == b'?' && !is_sep(*first) => {
+                rec(&pattern[1..], tail)
+            }
             _ => false,
         }
     }

@@ -1,4 +1,8 @@
-//! One-shot XXH3-64 (seed 0, default secret), for [`super::proc`] only.
+//! One-shot XXH3-64 (seed 0, default secret).
+//!
+//! [`super::proc`] uses it for process identity. [`super::chunk`] uses it to fill
+//! the Gear table (2-byte inputs, well inside the limit below). Callers that need
+//! a rolling hash must not call this in a loop: it does not roll.
 //!
 //! ADR-0007 names `xxh3_64` as the process-identity hash. This is the public
 //! one-shot function (`XXH3_64bits`), not a seeded or custom-secret variant, so
@@ -34,11 +38,12 @@ const PRIME_MX2: u64 = 0x9FB2_1C65_1E98_DF25;
 /// implemented; the striped accumulator path is intentionally absent.
 const MIDSIZE_MAX: usize = 240;
 
-/// `XXH3_64bits(input, len)` with seed 0 and the default secret.
+/// `XXH3_64bits` with seed 0 and the default secret.
 ///
-/// Returns `None` when `input.len() > 240`. Process-identity inputs never reach
-/// that; refusing is safer than emitting a digest that is not XXH3.
-pub(crate) fn xxh3_64(input: &[u8]) -> Option<u64> {
+/// Returns `None` when `input.len() > 240`. The long-input path is not
+/// implemented, and a wrong digest is worse than no digest. Process-identity
+/// inputs never reach that length.
+pub fn xxh3_64(input: &[u8]) -> Option<u64> {
     let len = input.len();
     if len > MIDSIZE_MAX {
         return None;

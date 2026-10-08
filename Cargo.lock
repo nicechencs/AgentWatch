@@ -51,7 +51,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "aw-agent-adapters"
 version = "0.1.0"
 dependencies = [
- "aw-core",
+ "regex",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -59,6 +61,7 @@ name = "aw-cli"
 version = "0.1.0"
 dependencies = [
  "aw-core",
+ "aw-proxy",
  "clap",
  "insta",
  "serde",
@@ -108,7 +111,9 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
@@ -125,6 +130,7 @@ dependencies = [
  "aw-proxy",
  "aw-store",
  "flate2",
+ "rusqlite",
  "rust-embed",
  "serde",
  "serde_json",
@@ -151,6 +157,17 @@ name = "aw-proxy"
 version = "0.1.0"
 dependencies = [
  "aw-core",
+ "flate2",
+ "pem",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "time",
+ "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]

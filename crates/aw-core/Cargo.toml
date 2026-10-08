@@ -14,6 +14,12 @@ description = "Shared event model and types. No runtime, platform, or database d
 serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive", "std"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 thiserror = { version = "2.0.20", default-features = false }
+# Chunk digests (P3-PROXY-04). sha2 0.11.0 is already in Cargo.lock (MIT OR
+# Apache-2.0). BLAKE3 is what the task card names, but that crate is not in the
+# lockfile and must not be added. zeroize 1.9.1 (MIT OR Apache-2.0) wipes the
+# pending chunk buffer; `derive` is unused.
+sha2 = { version = "0.11.0", default-features = false }
+zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 insta = { version = "1.49.0", default-features = false }

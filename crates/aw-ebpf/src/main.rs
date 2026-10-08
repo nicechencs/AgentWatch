@@ -12,10 +12,16 @@
 //! - `scope_pids` — tgids in the session
 //! - `events` — ringbuf, 16 MiB
 //! - `lost` — per-CPU counter of events the ringbuf could not accept
+//!
+//! P1-LNX-02 adds `proc`: the process-probe record layout (fork, exec, exit,
+//! cgroup attach). P1-LNX-03 adds `net`: the TCP/UDP record layout. Both are
+//! description only. No probe is attached from here.
 
 #![no_std]
 #![no_main]
 #![forbid(unsafe_code)]
+
+mod proc;
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {

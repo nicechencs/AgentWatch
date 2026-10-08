@@ -11,7 +11,7 @@ use std::io;
 use crate::exit;
 use crate::output::OutputMode;
 
-use super::query::{SearchQuery, QuerySource};
+use super::query::{QuerySource, SearchQuery};
 use super::render;
 use super::sessions::{query_outcome, write_ok};
 use super::Outcome;
@@ -98,9 +98,5 @@ fn resolve_since(text: &str) -> Result<i64, String> {
 
 fn looks_bare_duration(text: &str) -> bool {
     let text = text.trim();
-    !text.is_empty()
-        && text
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_ascii_digit())
+    !text.is_empty() && text.chars().next().is_some_and(|ch| ch.is_ascii_digit())
 }

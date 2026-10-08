@@ -65,9 +65,7 @@ pub(crate) fn run(args: FilesArgs<'_>, source: &dyn QuerySource) -> io::Result<O
             return Ok(super::error_outcome(
                 exit::USAGE,
                 "usage",
-                &format!(
-                    "--sort `{sort}` is not time, path, opens, bytes_read, or bytes_written"
-                ),
+                &format!("--sort `{sort}` is not time, path, opens, bytes_read, or bytes_written"),
                 args.json,
             ));
         }

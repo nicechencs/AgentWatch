@@ -21,6 +21,7 @@ path = "src/lib.rs"
 
 [dependencies]
 aw-core = { workspace = true }
+aw-proxy = { workspace = true }
 # Pinned in this crate (not workspace.dependencies): root Cargo.toml is out of
 # scope for P1-CLI-01. Versions match crates that already use them.
 # clap is MIT. serde and serde_json are MIT OR Apache-2.0.

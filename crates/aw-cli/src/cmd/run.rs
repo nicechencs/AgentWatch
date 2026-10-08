@@ -6,14 +6,19 @@
 //! that P1-LNX-04 / P1-MAC-03 have not landed. Tests pass a fake and assert the
 //! target's exit code comes back unchanged.
 //!
-//! `--proxy`, `--proxy-on-reject`, `--self-report`, `--mcp-tap`, and
-//! `--unsafe-no-redact` are refused with a pointer at the later card. Nothing
-//! here opens a proxy or disables redaction.
+//! `--self-report`, `--mcp-tap`, and `--unsafe-no-redact` are refused with a
+//! pointer at the later card. `--proxy` is accepted as a request and then
+//! refused by [`proxy_unavailable`]: this build plans the environment
+//! ([`aw_proxy::plan_injection`]) but does not open a listener or launch the
+//! target, because the daemon session API is not connected. Nothing here
+//! disables redaction.
 //!
 //! Command text, environment values, and the working directory are inputs to
 //! the launcher. They are not written to stdout, stderr, or an error string.
 
 use std::io::{self, Write};
+
+use aw_proxy::{hint_for_exe, plan_injection, ProxyOnReject};
 
 use serde_json::{json, Value};
 
@@ -54,13 +59,16 @@ pub(crate) struct RunArgs<'a> {
     pub quiet: bool,
 }
 
-/// Later-card flags. Present means the command stops before any launch.
+/// Later-card flags. Present means the command stops before any launch,
+/// except the proxy pair, which is checked by [`proxy_unavailable`] first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DeferredFlags {
+pub(crate) struct DeferredFlags<'a> {
     /// `--proxy`.
     pub proxy: bool,
     /// `--proxy-on-reject` was set.
     pub proxy_on_reject: bool,
+    /// The value, when the flag was set. Not a secret.
+    pub proxy_on_reject_value: Option<&'a str>,
     /// `--self-report` was set.
     pub self_report: bool,
     /// `--mcp-tap`.
@@ -212,6 +220,9 @@ pub(crate) fn run(
     launcher: &mut dyn Launcher,
     summary: &mut dyn SessionSummary,
 ) -> Outcome {
+    if let Some(detail) = proxy_unavailable(args, deferred) {
+        return super::error_outcome(exit::GENERAL, "not_available", &detail, args.json);
+    }
     if let Some(detail) = deferred_reason(deferred) {
         return super::error_outcome(exit::GENERAL, "not_available", &detail, args.json);
     }
@@ -272,14 +283,49 @@ pub(crate) fn run(
     }
 }
 
+/// `--proxy` is implemented as a plan, not a launch.
+///
+/// The message still contains `P3/P5` and `--proxy` so the existing refusal
+/// check keeps passing: nothing is launched, and the daemon is not contacted.
+/// A bad `--proxy-on-reject` value is named. A known Electron-family argv0 adds
+/// the static hint. The hint does not include the command's other arguments.
+fn proxy_unavailable(args: &RunArgs<'_>, flags: DeferredFlags) -> Option<String> {
+    if !flags.proxy && !flags.proxy_on_reject {
+        return None;
+    }
+    if flags.proxy_on_reject && !flags.proxy {
+        return Some(
+            "`--proxy-on-reject` 需要同时指定 `--proxy`。P3/P5 的监听尚未接入，nothing was launched"
+                .to_owned(),
+        );
+    }
+    if let Some(text) = flags.proxy_on_reject_value {
+        if ProxyOnReject::parse(text).is_none() {
+            return Some(
+                "`--proxy-on-reject` 只接受 fail 或 tunnel。P3/P5 的监听尚未接入，nothing was launched。--proxy 未启动"
+                    .to_owned(),
+            );
+        }
+    }
+    // The plan is computed so a bad path would surface here. The port is 0 only
+    // as "no listener was bound", and the plan is not printed (it would contain
+    // a URL). Hints do not contain the URL either.
+    let exe = args.command.first().map(String::as_str);
+    let _plan = plan_injection(0, "ca.pem", "bundle.pem", &[], exe);
+    let mut message = String::from(
+        "--proxy is not available in this build (P3/P5 提供); nothing was launched. 监听端口尚未接入 daemon",
+    );
+    if let Some(exe) = exe {
+        if let Some(hint) = hint_for_exe(exe) {
+            message.push(' ');
+            message.push_str(hint);
+        }
+    }
+    Some(message)
+}
+
 fn deferred_reason(flags: DeferredFlags) -> Option<String> {
     let mut which = Vec::new();
-    if flags.proxy {
-        which.push("--proxy");
-    }
-    if flags.proxy_on_reject {
-        which.push("--proxy-on-reject");
-    }
     if flags.self_report {
         which.push("--self-report");
     }
@@ -554,10 +600,11 @@ mod tests {
         }
     }
 
-    fn none() -> DeferredFlags {
+    fn none() -> DeferredFlags<'static> {
         DeferredFlags {
             proxy: false,
             proxy_on_reject: false,
+            proxy_on_reject_value: None,
             self_report: false,
             mcp_tap: false,
             unsafe_no_redact: false,

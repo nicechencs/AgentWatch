@@ -353,9 +353,8 @@ pub(crate) fn run(
             Err(err) => api_error(err, json),
         },
         DbOp::Vacuum => {
-            if !confirm.confirm(
-                "VACUUM rewrites the database and can take a long time. Continue?",
-            ) {
+            if !confirm.confirm("VACUUM rewrites the database and can take a long time. Continue?")
+            {
                 return super::error_outcome(
                     exit::USAGE,
                     "usage",
@@ -440,9 +439,8 @@ fn purge_api(args: PurgeArgs<'_>, api: &mut dyn DbApi, confirm: &mut dyn Confirm
         );
     }
     let confirmed = yes
-        || confirm.confirm(
-            "purge deletes ended sessions. Pinned and active sessions stay. Continue?",
-        );
+        || confirm
+            .confirm("purge deletes ended sessions. Pinned and active sessions stay. Continue?");
     if !confirmed {
         return super::error_outcome(
             exit::USAGE,
@@ -536,10 +534,7 @@ fn migrate_outcome(report: &MigrateReport, json: bool) -> Outcome {
             })
         )
     } else if report.steps.is_empty() {
-        let detail = report
-            .detail
-            .as_deref()
-            .unwrap_or("no pending migration");
+        let detail = report.detail.as_deref().unwrap_or("no pending migration");
         format!("{detail}\n")
     } else {
         let mut lines = String::new();
@@ -759,9 +754,7 @@ fn note(op: &str, detail: &str, json: bool) -> Outcome {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{
-        run_store, Clock, DbOp, DbStats, DbStore, FixedClock, PurgeRequest, PurgeResult,
-    };
+    use super::{run_store, Clock, DbOp, DbStats, DbStore, FixedClock, PurgeRequest, PurgeResult};
     use crate::cmd::daemon::Privilege;
     use crate::exit;
 

@@ -341,11 +341,7 @@ pub(crate) trait QuerySource {
     /// # Errors
     ///
     /// [`QueryError::NotFound`] or [`QueryError::BadArgument`].
-    fn files(
-        &self,
-        key: &str,
-        query: &FileQuery,
-    ) -> Result<Vec<FileItem>, QueryError>;
+    fn files(&self, key: &str, query: &FileQuery) -> Result<Vec<FileItem>, QueryError>;
 
     /// Events around one record (`GET /sessions/{sid}/around`).
     ///
@@ -528,17 +524,17 @@ pub(crate) fn around_request(
     window: &str,
 ) -> crate::client::ApiRequest {
     crate::client::ApiRequest::get_query(
-        &format!(
-            "/api/v1/sessions/{}/around",
-            encode_path_segment(session)
-        ),
+        &format!("/api/v1/sessions/{}/around", encode_path_segment(session)),
         encode_query(&[("ref", reference), ("window", window)]),
     )
 }
 
 /// `GET /api/v1/search?q&kind&since`.
 #[must_use]
-pub(crate) fn search_request(query: &SearchQuery, since: Option<&str>) -> crate::client::ApiRequest {
+pub(crate) fn search_request(
+    query: &SearchQuery,
+    since: Option<&str>,
+) -> crate::client::ApiRequest {
     let mut pairs: Vec<(&str, &str)> = vec![("q", query.text.as_str())];
     if let Some(kind) = query.kind.as_deref() {
         pairs.push(("kind", kind));
@@ -990,10 +986,16 @@ impl QuerySource for MemorySource {
 
 /// `<table>:<id>`. The id is numeric. Anything else is a usage error, not a lookup.
 pub(crate) fn split_reference(reference: &str) -> Result<(&str, i64), QueryError> {
-    let (table, id) = reference.split_once(':').ok_or_else(|| QueryError::BadArgument {
-        detail: format!("`{reference}` is not <table>:<id>"),
-    })?;
-    if table.is_empty() || !table.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+    let (table, id) = reference
+        .split_once(':')
+        .ok_or_else(|| QueryError::BadArgument {
+            detail: format!("`{reference}` is not <table>:<id>"),
+        })?;
+    if table.is_empty()
+        || !table
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
         return Err(QueryError::BadArgument {
             detail: format!("`{reference}` has an empty or illegal table name"),
         });
@@ -1054,7 +1056,11 @@ fn group_file_rows(rows: &[FileItem], group_by: Option<&str>) -> Result<Vec<File
                     } else {
                         None
                     },
-                    proc_pid: if by == FileGroup::Proc { row.proc_pid } else { None },
+                    proc_pid: if by == FileGroup::Proc {
+                        row.proc_pid
+                    } else {
+                        None
+                    },
                     proc_exe: if by == FileGroup::Proc {
                         row.proc_exe.clone()
                     } else {

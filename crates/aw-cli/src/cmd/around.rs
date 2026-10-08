@@ -84,13 +84,16 @@ fn window_ns(text: &str) -> Result<i64, String> {
     let duration = match arg {
         crate::output::TimeArg::BeforeNow(duration) => duration,
         crate::output::TimeArg::FromSessionStart(_) => {
-            return Err("`--window` is a duration such as 10s, not a session-relative time".to_owned());
+            return Err(
+                "`--window` is a duration such as 10s, not a session-relative time".to_owned(),
+            );
         }
         crate::output::TimeArg::Rfc3339(_) => {
             return Err("`--window` is a duration such as 10s, not an absolute time".to_owned());
         }
     };
-    let count = i64::try_from(duration.count).map_err(|_| "window does not fit in i64".to_owned())?;
+    let count =
+        i64::try_from(duration.count).map_err(|_| "window does not fit in i64".to_owned())?;
     let unit: i64 = match duration.unit {
         crate::output::TimeUnit::Millis => 1_000_000,
         crate::output::TimeUnit::Seconds => 1_000_000_000,

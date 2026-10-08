@@ -332,8 +332,12 @@ pub(crate) enum DaemonCmd {
     Stop,
     /// 重启
     Restart,
-    /// 安装系统服务
-    Install,
+    /// 安装系统服务。没有 `--yes` 时只打印计划，不输出可执行命令
+    Install {
+        /// 确认后才输出供人工执行的 sc.exe 文本。本进程不运行它
+        #[arg(long)]
+        yes: bool,
+    },
     /// 卸载系统服务
     Uninstall {
         #[arg(long)]
@@ -491,7 +495,7 @@ pub(crate) fn command_label(command: &Command) -> &'static str {
             DaemonCmd::Start => "daemon start",
             DaemonCmd::Stop => "daemon stop",
             DaemonCmd::Restart => "daemon restart",
-            DaemonCmd::Install => "daemon install",
+            DaemonCmd::Install { .. } => "daemon install",
             DaemonCmd::Uninstall { .. } => "daemon uninstall",
             DaemonCmd::Logs { .. } => "daemon logs",
         },

@@ -306,11 +306,13 @@ fn parse_set_value(text: &str) -> Result<Value, String> {
     if trimmed.starts_with('{')
         || trimmed.starts_with('[')
         || trimmed.starts_with('"')
-        || trimmed.chars().next().is_some_and(|ch| ch.is_ascii_digit() || ch == '-')
+        || trimmed
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_digit() || ch == '-')
     {
-        return serde_json::from_str(trimmed).map_err(|err| {
-            format!("`{trimmed}` is not valid JSON for a config value ({err})")
-        });
+        return serde_json::from_str(trimmed)
+            .map_err(|err| format!("`{trimmed}` is not valid JSON for a config value ({err})"));
     }
     Ok(Value::String(trimmed.to_owned()))
 }

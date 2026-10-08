@@ -16,6 +16,7 @@ mod files;
 mod flows;
 mod gaps;
 mod procs;
+mod proxy;
 mod ps;
 mod query;
 mod render;
@@ -133,6 +134,9 @@ fn dispatch(
     if let Command::Version { check } = &cli.command {
         return Ok(version_outcome(*check, json));
     }
+    if let Some(outcome) = proxy_command(&cli.command, json) {
+        return Ok(outcome);
+    }
     if let Some(outcome) = launch_command(&cli, json) {
         return Ok(outcome);
     }
@@ -167,6 +171,16 @@ fn dispatch(
         )),
         Err(err) => Ok(client_outcome(err, &endpoint, json)),
     }
+}
+
+/// `aw proxy` (P3-PROXY-01). Does not read `ca.key` and does not probe `/health`.
+fn proxy_command(command: &Command, json: bool) -> Option<Outcome> {
+    let Command::Proxy(cmd) = command else {
+        return None;
+    };
+    // `--confirm` is not on the shared clap tree. Without it, `trust` / `untrust`
+    // stop at the prompt and do not call a certificate tool.
+    Some(proxy::run(cmd, json, false, &mut proxy::UnwiredProxy))
 }
 
 /// `run`, `attach`, `stop`, and `ps` (P1-CLI-02).
@@ -221,6 +235,7 @@ fn launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
             let deferred = run::DeferredFlags {
                 proxy: *proxy,
                 proxy_on_reject: proxy_on_reject.is_some(),
+                proxy_on_reject_value: proxy_on_reject.as_deref(),
                 self_report: self_report.is_some(),
                 mcp_tap: *mcp_tap,
                 unsafe_no_redact: *unsafe_no_redact,
@@ -399,7 +414,7 @@ fn ops_command(command: &Command, json: bool) -> Option<Outcome> {
                 tree::DaemonCmd::Start => daemon::DaemonOp::Start,
                 tree::DaemonCmd::Stop => daemon::DaemonOp::Stop,
                 tree::DaemonCmd::Restart => daemon::DaemonOp::Restart,
-                tree::DaemonCmd::Install => daemon::DaemonOp::Install,
+                tree::DaemonCmd::Install { yes } => daemon::DaemonOp::Install { confirm: *yes },
                 tree::DaemonCmd::Uninstall { purge, check } => daemon::DaemonOp::Uninstall {
                     purge: *purge,
                     check: *check,

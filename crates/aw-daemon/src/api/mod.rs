@@ -17,10 +17,9 @@ mod openapi;
 mod query;
 mod routes;
 
-// Not re-exported. `main` does not start the listener yet, and a `pub use` of an
-// unused name warns even with the module-level `dead_code` allow. Callers in
-// this crate use `http::` and `routes::` directly. A later card that wires
-// `main` can re-export then.
+pub(crate) use http::{HttpServer, DEFAULT_HTTP_PORT};
+pub(crate) use query::StoreQuery;
+pub(crate) use routes::ApiState;
 
 /// Whether a Windows named-pipe DACL was actually applied and verified.
 ///

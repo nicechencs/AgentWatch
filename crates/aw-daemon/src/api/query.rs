@@ -1,37 +1,40 @@
 //! Read boundary between the HTTP API and `aw-store`.
 //!
 //! P2-DAEMON-02. `aw-store` is owned by another card and is not edited here.
-//! [`SessionQuery`] is what the routes call. [`StoreQuery`] is the default: it
-//! calls only the functions that crate already exports (`list_sessions`,
-//! `session_summary`, `timeline`, `process_tree`, `flows`, `gaps`,
-//! [`aw_store::Retention::stats`]).
+//! [`SessionQuery`] is what the routes call. [`StoreQuery`] is the default. It
+//! calls the functions that crate exports: the reads (`list_sessions`,
+//! `session_summary`, `timeline`, `timeline_histogram`, `process_tree`,
+//! `process_detail`, `flows`, `flow_buckets`, `traffic`, `dns_events`, `gaps`,
+//! `files`, `around`, `search`), the session writes (`patch_session`,
+//! `stop_session`, `delete_session`), and [`aw_store::Retention`] for stats and
+//! purge. `db_vacuum` and `db_migrate` go through the same store.
 //!
 //! This module does not name `rusqlite`. A second copy of that crate would not
 //! match the `Connection` `aw-store` returns, and root `Cargo.toml` cannot grow
-//! a workspace dependency to dedupe it. Lookups and updates that have no
-//! exported function are [`QueryBackendError::Unimplemented`]. The trait docs
-//! name the signature a later `aw-store` card should add.
+//! a workspace dependency to dedupe it. SQL stays inside `aw-store`.
 //!
-//! `public_id` resolution is the one lookup those functions do not offer (they
-//! take the integer `sessions.id`). [`IdMap`] is filled by the session layer
-//! when it creates a row. An unknown public id is "not found", not a guessed id.
+//! `public_id` resolution: functions take the integer `sessions.id`. [`IdMap`]
+//! is filled by the session layer when it creates a row, and by
+//! [`aw_store::session_by_public_id`] when a later request names an id this
+//! process has not seen. An unknown public id is "not found", not a guessed id.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use aw_store::{
-    around, files, flows, gaps, list_sessions, process_tree, search, session_summary, timeline,
-    CompileCtx, Cursor, FileGroupBy, FileQuery, FlowQuery, FtsMode, QueryError, Retention,
-    RetentionConfig, SessionFilter, SessionListItem, SessionSummary, Store, StoreError, StoreExpr,
-    TimelinePage, TimelineQuery,
+    around, delete_session, dns_events, files, flow_buckets, flows, gaps, list_sessions,
+    patch_session, process_detail, process_tree, search, session_by_public_id, session_summary,
+    stop_session, timeline, timeline_histogram, traffic, CompileCtx, Cursor, FileGroupBy, FileQuery,
+    FlowQuery, FtsMode, ProcessNode, PurgeScope, QueryError, Retention, RetentionConfig,
+    SessionFilter, SessionListItem, SessionSummary, Store, StoreError, StoreExpr, TimelinePage,
+    TimelineQuery,
 };
 
-// `files`, `around`, and `search` call the functions `aw-store` exports. A
-// filter string is parsed by `aw_core` and folded into the store AST, which
-// has the same shape. Lookups that crate does not export (public_id,
-// histogram, process detail, flow buckets, traffic, dns, patch, delete, stop)
-// stay [`QueryBackendError::Unimplemented`] and the route answers 501.
+// Every method calls a function `aw-store` exports. A filter string is parsed
+// by `aw_core` and folded into the store AST, which has the same shape. An
+// unknown public id is resolved with `session_by_public_id` and remembered;
+// `None` from that lookup is "not found", not a guessed id.
 
 /// One page, plus the cursor the client sends back as `?cursor=`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,23 +155,8 @@ impl IdMap {
 
 /// What the routes need from storage.
 ///
-/// Read methods that `aw-store` already exports are implemented. The rest
-/// return [`QueryBackendError::Unimplemented`] until that crate grows them.
-/// Assumed signatures (not called today):
-///
-/// - `session_by_public_id(conn, user_id, public_id) -> Option<i64>`
-/// - `patch_session(conn, user_id, session_id, name, pinned)`
-/// - `delete_session(conn, user_id, session_id)`
-/// - `stop_session(conn, user_id, session_id, ended_ns)`
-/// - `timeline_histogram(conn, user_id, session_id, filter, from, to, buckets) -> Vec<Bucket>`
-/// - `process_detail(conn, user_id, session_id, proc_uid) -> Row`
-/// - `flow_buckets(conn, user_id, session_id, flow_id) -> Vec<Bucket>`
-/// - `traffic(conn, user_id, session_id, group_by, from, to, step) -> Series`
-/// - `dns_events(conn, user_id, session_id, filter, cursor, limit) -> Page`
-/// - `timeline_histogram(conn, user_id, session_id, filter, from, to, buckets) -> Vec<Bucket>`
-/// - `process_detail(conn, user_id, session_id, proc_uid) -> Row`
-///
-/// `files`, `around`, and `search` are wired to the functions `aw-store` exports.
+/// Every method is backed by a function `aw-store` exports. A session the
+/// caller cannot see is `Ok(None)`, which the route turns into 404.
 pub trait SessionQuery {
     /// `GET /sessions`.
     fn list_sessions(
@@ -191,7 +179,7 @@ pub trait SessionQuery {
         sid: &str,
     ) -> Result<Option<SessionSummary>, QueryBackendError>;
 
-    /// `PATCH /sessions/{sid}`. No exported update function yet.
+    /// `PATCH /sessions/{sid}`.
     fn patch_session(
         &self,
         user_id: &str,
@@ -200,10 +188,10 @@ pub trait SessionQuery {
         pinned: Option<bool>,
     ) -> Result<Option<()>, QueryBackendError>;
 
-    /// `DELETE /sessions/{sid}`. No exported delete function yet.
+    /// `DELETE /sessions/{sid}`.
     fn delete_session(&self, user_id: &str, sid: &str) -> Result<Option<()>, QueryBackendError>;
 
-    /// `POST /sessions/{sid}/stop`. No exported stop function yet.
+    /// `POST /sessions/{sid}/stop`.
     fn stop_session(&self, user_id: &str, sid: &str) -> Result<Option<()>, QueryBackendError>;
 
     /// `GET /sessions/{sid}/timeline`.
@@ -299,6 +287,21 @@ pub trait SessionQuery {
 
     /// `GET /db/stats`.
     fn db_stats(&self, user_id: &str, admin: bool) -> Result<serde_json::Value, QueryBackendError>;
+
+    /// `POST /db/purge`. Admin only; the route has already checked that.
+    fn db_purge(
+        &self,
+        user_id: &str,
+        admin: bool,
+        older_than_ns: Option<i64>,
+        all: bool,
+    ) -> Result<serde_json::Value, QueryBackendError>;
+
+    /// `POST /db/vacuum`. Admin only.
+    fn db_vacuum(&self, user_id: &str, admin: bool) -> Result<serde_json::Value, QueryBackendError>;
+
+    /// `POST /db/migrate`. Admin only.
+    fn db_migrate(&self, user_id: &str, admin: bool) -> Result<serde_json::Value, QueryBackendError>;
 }
 
 /// Default backend. Opens a short-lived [`Store`] per call so the writer is
@@ -349,15 +352,39 @@ impl StoreQuery {
         Store::open(path).map(Some).map_err(map_store)
     }
 
-    fn session_id(&self, sid: &str) -> Result<Option<i64>, QueryBackendError> {
+    /// Integer id already remembered for `sid`. A numeric `sid` is the id itself.
+    ///
+    /// A miss is `Ok(None)`, not an error: the caller has a connection and asks
+    /// `aw-store` before deciding the session is absent.
+    fn remembered(&self, sid: &str) -> Option<i64> {
         if let Ok(id) = sid.parse::<i64>() {
-            return Ok(Some(id));
+            return Some(id);
         }
         let guard = match self.ids.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        Ok(guard.get(sid))
+        guard.get(sid)
+    }
+
+    /// Integer id for `sid`. A public id that is not in [`IdMap`] is looked up
+    /// and remembered. `Ok(None)` when the store has no such session for this
+    /// user — that is "not found", not a guessed id.
+    fn resolve_id(
+        &self,
+        store: &Store,
+        user_id: &str,
+        sid: &str,
+    ) -> Result<Option<i64>, QueryBackendError> {
+        if let Some(id) = self.remembered(sid) {
+            return Ok(Some(id));
+        }
+        let found =
+            session_by_public_id(store.connection(), user_id, sid).map_err(map_query)?;
+        if let Some(id) = found {
+            self.remember(sid, id);
+        }
+        Ok(found)
     }
 }
 
@@ -419,29 +446,48 @@ impl SessionQuery for StoreQuery {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
-        let Some(id) = self.session_id(sid)? else {
-            // No exported public_id lookup. Do not guess.
-            return Err(missing("session_by_public_id"));
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
         };
         session_summary(store.connection(), user_id, id).map_err(map_query)
     }
 
     fn patch_session(
         &self,
-        _user_id: &str,
-        _sid: &str,
-        _name: Option<&str>,
-        _pinned: Option<bool>,
+        user_id: &str,
+        sid: &str,
+        name: Option<&str>,
+        pinned: Option<bool>,
     ) -> Result<Option<()>, QueryBackendError> {
-        Err(missing("patch_session"))
+        let Some(store) = self.open()? else {
+            return Ok(None);
+        };
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
+        };
+        patch_session(store.connection(), user_id, id, name, pinned).map_err(map_query)
     }
 
-    fn delete_session(&self, _user_id: &str, _sid: &str) -> Result<Option<()>, QueryBackendError> {
-        Err(missing("delete_session"))
+    fn delete_session(&self, user_id: &str, sid: &str) -> Result<Option<()>, QueryBackendError> {
+        let Some(store) = self.open()? else {
+            return Ok(None);
+        };
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
+        };
+        delete_session(store.connection(), user_id, id).map_err(map_query)
     }
 
-    fn stop_session(&self, _user_id: &str, _sid: &str) -> Result<Option<()>, QueryBackendError> {
-        Err(missing("stop_session"))
+    fn stop_session(&self, user_id: &str, sid: &str) -> Result<Option<()>, QueryBackendError> {
+        let Some(store) = self.open()? else {
+            return Ok(None);
+        };
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
+        };
+        // Wall clock of the user action, not an observation time.
+        let ended_ns = unix_now_ns();
+        stop_session(store.connection(), user_id, id, ended_ns).map_err(map_query)
     }
 
     fn timeline(
@@ -453,8 +499,8 @@ impl SessionQuery for StoreQuery {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
-        let Some(id) = self.session_id(sid)? else {
-            return Err(missing("session_by_public_id"));
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
         };
         let cursor = parse_cursor(query.cursor.as_deref())?;
         let q = TimelineQuery {
@@ -469,11 +515,36 @@ impl SessionQuery for StoreQuery {
 
     fn histogram(
         &self,
-        _user_id: &str,
-        _sid: &str,
-        _query: &ListQuery,
+        user_id: &str,
+        sid: &str,
+        query: &ListQuery,
     ) -> Result<Option<serde_json::Value>, QueryBackendError> {
-        Err(missing("timeline_histogram"))
+        let Some(store) = self.open()? else {
+            return Ok(None);
+        };
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
+        };
+        let buckets = query.buckets.unwrap_or(60).max(1);
+        let rows = timeline_histogram(
+            store.connection(),
+            user_id,
+            id,
+            query.from_ns,
+            query.to_ns,
+            buckets,
+        )
+        .map_err(map_query)?;
+        Ok(rows.map(|rows| {
+            serde_json::json!({
+                "buckets": rows.iter().map(|bucket| serde_json::json!({
+                    "start_ns": bucket.start_ns,
+                    "end_ns": bucket.end_ns,
+                    "count": bucket.count,
+                    "gap": bucket.gap,
+                })).collect::<Vec<_>>(),
+            })
+        }))
     }
 
     fn processes(
@@ -485,8 +556,8 @@ impl SessionQuery for StoreQuery {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
-        let Some(id) = self.session_id(sid)? else {
-            return Err(missing("session_by_public_id"));
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
         };
         let tree = process_tree(store.connection(), user_id, id).map_err(map_query)?;
         Ok(tree.map(|nodes| serde_json::json!({ "processes": nodes_json(&nodes) })))
@@ -494,11 +565,29 @@ impl SessionQuery for StoreQuery {
 
     fn process_detail(
         &self,
-        _user_id: &str,
-        _sid: &str,
-        _proc_uid_hex: &str,
+        user_id: &str,
+        sid: &str,
+        proc_uid_hex: &str,
     ) -> Result<Option<serde_json::Value>, QueryBackendError> {
-        Err(missing("process_detail"))
+        let proc_uid = parse_proc_uid(proc_uid_hex)?;
+        let Some(store) = self.open()? else {
+            return Ok(None);
+        };
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
+        };
+        let detail = process_detail(store.connection(), user_id, id, proc_uid).map_err(map_query)?;
+        let Some(detail) = detail else {
+            return Ok(None);
+        };
+        // `children` on the detail is a list of uids. The UI reads
+        // `ProcessNode[]`, so each child is taken from the session tree.
+        let tree = process_tree(store.connection(), user_id, id).map_err(map_query)?;
+        let children = match tree {
+            Some(nodes) => child_nodes(&nodes, &detail.children),
+            None => Vec::new(),
+        };
+        Ok(Some(process_detail_json(&detail, &children)))
     }
 
     fn files(
@@ -522,8 +611,8 @@ impl SessionQuery for StoreQuery {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
-        let Some(id) = self.session_id(sid)? else {
-            return Err(missing("session_by_public_id"));
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
         };
         let expr = store_expr(query.filter.as_deref())?;
         let cursor = parse_cursor(query.cursor.as_deref())?;
@@ -549,8 +638,8 @@ impl SessionQuery for StoreQuery {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
-        let Some(id) = self.session_id(sid)? else {
-            return Err(missing("session_by_public_id"));
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
         };
         let q = FlowQuery {
             filter: query.filter.as_deref(),
@@ -565,29 +654,89 @@ impl SessionQuery for StoreQuery {
 
     fn flow_buckets(
         &self,
-        _user_id: &str,
-        _sid: &str,
-        _flow_id: i64,
+        user_id: &str,
+        sid: &str,
+        flow_id: i64,
     ) -> Result<Option<serde_json::Value>, QueryBackendError> {
-        Err(missing("flow_buckets"))
+        let Some(store) = self.open()? else {
+            return Ok(None);
+        };
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
+        };
+        let rows = flow_buckets(store.connection(), user_id, id, flow_id).map_err(map_query)?;
+        Ok(rows.map(|rows| {
+            serde_json::json!({
+                "buckets": rows.iter().map(|bucket| serde_json::json!({
+                    "bucket_ns": bucket.bucket_ns,
+                    "bytes_up": bucket.bytes_up,
+                    "bytes_down": bucket.bytes_down,
+                    "evidence": bucket.evidence,
+                })).collect::<Vec<_>>(),
+            })
+        }))
     }
 
     fn traffic(
         &self,
-        _user_id: &str,
-        _sid: &str,
-        _query: &ListQuery,
+        user_id: &str,
+        sid: &str,
+        query: &ListQuery,
     ) -> Result<Option<serde_json::Value>, QueryBackendError> {
-        Err(missing("traffic"))
+        let Some(store) = self.open()? else {
+            return Ok(None);
+        };
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
+        };
+        // `step` is a duration. Absent means 5s, the same default the store uses
+        // when the step is zero.
+        let step_ns = match query.step.as_deref() {
+            None => 5_000_000_000,
+            Some(_) => parse_step_ns(query.step.as_deref())?,
+        };
+        let rows = traffic(
+            store.connection(),
+            user_id,
+            id,
+            query.from_ns,
+            query.to_ns,
+            step_ns,
+        )
+        .map_err(map_query)?;
+        Ok(rows.map(traffic_json))
     }
 
     fn dns(
         &self,
-        _user_id: &str,
-        _sid: &str,
-        _query: &ListQuery,
+        user_id: &str,
+        sid: &str,
+        query: &ListQuery,
     ) -> Result<Option<serde_json::Value>, QueryBackendError> {
-        Err(missing("dns_events"))
+        let Some(store) = self.open()? else {
+            return Ok(None);
+        };
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
+        };
+        let cursor = parse_cursor(query.cursor.as_deref())?;
+        let page = dns_events(
+            store.connection(),
+            user_id,
+            id,
+            query.from_ns,
+            query.to_ns,
+            Some(query.limit),
+            cursor,
+        )
+        .map_err(map_query)?;
+        Ok(page.map(|page| {
+            let next_cursor = page.next.as_ref().map(|c| format!("{},{}", c.ts_ns, c.id));
+            serde_json::json!({
+                "dns": page.rows.iter().map(dns_json).collect::<Vec<_>>(),
+                "next_cursor": next_cursor,
+            })
+        }))
     }
 
     fn gaps(
@@ -598,8 +747,8 @@ impl SessionQuery for StoreQuery {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
-        let Some(id) = self.session_id(sid)? else {
-            return Err(missing("session_by_public_id"));
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
         };
         let rows = gaps(store.connection(), user_id, id).map_err(map_query)?;
         Ok(rows.map(|rows| {
@@ -628,8 +777,8 @@ impl SessionQuery for StoreQuery {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
-        let Some(id) = self.session_id(sid)? else {
-            return Err(missing("session_by_public_id"));
+        let Some(id) = self.resolve_id(&store, user_id, sid)? else {
+            return Ok(None);
         };
         let page = around(
             store.connection(),
@@ -744,10 +893,111 @@ impl SessionQuery for StoreQuery {
             })),
         }))
     }
+
+    fn db_purge(
+        &self,
+        _user_id: &str,
+        admin: bool,
+        older_than_ns: Option<i64>,
+        all: bool,
+    ) -> Result<serde_json::Value, QueryBackendError> {
+        if !admin {
+            return Err(QueryBackendError::BadArgument {
+                name: "caller".to_owned(),
+                expected: "an administrator".to_owned(),
+            });
+        }
+        // The route rejects a body that names neither. Both together is `all`:
+        // it is the wider of the two and does not silently narrow.
+        let scope = if all {
+            PurgeScope::All
+        } else if let Some(ended_before_ns) = older_than_ns {
+            PurgeScope::OlderThan { ended_before_ns }
+        } else {
+            return Err(QueryBackendError::BadArgument {
+                name: "body".to_owned(),
+                expected: "older_than or all".to_owned(),
+            });
+        };
+        let mut store = self.open_mut()?;
+        let path = self.db_path.clone().ok_or_else(missing_db)?;
+        let mut retention = Retention::new(&mut store, &path, RetentionConfig::default());
+        let reports = retention.purge(scope).map_err(map_store)?;
+        Ok(serde_json::json!({
+            "purged": reports.iter().map(|report| serde_json::json!({
+                "public_id": report.public_id,
+                "session_id": report.session_id,
+                "reason": purge_reason(report.reason),
+                "deleted_ns": report.deleted_ns,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
+    fn db_vacuum(
+        &self,
+        _user_id: &str,
+        admin: bool,
+    ) -> Result<serde_json::Value, QueryBackendError> {
+        if !admin {
+            return Err(QueryBackendError::BadArgument {
+                name: "caller".to_owned(),
+                expected: "an administrator".to_owned(),
+            });
+        }
+        let mut store = self.open_mut()?;
+        let path = self.db_path.clone().ok_or_else(missing_db)?;
+        // Deletes nothing: `vacuum` only returns already-freed pages and
+        // truncates the WAL. This crate does not name `rusqlite`, so the
+        // pragma runs inside `aw-store`.
+        let mut retention = Retention::new(&mut store, &path, RetentionConfig::default());
+        retention.vacuum().map_err(map_store)?;
+        Ok(serde_json::json!({ "ok": true }))
+    }
+
+    fn db_migrate(
+        &self,
+        _user_id: &str,
+        admin: bool,
+    ) -> Result<serde_json::Value, QueryBackendError> {
+        if !admin {
+            return Err(QueryBackendError::BadArgument {
+                name: "caller".to_owned(),
+                expected: "an administrator".to_owned(),
+            });
+        }
+        let mut store = self.open_mut()?;
+        aw_store::apply_file_schema(&mut store).map_err(map_store)?;
+        Ok(serde_json::json!({ "file_schema_version": aw_store::FILE_SCHEMA_VERSION }))
+    }
 }
 
-fn missing(what: &'static str) -> QueryBackendError {
-    QueryBackendError::Unimplemented { what }
+impl StoreQuery {
+    /// Open the database for a write. A missing file is created by `Store::open`,
+    /// unlike [`StoreQuery::open`], which treats absence as "no database".
+    fn open_mut(&self) -> Result<Store, QueryBackendError> {
+        let path = self.db_path.as_ref().ok_or_else(missing_db)?;
+        Store::open(path).map_err(map_store)
+    }
+}
+
+fn missing_db() -> QueryBackendError {
+    QueryBackendError::Store("no database configured".to_owned())
+}
+
+fn purge_reason(reason: aw_store::PurgeReason) -> &'static str {
+    match reason {
+        aw_store::PurgeReason::Age => "age",
+        aw_store::PurgeReason::Size => "size",
+        aw_store::PurgeReason::OlderThan => "older_than",
+        aw_store::PurgeReason::All => "all",
+    }
+}
+
+fn unix_now_ns() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
 }
 
 fn map_query(err: QueryError) -> QueryBackendError {
@@ -786,26 +1036,40 @@ fn map_store(err: StoreError) -> QueryBackendError {
     QueryBackendError::Store(err.to_string())
 }
 
+/// `step` uses the same `<n>`, `<n>s`, `<n>ms`, `<n>ns` forms as `window`.
+fn parse_step_ns(raw: Option<&str>) -> Result<i64, QueryBackendError> {
+    parse_duration_ns(raw, "step")
+}
+
 fn parse_window_ns(raw: Option<&str>) -> Result<i64, QueryBackendError> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         // api-and-cli default window is 10s.
         return Ok(10 * 1_000_000_000);
     };
-    let (num, unit) = raw.split_at(raw.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(raw.len()));
-    let n = num.parse::<i64>().map_err(|_| QueryBackendError::BadArgument {
-        name: "window".to_owned(),
+    parse_duration_ns(Some(raw), "window")
+}
+
+fn parse_duration_ns(raw: Option<&str>, name: &str) -> Result<i64, QueryBackendError> {
+    let bad = || QueryBackendError::BadArgument {
+        name: name.to_owned(),
         expected: "<n>s|<n>ms|<n>ns".to_owned(),
-    })?;
+    };
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Err(bad());
+    };
+    let split = raw
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(raw.len());
+    let (num, unit) = raw.split_at(split);
+    let n = num.parse::<i64>().map_err(|_| bad())?;
+    if n < 0 {
+        return Err(bad());
+    }
     let scale: i64 = match unit {
         "" | "s" => 1_000_000_000,
         "ms" => 1_000_000,
         "ns" => 1,
-        _ => {
-            return Err(QueryBackendError::BadArgument {
-                name: "window".to_owned(),
-                expected: "<n>s|<n>ms|<n>ns".to_owned(),
-            })
-        }
+        _ => return Err(bad()),
     };
     Ok(n.saturating_mul(scale))
 }
@@ -829,6 +1093,117 @@ fn parse_cursor(raw: Option<&str>) -> Result<Option<Cursor>, QueryBackendError> 
         expected: "<ts_ns>,<id>".to_owned(),
     })?;
     Ok(Some(Cursor { ts_ns, id }))
+}
+
+/// Hex `proc_uid`. A bad string is a 400, not a lookup of uid 0.
+fn parse_proc_uid(hex: &str) -> Result<i64, QueryBackendError> {
+    let text = hex.trim();
+    let text = text.strip_prefix("0x").unwrap_or(text);
+    if text.is_empty() {
+        return Err(QueryBackendError::BadArgument {
+            name: "proc_uid".to_owned(),
+            expected: "hex proc uid".to_owned(),
+        });
+    }
+    u64::from_str_radix(text, 16)
+        .map(|uid| uid as i64)
+        .map_err(|_| QueryBackendError::BadArgument {
+            name: "proc_uid".to_owned(),
+            expected: "hex proc uid".to_owned(),
+        })
+}
+
+/// Direct children of `detail`, as the tree already shaped them.
+fn child_nodes(nodes: &[ProcessNode], child_uids: &[i64]) -> Vec<ProcessNode> {
+    let mut out = Vec::with_capacity(child_uids.len());
+    for uid in child_uids {
+        if let Some(node) = find_node(nodes, *uid) {
+            out.push(node.clone());
+        }
+    }
+    out
+}
+
+fn find_node(nodes: &[ProcessNode], proc_uid: i64) -> Option<&ProcessNode> {
+    for node in nodes {
+        if node.proc_uid == proc_uid {
+            return Some(node);
+        }
+        if let Some(found) = find_node(&node.children, proc_uid) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn process_detail_json(detail: &aw_store::ProcessDetail, children: &[ProcessNode]) -> serde_json::Value {
+    serde_json::json!({
+        "proc_uid": format!("{:x}", detail.proc_uid as u64),
+        "pid": detail.pid,
+        "parent_uid": detail.parent_uid.map(|id| format!("{id:x}")),
+        "ppid": detail.ppid,
+        "depth": detail.depth,
+        "start_ns": detail.start_ns,
+        "exit_ns": detail.exit_ns,
+        "exit_code": detail.exit_code,
+        "exit_signal": detail.exit_signal,
+        "how": detail.how,
+        "user_id": detail.user_id,
+        "signer": detail.signer,
+        "evidence": detail.evidence,
+        "field_evidence": detail.field_evidence,
+        "source": detail.source,
+        "agent": detail.agent,
+        "images": detail.images.iter().map(process_image_json).collect::<Vec<_>>(),
+        "children": nodes_json(children),
+    })
+}
+
+fn process_image_json(image: &aw_store::ProcessImage) -> serde_json::Value {
+    serde_json::json!({
+        "seq": image.seq,
+        "ts_ns": image.ts_ns,
+        "exe": image.exe,
+        "argv": image.argv,
+        "cwd": image.cwd,
+        "evidence": image.evidence,
+        "source": image.source,
+    })
+}
+
+/// `TrafficSeries`: one label per window, each direction a one-element array.
+/// A NULL sum stays NULL inside that array; it is not rewritten as 0.
+fn traffic_json(buckets: Vec<aw_store::TrafficBucket>) -> serde_json::Value {
+    let labels: Vec<String> = buckets.iter().map(|bucket| bucket.bucket_ns.to_string()).collect();
+    let points: Vec<serde_json::Value> = buckets
+        .iter()
+        .map(|bucket| {
+            serde_json::json!({
+                "start_ns": bucket.bucket_ns,
+                "values_up": [bucket.bytes_up],
+                "values_down": [bucket.bytes_down],
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "labels": labels,
+        "buckets": points,
+        "approximate": false,
+    })
+}
+
+fn dns_json(row: &aw_store::DnsEvent) -> serde_json::Value {
+    serde_json::json!({
+        "id": row.id,
+        "ts_ns": row.ts_ns,
+        "proc_uid": row.proc_uid.map(|id| format!("{id:x}")),
+        "qname": row.qname,
+        "qtype": row.qtype,
+        "rcode": row.rcode,
+        "answers": row.answers,
+        "evidence": row.evidence,
+        "source": row.source,
+    })
 }
 
 fn nodes_json(nodes: &[aw_store::ProcessNode]) -> Vec<serde_json::Value> {

@@ -241,16 +241,43 @@ impl LiveHub {
 
     /// Publish one already-redacted JSON record. Returns the sequence number.
     pub fn publish(&mut self, session_id: &str, json_body: &str) -> u64 {
+        self.push_at(session_id, json_body.to_owned())
+    }
+
+    /// Same as [`Self::publish`], but a JSON object gets `id` set to the sequence
+    /// this call returns. Callers that already chose their own body use [`Self::publish`].
+    fn publish_stamped(&mut self, session_id: &str, json_body: &str) -> u64 {
+        // Sequence is assigned inside `push_at`. Stamp with the next value, which
+        // is what `push_at` will store. The two agree because nothing else mutates
+        // `seq` between these lines.
+        let seq = self.seq.saturating_add(1);
+        self.push_at(session_id, stamp_id(seq, json_body))
+    }
+
+    fn push_at(&mut self, session_id: &str, body: String) -> u64 {
         self.seq = self.seq.saturating_add(1);
+        let seq = self.seq;
         let buf = self.buffers.entry(session_id.to_owned()).or_default();
-        buf.push_back(LiveRecord {
-            seq: self.seq,
-            body: json_body.to_owned(),
-        });
+        buf.push_back(LiveRecord { seq, body });
         while buf.len() > Self::CAP {
             buf.pop_front();
         }
-        self.seq
+        seq
+    }
+
+    /// Publish one [`aw_pipeline::Output`] as timeline records.
+    ///
+    /// One JSON body per business row. `flow_buckets` are rollups, not events, so
+    /// they are not published. Returns how many records were pushed. A row with no
+    /// session id is published under `fallback_session` when that is `Some`;
+    /// otherwise it is skipped and counted nowhere (it is not dropped silently —
+    /// the caller still holds the `Output`).
+    pub fn publish_output(
+        &mut self,
+        fallback_session: Option<&str>,
+        output: &aw_pipeline::Output,
+    ) -> u64 {
+        publish_output_into(self, fallback_session, output)
     }
 
     /// Records with `seq` strictly after `after`, plus whether the buffer no
@@ -262,6 +289,382 @@ impl LiveHub {
         let lagged = buf.front().is_some_and(|first| first.seq > after.saturating_add(1));
         let rows = buf.iter().filter(|row| row.seq > after).collect();
         (rows, lagged)
+    }
+}
+
+/// Publish `output` into `hub` under `session_id`.
+///
+/// The daemon's foreground runtime does not drain the pipeline yet, so nothing
+/// calls this. A later runtime that holds both the hub and a pipeline [`aw_pipeline::Output`]
+/// calls it once per flush. `session_id` is the live-route id (`s-1`), not the
+/// integer [`aw_core::SessionId`] on a row. A row is published under that id.
+///
+/// `flow_buckets` are not published. Argv, environment values, URLs, and headers
+/// are not fields of these records and are not read here.
+pub fn publish_output(
+    hub: &std::sync::Mutex<LiveHub>,
+    session_id: &str,
+    output: &aw_pipeline::Output,
+) -> u64 {
+    match hub.lock() {
+        Ok(mut guard) => guard.publish_output(Some(session_id), output),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .publish_output(Some(session_id), output),
+    }
+}
+
+fn publish_output_into(
+    hub: &mut LiveHub,
+    fallback_session: Option<&str>,
+    output: &aw_pipeline::Output,
+) -> u64 {
+    let mut n = 0u64;
+    for row in &output.processes {
+        if let Some(sid) = session_key(row.session_id, fallback_session) {
+            let _ = hub.publish_stamped(&sid, &proc_record(row));
+            n = n.saturating_add(1);
+        }
+    }
+    for row in &output.file_access {
+        if let Some(sid) = session_key(row.session_id, fallback_session) {
+            let _ = hub.publish_stamped(&sid, &file_record(row));
+            n = n.saturating_add(1);
+        }
+    }
+    for row in &output.net_flows {
+        if let Some(sid) = session_key(row.session_id, fallback_session) {
+            let _ = hub.publish_stamped(&sid, &net_record(row));
+            n = n.saturating_add(1);
+        }
+    }
+    for row in &output.dns {
+        if let Some(sid) = session_key(row.session_id, fallback_session) {
+            let _ = hub.publish_stamped(&sid, &dns_record(row));
+            n = n.saturating_add(1);
+        }
+    }
+    for row in &output.gaps {
+        if let Some(sid) = session_key(row.session_id, fallback_session) {
+            let _ = hub.publish_stamped(&sid, &gap_record(row));
+            n = n.saturating_add(1);
+        }
+    }
+    n
+}
+
+fn session_key(id: Option<aw_core::SessionId>, fallback: Option<&str>) -> Option<String> {
+    match id {
+        Some(id) => Some(id.0.to_string()),
+        None => fallback.map(str::to_owned),
+    }
+}
+
+/// Write `id` into a JSON object. Non-objects are returned unchanged so a caller
+/// that already built a body is not rewritten into something else.
+fn stamp_id(seq: u64, json_body: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(json_body) else {
+        return json_body.to_owned();
+    };
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("id".to_owned(), json!(seq));
+        return serde_json::to_string(&value).unwrap_or_else(|_| json_body.to_owned());
+    }
+    json_body.to_owned()
+}
+
+fn proc_record(row: &aw_pipeline::ProcessRec) -> String {
+    let mut fields = serde_json::Map::new();
+    fields.insert("pid".to_owned(), json!(row.pid));
+    fields.insert("ppid".to_owned(), opt_u32(row.ppid));
+    fields.insert("parent_uid".to_owned(), opt_proc(row.parent_uid));
+    fields.insert("depth".to_owned(), opt_u32(row.depth));
+    fields.insert("exit_ns".to_owned(), opt_u64(row.exit_ns));
+    fields.insert("exit_code".to_owned(), opt_i32(row.exit_code));
+    fields.insert("exit_signal".to_owned(), opt_i32(row.exit_signal));
+    fields.insert("how".to_owned(), json!(start_how_label(row.how)));
+    fields.insert("user_id".to_owned(), opt_string(row.user_id.as_deref()));
+    fields.insert("signer".to_owned(), opt_string(row.signer.as_deref()));
+    fields.insert("agent".to_owned(), opt_string(row.agent.as_deref()));
+    // No image, argv, or cwd on ProcessRec. The summary names the agent or the
+    // start kind, never a command line.
+    let summary = match row.agent.as_deref() {
+        Some(agent) if !agent.is_empty() => format!("process {agent}"),
+        _ => format!("process {}", start_how_label(row.how)),
+    };
+    timeline_body(
+        "proc",
+        row.start_ns,
+        &row.evidence,
+        &row.source,
+        Some(row.proc_uid),
+        &summary,
+        fields,
+    )
+}
+
+fn file_record(row: &aw_pipeline::FileAccessRec) -> String {
+    let mut fields = serde_json::Map::new();
+    fields.insert("op".to_owned(), json!(row.op));
+    fields.insert("path".to_owned(), json!(row.path));
+    fields.insert("path_to".to_owned(), opt_string(row.path_to.as_deref()));
+    fields.insert("access".to_owned(), opt_string(row.access.as_deref()));
+    fields.insert("last_ns".to_owned(), json!(row.last_ns));
+    fields.insert("opens".to_owned(), json!(row.opens));
+    fields.insert("reads".to_owned(), opt_u64(row.reads));
+    fields.insert("bytes_read".to_owned(), opt_u64(row.bytes_read));
+    fields.insert("writes".to_owned(), opt_u64(row.writes));
+    fields.insert("bytes_written".to_owned(), opt_u64(row.bytes_written));
+    fields.insert("created".to_owned(), opt_bool(row.created));
+    fields.insert("truncated".to_owned(), opt_bool(row.truncated));
+    fields.insert("modified".to_owned(), opt_bool(row.modified));
+    fields.insert("result".to_owned(), opt_i32(row.result));
+    fields.insert("partial".to_owned(), json!(row.partial));
+    fields.insert(
+        "sensitive_rule".to_owned(),
+        opt_string(row.sensitive_rule.as_deref()),
+    );
+    let summary = format!("{} {}", row.op, path_base(&row.path));
+    timeline_body(
+        "file",
+        row.first_ns,
+        &row.evidence,
+        &row.source,
+        row.proc_uid,
+        &summary,
+        fields,
+    )
+}
+
+fn net_record(row: &aw_pipeline::NetFlowRec) -> String {
+    let mut fields = serde_json::Map::new();
+    fields.insert("proto".to_owned(), opt_string(row.proto.as_deref()));
+    fields.insert("direction".to_owned(), opt_string(row.direction.as_deref()));
+    fields.insert("local_ip".to_owned(), opt_string(row.local_ip.as_deref()));
+    fields.insert("local_port".to_owned(), opt_u16(row.local_port));
+    fields.insert("remote_ip".to_owned(), opt_string(row.remote_ip.as_deref()));
+    fields.insert("remote_port".to_owned(), opt_u16(row.remote_port));
+    fields.insert("domain".to_owned(), opt_string(row.domain.as_deref()));
+    fields.insert(
+        "domain_source".to_owned(),
+        opt_string(row.domain_source.as_deref()),
+    );
+    fields.insert("sni".to_owned(), opt_string(row.sni.as_deref()));
+    fields.insert("bytes_up".to_owned(), opt_u64(row.bytes_up));
+    fields.insert("bytes_down".to_owned(), opt_u64(row.bytes_down));
+    fields.insert("end_ns".to_owned(), opt_u64(row.end_ns));
+    fields.insert("via_proxy".to_owned(), json!(row.via_proxy));
+    fields.insert("partial".to_owned(), json!(row.partial));
+    fields.insert("flow_id".to_owned(), opt_u64(row.flow_id));
+    // Domain or remote endpoint. No URL is stored on NetFlowRec.
+    let summary = match row.domain.as_deref() {
+        Some(domain) if !domain.is_empty() => format!("flow {domain}"),
+        _ => match (row.remote_ip.as_deref(), row.remote_port) {
+            (Some(ip), Some(port)) => format!("flow {ip}:{port}"),
+            (Some(ip), None) => format!("flow {ip}"),
+            _ => "flow".to_owned(),
+        },
+    };
+    timeline_body(
+        "net",
+        row.start_ns,
+        &row.evidence,
+        &row.source,
+        row.proc_uid,
+        &summary,
+        fields,
+    )
+}
+
+fn dns_record(row: &aw_pipeline::DnsRec) -> String {
+    let mut fields = serde_json::Map::new();
+    fields.insert("qname".to_owned(), json!(row.qname));
+    fields.insert("qtype".to_owned(), json!(row.qtype));
+    fields.insert("rcode".to_owned(), opt_u16(row.rcode));
+    fields.insert("answers".to_owned(), json!(row.answers));
+    fields.insert("ttl_min".to_owned(), opt_u32(row.ttl_min));
+    fields.insert("server".to_owned(), opt_string(row.server.as_deref()));
+    let summary = if row.qname.is_empty() {
+        "dns".to_owned()
+    } else {
+        format!("dns {}", row.qname)
+    };
+    timeline_body(
+        "dns",
+        row.ts_ns,
+        &row.evidence,
+        &row.source,
+        row.proc_uid,
+        &summary,
+        fields,
+    )
+}
+
+fn gap_record(row: &aw_pipeline::GapRec) -> String {
+    let mut fields = serde_json::Map::new();
+    let kind = gap_kind_label(row.gap_kind);
+    fields.insert("gap_kind".to_owned(), json!(kind));
+    fields.insert("collector".to_owned(), json!(row.collector.as_str()));
+    fields.insert("affects".to_owned(), json!(row.affects));
+    fields.insert("from_mono_ns".to_owned(), json!(row.from_mono_ns));
+    fields.insert("to_mono_ns".to_owned(), json!(row.to_mono_ns));
+    fields.insert("count".to_owned(), opt_u64(row.count));
+    fields.insert("detail".to_owned(), opt_string(row.detail.as_deref()));
+    let summary = match row.detail.as_deref() {
+        Some(detail) if !detail.is_empty() => format!("gap {kind}: {detail}"),
+        _ => format!("gap {kind}"),
+    };
+    timeline_body(
+        "gap",
+        row.ts_mono_ns,
+        &row.evidence,
+        &row.source,
+        row.proc.as_ref().map(|proc| proc.uid),
+        &summary,
+        fields,
+    )
+}
+
+/// TimelineItem shape the UI parses for an SSE `record` event. `id` is `0` here
+/// and replaced with the hub sequence before the body is stored.
+fn timeline_body(
+    kind: &str,
+    ts_ns: u64,
+    evidence: &aw_core::Evidence,
+    source: &aw_core::Source,
+    proc_uid: Option<aw_core::ProcUid>,
+    summary: &str,
+    fields: serde_json::Map<String, Value>,
+) -> String {
+    let value = json!({
+        "kind": kind,
+        "id": 0,
+        "ts_ns": ts_ns,
+        "evidence": evidence_label(evidence),
+        "source": source.as_str(),
+        "proc_uid": proc_uid.map(|uid| format!("{:x}", uid.0)),
+        "summary": summary,
+        "fields": Value::Object(fields),
+    });
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn evidence_label(evidence: &aw_core::Evidence) -> String {
+    match evidence {
+        aw_core::Evidence::E1 => "E1".to_owned(),
+        aw_core::Evidence::E2 => "E2".to_owned(),
+        aw_core::Evidence::E3 => "E3".to_owned(),
+        aw_core::Evidence::S => "S".to_owned(),
+        aw_core::Evidence::I => "I".to_owned(),
+        aw_core::Evidence::NA(reason) => format!("NA({})", na_reason_label(reason)),
+    }
+}
+
+fn na_reason_label(reason: &aw_core::NaReason) -> &'static str {
+    match reason {
+        aw_core::NaReason::EsNoReadEvent => "es_no_read_event",
+        aw_core::NaReason::MmapNotObservable => "mmap_not_observable",
+        aw_core::NaReason::TlsNoProxy => "tls_no_proxy",
+        aw_core::NaReason::DirectBypassProxy => "direct_bypass_proxy",
+        aw_core::NaReason::CertPinned => "cert_pinned",
+        aw_core::NaReason::Quic => "quic",
+        aw_core::NaReason::Ech => "ech",
+        aw_core::NaReason::NoDnsObserved => "no_dns_observed",
+        aw_core::NaReason::Preexisting => "preexisting",
+        aw_core::NaReason::CollectorUnavailable => "collector_unavailable",
+        aw_core::NaReason::Redacted => "redacted",
+        aw_core::NaReason::AttributionBreak => "attribution_break",
+        aw_core::NaReason::PartialClientHello => "partial_client_hello",
+        aw_core::NaReason::H2Hpack => "h2_hpack",
+        aw_core::NaReason::TooLarge => "too_large",
+        aw_core::NaReason::FileChanged => "file_changed",
+        aw_core::NaReason::PeerUnknown => "peer_unknown",
+        aw_core::NaReason::ProtocolNotObserved => "protocol_not_observed",
+        aw_core::NaReason::Unknown => "unknown",
+    }
+}
+
+fn gap_kind_label(kind: aw_core::GapKind) -> &'static str {
+    match kind {
+        aw_core::GapKind::Dropped => "dropped",
+        aw_core::GapKind::LostByOs => "lost_by_os",
+        aw_core::GapKind::Restart => "restart",
+        aw_core::GapKind::RateLimited => "rate_limited",
+        aw_core::GapKind::Permission => "permission",
+        aw_core::GapKind::AttachWindow => "attach_window",
+        aw_core::GapKind::Unsupported => "unsupported",
+        aw_core::GapKind::ScopeRace => "scope_race",
+        aw_core::GapKind::CollectorDisconnected => "collector_disconnected",
+        aw_core::GapKind::SelfReportDropped => "self_report_dropped",
+        aw_core::GapKind::AttributionUnknown => "attribution_unknown",
+        aw_core::GapKind::CacheEvicted => "cache_evicted",
+        aw_core::GapKind::ParseError => "parse_error",
+        aw_core::GapKind::RuleStateEvicted => "rule_state_evicted",
+        aw_core::GapKind::Unknown => "unknown",
+    }
+}
+
+fn start_how_label(how: aw_core::StartHow) -> &'static str {
+    match how {
+        aw_core::StartHow::Fork => "fork",
+        aw_core::StartHow::Exec => "exec",
+        aw_core::StartHow::Spawn => "spawn",
+        aw_core::StartHow::Snapshot => "snapshot",
+        aw_core::StartHow::Unknown => "unknown",
+    }
+}
+
+/// Last path segment. A path is not argv and not a URL. An empty path stays empty.
+fn path_base(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn opt_string(value: Option<&str>) -> Value {
+    match value {
+        Some(text) => json!(text),
+        None => Value::Null,
+    }
+}
+
+fn opt_u64(value: Option<u64>) -> Value {
+    match value {
+        Some(n) => json!(n),
+        None => Value::Null,
+    }
+}
+
+fn opt_u32(value: Option<u32>) -> Value {
+    match value {
+        Some(n) => json!(n),
+        None => Value::Null,
+    }
+}
+
+fn opt_u16(value: Option<u16>) -> Value {
+    match value {
+        Some(n) => json!(n),
+        None => Value::Null,
+    }
+}
+
+fn opt_i32(value: Option<i32>) -> Value {
+    match value {
+        Some(n) => json!(n),
+        None => Value::Null,
+    }
+}
+
+fn opt_bool(value: Option<bool>) -> Value {
+    match value {
+        Some(flag) => json!(flag),
+        None => Value::Null,
+    }
+}
+
+fn opt_proc(value: Option<aw_core::ProcUid>) -> Value {
+    match value {
+        Some(uid) => json!(format!("{:x}", uid.0)),
+        None => Value::Null,
     }
 }
 
@@ -482,7 +885,9 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
         ("GET", "/api/v1/processes") => system_processes(req),
         ("POST", "/api/v1/sessions/run") => not_implemented("run"),
         ("GET", "/api/v1/db/stats") => db_stats(state, caller),
-        ("POST", "/api/v1/db/purge") => admin_or_501(caller, "db_purge"),
+        ("POST", "/api/v1/db/purge") => db_purge(state, caller, &req.body),
+        ("POST", "/api/v1/db/vacuum") => db_admin(state, caller, StoreOp::Vacuum),
+        ("POST", "/api/v1/db/migrate") => db_admin(state, caller, StoreOp::Migrate),
         ("PUT", "/api/v1/config") => put_config(state, caller, &req.body),
         ("GET", "/api/v1/config") => {
             ApiResponse::json(200, &json!({ "config": state.config_json }))
@@ -498,22 +903,115 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
     }
 }
 
-fn admin_or_501(caller: &Caller, op: &str) -> ApiResponse {
+/// Which admin store operation [`db_admin`] runs.
+enum StoreOp {
+    Vacuum,
+    Migrate,
+}
+
+/// `POST /db/purge`. A non-admin is 403. An admin purges.
+///
+/// The body is `{ "older_than"?: "<duration>", "all"?: bool }`. `older_than`
+/// is a duration (`30d`, `12h`, `30m`, or the `<n>s` / `<n>ms` / `<n>ns` forms),
+/// measured back from now. A body that names neither field is a 400.
+fn db_purge(state: &ApiState, caller: &Caller, body: &[u8]) -> ApiResponse {
+    if !caller_is_admin(caller) {
+        return forbidden();
+    }
+    let value: serde_json::Value = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        match serde_json::from_slice(body) {
+            Ok(value) => value,
+            Err(_) => return error_response(400, "bad_request", "purge body is not JSON"),
+        }
+    };
+    let all = value.get("all").and_then(serde_json::Value::as_bool);
+    let older = value.get("older_than").and_then(serde_json::Value::as_str);
+    if all.is_none() && older.is_none() {
+        return error_response(400, "bad_argument", "body: expected older_than or all");
+    }
+    let older_than_ns = match older {
+        None => None,
+        Some(text) => match older_than_cutoff_ns(text) {
+            Ok(ns) => Some(ns),
+            Err(response) => return response,
+        },
+    };
+    match state
+        .query
+        .db_purge(&caller.user_id, true, older_than_ns, all.unwrap_or(false))
+    {
+        Ok(value) => ApiResponse::json(200, &value),
+        Err(err) => from_backend(err),
+    }
+}
+
+/// `older_than` is how far back from now. The store wants the cutoff instant.
+fn older_than_cutoff_ns(text: &str) -> Result<i64, ApiResponse> {
+    let age = parse_age_ns(text).ok_or_else(|| {
+        error_response(
+            400,
+            "bad_argument",
+            "older_than: expected <n>d|<n>h|<n>m|<n>s|<n>ms|<n>ns",
+        )
+    })?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    Ok(now.saturating_sub(age))
+}
+
+fn parse_age_ns(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let split = raw.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(raw.len());
+    let (num, unit) = raw.split_at(split);
+    let n = num.parse::<i64>().ok()?;
+    if n < 0 {
+        return None;
+    }
+    let scale = match unit {
+        "" | "s" => 1_000_000_000,
+        "ms" => 1_000_000,
+        "ns" => 1,
+        "m" => 60 * 1_000_000_000,
+        "h" => 60 * 60 * 1_000_000_000,
+        "d" => 24 * 60 * 60 * 1_000_000_000,
+        _ => return None,
+    };
+    Some(n.saturating_mul(scale))
+}
+
+fn db_admin(state: &ApiState, caller: &Caller, op: StoreOp) -> ApiResponse {
+    if !caller_is_admin(caller) {
+        return forbidden();
+    }
+    let result = match op {
+        StoreOp::Vacuum => state.query.db_vacuum(&caller.user_id, true),
+        StoreOp::Migrate => state.query.db_migrate(&caller.user_id, true),
+    };
+    match result {
+        Ok(value) => ApiResponse::json(200, &value),
+        Err(err) => from_backend(err),
+    }
+}
+
+fn caller_is_admin(caller: &Caller) -> bool {
     let input = AuthInput {
         http: false,
         host: None,
         listen_port: 0,
         authorization: None,
         caller: Some(caller.clone()),
-        operation: op.to_owned(),
+        operation: "db_purge".to_owned(),
         session_owner: None,
         target_process_owner: None,
     };
-    match authorize(&input) {
-        AuthDecision::Allow(_) => not_implemented(op),
-        AuthDecision::Forbidden => forbidden(),
-        AuthDecision::Misdirected | AuthDecision::Unauthorized => unauthorized(),
-    }
+    matches!(authorize(&input), AuthDecision::Allow(_))
 }
 
 fn session_sub(

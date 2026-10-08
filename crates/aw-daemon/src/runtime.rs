@@ -35,6 +35,7 @@ use tracing::{Event, Level, Subscriber};
 use tracing_core::span::{Attributes, Id, Record};
 use tracing_core::Metadata;
 
+use crate::api::{ApiState, HttpServer, StoreQuery, DEFAULT_HTTP_PORT};
 use crate::config::{resolve_data_dir, ConfigWarning, DaemonConfig};
 use crate::paths::ensure_data_dir;
 
@@ -465,12 +466,30 @@ pub fn run_foreground(
     let stop = StopFlag::new();
     let batcher = Batcher::spawn(Arc::clone(&stop));
 
+    // Loopback only. `HttpServer::bind` refuses anything else. A port that is
+    // already taken is a warning: the daemon keeps running without HTTP.
+    let mut http = match HttpServer::bind(DEFAULT_HTTP_PORT, foreground_api(config, &data_dir)) {
+        Ok(server) => {
+            tracing::info!(port = server.addr.port(), "http listener started");
+            Some(server)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "http listener not started");
+            None
+        }
+    };
+
     while !stop.is_set() {
         if stop_path.is_file() {
             stop.request();
             break;
         }
         thread::sleep(POLL);
+    }
+
+    stop.request();
+    if let Some(server) = http.as_mut() {
+        server.shutdown();
     }
 
     // Order is part of the acceptance test. Do not reorder these lines.
@@ -482,6 +501,43 @@ pub fn run_foreground(
     tracing::info!("{}", SHUTDOWN_CLOSE_STORE);
     drop(lock);
     Ok(())
+}
+
+/// API state for the foreground listener: the data-dir database, the loaded
+/// config, and no in-memory sessions.
+fn foreground_api(config: &DaemonConfig, data_dir: &Path) -> ApiState {
+    let mut state = ApiState::default();
+    state.sessions.clear();
+    state.query = StoreQuery::open_path(data_dir.join("agentwatch.db"));
+    state.config_json = config_snapshot(config);
+    state
+}
+
+/// Non-secret view of the loaded config. No paths: the data directory can
+/// contain a user name, and the startup log already recorded it.
+fn config_snapshot(config: &DaemonConfig) -> serde_json::Value {
+    serde_json::json!({
+        "retention": {
+            "max_db_size_mb": config.retention.max_db_size_mb,
+            "max_age_days": config.retention.max_age_days,
+        },
+        "proxy": {
+            "on_tls_reject": match config.proxy.on_tls_reject {
+                crate::config::TlsReject::Fail => "fail",
+                crate::config::TlsReject::Tunnel => "tunnel",
+            },
+            "max_hash_body": config.proxy.max_hash_body,
+        },
+        "collectors": {
+            "windows": { "sni": config.collectors.windows.sni },
+            "linux": {
+                "tls_uprobe": config.collectors.linux.tls_uprobe,
+                "ipc_payload_peek": config.collectors.linux.ipc_payload_peek,
+            },
+        },
+        "correlation": { "max_hash_file_size": config.correlation.max_hash_file_size },
+        "debug": { "keep_raw_events": config.debug.keep_raw_events },
+    })
 }
 
 /// Install the process-wide file subscriber. Call once per process.

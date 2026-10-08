@@ -21,13 +21,13 @@ use aw_core::{
 use super::path::{join_cwd, CwdLookup, PathJoin};
 use super::record::{
     OpenIn, PendingIn, ACCESS_EXEC, ACCESS_READ, ACCESS_READ_WRITE, ACCESS_WRITE, CREATED,
-    CREATED_UNKNOWN, DST_TRUNCATED, D_PATH_DENIED, END_FILE, END_SOCKET, FD_OTHER, FD_PIPE,
-    FD_REGULAR, FD_SOCKET, FLUSH_LEN, HAS_ACCESS, HAS_DIRFD, HAS_DST, HAS_FD, HAS_PATH, HAS_RESULT,
-    IS_DIR, IS_DIR_UNKNOWN, KIND_CLOSE, KIND_CREATE, KIND_DELETE, KIND_EXIT_FLUSH, KIND_MMAP,
-    KIND_OPEN, KIND_RENAME, KIND_TRANSFER, OPEN_HEADER_LEN, PATH_CAP, PATH_D_PATH, PATH_DENTRY,
-    PATH_PROC_FD, PATH_RESOLVED, PATH_TRUNCATED, PATH_USER, PENDING_MAP_FULL, PENDING_RING_FULL,
-    RECORD_OPEN, RECORD_RW, TRANSFER_LEN, TRUNCATED, TRUNCATED_UNKNOWN, WHICH_COPY_FILE_RANGE,
-    WHICH_MMAP, WHICH_SENDFILE, WHICH_SPLICE, END_NONE, END_PIPE,
+    CREATED_UNKNOWN, DST_TRUNCATED, D_PATH_DENIED, END_FILE, END_NONE, END_PIPE, END_SOCKET,
+    FD_OTHER, FD_PIPE, FD_REGULAR, FD_SOCKET, FLUSH_LEN, HAS_ACCESS, HAS_DIRFD, HAS_DST, HAS_FD,
+    HAS_PATH, HAS_RESULT, IS_DIR, IS_DIR_UNKNOWN, KIND_CLOSE, KIND_CREATE, KIND_DELETE,
+    KIND_EXIT_FLUSH, KIND_MMAP, KIND_OPEN, KIND_RENAME, KIND_TRANSFER, OPEN_HEADER_LEN, PATH_CAP,
+    PATH_DENTRY, PATH_D_PATH, PATH_PROC_FD, PATH_RESOLVED, PATH_TRUNCATED, PATH_USER,
+    PENDING_MAP_FULL, PENDING_RING_FULL, RECORD_OPEN, RECORD_RW, TRANSFER_LEN, TRUNCATED,
+    TRUNCATED_UNKNOWN, WHICH_COPY_FILE_RANGE, WHICH_MMAP, WHICH_SENDFILE, WHICH_SPLICE,
 };
 
 /// `linux.ebpf/lsm_file_open`.
@@ -255,12 +255,7 @@ pub fn pending_gap(pending: &PendingIn) -> Option<RawEvent> {
 /// (linux.md §2.2). The byte counters are `NA(preexisting)`: the collector
 /// did not see the reads and writes that already happened. This is not a
 /// zero.
-pub fn pre_existing_fd(
-    ctx: DecodeOutcome<'_>,
-    fd: u32,
-    path: &FdPathRead,
-    kind: u8,
-) -> RawEvent {
+pub fn pre_existing_fd(ctx: DecodeOutcome<'_>, fd: u32, path: &FdPathRead, kind: u8) -> RawEvent {
     let (path_text, path_ev) = match path {
         FdPathRead::Known(known) => (Some(known.path.clone()), known.evidence.clone()),
         FdPathRead::Unknown => (None, Evidence::NA(NaReason::CollectorUnavailable)),
@@ -409,7 +404,13 @@ fn decode_flush(
     let mut seq = ctx.seq;
     let mut events = Vec::new();
     if regular && totals_known && reads > 0 {
-        let read = FileRead::new(handle, path.clone(), Some(bytes_read), None, Some(IoVia::Syscall));
+        let read = FileRead::new(
+            handle,
+            path.clone(),
+            Some(bytes_read),
+            None,
+            Some(IoVia::Syscall),
+        );
         let mut event = event_at(
             ts,
             ctx,
@@ -438,11 +439,7 @@ fn decode_flush(
         events.push(event);
         seq += 1;
     }
-    let modified = if totals_known {
-        Some(writes > 0)
-    } else {
-        None
-    };
+    let modified = if totals_known { Some(writes > 0) } else { None };
     let close = FileClose::new(handle, path.clone(), modified);
     let mut event = event_at(
         ts,
@@ -957,9 +954,7 @@ fn parse_open(bytes: &[u8]) -> Result<OpenIn, FileDecodeError> {
         return Err(FileDecodeError::TruncatedRecord);
     }
     let path = if flags & HAS_PATH != 0 {
-        Some(utf8(
-            &bytes[OPEN_HEADER_LEN..OPEN_HEADER_LEN + path_len],
-        )?)
+        Some(utf8(&bytes[OPEN_HEADER_LEN..OPEN_HEADER_LEN + path_len])?)
     } else {
         None
     };
@@ -1088,4 +1083,3 @@ fn get_u64(bytes: &[u8], at: usize) -> u64 {
         bytes[at + 7],
     ])
 }
-

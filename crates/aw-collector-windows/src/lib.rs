@@ -25,6 +25,10 @@ pub mod file_map;
 #[cfg(target_os = "windows")]
 pub mod peb;
 pub mod scope;
+/// Pktmon SNI skeleton (P3-WIN-01). Pure classification plus a capture handle
+/// that refuses to start: pktmon's real-time payload is still 【待验证】.
+/// No ETW session is opened here. Compiles on every target; it does not call Win32.
+pub mod sni;
 
 #[cfg(target_os = "windows")]
 pub use etw::trace::Session as WindowsCollector;

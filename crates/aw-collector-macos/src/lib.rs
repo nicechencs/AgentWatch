@@ -16,6 +16,7 @@ mod eslogger;
 mod nettop;
 mod pktap;
 mod scope;
+mod sni;
 
 #[cfg(target_os = "macos")]
 mod endpoint_security;
@@ -41,3 +42,11 @@ pub use scope::{
     attach_snapshot, on_attribution, on_fork, on_unknown_pid, ChildList, ForkParent, ScopeAction,
     ScopeSet, SnapshotError, LAUNCHD_PID, LINK_BROKEN_NOTE, PENDING_HOLD,
 };
+pub use sni::{
+    handshake_sni, pid_in_session, unattributed_dns, GapNote, GapReason, SniError, UnattributedDns,
+    DNS_UNATTRIBUTED, EVIDENCE_INFERRED, MDNS_RESPONDER as SNI_MDNS_RESPONDER, SOURCE_PKTAP_SNI,
+    TCPDUMP_ARGS, TCPDUMP_BIN, UNATTRIBUTED_REASON,
+};
+
+#[cfg(target_os = "macos")]
+pub use sni::PktapSni;

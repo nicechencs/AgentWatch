@@ -352,8 +352,11 @@ impl Consumer {
             Some(FileOp::Close) => {
                 EventKind::FileClose(aw_core::FileClose::new(props.file_object, None, None))
             }
-            Some(FileOp::Read) | Some(FileOp::Write) | Some(FileOp::NameCreate)
-            | Some(FileOp::NameDelete) | None => {
+            Some(FileOp::Read)
+            | Some(FileOp::Write)
+            | Some(FileOp::NameCreate)
+            | Some(FileOp::NameDelete)
+            | None => {
                 return Vec::new();
             }
         };
@@ -453,9 +456,7 @@ fn provider_affects(provider: &super::trace::ProviderId) -> &'static str {
         provider.data4[7],
     );
     match session::classify_provider(&guid) {
-        session::ProviderClass::P1
-            if guid.eq_ignore_ascii_case(session::KERNEL_PROCESS_GUID) =>
-        {
+        session::ProviderClass::P1 if guid.eq_ignore_ascii_case(session::KERNEL_PROCESS_GUID) => {
             "proc"
         }
         session::ProviderClass::P1 if guid.eq_ignore_ascii_case(session::DNS_CLIENT_GUID) => "dns",

@@ -103,6 +103,8 @@ ETW 不提供 TLS 载荷。可选方案：
 2. **WinDivert**（SNIFF 模式）：需要携带一个已签名驱动，许可证是 LGPLv3/GPLv2 双授权，作为可选组件。
 3. 不采集 SNI，只用 DNS 回填域名（这是 P1 的默认做法）。
 
+P3-WIN-01（2026-10-08）没有在本机或 CI 上订阅 `Microsoft-Windows-PktMon`，也没有跑 `pktmon`。上面第 1 条的【待验证】保持原样：pktmon 实时包内容能力仍为未验证。`aw-collector-windows` 的 `sni` 模块默认关闭（`collectors.windows.sni` 缺省为 false），`PktmonSni::start` 不建立 ETW 会话，启动时返回 `SniError::Unverified`。WinDivert 仍不进入默认安装包。
+
 ## 3. 到 RawEvent 的映射汇总
 
 | EventKind | 来源 | 等级 | 备注 |

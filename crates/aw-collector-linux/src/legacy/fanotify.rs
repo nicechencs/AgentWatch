@@ -96,7 +96,8 @@ pub const INIT_FLAGS: u32 =
     FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_REPORT_FID | FAN_REPORT_DFID_NAME | FAN_UNLIMITED_QUEUE;
 
 /// Marks that do not depend on a kernel version.
-pub const MARK_ALWAYS: u64 = FAN_OPEN | FAN_ACCESS | FAN_MODIFY | FAN_CLOSE_WRITE | FAN_CLOSE_NOWRITE;
+pub const MARK_ALWAYS: u64 =
+    FAN_OPEN | FAN_ACCESS | FAN_MODIFY | FAN_CLOSE_WRITE | FAN_CLOSE_NOWRITE;
 
 /// Extra marks on Linux 5.1+ (create and delete).
 pub const MARK_SINCE_5_1: u64 = FAN_CREATE | FAN_DELETE;
@@ -303,7 +304,13 @@ pub fn decode_fanotify(event: &FanEvent, seq: u64) -> Result<Vec<RawEvent>, Fano
         return Ok(vec![attribution_gap(event, seq)]);
     }
     if event.mask & (FAN_ACCESS | FAN_MODIFY) != 0
-        && event.mask & (FAN_OPEN | FAN_CLOSE_WRITE | FAN_CLOSE_NOWRITE | FAN_CREATE | FAN_DELETE | FAN_RENAME)
+        && event.mask
+            & (FAN_OPEN
+                | FAN_CLOSE_WRITE
+                | FAN_CLOSE_NOWRITE
+                | FAN_CREATE
+                | FAN_DELETE
+                | FAN_RENAME)
             == 0
     {
         // Counted by the caller. One access is not yet a byte event.
@@ -319,7 +326,8 @@ pub fn decode_fanotify(event: &FanEvent, seq: u64) -> Result<Vec<RawEvent>, Fano
     if event.mask & FAN_DELETE != 0 || event.mask & FAN_DELETE_SELF != 0 {
         out.push(delete_event(event, seq + out.len() as u64));
     }
-    if event.mask & FAN_RENAME != 0 || event.mask & (FAN_MOVED_FROM | FAN_MOVED_TO) == (FAN_MOVED_FROM | FAN_MOVED_TO)
+    if event.mask & FAN_RENAME != 0
+        || event.mask & (FAN_MOVED_FROM | FAN_MOVED_TO) == (FAN_MOVED_FROM | FAN_MOVED_TO)
     {
         out.push(rename_event(event, seq + out.len() as u64));
     }
@@ -342,12 +350,7 @@ pub fn flush_count(count: &FanCount, seq: u64) -> Option<RawEvent> {
         return None;
     }
     let kind = if count.mask & FAN_MODIFY != 0 {
-        EventKind::FileWrite(FileWrite::new(
-            None,
-            count.path.clone(),
-            None,
-            None,
-        ))
+        EventKind::FileWrite(FileWrite::new(None, count.path.clone(), None, None))
     } else {
         EventKind::FileRead(FileRead::new(
             None,
@@ -357,7 +360,13 @@ pub fn flush_count(count: &FanCount, seq: u64) -> Option<RawEvent> {
             Some(IoVia::Syscall),
         ))
     };
-    let mut event = base(count.to_mono_ns, count.ts_wall_ns, seq, Some(proc_of(count.pid, count.proc_uid)), kind);
+    let mut event = base(
+        count.to_mono_ns,
+        count.ts_wall_ns,
+        seq,
+        Some(proc_of(count.pid, count.proc_uid)),
+        kind,
+    );
     event.mark_na(FIELD_BYTES, NaReason::CollectorUnavailable);
     event.mark_na("offset", NaReason::CollectorUnavailable);
     event.mark_na("handle", NaReason::CollectorUnavailable);
@@ -403,7 +412,10 @@ fn open_event(event: &FanEvent, seq: u64) -> RawEvent {
 }
 
 fn create_event(event: &FanEvent, seq: u64) -> RawEvent {
-    let create = FileCreate::new(event.path.clone().unwrap_or_default(), event.mask & FAN_ONDIR != 0);
+    let create = FileCreate::new(
+        event.path.clone().unwrap_or_default(),
+        event.mask & FAN_ONDIR != 0,
+    );
     let mut raw = base(
         event.ts_mono_ns,
         event.ts_wall_ns,
@@ -499,7 +511,9 @@ fn overflow_gap(event: &FanEvent, seq: u64) -> RawEvent {
         event.ts_mono_ns,
         event.ts_mono_ns,
         None,
-        Some("fanotify queue overflowed (FAN_Q_OVERFLOW); the kernel dropped file events".to_owned()),
+        Some(
+            "fanotify queue overflowed (FAN_Q_OVERFLOW); the kernel dropped file events".to_owned(),
+        ),
     );
     let mut raw = base(
         event.ts_mono_ns,

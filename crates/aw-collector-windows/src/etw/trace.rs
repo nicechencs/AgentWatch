@@ -520,7 +520,13 @@ fn provider_with_callback(
         // `EventRecord` does not outlive this callback, and the read/write path
         // must not be queued at all. Every other provider stays header-only.
         let message = if is_kernel_file {
-            match file_message(record, locator, header, file_tally.as_deref(), &file_skipped) {
+            match file_message(
+                record,
+                locator,
+                header,
+                file_tally.as_deref(),
+                &file_skipped,
+            ) {
                 Some(message) => message,
                 None => return,
             }

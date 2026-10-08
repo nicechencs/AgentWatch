@@ -29,6 +29,10 @@ httparse = "1.10.1"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1.15.1"
 rcgen = "0.13.2"
+# P2-SIM-01: gen-db writes a synthetic SQLite benchmark database.
+# License: MIT OR Apache-2.0. Version matches aw-store to share the bundled
+# SQLite via the workspace lock (Cargo deduplicates same version + features).
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 
 [dev-dependencies]
 serde_json = "1.0.151"

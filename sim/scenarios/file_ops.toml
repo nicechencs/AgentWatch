@@ -1,0 +1,156 @@
+# P2-SIM-01. File-operation bait scenario.
+#
+# Performs: read (known bytes), write, create, truncate (write with 0 bytes),
+# delete, rename, mmap-read, and a failed open — all inside the temp sim root.
+# Also plants bait files at paths that resemble sensitive locations
+# (home/.ssh/id_rsa, home/.aws/credentials, home/.env, etc.) inside the same
+# temp root; none of these are the real user's home directory.
+#
+# Limit: the "home/" prefix is relative to the sim root, not the OS home dir.
+# paths::under_root rejects `~` and absolute paths, so escaping is impossible.
+
+name = "file_ops"
+description = "诱饵文件的完整文件操作集：读/写/创建/截断/删除/重命名/mmap/失败打开，含敏感路径模拟"
+
+[setup]
+files = [
+  # Bait: size 412 matches the bait_bytes test in main.rs unit tests
+  { path = "home/.ssh/id_rsa",              size = 412,  content = "random" },
+  { path = "home/.ssh/id_rsa.pub",          size = 128,  content = "random" },
+  { path = "home/.aws/credentials",         size = 256,  content = "random" },
+  { path = "home/.aws/config",              size = 128,  content = "random" },
+  # .env is written as a literal line so it looks like an env file but
+  # contains only the SIMBAIT pattern — no real values.
+  { path = "home/.env",                     size = 0,    content = "SIMBAIT_DB_URL=not-a-secret\n" },
+  { path = "home/.netrc",                   size = 128,  content = "random" },
+  { path = "home/.gnupg/pubring.gpg",       size = 64,   content = "random" },
+  { path = "work/data.bin",                 size = 4096, content = "random" },
+  { path = "work/large.dat",                size = 65536, content = "random" },
+]
+
+# ---------------------------------------------------------------------------
+# 1. Reads at known sizes
+# ---------------------------------------------------------------------------
+[[step]]
+action = "read_file"
+id = "read_ssh_key"
+path = "home/.ssh/id_rsa"
+
+[[step]]
+action = "read_file"
+id = "read_aws_creds"
+path = "home/.aws/credentials"
+
+[[step]]
+action = "read_file"
+id = "read_env"
+path = "home/.env"
+
+[[step]]
+action = "read_file"
+id = "read_large"
+path = "work/large.dat"
+
+# ---------------------------------------------------------------------------
+# 2. mmap read
+# ---------------------------------------------------------------------------
+[[step]]
+action = "read_file"
+id = "mmap_data"
+path = "work/data.bin"
+mode = "mmap"
+
+[[step]]
+action = "read_file"
+id = "mmap_large"
+path = "work/large.dat"
+mode = "mmap"
+
+# ---------------------------------------------------------------------------
+# 3. Write / create
+# ---------------------------------------------------------------------------
+[[step]]
+action = "write_file"
+id = "write_out"
+path = "work/out.txt"
+bytes = 4096
+
+[[step]]
+action = "create"
+id = "create_new"
+path = "work/created.bin"
+bytes = 1024
+
+[[step]]
+action = "write_file"
+id = "write_sensitive_like"
+path = "work/token.json"
+bytes = 256
+
+# ---------------------------------------------------------------------------
+# 4. Truncate — write_file with 0 bytes overwrites with an empty body,
+#    which is the closest portable equivalent to O_TRUNC on the sim level.
+# ---------------------------------------------------------------------------
+[[step]]
+action = "write_file"
+id = "truncate_out"
+path = "work/out.txt"
+bytes = 0
+
+[[step]]
+action = "write_file"
+id = "truncate_created"
+path = "work/created.bin"
+bytes = 0
+
+# ---------------------------------------------------------------------------
+# 5. Rename
+# ---------------------------------------------------------------------------
+[[step]]
+action = "rename"
+id = "rename_token"
+from = "work/token.json"
+to = "work/token.json.bak"
+
+# ---------------------------------------------------------------------------
+# 6. Delete
+# ---------------------------------------------------------------------------
+[[step]]
+action = "delete"
+id = "delete_backup"
+path = "work/token.json.bak"
+
+[[step]]
+action = "delete"
+id = "delete_out"
+path = "work/out.txt"
+
+# ---------------------------------------------------------------------------
+# 7. Failed open — read a path that was never created.
+#    exec.rs records ok:false and an error string; the scenario runner does
+#    NOT abort: the step's failure is the intentional observable event.
+#    Because run_step propagates Err, we wrap it in a spawn child that
+#    tolerates non-zero: the parent step is a spawn whose child tries the
+#    failing read.  Actually, read_file propagates errors upward, so we do
+#    the "failed open" as a read of a nonexistent path inside a spawn child
+#    so its exit code is separate from the main process.
+# ---------------------------------------------------------------------------
+[[step]]
+action = "spawn"
+id = "open_fail_child"
+steps = [
+  { action = "read_file", id = "open_fail", path = "work/does_not_exist.bin" },
+]
+
+# ---------------------------------------------------------------------------
+# 8. Read back the sensitive bait paths a second time to confirm they survive
+# ---------------------------------------------------------------------------
+[[step]]
+action = "read_file"
+id = "read_gnupg"
+path = "home/.gnupg/pubring.gpg"
+
+[[step]]
+action = "read_file"
+id = "read_netrc"
+path = "home/.netrc"

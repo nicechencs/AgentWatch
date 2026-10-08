@@ -1,6 +1,8 @@
-# P1-SIM-01. Process and network half of the typical_agent load from
-# performance-budget: about 20 execs and about 10 connections per second
-# for 10 minutes. File activity is P2 and is not in this file.
+# P1-SIM-01 (process+network) + P2-SIM-01 (file ops).
+# Process and network: about 20 execs and about 10 connections per second
+# for 10 minutes.
+# File ops (P2): about 200 file opens per second for the same 10 minutes,
+# spread across a handful of bait paths to simulate a real agent read pattern.
 #
 # `duration_ms` is the nominal length. `sim run --duration <ms>` (or
 # SIM_DURATION_MS) scales `times` by `<ms> / duration_ms`, so a test can

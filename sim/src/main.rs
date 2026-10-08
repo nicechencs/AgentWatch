@@ -6,10 +6,13 @@
 //!
 #![forbid(unsafe_code)]
 
+mod compare;
 mod eval;
 mod exec;
+mod gen_db;
 mod http_step;
 mod paths;
+mod scan_secrets;
 mod scenario;
 mod server;
 mod truth;
@@ -39,15 +42,34 @@ fn run() -> Result<(), String> {
         }
         "serve" => server::serve(args.collect()),
         "eval" => cmd_eval(args.collect()),
-        "compare" | "scan-secrets" | "gen-db" => Err(format!(
-            "`sim {cmd}` is not part of this build (see later SIM tasks)"
-        )),
+        // P2-SIM-01 subcommands.
+        "compare" => compare::run(args.collect()),
+        "scan-secrets" => scan_secrets::run(args.collect()),
+        "gen-db" => gen_db::run(args.collect()),
         other => Err(format!("unknown command `{other}`\n{}\n", usage())),
     }
 }
 
 fn usage() -> String {
-    "usage:\n  sim run <scenario.toml> --truth <file> [--root <dir>] [--duration <ms>]\n  sim spawn --payload <file> --truth <file> --ppid <pid>\n  sim serve --http 127.0.0.1:0 --https 127.0.0.1:0 --truth <file> --cert-out <dir>\n    (`sim serve --help` for the byte server)\n  sim eval --truth <file> --export <file.jsonl> --thresholds <toml> [--platform linux|windows|macos|macos-m1]\n\n  --duration <ms> shortens steps that declare duration_ms (and long_conn).\n  SIM_DURATION_MS does the same when --duration is omitted.\n  sim eval reads files only. --session is refused: it would need a daemon.\n".to_string()
+    concat!(
+        "usage:\n",
+        "  sim run <scenario.toml> --truth <file> [--root <dir>] [--duration <ms>]\n",
+        "  sim spawn --payload <file> --truth <file> --ppid <pid>\n",
+        "  sim serve --http 127.0.0.1:0 --https 127.0.0.1:0 --truth <file> --cert-out <dir>\n",
+        "    (`sim serve --help` for the byte server)\n",
+        "  sim eval --truth <file> --export <file.jsonl> --thresholds <toml> ",
+        "[--platform linux|windows|macos|macos-m1]\n",
+        "  sim compare --truth <file> --session <SESSION_ID> [--base-url http://127.0.0.1:7456]\n",
+        "              [--token <BEARER>] [--json-out out.json] [--md-out out.md]\n",
+        "  sim scan-secrets <db_path> [<extra_file> ...]\n",
+        "  sim gen-db --rows N [--out bench.db] [--sessions 4]\n",
+        "\n",
+        "  --duration <ms> shortens steps that declare duration_ms (and long_conn).\n",
+        "  SIM_DURATION_MS does the same when --duration is omitted.\n",
+        "  sim eval reads files only. --session is refused: it would need a daemon.\n",
+        "  sim compare fetches session rows from a running daemon (or uses --session @last).\n",
+    )
+    .to_string()
 }
 
 fn cmd_eval(args: Vec<String>) -> Result<(), String> {

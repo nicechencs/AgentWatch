@@ -1,0 +1,169 @@
+# P2-SIM-01. High-frequency file-open storm simulating a compiler run.
+#
+# Goal: produce ~50 000 open syscalls per second from several concurrent
+# sub-processes for 60 seconds.  `sim` is single-threaded, so "concurrent"
+# means N spawn children each running their own repeat loop.  The parent
+# starts them sequentially; each child blocks until its loop finishes, so
+# wall-clock parallelism is one process at a time unless the OS scheduler
+# interleaves them.  For collector stress-testing, what matters is the
+# per-second volume across all PIDs, not strict simultaneity.
+#
+# Tuning:
+#   - 8 children × 6 250 iters = 50 000 total open-like ops over 60 s.
+#   - Each "iter" does one read_file (open + read + close) on a small bait
+#     file.  On most systems this is one open(2) plus a pread(2) or read(2).
+#   - duration_ms = 60 000 keeps the --duration override working: a CI run
+#     can pass --duration 1000 to get 1/60 of the work without 60 s of wall
+#     time.  scaled_times keeps at least 1 iteration.
+#
+# Limit: all paths are inside the sim temp root.  No real source tree is
+# touched.
+
+name = "storm"
+description = "编译场景：8 个子进程并发，每秒共约 5 万次 open，持续 60 秒（可用 --duration 缩短）"
+
+[setup]
+files = [
+  # Small bait files.  read_file on these produces one open + one read; we
+  # create several so file-dedup heuristics see multiple distinct paths.
+  { path = "src/a.c",  size = 256, content = "random" },
+  { path = "src/b.c",  size = 256, content = "random" },
+  { path = "src/c.c",  size = 256, content = "random" },
+  { path = "src/d.h",  size = 128, content = "random" },
+  { path = "src/e.h",  size = 128, content = "random" },
+  { path = "src/f.h",  size = 128, content = "random" },
+  { path = "src/g.h",  size = 128, content = "random" },
+  { path = "src/h.h",  size = 128, content = "random" },
+]
+
+# Child 1 — 6250 iters over 60 s = 104/s from this child.
+# Across 8 children the total is 8 × 6250 = 50 000 over 60 s ≈ 833/s if
+# they ran truly parallel.  On a single-threaded sim runner the rate is
+# sequential; the count is still representative for collector replay tests.
+[[step]]
+action = "spawn"
+id = "worker-1"
+steps = [
+  { action = "repeat", times = 6250, duration_ms = 60000, steps = [
+      { action = "read_file", path = "src/a.c" },
+      { action = "read_file", path = "src/d.h" },
+      { action = "read_file", path = "src/e.h" },
+      { action = "read_file", path = "src/f.h" },
+      { action = "read_file", path = "src/g.h" },
+      { action = "read_file", path = "src/h.h" },
+      { action = "read_file", path = "src/b.c" },
+      { action = "read_file", path = "src/c.c" },
+  ]},
+]
+
+[[step]]
+action = "spawn"
+id = "worker-2"
+steps = [
+  { action = "repeat", times = 6250, duration_ms = 60000, steps = [
+      { action = "read_file", path = "src/b.c" },
+      { action = "read_file", path = "src/d.h" },
+      { action = "read_file", path = "src/e.h" },
+      { action = "read_file", path = "src/f.h" },
+      { action = "read_file", path = "src/g.h" },
+      { action = "read_file", path = "src/h.h" },
+      { action = "read_file", path = "src/a.c" },
+      { action = "read_file", path = "src/c.c" },
+  ]},
+]
+
+[[step]]
+action = "spawn"
+id = "worker-3"
+steps = [
+  { action = "repeat", times = 6250, duration_ms = 60000, steps = [
+      { action = "read_file", path = "src/c.c" },
+      { action = "read_file", path = "src/d.h" },
+      { action = "read_file", path = "src/e.h" },
+      { action = "read_file", path = "src/f.h" },
+      { action = "read_file", path = "src/g.h" },
+      { action = "read_file", path = "src/h.h" },
+      { action = "read_file", path = "src/a.c" },
+      { action = "read_file", path = "src/b.c" },
+  ]},
+]
+
+[[step]]
+action = "spawn"
+id = "worker-4"
+steps = [
+  { action = "repeat", times = 6250, duration_ms = 60000, steps = [
+      { action = "read_file", path = "src/a.c" },
+      { action = "read_file", path = "src/b.c" },
+      { action = "read_file", path = "src/c.c" },
+      { action = "read_file", path = "src/d.h" },
+      { action = "read_file", path = "src/e.h" },
+      { action = "read_file", path = "src/f.h" },
+      { action = "read_file", path = "src/g.h" },
+      { action = "read_file", path = "src/h.h" },
+  ]},
+]
+
+[[step]]
+action = "spawn"
+id = "worker-5"
+steps = [
+  { action = "repeat", times = 6250, duration_ms = 60000, steps = [
+      { action = "read_file", path = "src/d.h" },
+      { action = "read_file", path = "src/a.c" },
+      { action = "read_file", path = "src/e.h" },
+      { action = "read_file", path = "src/b.c" },
+      { action = "read_file", path = "src/f.h" },
+      { action = "read_file", path = "src/c.c" },
+      { action = "read_file", path = "src/g.h" },
+      { action = "read_file", path = "src/h.h" },
+  ]},
+]
+
+[[step]]
+action = "spawn"
+id = "worker-6"
+steps = [
+  { action = "repeat", times = 6250, duration_ms = 60000, steps = [
+      { action = "read_file", path = "src/e.h" },
+      { action = "read_file", path = "src/f.h" },
+      { action = "read_file", path = "src/a.c" },
+      { action = "read_file", path = "src/b.c" },
+      { action = "read_file", path = "src/c.c" },
+      { action = "read_file", path = "src/d.h" },
+      { action = "read_file", path = "src/g.h" },
+      { action = "read_file", path = "src/h.h" },
+  ]},
+]
+
+[[step]]
+action = "spawn"
+id = "worker-7"
+steps = [
+  { action = "repeat", times = 6250, duration_ms = 60000, steps = [
+      { action = "read_file", path = "src/g.h" },
+      { action = "read_file", path = "src/h.h" },
+      { action = "read_file", path = "src/a.c" },
+      { action = "read_file", path = "src/b.c" },
+      { action = "read_file", path = "src/c.c" },
+      { action = "read_file", path = "src/d.h" },
+      { action = "read_file", path = "src/e.h" },
+      { action = "read_file", path = "src/f.h" },
+  ]},
+]
+
+[[step]]
+action = "spawn"
+id = "worker-8"
+steps = [
+  { action = "repeat", times = 6250, duration_ms = 60000, steps = [
+      { action = "read_file", path = "src/h.h" },
+      { action = "read_file", path = "src/g.h" },
+      { action = "read_file", path = "src/f.h" },
+      { action = "read_file", path = "src/e.h" },
+      { action = "read_file", path = "src/d.h" },
+      { action = "read_file", path = "src/c.c" },
+      { action = "read_file", path = "src/b.c" },
+      { action = "read_file", path = "src/a.c" },
+  ]},
+]

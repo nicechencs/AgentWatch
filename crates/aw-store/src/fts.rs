@@ -161,4 +161,3 @@ fn parse_mode(text: &str) -> Result<FtsMode, StoreError> {
         }),
     }
 }
-

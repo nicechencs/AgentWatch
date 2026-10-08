@@ -25,7 +25,9 @@ use crate::query::filter::{parse, Expr};
 // `pub(crate)` so `export` can compile a filter without copying the SQL builder.
 pub(crate) use sql::{compile, Param, Target};
 
-pub use ast::{Expr as StoreExpr, Field as StoreField, Op as StoreOp, Term as StoreTerm, Value as StoreValue};
+pub use ast::{
+    Expr as StoreExpr, Field as StoreField, Op as StoreOp, Term as StoreTerm, Value as StoreValue,
+};
 pub use compile::{
     around_sql, compile as compile_store_expr, compile_predicate, keyset_suffix, search_sql,
     search_sql_instr, CompileCtx, Compiled, Param as StoreParam, Target as StoreTarget,
@@ -747,7 +749,10 @@ pub fn files(
         .prepare(&sql)
         .map_err(|err| QueryError::sqlite("files", err))?;
     let rows = stmt
-        .query_map(params_from_iter(bind.iter().map(store_param_to_sql)), read_file)
+        .query_map(
+            params_from_iter(bind.iter().map(store_param_to_sql)),
+            read_file,
+        )
         .map_err(|err| QueryError::sqlite("files", err))?;
     let mut rows = collect_rows(rows)?;
     let next = if query.group_by == FileGroupBy::None && rows.len() as i64 > page {
@@ -810,16 +815,19 @@ pub fn around(
         .prepare(&sql)
         .map_err(|err| QueryError::sqlite("around", err))?;
     let rows = stmt
-        .query_map(params_from_iter(bind.iter().map(store_param_to_sql)), |row| {
-            Ok(TimelineRow {
-                session_id: row.get(0)?,
-                ts_ns: row.get(1)?,
-                cat: row.get(2)?,
-                id: row.get(3)?,
-                proc_uid: row.get(4)?,
-                evidence: row.get(5)?,
-            })
-        })
+        .query_map(
+            params_from_iter(bind.iter().map(store_param_to_sql)),
+            |row| {
+                Ok(TimelineRow {
+                    session_id: row.get(0)?,
+                    ts_ns: row.get(1)?,
+                    cat: row.get(2)?,
+                    id: row.get(3)?,
+                    proc_uid: row.get(4)?,
+                    evidence: row.get(5)?,
+                })
+            },
+        )
         .map_err(|err| QueryError::sqlite("around", err))?;
     let rows = collect_rows(rows)?;
     Ok(Some(TimelinePage { rows, next: None }))
@@ -859,7 +867,11 @@ pub fn search(
     } else {
         StoreParam::Text(needle.to_lowercase())
     };
-    let sql = if fts { search_sql() } else { search_sql_instr() };
+    let sql = if fts {
+        search_sql()
+    } else {
+        search_sql_instr()
+    };
     let bind = [
         StoreParam::Text(user_id.to_string()),
         needle_param.clone(),
@@ -871,20 +883,813 @@ pub fn search(
         .prepare(sql)
         .map_err(|err| QueryError::sqlite("search", err))?;
     let rows = stmt
-        .query_map(params_from_iter(bind.iter().map(store_param_to_sql)), |row| {
-            Ok(SearchHit {
-                src: row.get(0)?,
-                src_id: row.get(1)?,
-                session_id: row.get(2)?,
-                public_id: row.get(3)?,
-            })
-        })
+        .query_map(
+            params_from_iter(bind.iter().map(store_param_to_sql)),
+            |row| {
+                Ok(SearchHit {
+                    src: row.get(0)?,
+                    src_id: row.get(1)?,
+                    session_id: row.get(2)?,
+                    public_id: row.get(3)?,
+                })
+            },
+        )
         .map_err(|err| QueryError::sqlite("search", err))?;
     let mut hits = collect_rows(rows)?;
     if let Some(since) = since_ns {
         hits.retain(|hit| hit_time(conn, hit).unwrap_or(None).unwrap_or(i64::MIN) >= since);
     }
     Ok(hits)
+}
+
+/// Integer `sessions.id` for `public_id`, when that session belongs to `user_id`.
+///
+/// `None` when no session with that public id is owned by this user. Another
+/// user's id is not returned.
+pub fn session_by_public_id(
+    conn: &Connection,
+    user_id: &str,
+    public_id: &str,
+) -> Result<Option<i64>, QueryError> {
+    conn.query_row(
+        "SELECT id FROM sessions WHERE public_id = ? AND user_id = ?",
+        rusqlite::params![public_id, user_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|err| QueryError::sqlite("session_by_public_id", err))
+}
+
+/// Set `name` and/or `pinned` on a session owned by `user_id`.
+///
+/// A `None` argument leaves that column as it is. It does not write NULL.
+/// `Ok(None)` when the session is not visible.
+pub fn patch_session(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+    name: Option<&str>,
+    pinned: Option<bool>,
+) -> Result<Option<()>, QueryError> {
+    if !session_visible(conn, user_id, session_id)? {
+        return Ok(None);
+    }
+    // Both arguments absent is a no-op, not an UPDATE that would touch the row.
+    if name.is_none() && pinned.is_none() {
+        return Ok(Some(()));
+    }
+    let mut sql = String::from("UPDATE sessions SET ");
+    let mut bind: Vec<Param> = Vec::new();
+    if let Some(name) = name {
+        sql.push_str("name = ?");
+        bind.push(Param::Text(name.to_string()));
+    }
+    if let Some(pinned) = pinned {
+        if !bind.is_empty() {
+            sql.push_str(", ");
+        }
+        sql.push_str("pinned = ?");
+        bind.push(Param::Int(i64::from(pinned)));
+    }
+    sql.push_str(" WHERE id = ? AND user_id = ?");
+    bind.push(Param::Int(session_id));
+    bind.push(Param::Text(user_id.to_string()));
+    conn.execute(&sql, params_from_iter(bind.iter().map(Param::to_sql)))
+        .map_err(|err| QueryError::sqlite("patch_session", err))?;
+    Ok(Some(()))
+}
+
+/// Mark a session stopped at `ended_ns`.
+///
+/// Writes `ended_ns` and `end_reason = 'stopped'` only while the session is
+/// still active. An already-ended session is left as it was, including its
+/// original end time, and still returns `Ok(Some(()))`. `Ok(None)` when the
+/// session is not visible.
+pub fn stop_session(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+    ended_ns: i64,
+) -> Result<Option<()>, QueryError> {
+    if !session_visible(conn, user_id, session_id)? {
+        return Ok(None);
+    }
+    conn.execute(
+        "UPDATE sessions SET ended_ns = ?, end_reason = 'stopped' \
+         WHERE id = ? AND user_id = ? AND ended_ns IS NULL",
+        rusqlite::params![ended_ns, session_id, user_id],
+    )
+    .map_err(|err| QueryError::sqlite("stop_session", err))?;
+    Ok(Some(()))
+}
+
+/// Delete one ended, unpinned session owned by `user_id`.
+///
+/// Children are removed in the same order and with the same statements as
+/// retention's purge, so the FTS delete triggers on `file_access` and
+/// `process_images` fire. The session row goes last. `Ok(None)` when the
+/// session is not visible. A session that is still active or pinned is an
+/// error and is not deleted.
+pub fn delete_session(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+) -> Result<Option<()>, QueryError> {
+    let state = session_delete_state(conn, user_id, session_id)?;
+    let Some((public_id, ended, pinned)) = state else {
+        return Ok(None);
+    };
+    if ended.is_none() {
+        return Err(QueryError::BadArgument {
+            name: "session",
+            expected: "an ended session; this one is still active",
+        });
+    }
+    if pinned {
+        return Err(QueryError::BadArgument {
+            name: "session",
+            expected: "an unpinned session",
+        });
+    }
+    delete_session_rows(conn, session_id, &public_id)
+}
+
+/// One histogram bucket. `count` is a real row count: `0` means the bucket had
+/// no timeline rows, not that the count is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistBucket {
+    /// Inclusive start, Unix nanoseconds.
+    pub start_ns: i64,
+    /// End of the bucket. Exclusive for every bucket but the last, which also
+    /// holds a row whose `ts_ns` equals the span end.
+    pub end_ns: i64,
+    /// Timeline rows in this bucket.
+    pub count: i64,
+    /// `true` when any `gaps` row for the session overlaps this bucket.
+    pub gap: bool,
+}
+
+/// Timeline counts in `buckets` equal-width slices of the span.
+///
+/// The span runs from `from_ns` (or the session's `started_ns`) to `to_ns` (or
+/// the session's `ended_ns`, or the latest timeline `ts_ns` while the session
+/// is still active). `buckets` is clamped to `1..=360`. Empty buckets are
+/// included. A bucket that overlaps any gap has `gap: true`. `Ok(None)` when
+/// the session is not visible.
+pub fn timeline_histogram(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+    from_ns: Option<i64>,
+    to_ns: Option<i64>,
+    buckets: i64,
+) -> Result<Option<Vec<HistBucket>>, QueryError> {
+    ensure_timeline(conn)?;
+    if !session_visible(conn, user_id, session_id)? {
+        return Ok(None);
+    }
+    let bounds = session_span(conn, session_id)?;
+    let Some((started, ended)) = bounds else {
+        return Ok(None);
+    };
+    let start = from_ns.unwrap_or(started);
+    let end = match to_ns {
+        Some(to) => to,
+        None => match ended {
+            Some(ended) => ended,
+            None => latest_timeline_ts(conn, session_id)?.unwrap_or(started),
+        },
+    };
+    let requested = buckets.clamp(1, 360);
+    let (start, end) = if end < start {
+        (end, start)
+    } else {
+        (start, end)
+    };
+    // A span shorter than `requested` nanoseconds cannot be split into that
+    // many non-empty slices. Cap the count so every bucket has a real range,
+    // and let the last bucket absorb the remainder of the integer division.
+    let span = end.saturating_sub(start);
+    let n = if span <= 0 {
+        1
+    } else {
+        requested.min(span).max(1)
+    };
+    let width = if span <= 0 || n <= 1 { 1 } else { span / n };
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let bucket_start = if i == 0 {
+            start
+        } else {
+            start.saturating_add(width.saturating_mul(i))
+        };
+        let bucket_end = if i + 1 == n {
+            end
+        } else {
+            start.saturating_add(width.saturating_mul(i + 1))
+        };
+        out.push(HistBucket {
+            start_ns: bucket_start,
+            end_ns: bucket_end,
+            count: 0,
+            gap: false,
+        });
+    }
+    fill_histogram_counts(conn, session_id, start, end, width, &mut out)?;
+    fill_histogram_gaps(conn, session_id, start, end, width, &mut out)?;
+    Ok(Some(out))
+}
+
+/// One `process_images` row attached to a [`ProcessDetail`].
+///
+/// `argv` is the stored text, already redacted by the writer. This type has no
+/// `Debug` impl so a log of the struct cannot print it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProcessImage {
+    /// Sequence within the process.
+    pub seq: i64,
+    /// Observation time, Unix nanoseconds.
+    pub ts_ns: i64,
+    /// Executable path, or unknown.
+    pub exe: Option<String>,
+    /// Redacted argv, or unknown. Never rewritten here.
+    pub argv: Option<String>,
+    /// Working directory, or unknown.
+    pub cwd: Option<String>,
+    /// Evidence label.
+    pub evidence: String,
+    /// Collector source string.
+    pub source: String,
+}
+
+/// One `processes` row plus its images and child `proc_uid`s.
+///
+/// No `Debug`: `images` carries argv.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProcessDetail {
+    /// `ProcUid` bit-cast to `i64`.
+    pub proc_uid: i64,
+    /// OS pid.
+    pub pid: i64,
+    /// Parent `ProcUid`, or unknown.
+    pub parent_uid: Option<i64>,
+    /// Parent pid, or unknown.
+    pub ppid: Option<i64>,
+    /// Distance from the session root, as stored.
+    pub depth: i64,
+    /// Start, Unix nanoseconds.
+    pub start_ns: i64,
+    /// Exit, or still running.
+    pub exit_ns: Option<i64>,
+    /// Exit code, or unknown.
+    pub exit_code: Option<i64>,
+    /// Exit signal, or unknown.
+    pub exit_signal: Option<i64>,
+    /// How the process was observed.
+    pub how: String,
+    /// OS user of the process, or unknown.
+    pub user_id: Option<String>,
+    /// Signer, or unknown.
+    pub signer: Option<String>,
+    /// Evidence label.
+    pub evidence: String,
+    /// JSON field evidence, or unknown.
+    pub field_evidence: Option<String>,
+    /// Collector source string.
+    pub source: String,
+    /// Agent profile, or unknown.
+    pub agent: Option<String>,
+    /// Images, ordered by `seq`.
+    pub images: Vec<ProcessImage>,
+    /// Child `proc_uid`s in this session, ordered by `(start_ns, proc_uid)`.
+    pub children: Vec<i64>,
+}
+
+/// One process in a session owned by `user_id`.
+///
+/// `Ok(None)` when the session is not visible or the process is not in it.
+pub fn process_detail(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+    proc_uid: i64,
+) -> Result<Option<ProcessDetail>, QueryError> {
+    if !session_visible(conn, user_id, session_id)? {
+        return Ok(None);
+    }
+    let detail = conn
+        .query_row(
+            "SELECT proc_uid, pid, parent_uid, ppid, depth, start_ns, exit_ns, exit_code, \
+                    exit_signal, how, user_id, signer, evidence, field_evidence, source, agent \
+             FROM processes \
+             WHERE session_id = ? AND proc_uid = ?",
+            rusqlite::params![session_id, proc_uid],
+            |row| {
+                Ok(ProcessDetail {
+                    proc_uid: row.get(0)?,
+                    pid: row.get(1)?,
+                    parent_uid: row.get(2)?,
+                    ppid: row.get(3)?,
+                    depth: row.get(4)?,
+                    start_ns: row.get(5)?,
+                    exit_ns: row.get(6)?,
+                    exit_code: row.get(7)?,
+                    exit_signal: row.get(8)?,
+                    how: row.get(9)?,
+                    user_id: row.get(10)?,
+                    signer: row.get(11)?,
+                    evidence: row.get(12)?,
+                    field_evidence: row.get(13)?,
+                    source: row.get(14)?,
+                    agent: row.get(15)?,
+                    images: Vec::new(),
+                    children: Vec::new(),
+                })
+            },
+        )
+        .optional()
+        .map_err(|err| QueryError::sqlite("process_detail", err))?;
+    let Some(mut detail) = detail else {
+        return Ok(None);
+    };
+    detail.images = process_images(conn, session_id, proc_uid)?;
+    detail.children = process_children(conn, session_id, proc_uid)?;
+    Ok(Some(detail))
+}
+
+/// One `net_flow_buckets` row. The byte columns are `NOT NULL`, so `0` is a
+/// stored accumulator, not a stand-in for unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowBucket {
+    /// Bucket start, Unix nanoseconds.
+    pub bucket_ns: i64,
+    /// Bytes up accumulated in this bucket.
+    pub bytes_up: i64,
+    /// Bytes down accumulated in this bucket.
+    pub bytes_down: i64,
+    /// Evidence label.
+    pub evidence: String,
+}
+
+/// Buckets for one flow, when that flow belongs to a session owned by `user_id`.
+///
+/// `Ok(None)` when the session is not visible or the flow is not in it.
+pub fn flow_buckets(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+    flow_id: i64,
+) -> Result<Option<Vec<FlowBucket>>, QueryError> {
+    if !session_visible(conn, user_id, session_id)? {
+        return Ok(None);
+    }
+    let owned: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM net_flows WHERE id = ? AND session_id = ?",
+            rusqlite::params![flow_id, session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| QueryError::sqlite("flow_buckets", err))?;
+    if owned.is_none() {
+        return Ok(None);
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT bucket_ns, bytes_up, bytes_down, evidence \
+             FROM net_flow_buckets \
+             WHERE flow_id = ? AND session_id = ? \
+             ORDER BY bucket_ns",
+        )
+        .map_err(|err| QueryError::sqlite("flow_buckets", err))?;
+    let rows = stmt
+        .query_map(rusqlite::params![flow_id, session_id], |row| {
+            Ok(FlowBucket {
+                bucket_ns: row.get(0)?,
+                bytes_up: row.get(1)?,
+                bytes_down: row.get(2)?,
+                evidence: row.get(3)?,
+            })
+        })
+        .map_err(|err| QueryError::sqlite("flow_buckets", err))?;
+    Ok(Some(collect_rows(rows)?))
+}
+
+/// Bytes summed from `net_flow_buckets` over one `step_ns` window.
+///
+/// Both sums are `Some`: the source columns are `NOT NULL`, so the sum is a
+/// real total. A window with no rows is omitted rather than emitted as zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrafficBucket {
+    /// Window start, Unix nanoseconds. Aligned down to `step_ns`.
+    pub bucket_ns: i64,
+    /// Sum of `bytes_up` in the window.
+    pub bytes_up: Option<i64>,
+    /// Sum of `bytes_down` in the window.
+    pub bytes_down: Option<i64>,
+}
+
+/// Session traffic rolled into `step_ns`-wide buckets.
+///
+/// `step_ns` of `0` is read as 5 seconds. Only windows that contain at least
+/// one bucket row are returned. `from_ns` / `to_ns` are inclusive bounds on
+/// `bucket_ns`. `Ok(None)` when the session is not visible.
+pub fn traffic(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+    from_ns: Option<i64>,
+    to_ns: Option<i64>,
+    step_ns: i64,
+) -> Result<Option<Vec<TrafficBucket>>, QueryError> {
+    if !session_visible(conn, user_id, session_id)? {
+        return Ok(None);
+    }
+    let step = if step_ns == 0 { 5_000_000_000 } else { step_ns };
+    if step < 0 {
+        return Err(QueryError::BadArgument {
+            name: "step_ns",
+            expected: "a non-negative step in nanoseconds",
+        });
+    }
+    let mut sql = String::from(
+        "SELECT (bucket_ns / ?) * ? AS win, SUM(bytes_up), SUM(bytes_down) \
+         FROM net_flow_buckets \
+         WHERE session_id = ?",
+    );
+    let mut bind = vec![Param::Int(step), Param::Int(step), Param::Int(session_id)];
+    if let Some(from) = from_ns {
+        sql.push_str(" AND bucket_ns >= ?");
+        bind.push(Param::Int(from));
+    }
+    if let Some(to) = to_ns {
+        sql.push_str(" AND bucket_ns <= ?");
+        bind.push(Param::Int(to));
+    }
+    sql.push_str(" GROUP BY win ORDER BY win");
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| QueryError::sqlite("traffic", err))?;
+    let rows = stmt
+        .query_map(params_from_iter(bind.iter().map(Param::to_sql)), |row| {
+            Ok(TrafficBucket {
+                bucket_ns: row.get(0)?,
+                bytes_up: row.get(1)?,
+                bytes_down: row.get(2)?,
+            })
+        })
+        .map_err(|err| QueryError::sqlite("traffic", err))?;
+    Ok(Some(collect_rows(rows)?))
+}
+
+/// One `dns` row. `rcode` and `answers` stay `None` when the column is NULL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsEvent {
+    /// Row id.
+    pub id: i64,
+    /// Observation time, Unix nanoseconds.
+    pub ts_ns: i64,
+    /// Asking process, or unknown.
+    pub proc_uid: Option<i64>,
+    /// Query name.
+    pub qname: String,
+    /// Query type, as stored.
+    pub qtype: i64,
+    /// Response code, or unknown.
+    pub rcode: Option<i64>,
+    /// JSON answers, or unknown.
+    pub answers: Option<String>,
+    /// Evidence label.
+    pub evidence: String,
+    /// Collector source string.
+    pub source: String,
+}
+
+/// A page of DNS rows plus the cursor for the following page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsPage {
+    /// Rows, ordered by `(ts_ns, id)`.
+    pub rows: Vec<DnsEvent>,
+    /// Present when another row exists after this page.
+    pub next: Option<Cursor>,
+}
+
+/// DNS rows for a session, paged the same way as [`timeline`].
+///
+/// `from_ns` / `to_ns` are inclusive bounds on `ts_ns`. `cursor` skips pairs at
+/// or before it. `limit` defaults to [`DEFAULT_TIMELINE_LIMIT`] and is capped
+/// at [`MAX_TIMELINE_LIMIT`]. `Ok(None)` when the session is not visible.
+pub fn dns_events(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+    from_ns: Option<i64>,
+    to_ns: Option<i64>,
+    limit: Option<i64>,
+    cursor: Option<Cursor>,
+) -> Result<Option<DnsPage>, QueryError> {
+    if !session_visible(conn, user_id, session_id)? {
+        return Ok(None);
+    }
+    let page = limit.unwrap_or(DEFAULT_TIMELINE_LIMIT);
+    if !(0..=MAX_TIMELINE_LIMIT).contains(&page) {
+        return Err(QueryError::BadArgument {
+            name: "limit",
+            expected: "0..=1000",
+        });
+    }
+    let mut sql = String::from(
+        "SELECT dns.id, dns.ts_ns, dns.proc_uid, dns.qname, dns.qtype, dns.rcode, \
+                dns.answers, dns.evidence, dns.source \
+         FROM dns \
+         JOIN sessions ON sessions.id = dns.session_id \
+         WHERE dns.session_id = ? AND sessions.user_id = ?",
+    );
+    let mut bind = vec![Param::Int(session_id), Param::Text(user_id.to_string())];
+    if let Some(from) = from_ns {
+        sql.push_str(" AND dns.ts_ns >= ?");
+        bind.push(Param::Int(from));
+    }
+    if let Some(to) = to_ns {
+        sql.push_str(" AND dns.ts_ns <= ?");
+        bind.push(Param::Int(to));
+    }
+    if let Some(cursor) = cursor {
+        sql.push_str(" AND (dns.ts_ns > ? OR (dns.ts_ns = ? AND dns.id > ?))");
+        bind.push(Param::Int(cursor.ts_ns));
+        bind.push(Param::Int(cursor.ts_ns));
+        bind.push(Param::Int(cursor.id));
+    }
+    sql.push_str(" ORDER BY dns.ts_ns, dns.id LIMIT ?");
+    bind.push(Param::Int(page.saturating_add(1)));
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| QueryError::sqlite("dns_events", err))?;
+    let rows = stmt
+        .query_map(params_from_iter(bind.iter().map(Param::to_sql)), |row| {
+            Ok(DnsEvent {
+                id: row.get(0)?,
+                ts_ns: row.get(1)?,
+                proc_uid: row.get(2)?,
+                qname: row.get(3)?,
+                qtype: row.get(4)?,
+                rcode: row.get(5)?,
+                answers: row.get(6)?,
+                evidence: row.get(7)?,
+                source: row.get(8)?,
+            })
+        })
+        .map_err(|err| QueryError::sqlite("dns_events", err))?;
+    let mut rows = collect_rows(rows)?;
+    let next = if rows.len() as i64 > page {
+        rows.truncate(page as usize);
+        rows.last().map(|row| Cursor {
+            ts_ns: row.ts_ns,
+            id: row.id,
+        })
+    } else {
+        None
+    };
+    Ok(Some(DnsPage { rows, next }))
+}
+
+/// `(public_id, ended_ns, pinned)`. `None` when the session is not this user's.
+fn session_delete_state(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+) -> Result<Option<(String, Option<i64>, bool)>, QueryError> {
+    conn.query_row(
+        "SELECT public_id, ended_ns, pinned FROM sessions WHERE id = ? AND user_id = ?",
+        rusqlite::params![session_id, user_id],
+        |row| {
+            let pinned: i64 = row.get(2)?;
+            Ok((row.get(0)?, row.get(1)?, pinned != 0))
+        },
+    )
+    .optional()
+    .map_err(|err| QueryError::sqlite("session_delete_state", err))
+}
+
+/// Child tables, in the order retention deletes them. Names and keys are this
+/// const list, never caller input. `net_flow_buckets` precedes `net_flows`
+/// because it references `net_flows.id`. FTS rows are removed by the
+/// BEFORE DELETE triggers, so `fts_text` is not deleted from here.
+const DELETE_CHILDREN: &[(&str, &str)] = &[
+    ("file_access", "id"),
+    ("net_flow_buckets", "flow_id, bucket_ns"),
+    ("processes", "session_id, proc_uid"),
+    ("process_images", "id"),
+    ("net_flows", "id"),
+    ("dns", "id"),
+    ("gaps", "id"),
+];
+
+/// Rows removed per statement. Same batch size retention uses.
+const DELETE_BATCH_ROWS: i64 = 5000;
+
+fn delete_session_rows(
+    conn: &Connection,
+    session_id: i64,
+    public_id: &str,
+) -> Result<Option<()>, QueryError> {
+    for (name, key) in DELETE_CHILDREN {
+        if !query_table_exists(conn, name)? {
+            continue;
+        }
+        let sql = format!(
+            "DELETE FROM {name} WHERE ({key}) IN \
+             (SELECT {key} FROM {name} WHERE session_id = ?1 LIMIT {DELETE_BATCH_ROWS})"
+        );
+        loop {
+            let n = conn
+                .execute(&sql, rusqlite::params![session_id])
+                .map_err(|err| QueryError::sqlite("delete_session", err))?;
+            if n == 0 {
+                break;
+            }
+        }
+    }
+    conn.execute(
+        "DELETE FROM sessions WHERE id = ?1",
+        rusqlite::params![session_id],
+    )
+    .map_err(|err| QueryError::sqlite("delete_session", err))?;
+    // Same audit row retention writes: `purged:<public_id>` → `<ns>,user`.
+    let deleted_ns = unix_now_ns();
+    let key = format!("purged:{public_id}");
+    let value = format!("{deleted_ns},user");
+    conn.execute(
+        "INSERT INTO schema_meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )
+    .map_err(|err| QueryError::sqlite("delete_session_audit", err))?;
+    Ok(Some(()))
+}
+
+fn query_table_exists(conn: &Connection, name: &str) -> Result<bool, QueryError> {
+    let found: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .map_err(|err| QueryError::sqlite("table_exists", err))?;
+    Ok(found > 0)
+}
+
+fn unix_now_ns() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_nanos()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
+/// `(started_ns, ended_ns)`. `ended_ns` stays `None` while the session is active.
+fn session_span(
+    conn: &Connection,
+    session_id: i64,
+) -> Result<Option<(i64, Option<i64>)>, QueryError> {
+    conn.query_row(
+        "SELECT started_ns, ended_ns FROM sessions WHERE id = ?",
+        rusqlite::params![session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(|err| QueryError::sqlite("session_span", err))
+}
+
+fn latest_timeline_ts(conn: &Connection, session_id: i64) -> Result<Option<i64>, QueryError> {
+    conn.query_row(
+        "SELECT MAX(ts_ns) FROM timeline WHERE session_id = ?",
+        rusqlite::params![session_id],
+        |row| row.get(0),
+    )
+    .map_err(|err| QueryError::sqlite("timeline_latest", err))
+}
+
+fn fill_histogram_counts(
+    conn: &Connection,
+    session_id: i64,
+    start: i64,
+    end: i64,
+    width: i64,
+    out: &mut [HistBucket],
+) -> Result<(), QueryError> {
+    let n = out.len() as i64;
+    // The last bucket is closed on the right so a row at exactly `end` counts.
+    let mut stmt = conn
+        .prepare(
+            "SELECT ts_ns FROM timeline \
+             WHERE session_id = ? AND ts_ns >= ? AND ts_ns <= ?",
+        )
+        .map_err(|err| QueryError::sqlite("timeline_histogram", err))?;
+    let rows = stmt
+        .query_map(rusqlite::params![session_id, start, end], |row| row.get(0))
+        .map_err(|err| QueryError::sqlite("timeline_histogram", err))?;
+    for row in rows {
+        let ts: i64 = row.map_err(|err| QueryError::sqlite("timeline_histogram", err))?;
+        let idx = bucket_index(ts, start, end, width, n);
+        out[idx].count = out[idx].count.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn fill_histogram_gaps(
+    conn: &Connection,
+    session_id: i64,
+    start: i64,
+    end: i64,
+    width: i64,
+    out: &mut [HistBucket],
+) -> Result<(), QueryError> {
+    let n = out.len() as i64;
+    let mut stmt = conn
+        .prepare(
+            "SELECT from_ns, to_ns FROM gaps \
+             WHERE session_id = ? AND to_ns >= ? AND from_ns <= ?",
+        )
+        .map_err(|err| QueryError::sqlite("timeline_histogram_gaps", err))?;
+    let rows = stmt
+        .query_map(rusqlite::params![session_id, start, end], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .map_err(|err| QueryError::sqlite("timeline_histogram_gaps", err))?;
+    for row in rows {
+        let (from_ns, to_ns): (i64, i64) =
+            row.map_err(|err| QueryError::sqlite("timeline_histogram_gaps", err))?;
+        let mut first = bucket_index(from_ns.max(start), start, end, width, n);
+        let mut last = bucket_index(to_ns.min(end), start, end, width, n);
+        if first > last {
+            std::mem::swap(&mut first, &mut last);
+        }
+        for bucket in &mut out[first..=last] {
+            bucket.gap = true;
+        }
+    }
+    Ok(())
+}
+
+/// Bucket index for `ts`. A timestamp at exactly `end` lands in the last bucket.
+fn bucket_index(ts: i64, start: i64, end: i64, width: i64, buckets: i64) -> usize {
+    if ts >= end || width <= 0 {
+        return (buckets - 1).max(0) as usize;
+    }
+    let offset = ts.saturating_sub(start);
+    let idx = if width == 1 && offset >= buckets {
+        buckets - 1
+    } else {
+        offset / width
+    };
+    idx.clamp(0, buckets - 1) as usize
+}
+
+fn process_images(
+    conn: &Connection,
+    session_id: i64,
+    proc_uid: i64,
+) -> Result<Vec<ProcessImage>, QueryError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT seq, ts_ns, exe, argv, cwd, evidence, source \
+             FROM process_images \
+             WHERE session_id = ? AND proc_uid = ? \
+             ORDER BY seq",
+        )
+        .map_err(|err| QueryError::sqlite("process_images", err))?;
+    let rows = stmt
+        .query_map(rusqlite::params![session_id, proc_uid], |row| {
+            Ok(ProcessImage {
+                seq: row.get(0)?,
+                ts_ns: row.get(1)?,
+                exe: row.get(2)?,
+                argv: row.get(3)?,
+                cwd: row.get(4)?,
+                evidence: row.get(5)?,
+                source: row.get(6)?,
+            })
+        })
+        .map_err(|err| QueryError::sqlite("process_images", err))?;
+    collect_rows(rows)
+}
+
+fn process_children(
+    conn: &Connection,
+    session_id: i64,
+    proc_uid: i64,
+) -> Result<Vec<i64>, QueryError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT proc_uid FROM processes \
+             WHERE session_id = ? AND parent_uid = ? \
+             ORDER BY start_ns, proc_uid",
+        )
+        .map_err(|err| QueryError::sqlite("process_children", err))?;
+    let rows = stmt
+        .query_map(rusqlite::params![session_id, proc_uid], |row| row.get(0))
+        .map_err(|err| QueryError::sqlite("process_children", err))?;
+    collect_rows(rows)
 }
 
 fn hit_time(conn: &Connection, hit: &SearchHit) -> Result<Option<i64>, QueryError> {

@@ -411,6 +411,16 @@ impl<'a> Retention<'a> {
         checkpoint_truncate(self.conn)?;
         Ok(purged)
     }
+
+    /// Return free pages to the OS and truncate the WAL. Deletes nothing.
+    ///
+    /// `incremental_vacuum` only gives back pages already freed by a deletion,
+    /// so on a database with no purged sessions this changes nothing and still
+    /// succeeds.
+    pub fn vacuum(&mut self) -> Result<(), StoreError> {
+        incremental_vacuum(self.conn)?;
+        checkpoint_truncate(self.conn)
+    }
 }
 
 fn judge_disk(free_bytes: Option<u64>, min_free: u64) -> (DiskCheck, WriteMode) {

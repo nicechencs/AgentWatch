@@ -44,11 +44,14 @@ pub enum QueryError {
         /// Why, without echoing the value.
         message: &'static str,
     },
-    /// `group_by` or `sort` is not one of the documented tokens.
+    /// `group_by`, `sort`, or a session mutation the caller is not allowed to make.
+    ///
+    /// A pinned or still-active session cannot be deleted. `expected` says which
+    /// state was refused, not the session's contents.
     BadArgument {
-        /// Which argument.
+        /// Which argument or which refusal.
         name: &'static str,
-        /// Allowed tokens, for the caller.
+        /// Allowed tokens, or the state that blocked the change.
         expected: &'static str,
     },
     /// SQLite returned an error. The message is rusqlite's Display, not Debug.

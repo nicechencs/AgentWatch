@@ -363,7 +363,10 @@ impl RecordSink for SqliteSink<'_> {
                         code: rusqlite::ErrorCode::DiskFull,
                         extended_code: 13,
                     },
-                    Some("free disk is below min_free_disk_bytes; detail rows were not written".into()),
+                    Some(
+                        "free disk is below min_free_disk_bytes; detail rows were not written"
+                            .into(),
+                    ),
                 ),
             ));
         }

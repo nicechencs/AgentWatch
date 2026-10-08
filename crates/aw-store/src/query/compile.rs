@@ -852,7 +852,8 @@ fn contains_sql(
             // On the timeline the id column is not `file_access.id`. Fall back
             // to instr there: a correlated FTS lookup against the wrong id
             // would silently miss. The concrete-table form is the indexed path.
-            if column_is_bare_path(column) || matches!(hint, FtsSourceHint::Image | FtsSourceHint::Http)
+            if column_is_bare_path(column)
+                || matches!(hint, FtsSourceHint::Image | FtsSourceHint::Http)
             {
                 return Ok(format!(
                     "EXISTS (SELECT 1 FROM fts_text WHERE fts_text.src = '{src}' \
@@ -863,7 +864,9 @@ fn contains_sql(
         }
     }
     params.push(Param::Text(text.to_lowercase()));
-    Ok(format!("(instr(lower({column}), ?) > 0 AND {column} IS NOT NULL)"))
+    Ok(format!(
+        "(instr(lower({column}), ?) > 0 AND {column} IS NOT NULL)"
+    ))
 }
 
 fn column_is_bare_path(column: &str) -> bool {
@@ -921,9 +924,7 @@ fn any_of_text(
             } else {
                 column.to_string()
             };
-            parts.push(format!(
-                "({col} >= ? AND {col} < ? AND {col} GLOB ?)"
-            ));
+            parts.push(format!("({col} >= ? AND {col} < ? AND {col} GLOB ?)"));
         } else {
             params.push(Param::Text(glob_pattern(&text)));
             let col = if fold {
@@ -1063,10 +1064,12 @@ fn resolve_number(value: &Value, term: &Term, ctx: &CompileCtx) -> Result<i64, Q
 fn expect_text(value: &Value, field: &str) -> Result<String, QueryError> {
     match value {
         Value::Text(s) => Ok(s.clone()),
-        Value::Number(_) | Value::RelativeTime { .. } | Value::Bool(_) => Err(QueryError::BadField {
-            field: field.to_string(),
-            message: "expected text",
-        }),
+        Value::Number(_) | Value::RelativeTime { .. } | Value::Bool(_) => {
+            Err(QueryError::BadField {
+                field: field.to_string(),
+                message: "expected text",
+            })
+        }
     }
 }
 

@@ -5,15 +5,16 @@
 //! same name first, dropping out-of-scope events before any property parse, and
 //! polling `EventsLost` without blocking the callback.
 //!
-//! The callback does two things and returns. It reads the header PID, and on a
-//! hit it `try_send`s the header fields into a bounded channel. It never parses
-//! properties, never allocates for a rejected PID, and never blocks. A full or
-//! disconnected channel is counted; the event is not retried inside the callback
-//! because retrying would stall ETW's buffer.
+//! The callback reads the header PID and returns on a miss, before any parse.
+//! On a hit it `try_send`s into a bounded channel and never blocks. Process and
+//! network events go as a header only. A Kernel-File event is parsed here,
+//! because its `EventRecord` does not outlive the callback; a read or a write is
+//! folded into the tally instead of queued. A full or disconnected channel is
+//! counted and not retried, because retrying would stall ETW's buffer.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -23,9 +24,10 @@ use ferrisetw::trace::{TraceProperties, UserTrace};
 use ferrisetw::EventRecord;
 
 use super::ffi::{self, from_trace_error};
+use super::file::{self, FileProperties, IoTally};
 use super::session::{
-    self, EtwClockMode, EtwStamp, LossDelta, LossReading, ProviderSpec, QpcClock, ScopeFilter,
-    SessionConfig, SessionError,
+    self, classify_provider, EtwClockMode, EtwStamp, LossDelta, LossReading, ProviderClass,
+    ProviderSpec, QpcClock, ScopeFilter, SessionConfig, SessionError,
 };
 
 /// What the callback and the loss poller put on the channel.
@@ -33,12 +35,35 @@ use super::session::{
 /// Both travel on one bounded channel so a consumer sees them in one order.
 /// A loss notice is not an event: it carries no provider, no PID, and no
 /// payload. The consumer turns it into a `Gap` with [`gap_from_delta`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionMessage {
     /// An in-scope event, header only.
+    ///
+    /// Process and network events stay in this form: their property parsers are
+    /// not wired yet, and the consumer decodes them from a header alone. A
+    /// Kernel-File event never arrives as a header. Its record dies with the
+    /// callback, so the callback parses it and sends [`Self::File`] instead.
     Header(HeaderEvent),
+    /// One in-scope Kernel-File event, properties already copied out.
+    ///
+    /// Read and write are not in here. The callback folds those into the
+    /// [`IoTally`] it shares with the consumer, because forwarding each one
+    /// would fill the channel (windows.md §2.2).
+    File(FileEvent),
     /// `EventsLost` or `RealTimeBuffersLost` grew since the previous poll.
     Loss(LossDelta),
+}
+
+/// A Kernel-File event the callback parsed before the record went away.
+///
+/// `props` holds only the properties the §2.2 row names. A property the event
+/// did not carry is `None` inside it, never `0` or `""`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEvent {
+    /// Header fields, the same set a [`SessionMessage::Header`] carries.
+    pub header: HeaderEvent,
+    /// Properties copied off the record. `pid` and `tid` repeat the header.
+    pub props: FileProperties,
 }
 
 /// Header fields the callback forwards. No property bytes.
@@ -119,6 +144,14 @@ pub struct Session {
     closed: Arc<AtomicU64>,
     clock: Option<QpcClock>,
     clock_mode: EtwClockMode,
+    /// Read/write totals the Kernel-File callback fills. The consumer reads the
+    /// same tally on Close. `None` when the session was not started with
+    /// Kernel-File, in which case no callback writes it.
+    file_tally: Option<Arc<Mutex<IoTally>>>,
+    /// Kernel-File events the callback saw and did not queue: an id outside the
+    /// §2.2 table, or a schema the locator could not find. Counted so the skip
+    /// is not silent. The consumer reads it; the callback only adds.
+    file_skipped: Arc<AtomicU64>,
 }
 
 /// How many headers the channel holds. A full channel increments
@@ -151,6 +184,14 @@ impl Session {
         let (tx, rx) = sync_channel::<SessionMessage>(CHANNEL_BOUND);
         let full = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicU64::new(0));
+        // Built only when the config asks for Kernel-File. A P1 session has no
+        // file callback, so it has nothing to share the tally with.
+        let file_tally = config
+            .providers()
+            .iter()
+            .any(|provider| classify_provider(provider.guid) == ProviderClass::KernelFile)
+            .then(|| Arc::new(Mutex::new(IoTally::new())));
+        let file_skipped = Arc::new(AtomicU64::new(0));
 
         let mut builder = UserTrace::new()
             .named(config.name().to_owned())
@@ -162,6 +203,8 @@ impl Session {
                 tx.clone(),
                 Arc::clone(&full),
                 Arc::clone(&closed),
+                file_tally.clone(),
+                Arc::clone(&file_skipped),
             ));
         }
         let trace = builder.start_and_process().map_err(|err| {
@@ -189,6 +232,8 @@ impl Session {
             // header value is system time. See `EtwClockMode`. SPIKE-02 has not
             // confirmed this on a live session; the QPC path stays available.
             clock_mode: EtwClockMode::FileTime,
+            file_tally,
+            file_skipped,
         })
     }
 
@@ -215,6 +260,20 @@ impl Session {
     /// Events the callback could not queue because the receiver was dropped.
     pub fn channel_closed(&self) -> u64 {
         self.closed.load(Ordering::Relaxed)
+    }
+
+    /// The read/write tally, when this session enabled Kernel-File.
+    ///
+    /// The callback and the consumer share it. `None` on a session that did not
+    /// enable the provider, so a P1 consumer has nothing to lock.
+    pub fn file_tally(&self) -> Option<Arc<Mutex<IoTally>>> {
+        self.file_tally.clone()
+    }
+
+    /// Kernel-File events the callback skipped: an id outside the §2.2 table, or
+    /// a record whose schema the locator could not read. Not silent.
+    pub fn file_skipped(&self) -> u64 {
+        self.file_skipped.load(Ordering::Relaxed)
     }
 
     /// Clock sampled at start. `None` when QPC or the wall clock could not be read.
@@ -265,6 +324,155 @@ impl Drop for Session {
     }
 }
 
+/// What the Kernel-File callback does with one in-scope record.
+///
+/// `None` means "do not queue": a read or write, which was folded into the
+/// tally, an id outside the §2.2 table, or a record whose schema could not be
+/// read. The last two are counted on `skipped`. A schema miss still counts the
+/// read or write as unkeyed, so the tally's gap between headers and folded
+/// events stays visible.
+fn file_message(
+    record: &EventRecord,
+    locator: &SchemaLocator,
+    header: HeaderEvent,
+    tally: Option<&Mutex<IoTally>>,
+    skipped: &AtomicU64,
+) -> Option<SessionMessage> {
+    let Some(op) = file::classify(header.event_id) else {
+        skipped.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let is_io = matches!(op, file::FileOp::Read | file::FileOp::Write);
+    let Some(props) = file_properties(record, locator, &header) else {
+        skipped.fetch_add(1, Ordering::Relaxed);
+        if is_io {
+            // The callback counted this header by seeing it. Folding nothing
+            // would leave `header_reads_writes` ahead of the parsed rows with
+            // no explanation. An absent FileObject is the unkeyed bucket.
+            if let Some(tally) = tally {
+                if let Ok(mut tally) = tally.lock() {
+                    tally.note_header(header.pid);
+                    tally.add(header.pid, None, op == file::FileOp::Write, None, None);
+                }
+            }
+        }
+        return None;
+    };
+    if is_io {
+        if let Some(tally) = tally {
+            if let Ok(mut tally) = tally.lock() {
+                tally.note_header(header.pid);
+                tally.add(
+                    header.pid,
+                    props.file_object,
+                    op == file::FileOp::Write,
+                    props.io_size,
+                    props.byte_offset,
+                );
+            }
+        }
+        // Not queued. windows.md §2.2 and the task card: a read or a write is
+        // accumulated and emitted once, on Close.
+        return None;
+    }
+    Some(SessionMessage::File(FileEvent { header, props }))
+}
+
+/// Copy the §2.2 properties off one record.
+///
+/// `None` when the schema locator has nothing for the record. A property the
+/// schema does not name, or that does not parse as the type the table says,
+/// stays `None` inside the struct. It is not filled with `0` or `""`.
+///
+/// `CreateDisposition` is not its own column (windows.md §2.2 lists
+/// `CreateOptions`). The documented `FileIo_Create` layout stores the
+/// disposition in the high 8 bits of `CreateOptions`, so that is where it is
+/// read from. SPIKE-02 has not confirmed the split.
+fn file_properties(
+    record: &EventRecord,
+    locator: &SchemaLocator,
+    header: &HeaderEvent,
+) -> Option<FileProperties> {
+    use ferrisetw::parser::Parser;
+
+    let schema = locator.event_schema(record).ok()?;
+    let parser = Parser::create(record, &schema);
+    let mut props = FileProperties::bare(header.event_id);
+    props.pid = Some(header.pid);
+    props.tid = Some(header.tid);
+
+    props.file_object = pointer_prop(&parser, "FileObject");
+    props.file_key = pointer_prop(&parser, "FileKey");
+    props.irp = pointer_prop(&parser, "Irp");
+    props.file_name = text_prop(&parser, &["FileName", "FilePath"]);
+    props.create_options = u32_prop(&parser, "CreateOptions");
+    props.share_access = u32_prop(&parser, "ShareAccess");
+    props.file_attributes = u32_prop(&parser, "CreateAttributes");
+    props.create_disposition = props.create_options.map(|options| options >> 24);
+    props.issuing_thread_id = u32_prop(&parser, "IssuingThreadId");
+    props.io_size = u64_prop(&parser, "IOSize");
+    props.byte_offset = u64_prop(&parser, "ByteOffset");
+    props.io_flags = u32_prop(&parser, "IOFlags");
+    props.extra_info = u32_prop(&parser, "ExtraInfo");
+    props.status = status_prop(&parser);
+    Some(props)
+}
+
+/// A pointer-sized property, widened to `u64`.
+///
+/// ferrisetw rejects a pointer parsed as the wrong width (`InvalidType`), so
+/// both widths are tried. `0` is a real address only if the property parsed;
+/// a property the schema does not have stays `None`.
+fn pointer_prop(parser: &ferrisetw::parser::Parser, name: &str) -> Option<u64> {
+    if let Ok(value) = parser.try_parse::<u64>(name) {
+        return Some(value);
+    }
+    parser.try_parse::<u32>(name).ok().map(u64::from)
+}
+
+fn u32_prop(parser: &ferrisetw::parser::Parser, name: &str) -> Option<u32> {
+    parser
+        .try_parse::<u32>(name)
+        .ok()
+        .or_else(|| u64_prop(parser, name).and_then(|value| u32::try_from(value).ok()))
+}
+
+fn u64_prop(parser: &ferrisetw::parser::Parser, name: &str) -> Option<u64> {
+    parser
+        .try_parse::<u64>(name)
+        .ok()
+        .or_else(|| parser.try_parse::<u32>(name).ok().map(u64::from))
+}
+
+/// The first name the schema actually carries.
+///
+/// An empty string is not a path. The decoder treats "no path" as `None`, so a
+/// present-but-blank property is reported the same way.
+fn text_prop(parser: &ferrisetw::parser::Parser, names: &[&str]) -> Option<String> {
+    for name in names {
+        if let Ok(value) = parser.try_parse::<String>(name) {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// NTSTATUS, when the event carries one. §2.2 names no such column, so both
+/// spellings a manifest might use are tried and a miss stays `None`.
+fn status_prop(parser: &ferrisetw::parser::Parser) -> Option<i32> {
+    for name in ["Status", "NtStatus"] {
+        if let Ok(value) = parser.try_parse::<i32>(name) {
+            return Some(value);
+        }
+        if let Ok(value) = parser.try_parse::<u32>(name) {
+            return Some(value as i32);
+        }
+    }
+    None
+}
+
 fn buffer_properties(config: &SessionConfig) -> TraceProperties {
     TraceProperties {
         buffer_size: config.buffer_size_kb(),
@@ -284,16 +492,19 @@ fn provider_with_callback(
     tx: SyncSender<SessionMessage>,
     full: Arc<AtomicU64>,
     closed: Arc<AtomicU64>,
+    file_tally: Option<Arc<Mutex<IoTally>>>,
+    file_skipped: Arc<AtomicU64>,
 ) -> Provider {
-    let callback = move |record: &EventRecord, _locator: &SchemaLocator| {
+    let is_kernel_file = classify_provider(spec.guid) == ProviderClass::KernelFile;
+    let callback = move |record: &EventRecord, locator: &SchemaLocator| {
         // Header PID first. `process_id()` reads `EventHeader.ProcessId` and
-        // does not touch the schema locator. A miss returns before the channel.
+        // does not touch the schema locator. A miss returns before any parse.
         let pid = record.process_id();
         if !filter.contains(pid) {
             return;
         }
         let guid = record.provider_id();
-        let event = HeaderEvent {
+        let header = HeaderEvent {
             provider: ProviderId {
                 data1: guid.data1,
                 data2: guid.data2,
@@ -305,7 +516,18 @@ fn provider_with_callback(
             tid: record.thread_id(),
             raw_timestamp: record.raw_timestamp(),
         };
-        match tx.try_send(SessionMessage::Header(event)) {
+        // Kernel-File is the one provider whose record has to be read here. The
+        // `EventRecord` does not outlive this callback, and the read/write path
+        // must not be queued at all. Every other provider stays header-only.
+        let message = if is_kernel_file {
+            match file_message(record, locator, header, file_tally.as_deref(), &file_skipped) {
+                Some(message) => message,
+                None => return,
+            }
+        } else {
+            SessionMessage::Header(header)
+        };
+        match tx.try_send(message) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 full.fetch_add(1, Ordering::Relaxed);
@@ -439,6 +661,7 @@ mod tests {
         match queued {
             SessionMessage::Header(got) => assert_eq!(got.pid, 7),
             SessionMessage::Loss(_) => panic!("a header was queued, not a loss notice"),
+            SessionMessage::File(_) => panic!("a header was queued, not a file event"),
         }
         // The outsider was not queued behind the full channel.
         assert!(rx.try_recv().is_err());

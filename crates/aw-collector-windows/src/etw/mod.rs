@@ -11,7 +11,10 @@
 //! [`file`] classifies Kernel-File events, drops out-of-scope headers before any
 //! property parse, and accumulates read/write by `(pid, FileObject)`. The path
 //! cache and the `RawEvent` mapping live in [`crate::file_map`].
+//! [`consume`] drains the channel: it holds the file cache and the read/write
+//! tally, and it is where a file event becomes a `RawEvent`.
 
+pub mod consume;
 pub mod dns;
 mod ffi;
 pub mod file;
@@ -23,6 +26,7 @@ pub mod trace;
 #[cfg(all(test, feature = "e2e"))]
 mod session_e2e;
 
+pub use consume::Consumer;
 pub use dns::{
     decode_dns, parse_query_results, DecodedDns, DnsAnswerCache, DnsCacheRow, DnsProperties,
     EVENT_DNS_QUERY, EVENT_DNS_QUERY_COMPLETED, PID_ATTRIBUTION_NOTE, PID_FIELD, SOURCE_DNS_CLIENT,
@@ -54,6 +58,6 @@ pub use session::{
     NT_KERNEL_LOGGER, SESSION_PREFIX, SESSION_SOURCE,
 };
 pub use trace::{
-    gap_from_delta, probe, stop_leftover, CallbackAction, HeaderEvent, ProviderId, Session,
-    SessionMessage,
+    gap_from_delta, probe, stop_leftover, CallbackAction, FileEvent, HeaderEvent, ProviderId,
+    Session, SessionMessage,
 };

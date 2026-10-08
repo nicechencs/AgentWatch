@@ -37,6 +37,13 @@ pub enum QueryError {
         /// Why, without echoing the value.
         message: &'static str,
     },
+    /// Like [`QueryError::BadValue`] when the field name is owned (P2 AST).
+    BadField {
+        /// Field name from the AST. An identifier, not the user's value.
+        field: String,
+        /// Why, without echoing the value.
+        message: &'static str,
+    },
     /// `group_by` or `sort` is not one of the documented tokens.
     BadArgument {
         /// Which argument.
@@ -67,6 +74,7 @@ impl fmt::Display for QueryError {
                 write!(f, "operator {op} is not valid for {field}")
             }
             Self::BadValue { field, message } => write!(f, "bad value for {field}: {message}"),
+            Self::BadField { field, message } => write!(f, "bad value for {field}: {message}"),
             Self::BadArgument { name, expected } => {
                 write!(f, "bad {name}: expected {expected}")
             }

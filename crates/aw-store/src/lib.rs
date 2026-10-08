@@ -11,6 +11,8 @@
 
 mod error;
 mod export;
+mod file_access;
+mod fts;
 mod migrate;
 mod query;
 mod retention;
@@ -29,14 +31,21 @@ pub use export::{
 };
 pub use migrate::{OpenStatus, Store, SCHEMA_VERSION};
 pub use query::{
-    ensure_timeline, flows, gaps, list_sessions, parse_filter, process_tree, session_summary,
-    timeline, Cursor, FilterExpr, FlowGroupBy, FlowQuery, FlowRow, FlowSort, GapItem, ProcessNode,
-    QueryError, SessionFilter, SessionListItem, SessionSummary, TimelinePage, TimelineQuery,
+    around, around_sql, compile_predicate, compile_store_expr, ensure_timeline, files, flows, gaps,
+    keyset_suffix, list_sessions, parse_filter, process_tree, search, search_sql, search_sql_instr,
+    session_summary, timeline, AroundRow, CompileCtx, Compiled, Cursor, FileGroupBy, FilePage,
+    FileQuery,
+    FileRow, FilterExpr, FlowGroupBy, FlowQuery, FlowRow, FlowSort, GapItem, ProcessNode,
+    QueryError, SearchHit, SessionFilter, SessionListItem, SessionSummary, StoreExpr, StoreField,
+    StoreOp, StoreParam, StoreTarget, StoreTerm, StoreValue, TimelinePage, TimelineQuery,
     TimelineRow,
 };
+pub use file_access::FileAccessRow;
+pub use fts::{read_mode as read_fts_mode, set_mode as set_fts_mode, FtsMode, FtsSource};
+pub use migrate::FILE_SCHEMA_VERSION;
 pub use sink::{
-    DnsRow, GapRow, NetFlowBucketRow, NetFlowRow, ProcessImageRow, ProcessRow, RecordSink,
-    SessionRow, SqliteSink, WriteBatch,
+    apply_file_schema, DnsRow, GapRow, NetFlowBucketRow, NetFlowRow, ProcessImageRow, ProcessRow,
+    RecordSink, SessionRow, SqliteSink, WriteBatch,
 };
 
 /// Empty marker so the daemon can name this crate before it constructs a [`Store`].

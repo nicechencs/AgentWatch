@@ -11,6 +11,8 @@
 //! one statement, not a long transaction. Set `PRAGMA query_only` on a
 //! connection you own before lending it if you want SQLite to reject writes.
 
+mod ast;
+mod compile;
 mod error;
 mod filter;
 mod sql;
@@ -23,6 +25,11 @@ use crate::query::filter::{parse, Expr};
 // `pub(crate)` so `export` can compile a filter without copying the SQL builder.
 pub(crate) use sql::{compile, Param, Target};
 
+pub use ast::{Expr as StoreExpr, Field as StoreField, Op as StoreOp, Term as StoreTerm, Value as StoreValue};
+pub use compile::{
+    around_sql, compile as compile_store_expr, compile_predicate, keyset_suffix, search_sql,
+    search_sql_instr, CompileCtx, Compiled, Param as StoreParam, Target as StoreTarget,
+};
 pub use error::QueryError;
 #[allow(unused_imports)]
 pub use filter::{parse as parse_filter, Expr as FilterExpr};
@@ -34,6 +41,9 @@ pub const DEFAULT_TIMELINE_LIMIT: i64 = 100;
 
 /// Hard cap so a caller cannot ask for an unbounded page.
 pub const MAX_TIMELINE_LIMIT: i64 = 1000;
+
+/// Page cap from api-and-cli: a single response holds at most this many rows.
+pub const MAX_PAGE_LIMIT: i64 = 2000;
 
 /// Create the `timeline` view if this connection does not already have it.
 ///
@@ -596,6 +606,375 @@ pub fn gaps(
         })
         .map_err(|err| QueryError::sqlite("gaps", err))?;
     Ok(Some(collect_rows(rows)?))
+}
+
+/// One `file_access` row returned by [`files`].
+///
+/// Byte counts stay [`Option`]: NULL is "not observed", not zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRow {
+    /// `file_access.id`.
+    pub id: i64,
+    /// Session id.
+    pub session_id: i64,
+    /// `ProcUid` bit-cast to `i64`.
+    pub proc_uid: i64,
+    /// `access` / `create` / `delete` / `rename` / `exec`.
+    pub op: String,
+    /// Stored path. Already redacted at write time.
+    pub path: String,
+    /// First observation, Unix nanoseconds.
+    pub first_ns: i64,
+    /// Evidence label.
+    pub evidence: String,
+    /// Bytes read. `None` when the column is NULL.
+    pub bytes_read: Option<i64>,
+    /// Bytes written. `None` when the column is NULL.
+    pub bytes_written: Option<i64>,
+    /// Sensitive-path rule id, or none.
+    pub sensitive_rule: Option<String>,
+}
+
+/// How [`files`] groups rows. Grouping is done in process, after the indexed read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileGroupBy {
+    /// One row per access.
+    None,
+    /// By full path.
+    Path,
+    /// By parent directory. A path with no separator is its own group.
+    Dir,
+    /// By `proc_uid`.
+    Proc,
+}
+
+/// Filter and page for [`files`].
+#[derive(Debug, Clone)]
+pub struct FileQuery {
+    /// P2 AST. `None` matches every file row in the session.
+    pub expr: Option<StoreExpr>,
+    /// Grouping. Default is one row per access.
+    pub group_by: FileGroupBy,
+    /// Inclusive lower bound on `first_ns`.
+    pub from_ns: Option<i64>,
+    /// Inclusive upper bound on `first_ns`.
+    pub to_ns: Option<i64>,
+    /// Page size. `None` is [`DEFAULT_TIMELINE_LIMIT`]. Capped at [`MAX_PAGE_LIMIT`].
+    pub limit: Option<i64>,
+    /// Resume after this `(first_ns, id)`.
+    pub cursor: Option<Cursor>,
+    /// See [`CompileCtx`].
+    pub ctx: CompileCtx,
+}
+
+impl Default for FileQuery {
+    fn default() -> Self {
+        Self {
+            expr: None,
+            group_by: FileGroupBy::None,
+            from_ns: None,
+            to_ns: None,
+            limit: None,
+            cursor: None,
+            ctx: CompileCtx::default(),
+        }
+    }
+}
+
+/// A page of file rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePage {
+    /// Rows. Ungrouped pages are ordered by `(first_ns, id)`.
+    pub rows: Vec<FileRow>,
+    /// Set when another row exists after this page. Absent for grouped results:
+    /// grouping consumes the filtered set for the requested page only.
+    pub next: Option<Cursor>,
+    /// Field/kind mismatches from the compiler. Empty when every field applied.
+    pub warnings: Vec<String>,
+}
+
+/// File rows for a session owned by `user_id`.
+///
+/// `None` when the session is not visible. Requires `file_access` (migrations
+/// 0003–0005). A connection that has not applied them gets a SQLite error
+/// naming the missing table; this function does not migrate, because the
+/// connection may be read-only.
+pub fn files(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+    query: &FileQuery,
+) -> Result<Option<FilePage>, QueryError> {
+    if !session_visible(conn, user_id, session_id)? {
+        return Ok(None);
+    }
+    let expr = query.expr.clone().unwrap_or(StoreExpr::True);
+    let compiled = compile_predicate(&expr, StoreTarget::Files, &query.ctx)?;
+    let mut sql = String::from(
+        "SELECT file_access.id, file_access.session_id, file_access.proc_uid, \
+         file_access.op, file_access.path, file_access.first_ns, file_access.evidence, \
+         file_access.bytes_read, file_access.bytes_written, file_access.sensitive_rule \
+         FROM file_access \
+         JOIN sessions ON sessions.id = file_access.session_id \
+         WHERE file_access.session_id = ? AND sessions.user_id = ? AND (",
+    );
+    sql.push_str(&compiled.sql);
+    sql.push(')');
+    let mut bind = vec![
+        StoreParam::Int(session_id),
+        StoreParam::Text(user_id.to_string()),
+    ];
+    bind.extend(compiled.params);
+    if let Some(from) = query.from_ns {
+        sql.push_str(" AND file_access.first_ns >= ?");
+        bind.push(StoreParam::Int(from));
+    }
+    if let Some(to) = query.to_ns {
+        sql.push_str(" AND file_access.first_ns <= ?");
+        bind.push(StoreParam::Int(to));
+    }
+    if let Some(cursor) = query.cursor {
+        sql.push_str(&keyset_suffix("file_access.first_ns", "file_access.id"));
+        bind.push(StoreParam::Int(cursor.ts_ns));
+        bind.push(StoreParam::Int(cursor.ts_ns));
+        bind.push(StoreParam::Int(cursor.id));
+    } else {
+        sql.push_str(" ORDER BY file_access.first_ns, file_access.id LIMIT ?");
+    }
+    let page = clamp_page(query.limit)?;
+    bind.push(StoreParam::Int(page.saturating_add(1)));
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| QueryError::sqlite("files", err))?;
+    let rows = stmt
+        .query_map(params_from_iter(bind.iter().map(store_param_to_sql)), read_file)
+        .map_err(|err| QueryError::sqlite("files", err))?;
+    let mut rows = collect_rows(rows)?;
+    let next = if query.group_by == FileGroupBy::None && rows.len() as i64 > page {
+        rows.truncate(page as usize);
+        rows.last().map(|row| Cursor {
+            ts_ns: row.first_ns,
+            id: row.id,
+        })
+    } else {
+        if rows.len() as i64 > page {
+            rows.truncate(page as usize);
+        }
+        None
+    };
+    let rows = group_files(rows, query.group_by);
+    Ok(Some(FilePage {
+        rows,
+        next,
+        warnings: compiled.warnings,
+    }))
+}
+
+/// One timeline row from [`around`].
+pub type AroundRow = TimelineRow;
+
+/// Events within `window_ns` of `ref_table`:`ref_id`, both sides.
+///
+/// `ref_table` is one of `file_access`, `net_flows`, `dns`, `http`,
+/// `processes`, `gaps`, `process_images`. The reference id is bound. `None`
+/// when the session is not visible. An unknown reference yields an empty page,
+/// not an error: the id may have been purged.
+pub fn around(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+    ref_table: &str,
+    ref_id: i64,
+    window_ns: i64,
+    limit: Option<i64>,
+) -> Result<Option<TimelinePage>, QueryError> {
+    ensure_timeline(conn)?;
+    if !session_visible(conn, user_id, session_id)? {
+        return Ok(None);
+    }
+    let sql = around_sql(ref_table)?;
+    let page = clamp_page(limit)?;
+    let bind = [
+        StoreParam::Int(ref_id),
+        StoreParam::Int(session_id),
+        StoreParam::Int(session_id),
+        StoreParam::Int(window_ns),
+        StoreParam::Int(window_ns),
+        StoreParam::Int(page),
+    ];
+    // The SQL joins through the reference row, which is already constrained to
+    // this session. Ownership was checked above. Re-checking `user_id` in the
+    // statement would need another placeholder the helper does not reserve.
+    let _ = user_id;
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| QueryError::sqlite("around", err))?;
+    let rows = stmt
+        .query_map(params_from_iter(bind.iter().map(store_param_to_sql)), |row| {
+            Ok(TimelineRow {
+                session_id: row.get(0)?,
+                ts_ns: row.get(1)?,
+                cat: row.get(2)?,
+                id: row.get(3)?,
+                proc_uid: row.get(4)?,
+                evidence: row.get(5)?,
+            })
+        })
+        .map_err(|err| QueryError::sqlite("around", err))?;
+    let rows = collect_rows(rows)?;
+    Ok(Some(TimelinePage { rows, next: None }))
+}
+
+/// One cross-session search hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchHit {
+    /// `file_access` or `process_images`.
+    pub src: String,
+    /// Source row id.
+    pub src_id: i64,
+    /// Owning session.
+    pub session_id: i64,
+    /// Public session id.
+    pub public_id: String,
+}
+
+/// Substring search across the caller's sessions.
+///
+/// `fts` selects the FTS5 statement or the `instr` fallback. The needle is
+/// bound either way. `since_ns` is not part of the FTS statement (the index
+/// has no time column); when it is `Some`, hits are dropped unless the source
+/// row is at or after that instant. Dropping is a post-filter, not a string
+/// concatenated into SQL.
+pub fn search(
+    conn: &Connection,
+    user_id: &str,
+    needle: &str,
+    fts: bool,
+    since_ns: Option<i64>,
+    limit: Option<i64>,
+) -> Result<Vec<SearchHit>, QueryError> {
+    let page = clamp_page(limit)?;
+    let needle_param = if fts {
+        StoreParam::Text(crate::fts::match_query(needle))
+    } else {
+        StoreParam::Text(needle.to_lowercase())
+    };
+    let sql = if fts { search_sql() } else { search_sql_instr() };
+    let bind = [
+        StoreParam::Text(user_id.to_string()),
+        needle_param.clone(),
+        StoreParam::Text(user_id.to_string()),
+        needle_param,
+        StoreParam::Int(page),
+    ];
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|err| QueryError::sqlite("search", err))?;
+    let rows = stmt
+        .query_map(params_from_iter(bind.iter().map(store_param_to_sql)), |row| {
+            Ok(SearchHit {
+                src: row.get(0)?,
+                src_id: row.get(1)?,
+                session_id: row.get(2)?,
+                public_id: row.get(3)?,
+            })
+        })
+        .map_err(|err| QueryError::sqlite("search", err))?;
+    let mut hits = collect_rows(rows)?;
+    if let Some(since) = since_ns {
+        hits.retain(|hit| hit_time(conn, hit).unwrap_or(None).unwrap_or(i64::MIN) >= since);
+    }
+    Ok(hits)
+}
+
+fn hit_time(conn: &Connection, hit: &SearchHit) -> Result<Option<i64>, QueryError> {
+    let sql = match hit.src.as_str() {
+        "file_access" => "SELECT first_ns FROM file_access WHERE id = ?",
+        "process_images" => "SELECT ts_ns FROM process_images WHERE id = ?",
+        _ => return Ok(None),
+    };
+    conn.query_row(sql, rusqlite::params![hit.src_id], |row| row.get(0))
+        .optional()
+        .map_err(|err| QueryError::sqlite("search_time", err))
+}
+
+fn clamp_page(limit: Option<i64>) -> Result<i64, QueryError> {
+    let page = limit.unwrap_or(DEFAULT_TIMELINE_LIMIT);
+    if !(0..=MAX_PAGE_LIMIT).contains(&page) {
+        return Err(QueryError::BadArgument {
+            name: "limit",
+            expected: "0..=2000",
+        });
+    }
+    Ok(page)
+}
+
+fn read_file(row: &Row<'_>) -> rusqlite::Result<FileRow> {
+    Ok(FileRow {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        proc_uid: row.get(2)?,
+        op: row.get(3)?,
+        path: row.get(4)?,
+        first_ns: row.get(5)?,
+        evidence: row.get(6)?,
+        bytes_read: row.get(7)?,
+        bytes_written: row.get(8)?,
+        sensitive_rule: row.get(9)?,
+    })
+}
+
+fn group_files(rows: Vec<FileRow>, by: FileGroupBy) -> Vec<FileRow> {
+    if by == FileGroupBy::None {
+        return rows;
+    }
+    let mut groups: BTreeMap<String, FileRow> = BTreeMap::new();
+    for row in rows {
+        let key = match by {
+            FileGroupBy::None => String::new(),
+            FileGroupBy::Path => row.path.clone(),
+            FileGroupBy::Dir => parent_dir(&row.path),
+            FileGroupBy::Proc => row.proc_uid.to_string(),
+        };
+        groups
+            .entry(key)
+            .and_modify(|acc| {
+                acc.bytes_read = add_opt(acc.bytes_read, row.bytes_read);
+                acc.bytes_written = add_opt(acc.bytes_written, row.bytes_written);
+                if row.first_ns < acc.first_ns {
+                    acc.first_ns = row.first_ns;
+                    acc.id = row.id;
+                }
+            })
+            .or_insert(row);
+    }
+    let mut out: Vec<FileRow> = groups.into_values().collect();
+    out.sort_by_key(|row| (row.first_ns, row.id));
+    out
+}
+
+/// Parent directory of `path`. `/a/b` → `/a`. A path with no separator is unchanged.
+fn parent_dir(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut split = None;
+    for (i, byte) in bytes.iter().enumerate().rev() {
+        if *byte == b'/' || *byte == b'\\' {
+            split = Some(i);
+            break;
+        }
+    }
+    match split {
+        Some(0) => path[..1].to_string(),
+        Some(i) => path[..i].to_string(),
+        None => path.to_string(),
+    }
+}
+
+fn store_param_to_sql(param: &StoreParam) -> rusqlite::types::Value {
+    match param {
+        StoreParam::Text(s) => rusqlite::types::Value::Text(s.clone()),
+        StoreParam::Int(n) => rusqlite::types::Value::Integer(*n),
+    }
 }
 
 fn session_visible(conn: &Connection, user_id: &str, session_id: i64) -> Result<bool, QueryError> {

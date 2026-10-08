@@ -60,6 +60,14 @@ const NS_PER_DAY: i64 = 24 * 60 * 60 * 1_000_000_000;
 /// (the bucket table references `net_flows.id`). `sessions` is deleted last,
 /// one row at a time, after its children are gone.
 const CHILD_TABLES: &[ChildTable] = &[
+    // Present only after migrations 0003–0005. `delete_children_in_batches`
+    // skips a name that is not in sqlite_master, so a P1 database still purges.
+    // The FTS rows for these ids are removed by the BEFORE DELETE triggers in
+    // 0005_fts.sql; this list does not DELETE FROM fts_text itself.
+    ChildTable {
+        name: "file_access",
+        key: "id",
+    },
     ChildTable {
         name: "net_flow_buckets",
         key: "flow_id, bucket_ns",
@@ -483,6 +491,9 @@ fn delete_children_in_batches(
     table: &ChildTable,
     session_id: i64,
 ) -> Result<(), StoreError> {
+    if !table_exists(conn, table.name)? {
+        return Ok(());
+    }
     // Names and keys are the const list above, not user input.
     let sql = format!(
         "DELETE FROM {name} WHERE ({key}) IN \
@@ -589,16 +600,15 @@ fn sqlite_busy(err: &rusqlite::Error) -> bool {
 fn read_stats(conn: &Connection, db_path: &Path) -> Result<Stats, StoreError> {
     let page_bytes = page_bytes(conn)?;
     let wal_bytes = wal_len(db_path)?;
-    let tables = TABLE_NAMES
+    let mut tables = TABLE_NAMES
         .iter()
-        .map(|table| {
-            let sql = format!("SELECT COUNT(*) FROM {table}");
-            let rows: i64 = conn
-                .query_row(&sql, [], |row| row.get(0))
-                .map_err(|err| StoreError::sqlite("count_table", err))?;
-            Ok(TableCount { table, rows })
-        })
+        .map(|table| count_named(conn, table))
         .collect::<Result<Vec<_>, StoreError>>()?;
+    for table in OPTIONAL_TABLES {
+        if table_exists(conn, table)? {
+            tables.push(count_named(conn, table)?);
+        }
+    }
     let oldest_session = conn
         .query_row(
             "SELECT id, public_id, started_ns, ended_ns, pinned
@@ -638,6 +648,28 @@ const TABLE_NAMES: &[&str] = &[
     "dns",
     "gaps",
 ];
+
+/// Tables counted only when the migration that creates them has run.
+const OPTIONAL_TABLES: &[&str] = &["file_access"];
+
+fn count_named(conn: &Connection, table: &'static str) -> Result<TableCount, StoreError> {
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    let rows: i64 = conn
+        .query_row(&sql, [], |row| row.get(0))
+        .map_err(|err| StoreError::sqlite("count_table", err))?;
+    Ok(TableCount { table, rows })
+}
+
+fn table_exists(conn: &Connection, name: &str) -> Result<bool, StoreError> {
+    let found: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .map_err(|err| StoreError::sqlite("table_exists", err))?;
+    Ok(found > 0)
+}
 
 fn db_bytes(conn: &Connection, db_path: &Path) -> Result<u64, StoreError> {
     Ok(page_bytes(conn)?.saturating_add(wal_len(db_path)?))

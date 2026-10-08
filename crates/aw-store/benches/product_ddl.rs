@@ -84,6 +84,7 @@ fn sample_batch() -> WriteBatch {
         }],
         processes: Vec::with_capacity(ROWS),
         process_images: Vec::new(),
+        file_access: Vec::new(),
         net_flows: Vec::new(),
         net_flow_buckets: Vec::new(),
         dns: Vec::new(),

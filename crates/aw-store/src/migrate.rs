@@ -31,9 +31,43 @@ use rusqlite::{Connection, OpenFlags};
 use crate::error::StoreError;
 
 /// Version installed by [`MIGRATION_0001`].
+///
+/// P2 scripts (`0003` file_access, `0004` timeline, `0005` FTS) are **not**
+/// part of this number. [`crate::SqliteSink::write_batch`] applies them through
+/// [`Store::open_with_scripts`] when a batch contains `file_access` rows, and
+/// [`crate::query::files`] applies them before a file query. A database that
+/// never stores a file row stays at version 1, which is what the P1 reopen
+/// tests assert. `0002_timeline_view.sql` is still applied by
+/// [`crate::query::ensure_timeline`], not by this runner: it is not a numbered
+/// schema change.
 pub const SCHEMA_VERSION: u32 = 1;
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
+
+/// `file_access` table and its four indexes. storage.md §3.
+pub const MIGRATION_0003: &str = include_str!("../migrations/0003_file_access.sql");
+
+/// Rebuilds the `timeline` view so the `file` branch is present.
+pub const MIGRATION_0004: &str = include_str!("../migrations/0004_timeline_file.sql");
+
+/// FTS5 trigram index over path, argv, and URL. storage.md §3.2.
+pub const MIGRATION_0005: &str = include_str!("../migrations/0005_fts.sql");
+
+/// Version after [`MIGRATION_0003`], [`MIGRATION_0004`], and [`MIGRATION_0005`].
+pub const FILE_SCHEMA_VERSION: u32 = 5;
+
+/// Scripts [`Store::open`] does not apply on its own.
+///
+/// Pass them to [`Store::open_with_scripts`] (see [`apply_file_schema`]) when
+/// the caller is about to write or query `file_access`. Versions are strictly
+/// increasing and all greater than [`SCHEMA_VERSION`].
+pub fn file_schema_scripts() -> [(u32, &'static str); 3] {
+    [
+        (3, MIGRATION_0003),
+        (4, MIGRATION_0004),
+        (5, MIGRATION_0005),
+    ]
+}
 
 const META_VERSION: &str = "schema_version";
 const META_CREATED_NS: &str = "created_ns";

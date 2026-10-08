@@ -18,7 +18,10 @@
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
 use crate::error::StoreError;
-use crate::migrate::Store;
+use crate::file_access::{self, FileAccessRow};
+use crate::fts::{self, FtsMode, FtsSource};
+use crate::migrate::{self, Store};
+use crate::retention::WriteMode;
 
 /// Accepts one batch and commits it, or rolls it back.
 ///
@@ -27,8 +30,8 @@ pub trait RecordSink {
     /// Write `batch` in one `BEGIN IMMEDIATE` transaction.
     ///
     /// Order inside the transaction: `sessions`, `processes`, `process_images`,
-    /// `net_flows`, `net_flow_buckets`, `dns`, `gaps`. Processes are written
-    /// before flows. A failure rolls the whole batch back.
+    /// `file_access`, `net_flows`, `net_flow_buckets`, `dns`, `gaps`. Processes
+    /// are written before flows and file rows. A failure rolls the whole batch back.
     fn write_batch(&mut self, batch: &WriteBatch) -> Result<(), StoreError>;
 }
 
@@ -42,6 +45,9 @@ pub struct WriteBatch {
     pub processes: Vec<ProcessRow>,
     /// Exec images. `proc_uid` is not a foreign key.
     pub process_images: Vec<ProcessImageRow>,
+    /// Aggregated file accesses. `id` is the UPSERT key shared by a partial
+    /// snapshot and its final row.
+    pub file_access: Vec<FileAccessRow>,
     /// Flows. `id` is the UPSERT key.
     pub net_flows: Vec<NetFlowRow>,
     /// Per-bucket byte accumulators.
@@ -307,7 +313,11 @@ pub struct GapRow {
 
 /// [`RecordSink`] backed by a [`Store`] write connection.
 pub struct SqliteSink<'a> {
-    conn: &'a mut Connection,
+    store: &'a mut Store,
+    /// From [`crate::Retention::apply`]. [`WriteMode::MetadataAndGapsOnly`]
+    /// refuses detail rows (processes, files, flows, dns, images). Sessions
+    /// and gaps are still written. The default is [`WriteMode::Normal`].
+    write_mode: WriteMode,
 }
 
 impl<'a> SqliteSink<'a> {
@@ -317,18 +327,52 @@ impl<'a> SqliteSink<'a> {
             return Err(StoreError::ReadOnly);
         }
         Ok(Self {
-            conn: store.connection_mut(),
+            store,
+            write_mode: WriteMode::Normal,
         })
+    }
+
+    /// Remember the disk-pressure mode from the last retention pass.
+    ///
+    /// Not persisted. A new [`SqliteSink`] starts at [`WriteMode::Normal`].
+    pub fn set_write_mode(&mut self, mode: WriteMode) {
+        self.write_mode = mode;
     }
 }
 
 impl RecordSink for SqliteSink<'_> {
     fn write_batch(&mut self, batch: &WriteBatch) -> Result<(), StoreError> {
+        if !batch.file_access.is_empty() || image_has_argv(&batch.process_images) {
+            // 0003–0005. A P1 database stays at SCHEMA_VERSION until the first
+            // file row or indexed argv, which is what the P1 reopen test asserts.
+            apply_file_schema(self.store)?;
+        }
+        let fts = if file_schema_present(self.store.connection())? {
+            fts::read_mode(self.store.connection())?
+        } else {
+            FtsMode::Off
+        };
+        if self.write_mode == WriteMode::MetadataAndGapsOnly && batch_has_detail(batch) {
+            // storage.md §5: below min_free_disk_bytes, keep session metadata
+            // and gaps only. Detail is not silently dropped; the caller sees
+            // the error and records its own gap. This crate does not invent one.
+            return Err(StoreError::sqlite(
+                "disk_low_detail_refused",
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ErrorCode::DiskFull,
+                        extended_code: 13,
+                    },
+                    Some("free disk is below min_free_disk_bytes; detail rows were not written".into()),
+                ),
+            ));
+        }
         let tx = self
-            .conn
+            .store
+            .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| StoreError::sqlite("begin_batch", err))?;
-        let result = write_all(&tx, batch);
+        let result = write_all(&tx, batch, fts);
         match result {
             Ok(()) => tx
                 .commit()
@@ -341,10 +385,77 @@ impl RecordSink for SqliteSink<'_> {
     }
 }
 
-fn write_all(tx: &Transaction<'_>, batch: &WriteBatch) -> Result<(), StoreError> {
+fn batch_has_detail(batch: &WriteBatch) -> bool {
+    !batch.processes.is_empty()
+        || !batch.process_images.is_empty()
+        || !batch.file_access.is_empty()
+        || !batch.net_flows.is_empty()
+        || !batch.net_flow_buckets.is_empty()
+        || !batch.dns.is_empty()
+}
+
+fn image_has_argv(rows: &[ProcessImageRow]) -> bool {
+    rows.iter()
+        .any(|row| row.argv.as_deref().is_some_and(|text| !text.is_empty()))
+}
+
+fn file_schema_present(conn: &Connection) -> Result<bool, StoreError> {
+    let found: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'file_access'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| StoreError::sqlite("probe_file_access", err))?;
+    Ok(found > 0)
+}
+
+/// Apply migrations 0003, 0004, and 0005 if `file_access` is not there yet.
+///
+/// Uses [`Store::open_with_scripts`] on a second connection only when the
+/// table is missing. The caller's connection is the one that migrates: the
+/// scripts are the same strings, executed here so the open file does not have
+/// to be closed and reopened under the sink.
+pub fn apply_file_schema(store: &mut Store) -> Result<(), StoreError> {
+    if store.is_read_only() {
+        return Err(StoreError::ReadOnly);
+    }
+    if file_schema_present(store.connection())? {
+        return Ok(());
+    }
+    let conn = store.connection();
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|err| StoreError::sqlite("begin_file_schema", err))?;
+    let applied = (|| {
+        for (version, sql) in migrate::file_schema_scripts() {
+            tx.execute_batch(sql)
+                .map_err(|err| StoreError::sqlite("migrate_file_schema", err))?;
+            tx.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![version.to_string()],
+            )
+            .map_err(|err| StoreError::sqlite("migrate_file_schema_version", err))?;
+        }
+        Ok::<(), StoreError>(())
+    })();
+    match applied {
+        Ok(()) => tx
+            .commit()
+            .map_err(|err| StoreError::sqlite("commit_file_schema", err)),
+        Err(err) => {
+            drop(tx);
+            Err(err)
+        }
+    }
+}
+
+fn write_all(tx: &Transaction<'_>, batch: &WriteBatch, fts: FtsMode) -> Result<(), StoreError> {
     write_sessions(tx, &batch.sessions)?;
     write_processes(tx, &batch.processes)?;
-    write_images(tx, &batch.process_images)?;
+    write_images(tx, &batch.process_images, fts)?;
+    file_access::write_rows(tx, &batch.file_access, fts)?;
     write_flows(tx, &batch.net_flows)?;
     write_buckets(tx, &batch.net_flow_buckets)?;
     write_dns(tx, &batch.dns)?;
@@ -441,7 +552,11 @@ fn write_processes(tx: &Transaction<'_>, rows: &[ProcessRow]) -> Result<(), Stor
     Ok(())
 }
 
-fn write_images(tx: &Transaction<'_>, rows: &[ProcessImageRow]) -> Result<(), StoreError> {
+fn write_images(
+    tx: &Transaction<'_>,
+    rows: &[ProcessImageRow],
+    fts: FtsMode,
+) -> Result<(), StoreError> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -472,6 +587,12 @@ fn write_images(tx: &Transaction<'_>, rows: &[ProcessImageRow]) -> Result<(), St
             row.source,
         ])
         .map_err(|err| StoreError::sqlite("insert_image", err))?;
+        if let Some(id) = row.id {
+            // argv is already redacted. An unknown argv is not indexed as "".
+            if file_schema_present(tx)? {
+                fts::upsert(tx, fts, FtsSource::ProcessImage, id, row.argv.as_deref())?;
+            }
+        }
     }
     Ok(())
 }

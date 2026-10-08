@@ -168,10 +168,14 @@ pub(crate) enum Command {
     /// 发现
     Findings {
         session: String,
-        #[arg(long)]
+        #[arg(long, value_parser = ["info", "notice", "warn"])]
         min_severity: Option<String>,
+        /// 证据等级列表：E1、I 或 content_match，逗号分隔
         #[arg(long)]
         evidence: Option<String>,
+        /// 覆盖全局 --lang。zh 或 en
+        #[arg(long, value_parser = ["zh", "en"])]
+        lang: Option<String>,
     },
     /// 采集缺口
     Gaps { session: String },
@@ -356,8 +360,14 @@ pub(crate) enum DaemonCmd {
 pub(crate) enum RulesCmd {
     /// 已加载的规则
     List,
-    /// 用夹具试跑一条规则
-    Test { rule: String, fixture: String },
+    /// 用夹具试跑一条规则。不连接 daemon，不读会话库
+    Test {
+        rule: String,
+        fixture: String,
+        /// 期望的 findings JSON。不一致时以非 0 退出
+        #[arg(long)]
+        expect: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

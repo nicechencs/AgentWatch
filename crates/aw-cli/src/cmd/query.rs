@@ -358,6 +358,29 @@ pub(crate) trait QuerySource {
     /// [`QueryError::BadArgument`] for an unknown `kind`.
     /// [`QueryError::Unavailable`] when nothing is connected.
     fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHit>, QueryError>;
+
+    /// HTTP rows for one session (`GET /sessions/{sid}/http`).
+    ///
+    /// `reason` is `Some("no_proxy")` when the session exists and the proxy was
+    /// off. That is an empty list with a reason, not a missing session.
+    ///
+    /// # Errors
+    ///
+    /// [`QueryError::NotFound`] when the session is missing.
+    /// [`QueryError::Unavailable`] when nothing is connected. An unwired source
+    /// must not return an empty page: that would claim the session had no HTTP.
+    fn http(&self, key: &str, query: &HttpQuery) -> Result<HttpPage, QueryError>;
+
+    /// Findings for one session (`GET /sessions/{sid}/findings`).
+    ///
+    /// `text` is the wording the source already rendered. `None` means rendering
+    /// failed; the row still carries `wording_id` and `params`.
+    ///
+    /// # Errors
+    ///
+    /// [`QueryError::NotFound`] when the session is missing.
+    /// [`QueryError::Unavailable`] when nothing is connected.
+    fn findings(&self, key: &str, query: &FindingQuery) -> Result<Vec<FindingItem>, QueryError>;
 }
 
 /// One `file_access` row, or one group of them.
@@ -479,6 +502,112 @@ pub(crate) struct SearchHit {
     pub sensitive_rule: Option<String>,
 }
 
+/// One HTTP row. The URL and header text are already redacted by the pipeline.
+///
+/// Byte and duration columns are [`Option`]. `None` means the proxy did not
+/// observe them. It is not zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HttpItem {
+    /// Row id.
+    pub id: i64,
+    /// Unix nanoseconds.
+    pub ts_ns: i64,
+    /// Process, when the request was attributed.
+    pub proc_uid: Option<i64>,
+    /// `proc.pid` from the API summary. Not invented here.
+    pub proc_pid: Option<i64>,
+    /// Image basename. Not a path.
+    pub proc_exe: Option<String>,
+    /// Method (`GET`, `POST`, …).
+    pub method: String,
+    /// Already-redacted URL. Never a raw query string from the process.
+    pub url: String,
+    /// Response status. `None` when the exchange did not complete.
+    pub status: Option<i64>,
+    /// Request body length. `None` is not observed.
+    pub req_body_bytes: Option<i64>,
+    /// Response body length. `None` is not observed.
+    pub resp_body_bytes: Option<i64>,
+    /// Round-trip time in milliseconds. `None` is not observed.
+    pub duration_ms: Option<i64>,
+    /// Record evidence. HTTP through the proxy is E2; unknown stays `None`.
+    pub evidence: Option<Evidence>,
+}
+
+/// One page of HTTP rows, plus the reason an empty page is empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HttpPage {
+    /// Rows, oldest first.
+    pub rows: Vec<HttpItem>,
+    /// `no_proxy` when the session did not enable the proxy. `None` otherwise.
+    ///
+    /// An empty `rows` with `reason: None` means the proxy ran and recorded
+    /// nothing. `Some("no_proxy")` means URLs were not available.
+    pub reason: Option<String>,
+}
+
+/// Constraints for [`QuerySource::http`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HttpQuery {
+    /// Filter expression, forwarded as `filter=`. Not compiled here.
+    pub filter: Option<String>,
+}
+
+/// One finding the CLI can print.
+///
+/// `text` is the rendered sentence. `None` means the wording catalog refused
+/// it; the command prints that as unavailable and does not invent a sentence.
+/// `refs` is only included in `--json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FindingItem {
+    /// Row id.
+    pub id: i64,
+    /// Rule that fired.
+    pub rule_id: String,
+    /// `fact`, `fact_conjunction`, `inference`, or `content_match`.
+    pub kind: String,
+    /// Evidence string as stored (`E1`, `I`, `content_match`, …).
+    pub evidence: String,
+    /// `info`, `notice`, or `warn`.
+    pub severity: String,
+    /// Wording template id.
+    pub wording_id: String,
+    /// Template parameters, already safe to print.
+    pub params: Vec<(String, String)>,
+    /// Rendered sentence, or `None` when rendering failed.
+    pub text: Option<String>,
+    /// Why `text` is missing. Not a substitute sentence.
+    pub error: Option<String>,
+    /// How many times this key fired.
+    pub count: i64,
+    /// First observation, Unix nanoseconds.
+    pub first_ns: i64,
+    /// Last observation, Unix nanoseconds.
+    pub last_ns: i64,
+    /// Cited rows. Printed only with `--json`.
+    pub refs: Vec<FindingRef>,
+}
+
+/// One cited row: a table name plus the id inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FindingRef {
+    /// Table name (`file_access`, `net_flow`, `http`).
+    pub table: String,
+    /// Row id inside `table`.
+    pub id: i64,
+}
+
+/// Constraints for [`QuerySource::findings`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FindingQuery {
+    /// `info`, `notice`, or `warn`. The source drops anything below this.
+    pub min_severity: Option<String>,
+    /// Evidence tokens, or `content_match` (matched on `kind`).
+    pub evidence: Vec<String>,
+    /// `zh` or `en`. The source renders `text` in this language.
+    pub lang: Option<String>,
+}
+
 /// Constraints for [`QuerySource::search`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SearchQuery {
@@ -543,6 +672,48 @@ pub(crate) fn search_request(
         pairs.push(("since", since));
     }
     crate::client::ApiRequest::get_query("/api/v1/search", encode_query(&pairs))
+}
+
+/// `GET /api/v1/sessions/{sid}/http?filter=`.
+///
+/// The filter is forwarded, not compiled. A session with the proxy off is still
+/// this same request: the response carries `reason: no_proxy`.
+#[must_use]
+pub(crate) fn http_request(session: &str, query: &HttpQuery) -> crate::client::ApiRequest {
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    if let Some(filter) = query.filter.as_deref() {
+        pairs.push(("filter", filter));
+    }
+    crate::client::ApiRequest::get_query(
+        &format!("/api/v1/sessions/{}/http", encode_path_segment(session)),
+        encode_query(&pairs),
+    )
+}
+
+/// `GET /api/v1/sessions/{sid}/findings?lang&min_severity&evidence`.
+#[must_use]
+pub(crate) fn findings_request(
+    session: &str,
+    query: &FindingQuery,
+) -> crate::client::ApiRequest {
+    let evidence = query.evidence.join(",");
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    if let Some(lang) = query.lang.as_deref() {
+        pairs.push(("lang", lang));
+    }
+    if let Some(min_severity) = query.min_severity.as_deref() {
+        pairs.push(("min_severity", min_severity));
+    }
+    if !evidence.is_empty() {
+        pairs.push(("evidence", &evidence));
+    }
+    crate::client::ApiRequest::get_query(
+        &format!(
+            "/api/v1/sessions/{}/findings",
+            encode_path_segment(session)
+        ),
+        encode_query(&pairs),
+    )
 }
 
 /// Percent-encode one path segment. `@` in `@last` is left as-is: it is
@@ -676,6 +847,22 @@ impl QuerySource for UnavailableSource {
             detail: format!("{UNAVAILABLE}; GET /search is not served yet"),
         })
     }
+
+    fn http(&self, _: &str, _: &HttpQuery) -> Result<HttpPage, QueryError> {
+        Err(QueryError::Unavailable {
+            detail: format!(
+                "{UNAVAILABLE}; GET /sessions/{{sid}}/http is not served yet, so this command does not invent an empty list"
+            ),
+        })
+    }
+
+    fn findings(&self, _: &str, _: &FindingQuery) -> Result<Vec<FindingItem>, QueryError> {
+        Err(QueryError::Unavailable {
+            detail: format!(
+                "{UNAVAILABLE}; GET /sessions/{{sid}}/findings is not served yet, so this command does not invent an empty list"
+            ),
+        })
+    }
 }
 
 /// In-memory sessions for tests. Mutations are visible to later calls on the
@@ -708,6 +895,10 @@ pub(crate) struct MemorySession {
     pub around: Vec<AroundItem>,
     /// Hits this session contributes to `search`.
     pub search: Vec<SearchHit>,
+    /// HTTP rows. `reason` is set when the session had no proxy.
+    pub http: HttpPage,
+    /// Findings, already rendered. Filtering happens in [`MemorySource::findings`].
+    pub findings: Vec<FindingItem>,
 }
 
 #[cfg(test)]
@@ -982,6 +1173,66 @@ impl QuerySource for MemorySource {
         });
         Ok(hits)
     }
+
+    fn http(&self, key: &str, query: &HttpQuery) -> Result<HttpPage, QueryError> {
+        let index = self.find(key)?;
+        let page = &self.sessions[index].http;
+        let mut rows = page.rows.clone();
+        if let Some(filter) = query.filter.as_deref() {
+            if !filter.is_empty() {
+                let needle = filter.to_ascii_lowercase();
+                rows.retain(|row| {
+                    row.method.to_ascii_lowercase().contains(&needle)
+                        || row.url.to_ascii_lowercase().contains(&needle)
+                });
+            }
+        }
+        rows.sort_by_key(|row| (row.ts_ns, row.id));
+        Ok(HttpPage {
+            rows,
+            reason: page.reason.clone(),
+        })
+    }
+
+    fn findings(&self, key: &str, query: &FindingQuery) -> Result<Vec<FindingItem>, QueryError> {
+        let index = self.find(key)?;
+        let floor = severity_rank(query.min_severity.as_deref());
+        let mut rows: Vec<FindingItem> = self.sessions[index]
+            .findings
+            .iter()
+            .filter(|row| severity_rank(Some(row.severity.as_str())) >= floor)
+            .filter(|row| evidence_selected(row, &query.evidence))
+            .cloned()
+            .collect();
+        rows.sort_by_key(|row| (row.first_ns, row.id));
+        Ok(rows)
+    }
+}
+
+/// `info` < `notice` < `warn`. An unknown token sorts below `info`.
+#[cfg(test)]
+fn severity_rank(value: Option<&str>) -> u8 {
+    match value {
+        Some("warn") => 3,
+        Some("notice") => 2,
+        Some("info") => 1,
+        _ => 0,
+    }
+}
+
+/// `content_match` matches `kind`. Every other token matches `evidence`.
+#[cfg(test)]
+fn evidence_selected(row: &FindingItem, wanted: &[String]) -> bool {
+    if wanted.is_empty() {
+        return true;
+    }
+    wanted.iter().any(|token| {
+        if token == "content_match" {
+            row.kind == "content_match" || row.evidence == "content_match"
+        } else {
+            row.evidence == *token
+        }
+    })
 }
 
 /// `<table>:<id>`. The id is numeric. Anything else is a usage error, not a lookup.
@@ -1659,6 +1910,11 @@ pub(crate) fn sample_source() -> MemorySource {
         files: Vec::new(),
         around: Vec::new(),
         search: Vec::new(),
+        http: HttpPage {
+            rows: Vec::new(),
+            reason: None,
+        },
+        findings: Vec::new(),
     });
     source
 }

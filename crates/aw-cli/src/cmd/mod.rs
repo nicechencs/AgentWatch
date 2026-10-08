@@ -8,13 +8,17 @@
 mod around;
 mod attach;
 mod config;
+mod config_rules;
 mod daemon;
 mod db;
 mod doctor;
 mod export;
 mod files;
+mod findings;
 mod flows;
 mod gaps;
+mod hook;
+mod http;
 mod procs;
 mod proxy;
 mod ps;
@@ -126,13 +130,17 @@ fn dispatch(
     source: &mut dyn QuerySource,
 ) -> io::Result<Outcome> {
     let json = cli.json;
-    // `--lang`, `-q`, and `-v` are part of the tree. This card does not branch on them.
-    let _lang = cli.lang.as_deref();
+    // `--lang` selects the wording table for `findings` and `config rules test`.
+    // `-q` and `-v` are part of the tree. This card does not branch on them.
+    let lang = cli.lang.as_deref();
     let _quiet = cli.quiet;
     let _verbose = cli.verbose;
 
     if let Command::Version { check } = &cli.command {
         return Ok(version_outcome(*check, json));
+    }
+    if let Some(outcome) = hook_command(&cli, env_token.as_deref()) {
+        return Ok(outcome);
     }
     if let Some(outcome) = proxy_command(&cli.command, json) {
         return Ok(outcome);
@@ -140,10 +148,10 @@ fn dispatch(
     if let Some(outcome) = launch_command(&cli, json) {
         return Ok(outcome);
     }
-    if let Some(outcome) = query_command(&cli.command, json, source)? {
+    if let Some(outcome) = query_command(&cli.command, json, lang, source)? {
         return Ok(outcome);
     }
-    if let Some(outcome) = ops_command(&cli.command, json) {
+    if let Some(outcome) = ops_command(&cli.command, json, lang) {
         return Ok(outcome);
     }
     if let Some(detail) = usage_gap(&cli.command) {
@@ -171,6 +179,30 @@ fn dispatch(
         )),
         Err(err) => Ok(client_outcome(err, &endpoint, json)),
     }
+}
+
+/// `aw hook` (P5-AGENT-02). Always exit 0, before any daemon probe.
+///
+/// A usage error (missing `<AGENT>`) never reaches here: clap rejects it first.
+/// Daemon flags on the same command line are forwarded so the hook can find the
+/// listener. Failure to find it is still exit 0.
+fn hook_command(cli: &Cli, env_token: Option<&str>) -> Option<Outcome> {
+    let Command::Hook { agent, session } = &cli.command else {
+        return None;
+    };
+    let env_session = std::env::var(hook::SESSION_ENV).ok();
+    let input = EndpointInput {
+        socket: cli.socket.clone(),
+        http: cli.http.clone(),
+        token: cli.token.clone(),
+        token_env: env_token.map(str::to_owned),
+    };
+    Some(hook::run_from_stdio(
+        agent,
+        session.as_deref(),
+        env_session.as_deref(),
+        &input,
+    ))
 }
 
 /// `aw proxy` (P3-PROXY-01). Does not read `ca.key` and does not probe `/health`.
@@ -290,13 +322,17 @@ fn launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
     }
 }
 
-/// `sessions`, `timeline`, `procs`, `flows`, `gaps`. `None` for every other command.
+/// `sessions`, `timeline`, `procs`, `flows`, `gaps`, `files`, `around`, `search`,
+/// `http`, and `findings`. `None` for every other command.
 ///
-/// These do not open an HTTP transport. `http` and `findings` stay on the
-/// health-probe path. `files`, `around`, and `search` are wired here (P2-CLI-01).
+/// These do not open an HTTP transport. `http` and `findings` use the same
+/// [`QuerySource`] as the other query commands (P3-CLI-01). The production source
+/// returns `Unavailable` instead of an empty list, so they never reach the
+/// health probe.
 fn query_command(
     command: &Command,
     json: bool,
+    lang: Option<&str>,
     source: &mut dyn QuerySource,
 ) -> io::Result<Option<Outcome>> {
     match command {
@@ -375,6 +411,29 @@ fn query_command(
             },
             source,
         )?)),
+        Command::Http { session, filter } => Ok(Some(http::run(
+            http::HttpArgs {
+                session,
+                filter: filter.as_deref(),
+                json,
+            },
+            source,
+        )?)),
+        Command::Findings {
+            session,
+            min_severity,
+            evidence,
+            lang: finding_lang,
+        } => Ok(Some(findings::run(
+            findings::FindingsArgs {
+                session,
+                min_severity: min_severity.as_deref(),
+                evidence: evidence.as_deref(),
+                lang: finding_lang.as_deref().or(lang),
+                json,
+            },
+            source,
+        )?)),
         _ => Ok(None),
     }
 }
@@ -384,7 +443,7 @@ fn query_command(
 /// These do not open an HTTP transport and do not touch a service manager or a
 /// database. Each command calls an injected trait; the production values are
 /// empty stubs. `None` for every other command.
-fn ops_command(command: &Command, json: bool) -> Option<Outcome> {
+fn ops_command(command: &Command, json: bool, lang: Option<&str>) -> Option<Outcome> {
     let privilege = daemon::NotAdmin;
     match command {
         Command::Export {
@@ -456,6 +515,22 @@ fn ops_command(command: &Command, json: bool) -> Option<Outcome> {
                 &mut db::NotInteractive,
             ))
         }
+        // `rules list` and `rules test` load files offline. They do not call the
+        // unwired config client, so a down daemon is not exit 3 for them.
+        Command::Config(tree::ConfigCmd::Rules(tree::RulesCmd::List)) => {
+            Some(config_rules::list(json))
+        }
+        Command::Config(tree::ConfigCmd::Rules(tree::RulesCmd::Test {
+            rule,
+            fixture,
+            expect,
+        })) => Some(config_rules::test(
+            rule,
+            fixture,
+            expect.as_deref(),
+            lang,
+            json,
+        )),
         Command::Config(cmd) => Some(config::run(cmd, json, &mut config::UnwiredConfig)),
         _ => None,
     }

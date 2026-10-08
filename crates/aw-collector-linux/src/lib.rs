@@ -13,9 +13,11 @@
 #![forbid(unsafe_code)]
 
 mod decode;
+mod dns_parse;
 mod loader;
 mod lost;
 mod maps;
+mod netdecode;
 mod probe;
 
 #[cfg(target_os = "linux")]
@@ -31,10 +33,16 @@ pub use decode::proc::{
     KIND_CGROUP, KIND_EXEC, KIND_EXIT, KIND_FORK, SOURCE_CGROUP, SOURCE_EXEC as SOURCE_EBPF_EXEC,
     SOURCE_EXIT as SOURCE_EBPF_EXIT, SOURCE_FORK,
 };
+pub use dns_parse::{parse_dns, DnsParse, DnsParseInput, ParsedAnswer, ParsedDns};
 pub use loader::{classify_attach_error, BpfLoader, EmbeddedProgram, LoaderConfig};
 pub use lost::{lost_gap, LostSample, LOST_SOURCE};
 pub use maps::{
     shared_maps, MapKind, MapSpec, EVENTS, EVENTS_RINGBUF_BYTES, LOST, SCOPE_CGROUPS, SCOPE_PIDS,
+};
+pub use netdecode::{
+    connect_from_bytes, decode_net, dns_from_bytes, normalize_ip, proc_uid_ready, state_from_bytes,
+    stats_from_bytes, ConnectRecord, DecodedNet, DnsRecordIn, Endpoint, NetRecord, ProcIdentity,
+    SkipReason, StateRecord, StatsDelta, DNS_PAYLOAD_CAP, RESOLVED_STUB, SOURCE_PREFIX,
 };
 pub use probe::{
     all_probes, parse_collector_arg, select_tier, MountFailure, MountResult, PermissionError,

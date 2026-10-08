@@ -4,10 +4,37 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Explicit MITM proxy. Stub."
+description = "Explicit MITM proxy: session CA, loopback listener, metadata records."
 
 [dependencies]
 aw-core = { workspace = true }
+# P3-PROXY-01..03. Pinned here: root Cargo.toml is frozen. Versions match Cargo.lock.
+# rcgen: MIT OR Apache-2.0. ECDSA P-256 CA and 7-day leaves.
+rcgen = { version = "0.13.2", default-features = false, features = ["pem", "ring", "crypto"] }
+# rustls: Apache-2.0 OR ISC OR MIT. ring only. Used to build a client config the
+# backend can hold; this crate does not complete a MITM handshake (no hyper).
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+# rustls-pki-types: MIT OR Apache-2.0.
+rustls-pki-types = "1.15.1"
+# pem: MIT. Decode a stored CA certificate back to DER for its fingerprint.
+pem = "3.0.6"
+# sha2: MIT OR Apache-2.0. SHA-256 fingerprints of certificates, never of keys in Debug.
+sha2 = "0.11.0"
+# webpki-roots: MPL-2.0. Root public keys listed in `<session>/bundle.pem`.
+webpki-roots = "1.0.9"
+# time: MIT OR Apache-2.0. rcgen's not_before / not_after.
+time = { version = "0.3.55", default-features = false, features = ["std"] }
+# Request-body hashing (P3-PROXY-04). All three are already in Cargo.lock.
+# thiserror 2.0.20: MIT OR Apache-2.0. Error enum only.
+# flate2 1.1.2: MIT OR Apache-2.0. gzip inflate; rust_backend avoids a C toolchain.
+#   brotli and zstd are intentionally absent — those encodings return
+#   HashError::UnsupportedEncoding.
+# zeroize 1.9.1: MIT OR Apache-2.0. Wipes the decoded body before return.
+# serde_json comes through aw-core; this crate calls from_slice on the body.
+thiserror = { version = "2.0.20", default-features = false }
+flate2 = { version = "1.1.2", default-features = false, features = ["rust_backend"] }
+zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

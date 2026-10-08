@@ -12,6 +12,7 @@
 pub mod collector;
 pub mod error;
 pub mod event;
+pub mod filter;
 pub mod fixture;
 pub mod proc;
 pub mod time;
@@ -29,6 +30,7 @@ pub use event::{
     FileWrite, FlowDirection, FlowKey, Gap, GapKind, HeaderList, HttpRequest, HttpResponse, IoVia,
     IpcClose, IpcDirection, IpcKind, IpcOpen, IpcTransfer, L4Proto, NaReason, NetClose, NetConnect,
     NetRecv, NetSend, ProcRef, ProcUid, ProcessExit, ProcessStart, RawEvent, RawEventParts,
-    Redacted, SessionId, SocketAddr, Source, StartHow, TlsSni, ToolPhase, UserRef, SCHEMA_VERSION,
+    Redacted, Arg, SessionId, SocketAddr, Source, StartHow, TlsSni, ToolPhase, UserRef, SCHEMA_VERSION,
 };
+pub use filter::{parse as parse_filter, EvalCtx, Expr, FieldRef, FilterError, Op, RecordView, Term, Value};
 pub use fixture::{FixtureError, FixtureHeader, FixtureReader, FixtureWriter};

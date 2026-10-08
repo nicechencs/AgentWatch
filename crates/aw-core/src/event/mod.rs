@@ -24,6 +24,6 @@ pub use kinds::{
     AgentRpc, AgentToolCall, DnsAnswer, DnsQuery, DnsRecord, EnvMap, FileClose, FileCreate,
     FileDelete, FileOpen, FileRead, FileRename, FileWrite, FlowKey, Gap, HeaderList, HttpRequest,
     HttpResponse, IpcClose, IpcOpen, IpcTransfer, NetClose, NetConnect, NetRecv, NetSend,
-    ProcessExit, ProcessStart, Redacted, TlsSni,
+    ProcessExit, ProcessStart, Redacted, Arg, TlsSni,
 };
 pub use raw::{EventKind, RawEvent, RawEventParts};

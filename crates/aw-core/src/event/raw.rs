@@ -120,6 +120,24 @@ impl EventKind {
         }
     }
 
+    /// Executable base name of a `process_start`, for rules that depend on which
+    /// program is running (`argv.mysql_p`, `argv.basic_auth`).
+    ///
+    /// `None` for every other kind, and when the event carried no `exe`. The path
+    /// itself is not returned: only the last segment after `/` or `\`.
+    pub fn exe_base(&self) -> Option<String> {
+        let Self::ProcessStart(start) = self else {
+            return None;
+        };
+        let exe = start.exe.as_deref()?;
+        let base = exe.rsplit(['/', '\\']).next().unwrap_or(exe);
+        if base.is_empty() {
+            None
+        } else {
+            Some(base.to_owned())
+        }
+    }
+
     /// Option fields that event-schema §3 treats as semantically required.
     ///
     /// A `None` here must have an `NA(...)` entry in `field_evidence`. Other

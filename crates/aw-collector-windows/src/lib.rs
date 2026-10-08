@@ -18,6 +18,10 @@
 
 #[cfg(target_os = "windows")]
 pub mod etw;
+/// FileObject path cache. Pure: it does not call Win32. The ETW callback feeds
+/// it already-decoded properties, and it emits `RawEvent`s.
+#[cfg(target_os = "windows")]
+pub mod file_map;
 #[cfg(target_os = "windows")]
 pub mod peb;
 pub mod scope;

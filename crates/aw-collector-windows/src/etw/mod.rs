@@ -8,9 +8,13 @@
 //! Process back-fill (`NtQueryInformationProcess`, PEB) lives in [`crate::peb`].
 //! [`network`] decodes Kernel-Network events and pre-aggregates send/recv for 1 s.
 //! [`dns`] decodes DNS-Client 3006/3008. Neither opens a session.
+//! [`file`] classifies Kernel-File events, drops out-of-scope headers before any
+//! property parse, and accumulates read/write by `(pid, FileObject)`. The path
+//! cache and the `RawEvent` mapping live in [`crate::file_map`].
 
 pub mod dns;
 mod ffi;
+pub mod file;
 pub mod network;
 pub mod process;
 pub mod session;
@@ -22,6 +26,14 @@ mod session_e2e;
 pub use dns::{
     decode_dns, parse_query_results, DecodedDns, DnsAnswerCache, DnsCacheRow, DnsProperties,
     EVENT_DNS_QUERY, EVENT_DNS_QUERY_COMPLETED, PID_ATTRIBUTION_NOTE, PID_FIELD, SOURCE_DNS_CLIENT,
+};
+pub use file::{
+    classify as classify_file, disposition_creates, disposition_truncates, on_file_header,
+    unavailable as file_unavailable, FileCallback, FileOp, FileProperties, IoTally, IoTotals,
+    EVENT_CLOSE, EVENT_CREATE, EVENT_CREATE_NEW_FILE, EVENT_DELETE_PATH, EVENT_NAME_CREATE,
+    EVENT_NAME_DELETE, EVENT_READ, EVENT_RENAME_PATH, EVENT_WRITE, FILE_CREATE, FILE_OPEN,
+    FILE_OPEN_IF, FILE_OVERWRITE, FILE_OVERWRITE_IF, FILE_SUPERSEDE, PID_SYSTEM,
+    SOURCE_KERNEL_FILE,
 };
 pub use network::{
     decode_network, flush_due, normalize_ip, ConnectionKey, DecodedNetwork, FlowPreAgg,

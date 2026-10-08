@@ -53,7 +53,21 @@ pub const DNS_CLIENT_GUID: &str = "1C95126E-7EEA-49A9-A3FE-A378B03DDB4D";
 ///
 /// P1 does not enable this provider (task card restriction). The GUID is named
 /// so a config that asks for it can be rejected by identity, not by a typo.
+/// P2 turns it on through [`SessionConfig::with_kernel_file`], not through
+/// [`SessionConfig::from_parts`].
 pub const KERNEL_FILE_GUID: &str = "EDD08927-9CC4-4E65-B970-C2560FB5C289";
+
+/// Kernel-File keywords P2 enables, OR-ed.
+///
+/// Copied from windows.md §2.2 and 【待验证 SPIKE-02】: FILENAME 0x10, FILEIO
+/// 0x20, OP_END 0x40, CREATE 0x80, READ 0x100, WRITE 0x200, DELETE_PATH 0x400,
+/// RENAME_SETLINK_PATH 0x800, CREATE_NEW_FILE 0x1000. The task card names the
+/// same set (Create, Close, Read, Write, DeletePath, RenamePath, CreateNewFile,
+/// FileName). FILEIO and OP_END are in the documented mask and are included so
+/// Close (event 14) is not dropped by a keyword the table lists and the card
+/// does not spell out. A keyword this mask omits stays off.
+pub const KERNEL_FILE_KEYWORD: u64 =
+    0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000;
 
 /// `EVENT_TRACE_PROPERTIES.BufferSize`, in kilobytes.
 ///
@@ -120,6 +134,18 @@ impl ProviderSpec {
             name: "dns_client",
             guid: DNS_CLIENT_GUID,
             any_keyword: 0,
+        }
+    }
+
+    /// Kernel-File, with the documented keyword mask. P2 only.
+    ///
+    /// [`SessionConfig::from_parts`] still rejects this GUID. The only constructor
+    /// that enables it is [`SessionConfig::with_kernel_file`].
+    pub const fn kernel_file() -> Self {
+        Self {
+            name: "kernel_file",
+            guid: KERNEL_FILE_GUID,
+            any_keyword: KERNEL_FILE_KEYWORD,
         }
     }
 }
@@ -218,6 +244,29 @@ impl SessionConfig {
                 ProviderSpec::kernel_process(),
                 ProviderSpec::kernel_network(),
                 ProviderSpec::dns_client(),
+            ],
+        )
+    }
+
+    /// P1 providers plus Kernel-File, with the documented keyword mask.
+    ///
+    /// This is the P2 session. [`Self::p1`] stays three providers, and
+    /// [`Self::from_parts`] still refuses Kernel-File: a caller that wants the
+    /// file provider has to ask for it here, not by slipping the GUID into a
+    /// generic list. No `EVENT_FILTER_TYPE_PID` is set. The platform document
+    /// says that filter cannot grow as child processes appear, so the callback
+    /// filters on the header PID instead.
+    pub fn with_kernel_file(boot_id: &str) -> Result<Self, ConfigError> {
+        Self::build(
+            boot_id,
+            BUFFER_SIZE_KB,
+            MINIMUM_BUFFERS,
+            MAXIMUM_BUFFERS,
+            vec![
+                ProviderSpec::kernel_process(),
+                ProviderSpec::kernel_network(),
+                ProviderSpec::dns_client(),
+                ProviderSpec::kernel_file(),
             ],
         )
     }

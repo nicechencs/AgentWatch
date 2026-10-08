@@ -20,8 +20,8 @@ use std::net::IpAddr;
 
 use aw_core::{Evidence, ProcUid, SessionId};
 
-use crate::output::DnsRec;
 use super::dns::DnsCache;
+use crate::output::DnsRec;
 
 /// A/AAAA. Same values the DNS cache indexes. CNAME is not an address.
 const RTYPE_A: u16 = 1;
@@ -140,12 +140,7 @@ pub fn attribute_domain(
 ) -> DomainAttribution {
     let mut offers = Vec::new();
     if let Some(host) = non_empty(flow.proxy_connect) {
-        push_offer(
-            &mut offers,
-            host,
-            DomainSource::ProxyConnect,
-            &Evidence::E2,
-        );
+        push_offer(&mut offers, host, DomainSource::ProxyConnect, &Evidence::E2);
     }
     add_rows(
         &mut offers,

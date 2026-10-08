@@ -44,7 +44,9 @@ pub fn parse_rule(source: &str, file: Option<&Path>) -> Result<Rule, RuleError> 
         line: 1,
         detail: format!("the file is not valid TOML: {err}"),
     })?;
-    let root = value.as_table().ok_or_else(|| syntax(source, file, 0, "the file is not a table"))?;
+    let root = value
+        .as_table()
+        .ok_or_else(|| syntax(source, file, 0, "the file is not a table"))?;
     let rule = root
         .get("rule")
         .and_then(toml::Value::as_table)
@@ -59,7 +61,14 @@ pub fn parse_rule(source: &str, file: Option<&Path>) -> Result<Rule, RuleError> 
     let kind_text = optional_str(rule, "kind");
 
     let evidence = parse_evidence(&evidence_text).ok_or_else(|| {
-        invalid(source, file, &id, rule, "evidence", "evidence must be \"E1\", \"I\", or \"content_match\"")
+        invalid(
+            source,
+            file,
+            &id,
+            rule,
+            "evidence",
+            "evidence must be \"E1\", \"I\", or \"content_match\"",
+        )
     })?;
     let severity = parse_severity(&severity_text).ok_or_else(|| {
         invalid(
@@ -78,12 +87,27 @@ pub fn parse_rule(source: &str, file: Option<&Path>) -> Result<Rule, RuleError> 
         .and_then(toml::Value::as_array)
         .ok_or_else(|| invalid(source, file, &id, rule, "id", "missing [[rule.match]]"))?;
     if matches.is_empty() {
-        return Err(invalid(source, file, &id, rule, "id", "a rule needs at least one match step"));
+        return Err(invalid(
+            source,
+            file,
+            &id,
+            rule,
+            "id",
+            "a rule needs at least one match step",
+        ));
     }
     let steps = parse_steps(source, file, &id, matches)?;
 
     check_wording(source, file, &id, rule, &wording_id)?;
-    let kind = resolve_kind(&id, evidence, kind_text.as_deref(), steps.len(), source, file, rule)?;
+    let kind = resolve_kind(
+        &id,
+        evidence,
+        kind_text.as_deref(),
+        steps.len(),
+        source,
+        file,
+        rule,
+    )?;
 
     let emit = rule
         .get("emit")
@@ -127,28 +151,48 @@ fn parse_steps(
         })?;
         let alias = required_str(source, file, table, "as")?;
         if !is_ident(&alias) {
-            return Err(invalid(source, file, id, table, "as", "a step alias must be an identifier"));
+            return Err(invalid(
+                source,
+                file,
+                id,
+                table,
+                "as",
+                "a step alias must be an identifier",
+            ));
         }
         if seen_alias.iter().any(|have: &String| have == &alias) {
-            return Err(invalid(source, file, id, table, "as", "a step alias is used twice"));
+            return Err(invalid(
+                source,
+                file,
+                id,
+                table,
+                "as",
+                "a step alias is used twice",
+            ));
         }
         let record = required_str(source, file, table, "record")?;
-        let category = record_category(&record).ok_or_else(|| {
-            invalid(source, file, id, table, "record", "unknown record type")
-        })?;
+        let category = record_category(&record)
+            .ok_or_else(|| invalid(source, file, id, table, "record", "unknown record type"))?;
         let where_raw = tighten_ops(&optional_str(table, "where").unwrap_or_default());
         let where_text = alias_fields(&where_raw);
         let pred = filter::parse(&where_text)
             .map(|expr| rewrite_tag_prefix(mark_aliases(expr, &where_raw)))
             .map_err(|err| RuleError::Where {
-            file: file.map(Path::to_path_buf),
-            line: field_line(source, table, "where"),
-            rule_id: id.to_owned(),
-            step: alias.clone(),
-            detail: err.to_string(),
-        })?;
+                file: file.map(Path::to_path_buf),
+                line: field_line(source, table, "where"),
+                rule_id: id.to_owned(),
+                step: alias.clone(),
+                detail: err.to_string(),
+            })?;
         check_fields(
-            &CheckCtx { source, file, id, table, step: &alias, earlier: &seen_alias },
+            &CheckCtx {
+                source,
+                file,
+                id,
+                table,
+                step: &alias,
+                earlier: &seen_alias,
+            },
             &pred,
             category,
         )?;
@@ -159,13 +203,27 @@ fn parse_steps(
         };
         let same = match optional_str(table, "same") {
             Some(text) => Some(parse_same(&text).ok_or_else(|| {
-                invalid(source, file, id, table, "same", "same must be \"session\", \"process\", or \"process_tree\"")
+                invalid(
+                    source,
+                    file,
+                    id,
+                    table,
+                    "same",
+                    "same must be \"session\", \"process\", or \"process_tree\"",
+                )
             })?),
             None => None,
         };
         let threshold = match table.get("threshold") {
             Some(value) => Some(positive_int(value).ok_or_else(|| {
-                invalid(source, file, id, table, "threshold", "threshold must be a positive integer")
+                invalid(
+                    source,
+                    file,
+                    id,
+                    table,
+                    "threshold",
+                    "threshold must be a positive integer",
+                )
             })?),
             None => None,
         };
@@ -191,7 +249,14 @@ fn parse_steps(
             ));
         }
         seen_alias.push(alias.clone());
-        steps.push(MatchStep { alias, record, pred, within_ns, same, threshold });
+        steps.push(MatchStep {
+            alias,
+            record,
+            pred,
+            within_ns,
+            same,
+            threshold,
+        });
     }
     Ok(steps)
 }
@@ -208,7 +273,11 @@ struct CheckCtx<'a> {
 
 /// A field must belong to the step's record category, or be one of the generic
 /// fields. `alias.field` references an earlier step and is checked separately.
-fn check_fields(ctx: &CheckCtx<'_>, expr: &aw_core::filter::Expr, category: FieldKind) -> Result<(), RuleError> {
+fn check_fields(
+    ctx: &CheckCtx<'_>,
+    expr: &aw_core::filter::Expr,
+    category: FieldKind,
+) -> Result<(), RuleError> {
     let mut bad: Option<String> = None;
     walk(expr, &mut |term| {
         if bad.is_some() {
@@ -216,7 +285,10 @@ fn check_fields(ctx: &CheckCtx<'_>, expr: &aw_core::filter::Expr, category: Fiel
         }
         if let FieldRef::Named(info) = &term.field {
             if info.kind != FieldKind::Any && info.kind != category && category != FieldKind::Any {
-                bad = Some(format!("field `{}` does not apply to this record", info.name));
+                bad = Some(format!(
+                    "field `{}` does not apply to this record",
+                    info.name
+                ));
             }
         }
         for value in &term.values {
@@ -274,18 +346,21 @@ fn mark_aliases(expr: aw_core::filter::Expr, source: &str) -> aw_core::filter::E
         return expr;
     }
     match expr {
-        Expr::And(left, right) => {
-            Expr::And(Box::new(mark_aliases(*left, source)), Box::new(mark_aliases(*right, source)))
-        }
-        Expr::Or(left, right) => {
-            Expr::Or(Box::new(mark_aliases(*left, source)), Box::new(mark_aliases(*right, source)))
-        }
+        Expr::And(left, right) => Expr::And(
+            Box::new(mark_aliases(*left, source)),
+            Box::new(mark_aliases(*right, source)),
+        ),
+        Expr::Or(left, right) => Expr::Or(
+            Box::new(mark_aliases(*left, source)),
+            Box::new(mark_aliases(*right, source)),
+        ),
         Expr::Not(inner) => Expr::Not(Box::new(mark_aliases(*inner, source))),
         Expr::Term(mut term) => {
             let aliased = FIELD_ALIASES.iter().any(|(_, to)| term.field.name() == *to);
             if aliased {
                 if let Some(Value::Bool(value)) = term.values.first().cloned() {
-                    term.values.insert(0, Value::Text(format!("{ALIAS_MARK}:{value}")));
+                    term.values
+                        .insert(0, Value::Text(format!("{ALIAS_MARK}:{value}")));
                 }
             }
             Expr::Term(term)
@@ -329,9 +404,12 @@ fn tighten_ops(input: &str) -> String {
 
 /// `true` when the whitespace at `index` touches an operator on either side.
 fn operator_near(bytes: &[u8], index: usize) -> bool {
-    let prev = (0..index).rev().find(|at| !bytes[*at].is_ascii_whitespace());
+    let prev = (0..index)
+        .rev()
+        .find(|at| !bytes[*at].is_ascii_whitespace());
     let next = (index + 1..bytes.len()).find(|at| !bytes[*at].is_ascii_whitespace());
-    prev.is_some_and(|at| is_operator_byte(bytes[at])) || next.is_some_and(|at| is_operator_byte(bytes[at]))
+    prev.is_some_and(|at| is_operator_byte(bytes[at]))
+        || next.is_some_and(|at| is_operator_byte(bytes[at]))
 }
 
 fn is_operator_byte(byte: u8) -> bool {
@@ -346,17 +424,22 @@ fn is_operator_byte(byte: u8) -> bool {
 fn rewrite_tag_prefix(expr: aw_core::filter::Expr) -> aw_core::filter::Expr {
     use aw_core::filter::{Expr, Op, Value};
     match expr {
-        Expr::And(left, right) => {
-            Expr::And(Box::new(rewrite_tag_prefix(*left)), Box::new(rewrite_tag_prefix(*right)))
-        }
-        Expr::Or(left, right) => {
-            Expr::Or(Box::new(rewrite_tag_prefix(*left)), Box::new(rewrite_tag_prefix(*right)))
-        }
+        Expr::And(left, right) => Expr::And(
+            Box::new(rewrite_tag_prefix(*left)),
+            Box::new(rewrite_tag_prefix(*right)),
+        ),
+        Expr::Or(left, right) => Expr::Or(
+            Box::new(rewrite_tag_prefix(*left)),
+            Box::new(rewrite_tag_prefix(*right)),
+        ),
         Expr::Not(inner) => Expr::Not(Box::new(rewrite_tag_prefix(*inner))),
         Expr::Term(term)
             if term.field.name() == "tag"
                 && matches!(term.op, Op::Match | Op::Eq | Op::In)
-                && term.values.iter().any(|value| matches!(value, Value::Text(text) if text == "sensitive")) =>
+                && term
+                    .values
+                    .iter()
+                    .any(|value| matches!(value, Value::Text(text) if text == "sensitive")) =>
         {
             Expr::Term(aw_core::filter::Term {
                 field: FieldRef::Named(sensitive_tag_field()),
@@ -376,7 +459,11 @@ fn rewrite_tag_prefix(expr: aw_core::filter::Expr) -> aw_core::filter::Expr {
 /// answers `bool_value` with.
 fn sensitive_tag_field() -> &'static aw_core::filter::FieldInfo {
     use aw_core::filter::{FieldInfo, FieldType};
-    static FIELD: FieldInfo = FieldInfo { name: "tag_sensitive", ty: FieldType::Bool, kind: FieldKind::Any };
+    static FIELD: FieldInfo = FieldInfo {
+        name: "tag_sensitive",
+        ty: FieldType::Bool,
+        kind: FieldKind::Any,
+    };
     &FIELD
 }
 
@@ -463,7 +550,14 @@ fn check_wording(
             "wording",
             "wording is not a template in the wording catalog",
         )),
-        Err(other) => Err(invalid(source, file, id, rule, "wording", &other.to_string())),
+        Err(other) => Err(invalid(
+            source,
+            file,
+            id,
+            rule,
+            "wording",
+            &other.to_string(),
+        )),
     }
 }
 
@@ -512,20 +606,51 @@ fn parse_key(
         .and_then(toml::Value::as_array)
         .ok_or_else(|| invalid(source, file, id, emit, "key", "emit.key must be an array"))?;
     if values.is_empty() {
-        return Err(invalid(source, file, id, emit, "key", "emit.key must name at least one field"));
+        return Err(invalid(
+            source,
+            file,
+            id,
+            emit,
+            "key",
+            "emit.key must name at least one field",
+        ));
     }
     let mut key = Vec::with_capacity(values.len());
     for value in values {
         let text = value.as_str().ok_or_else(|| {
-            invalid(source, file, id, emit, "key", "an emit.key entry must be a string")
+            invalid(
+                source,
+                file,
+                id,
+                emit,
+                "key",
+                "an emit.key entry must be a string",
+            )
         })?;
         let (alias, field) = split_ref(text).ok_or_else(|| {
-            invalid(source, file, id, emit, "key", "an emit.key entry must be alias.field")
+            invalid(
+                source,
+                file,
+                id,
+                emit,
+                "key",
+                "an emit.key entry must be alias.field",
+            )
         })?;
         if !steps.iter().any(|step| step.alias == alias) {
-            return Err(invalid(source, file, id, emit, "key", "emit.key names a step the rule does not have"));
+            return Err(invalid(
+                source,
+                file,
+                id,
+                emit,
+                "key",
+                "emit.key names a step the rule does not have",
+            ));
         }
-        key.push(KeyField { alias: alias.to_owned(), field: field.to_owned() });
+        key.push(KeyField {
+            alias: alias.to_owned(),
+            field: field.to_owned(),
+        });
     }
     Ok(key)
 }
@@ -544,7 +669,14 @@ fn parse_upgrade(
         .strip_prefix("content_match(")
         .and_then(|rest| rest.strip_suffix(')'))
         .ok_or_else(|| {
-            invalid(source, file, id, emit, "upgrade_if", "upgrade_if must be content_match(step.path, step.flow)")
+            invalid(
+                source,
+                file,
+                id,
+                emit,
+                "upgrade_if",
+                "upgrade_if must be content_match(step.path, step.flow)",
+            )
         })?;
     let mut parts = inner.split(',').map(str::trim);
     let (path_step, flow_step) = match (parts.next(), parts.next(), parts.next()) {
@@ -561,14 +693,36 @@ fn parse_upgrade(
         }
     };
     let path_step = path_step.strip_suffix(".path").ok_or_else(|| {
-        invalid(source, file, id, emit, "upgrade_if", "the first argument must be a step's path")
+        invalid(
+            source,
+            file,
+            id,
+            emit,
+            "upgrade_if",
+            "the first argument must be a step's path",
+        )
     })?;
     let flow_step = flow_step.strip_suffix(".flow").ok_or_else(|| {
-        invalid(source, file, id, emit, "upgrade_if", "the second argument must be a step's flow")
+        invalid(
+            source,
+            file,
+            id,
+            emit,
+            "upgrade_if",
+            "the second argument must be a step's flow",
+        )
     })?;
-    if !steps.iter().any(|step| step.alias == path_step) || !steps.iter().any(|step| step.alias == flow_step)
+    if !steps.iter().any(|step| step.alias == path_step)
+        || !steps.iter().any(|step| step.alias == flow_step)
     {
-        return Err(invalid(source, file, id, emit, "upgrade_if", "upgrade_if names a step the rule does not have"));
+        return Err(invalid(
+            source,
+            file,
+            id,
+            emit,
+            "upgrade_if",
+            "upgrade_if names a step the rule does not have",
+        ));
     }
     Ok(UpgradeIf::ContentMatch {
         path_step: path_step.to_owned(),
@@ -586,15 +740,36 @@ fn parse_params(
         return Ok(Vec::new());
     };
     let values = values.as_array().ok_or_else(|| {
-        invalid(source, file, id, emit, "params", "emit.params must be an array of names")
+        invalid(
+            source,
+            file,
+            id,
+            emit,
+            "params",
+            "emit.params must be an array of names",
+        )
     })?;
     let mut names = Vec::with_capacity(values.len());
     for value in values {
         let name = value.as_str().ok_or_else(|| {
-            invalid(source, file, id, emit, "params", "a parameter name must be a string")
+            invalid(
+                source,
+                file,
+                id,
+                emit,
+                "params",
+                "a parameter name must be a string",
+            )
         })?;
         if !is_ident(name) {
-            return Err(invalid(source, file, id, emit, "params", "a parameter name must be an identifier"));
+            return Err(invalid(
+                source,
+                file,
+                id,
+                emit,
+                "params",
+                "a parameter name must be an identifier",
+            ));
         }
         names.push(name.to_owned());
     }
@@ -609,7 +784,14 @@ fn parse_within(
     text: &str,
 ) -> Result<u64, RuleError> {
     let nanos = duration_ns(text).ok_or_else(|| {
-        invalid(source, file, id, table, "within", "within must be a duration like \"10s\" or \"5m\"")
+        invalid(
+            source,
+            file,
+            id,
+            table,
+            "within",
+            "within must be a duration like \"10s\" or \"5m\"",
+        )
     })?;
     if nanos == 0 || nanos > MAX_WITHIN_NS {
         return Err(invalid(
@@ -671,7 +853,10 @@ fn parse_same(text: &str) -> Option<Same> {
 }
 
 fn record_category(record: &str) -> Option<FieldKind> {
-    RECORD_TYPES.iter().find(|(name, _)| *name == record).map(|(_, kind)| *kind)
+    RECORD_TYPES
+        .iter()
+        .find(|(name, _)| *name == record)
+        .map(|(_, kind)| *kind)
 }
 
 /// `alias.field` inside a value or a key.
@@ -711,11 +896,21 @@ fn required_str(
         .and_then(toml::Value::as_str)
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| syntax(source, file, table_origin(source, table), &format!("missing or empty `{key}`")))
+        .ok_or_else(|| {
+            syntax(
+                source,
+                file,
+                table_origin(source, table),
+                &format!("missing or empty `{key}`"),
+            )
+        })
 }
 
 fn optional_str(table: &toml::Table, key: &str) -> Option<String> {
-    table.get(key).and_then(toml::Value::as_str).map(str::to_owned)
+    table
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
 }
 
 fn required_int(
@@ -725,13 +920,29 @@ fn required_int(
     table: &toml::Table,
     key: &str,
 ) -> Result<u32, RuleError> {
-    let value = table.get(key).ok_or_else(|| {
-        invalid(source, file, id, table, key, &format!("missing `{key}`"))
-    })?;
+    let value = table
+        .get(key)
+        .ok_or_else(|| invalid(source, file, id, table, key, &format!("missing `{key}`")))?;
     let number = value.as_integer().ok_or_else(|| {
-        invalid(source, file, id, table, key, &format!("`{key}` must be an integer"))
+        invalid(
+            source,
+            file,
+            id,
+            table,
+            key,
+            &format!("`{key}` must be an integer"),
+        )
     })?;
-    u32::try_from(number).map_err(|_| invalid(source, file, id, table, key, &format!("`{key}` is out of range")))
+    u32::try_from(number).map_err(|_| {
+        invalid(
+            source,
+            file,
+            id,
+            table,
+            key,
+            &format!("`{key}` is out of range"),
+        )
+    })
 }
 
 fn positive_int(value: &toml::Value) -> Option<u64> {
@@ -758,7 +969,11 @@ fn table_origin(source: &str, table: &toml::Table) -> usize {
     };
     let mut search_from = 0;
     while let Some(found) = find_key(source, search_from, first) {
-        if table.keys().skip(1).all(|key| find_key(source, found, key).is_some()) {
+        if table
+            .keys()
+            .skip(1)
+            .all(|key| find_key(source, found, key).is_some())
+        {
             return found;
         }
         search_from = found.saturating_add(first.len());
@@ -775,7 +990,8 @@ fn find_key(source: &str, from: usize, key: &str) -> Option<usize> {
     let key_bytes = key.as_bytes();
     let mut index = from;
     while index + key_bytes.len() <= bytes.len() {
-        if &bytes[index..index + key_bytes.len()] == key_bytes && bounded(bytes, index, key_bytes.len())
+        if &bytes[index..index + key_bytes.len()] == key_bytes
+            && bounded(bytes, index, key_bytes.len())
         {
             return Some(index);
         }

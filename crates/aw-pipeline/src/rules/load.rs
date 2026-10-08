@@ -20,16 +20,34 @@ struct Builtin {
 
 /// The eight P3 rules. Order is the order they run in.
 const BUILTIN: &[Builtin] = &[
-    Builtin { name: "sensitive_access.toml", source: include_str!("../../rules/sensitive_access.toml") },
+    Builtin {
+        name: "sensitive_access.toml",
+        source: include_str!("../../rules/sensitive_access.toml"),
+    },
     Builtin {
         name: "sensitive_read_then_send.toml",
         source: include_str!("../../rules/sensitive_read_then_send.toml"),
     },
-    Builtin { name: "content_match.toml", source: include_str!("../../rules/content_match.toml") },
-    Builtin { name: "direct_bypass_proxy.toml", source: include_str!("../../rules/direct_bypass_proxy.toml") },
-    Builtin { name: "attribution_break.toml", source: include_str!("../../rules/attribution_break.toml") },
-    Builtin { name: "self_report_mismatch.toml", source: include_str!("../../rules/self_report_mismatch.toml") },
-    Builtin { name: "mass_delete.toml", source: include_str!("../../rules/mass_delete.toml") },
+    Builtin {
+        name: "content_match.toml",
+        source: include_str!("../../rules/content_match.toml"),
+    },
+    Builtin {
+        name: "direct_bypass_proxy.toml",
+        source: include_str!("../../rules/direct_bypass_proxy.toml"),
+    },
+    Builtin {
+        name: "attribution_break.toml",
+        source: include_str!("../../rules/attribution_break.toml"),
+    },
+    Builtin {
+        name: "self_report_mismatch.toml",
+        source: include_str!("../../rules/self_report_mismatch.toml"),
+    },
+    Builtin {
+        name: "mass_delete.toml",
+        source: include_str!("../../rules/mass_delete.toml"),
+    },
     Builtin {
         name: "new_executable_written_then_run.toml",
         source: include_str!("../../rules/new_executable_written_then_run.toml"),
@@ -77,9 +95,13 @@ impl RuleSet {
 pub fn load_builtin() -> Result<RuleSet, RuleError> {
     let mut rules = Vec::with_capacity(BUILTIN.len());
     for builtin in BUILTIN {
-        rules.push(parse_rule(builtin.source, None).map_err(|err| name_builtin(err, builtin.name))?);
+        rules
+            .push(parse_rule(builtin.source, None).map_err(|err| name_builtin(err, builtin.name))?);
     }
-    Ok(RuleSet { rules, overrides: Vec::new() })
+    Ok(RuleSet {
+        rules,
+        overrides: Vec::new(),
+    })
 }
 
 /// Built-in rules, then every `*.toml` in `dir`.
@@ -141,12 +163,30 @@ fn name_builtin(err: RuleError, name: &str) -> RuleError {
     let file = Some(PathBuf::from(name));
     match err {
         RuleError::Syntax { line, detail, .. } => RuleError::Syntax { file, line, detail },
-        RuleError::Invalid { line, rule_id, detail, .. } => {
-            RuleError::Invalid { file, line, rule_id, detail }
-        }
-        RuleError::Where { line, rule_id, step, detail, .. } => {
-            RuleError::Where { file, line, rule_id, step, detail }
-        }
+        RuleError::Invalid {
+            line,
+            rule_id,
+            detail,
+            ..
+        } => RuleError::Invalid {
+            file,
+            line,
+            rule_id,
+            detail,
+        },
+        RuleError::Where {
+            line,
+            rule_id,
+            step,
+            detail,
+            ..
+        } => RuleError::Where {
+            file,
+            line,
+            rule_id,
+            step,
+            detail,
+        },
         other => other,
     }
 }

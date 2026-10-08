@@ -189,7 +189,10 @@ impl StepFacts {
     }
 
     pub(crate) fn param(&self, name: &str) -> Option<String> {
-        self.params.get(name).cloned().or_else(|| self.fields.get(name).cloned())
+        self.params
+            .get(name)
+            .cloned()
+            .or_else(|| self.fields.get(name).cloned())
     }
 
     pub(crate) fn flag(&self, name: &str) -> Option<bool> {
@@ -202,5 +205,6 @@ impl StepFacts {
 /// answers it as a boolean field named `tag` compared against the text
 /// `sensitive` — see [`RuleRecord`]'s `RecordView`.
 pub fn has_sensitive_tag(tags: &[String]) -> bool {
-    tags.iter().any(|tag| tag == "sensitive" || tag.starts_with("sensitive."))
+    tags.iter()
+        .any(|tag| tag == "sensitive" || tag.starts_with("sensitive."))
 }

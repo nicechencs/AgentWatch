@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, VecDeque};
 use aw_core::filter::{EvalCtx, Expr, RecordView};
 
 use super::ast::{EvidenceLevel, KeyField, Rule, Same, UpgradeIf, DEFAULT_STATE_CAP};
-use super::load::RuleSet;
 use super::clock::RuleClock;
+use super::load::RuleSet;
 use super::record::{RuleRecord, StepFacts};
 
 /// Bounds the matcher checks while it runs.
@@ -208,14 +208,20 @@ impl Engine {
             return;
         }
         let state = &mut self.state[index];
-        while state.front().is_some_and(|partial| partial.anchor_ns.saturating_add(window) < now) {
+        while state
+            .front()
+            .is_some_and(|partial| partial.anchor_ns.saturating_add(window) < now)
+        {
             state.pop_front();
         }
     }
 
     fn offer(&mut self, index: usize, record: &RuleRecord, now: u64, out: &mut StepOutput) {
         let first_type = self.rules[index].steps[0].record.clone();
-        let second_type = self.rules[index].steps.get(1).map(|step| step.record.clone());
+        let second_type = self.rules[index]
+            .steps
+            .get(1)
+            .map(|step| step.record.clone());
         if record.record_type() == first_type && self.matches_step(index, 0, record, None) {
             self.note_first_step(index, record, now, out);
         }
@@ -224,7 +230,13 @@ impl Engine {
         }
     }
 
-    fn note_first_step(&mut self, index: usize, record: &RuleRecord, now: u64, out: &mut StepOutput) {
+    fn note_first_step(
+        &mut self,
+        index: usize,
+        record: &RuleRecord,
+        now: u64,
+        out: &mut StepOutput,
+    ) {
         let rule = &self.rules[index];
         let mut facts = record.facts();
         facts.alias = rule.steps[0].alias.clone();
@@ -276,7 +288,12 @@ impl Engine {
         }
         self.push_partial(
             index,
-            Partial { facts: vec![facts.clone()], anchor_ns: ts, session, proc_uid: proc },
+            Partial {
+                facts: vec![facts.clone()],
+                anchor_ns: ts,
+                session,
+                proc_uid: proc,
+            },
             ts,
             out,
         );
@@ -306,7 +323,14 @@ impl Engine {
         }
     }
 
-    fn pairs(&self, partial: &Partial, record: &RuleRecord, same: Option<Same>, window: u64, ts: u64) -> bool {
+    fn pairs(
+        &self,
+        partial: &Partial,
+        record: &RuleRecord,
+        same: Option<Same>,
+        window: u64,
+        ts: u64,
+    ) -> bool {
         if ts < partial.anchor_ns || ts.saturating_sub(partial.anchor_ns) > window {
             return false;
         }
@@ -353,7 +377,10 @@ impl Engine {
         // `path = a.path` cannot be answered by the shared evaluator, which has
         // no notion of an alias. Substitute the earlier step's value first, so
         // the comparison that reaches it is between two plain strings.
-        let pred = restore_fields(&bind_aliases(&self.rules[index].steps[step_index].pred, earlier));
+        let pred = restore_fields(&bind_aliases(
+            &self.rules[index].steps[step_index].pred,
+            earlier,
+        ));
         let view = AliasView { record, earlier };
         let hit = pred.to_predicate(ctx)(&view);
         hit
@@ -365,7 +392,9 @@ impl Engine {
             self.record_eviction(index, 1, now, out);
             return;
         }
-        let overflow = self.state[index].len().saturating_sub(cap.saturating_sub(1));
+        let overflow = self.state[index]
+            .len()
+            .saturating_sub(cap.saturating_sub(1));
         if overflow > 0 {
             self.state[index].drain(..overflow);
             self.record_eviction(index, u64::try_from(overflow).unwrap_or(u64::MAX), now, out);
@@ -402,7 +431,10 @@ impl Engine {
         let params = build_params(rule, facts, observed.unwrap_or(count));
         let refs = facts
             .iter()
-            .map(|fact| RecordRef { table: fact.record.clone(), id: fact.record_id })
+            .map(|fact| RecordRef {
+                table: fact.record.clone(),
+                id: fact.record_id,
+            })
             .collect();
         out.findings.push(FindingDraft {
             rule_id: rule.id.clone(),
@@ -428,8 +460,14 @@ impl Engine {
 fn restore_fields(expr: &Expr) -> Expr {
     match expr {
         Expr::True => Expr::True,
-        Expr::And(left, right) => Expr::And(Box::new(restore_fields(left)), Box::new(restore_fields(right))),
-        Expr::Or(left, right) => Expr::Or(Box::new(restore_fields(left)), Box::new(restore_fields(right))),
+        Expr::And(left, right) => Expr::And(
+            Box::new(restore_fields(left)),
+            Box::new(restore_fields(right)),
+        ),
+        Expr::Or(left, right) => Expr::Or(
+            Box::new(restore_fields(left)),
+            Box::new(restore_fields(right)),
+        ),
         Expr::Not(inner) => Expr::Not(Box::new(restore_fields(inner))),
         Expr::Term(term) => {
             let mut term = term.clone();
@@ -449,7 +487,11 @@ fn restore_fields(expr: &Expr) -> Expr {
 
 fn loopback_field() -> &'static aw_core::filter::FieldInfo {
     use aw_core::filter::{FieldInfo, FieldKind, FieldType};
-    static FIELD: FieldInfo = FieldInfo { name: "is_loopback", ty: FieldType::Bool, kind: FieldKind::Net };
+    static FIELD: FieldInfo = FieldInfo {
+        name: "is_loopback",
+        ty: FieldType::Bool,
+        kind: FieldKind::Net,
+    };
     &FIELD
 }
 
@@ -460,12 +502,14 @@ fn loopback_field() -> &'static aw_core::filter::FieldInfo {
 fn bind_aliases(expr: &Expr, earlier: Option<&StepFacts>) -> Expr {
     match expr {
         Expr::True => Expr::True,
-        Expr::And(left, right) => {
-            Expr::And(Box::new(bind_aliases(left, earlier)), Box::new(bind_aliases(right, earlier)))
-        }
-        Expr::Or(left, right) => {
-            Expr::Or(Box::new(bind_aliases(left, earlier)), Box::new(bind_aliases(right, earlier)))
-        }
+        Expr::And(left, right) => Expr::And(
+            Box::new(bind_aliases(left, earlier)),
+            Box::new(bind_aliases(right, earlier)),
+        ),
+        Expr::Or(left, right) => Expr::Or(
+            Box::new(bind_aliases(left, earlier)),
+            Box::new(bind_aliases(right, earlier)),
+        ),
         Expr::Not(inner) => Expr::Not(Box::new(bind_aliases(inner, earlier))),
         Expr::Term(term) => {
             let mut term = term.clone();
@@ -494,7 +538,10 @@ struct AliasView<'a> {
 impl RecordView for AliasView<'_> {
     fn text(&self, field: &str) -> Option<&str> {
         self.record.text(field).or_else(|| match field {
-            "path" => self.earlier.and_then(|facts| facts.text("path")).map(String::as_str),
+            "path" => self
+                .earlier
+                .and_then(|facts| facts.text("path"))
+                .map(String::as_str),
             _ => None,
         })
     }
@@ -521,7 +568,7 @@ fn build_key(fields: &[KeyField], facts: &[StepFacts]) -> String {
                 .find(|fact| fact.alias == field.alias)
                 .and_then(|fact| fact.text(&field.field))
                 .map(String::as_str)
-            .unwrap_or("");
+                .unwrap_or("");
             format!("{}={}", field.field, value)
         })
         .collect::<Vec<_>>()
@@ -541,8 +588,12 @@ fn pick_wording(rule: &Rule, facts: &[StepFacts]) -> String {
         return rule.wording.clone();
     }
     let flow = facts.iter().find(|fact| &fact.alias == flow_step);
-    let proxy_on = flow.and_then(|fact| fact.flag("proxy_enabled")).unwrap_or(false);
-    let compared = flow.and_then(|fact| fact.flag("hash_compared")).unwrap_or(false);
+    let proxy_on = flow
+        .and_then(|fact| fact.flag("proxy_enabled"))
+        .unwrap_or(false);
+    let compared = flow
+        .and_then(|fact| fact.flag("hash_compared"))
+        .unwrap_or(false);
     if !proxy_on {
         "infer.temporal_no_proxy".to_owned()
     } else if compared {
@@ -593,7 +644,10 @@ fn format_duration(ns: u64) -> String {
 /// filled from that step only.
 fn param_value(name: &str, facts: &[StepFacts]) -> Option<String> {
     if let Some((alias, field)) = name.split_once('.') {
-        return facts.iter().find(|fact| fact.alias == alias).and_then(|fact| fact.param(field));
+        return facts
+            .iter()
+            .find(|fact| fact.alias == alias)
+            .and_then(|fact| fact.param(field));
     }
     facts.iter().find_map(|fact| fact.param(name))
 }

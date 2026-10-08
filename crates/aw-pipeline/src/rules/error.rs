@@ -57,14 +57,25 @@ impl std::fmt::Display for RuleError {
             Self::Syntax { file, line, detail } => {
                 write!(f, "{}:{line}: {detail}", file_label(file.as_deref()))
             }
-            Self::Invalid { file, line, rule_id, detail } => {
+            Self::Invalid {
+                file,
+                line,
+                rule_id,
+                detail,
+            } => {
                 write!(
                     f,
                     "{}:{line}: rule `{rule_id}`: {detail}",
                     file_label(file.as_deref())
                 )
             }
-            Self::Where { file, line, rule_id, step, detail } => {
+            Self::Where {
+                file,
+                line,
+                rule_id,
+                step,
+                detail,
+            } => {
                 write!(
                     f,
                     "{}:{line}: rule `{rule_id}` step `{step}`: {detail}",

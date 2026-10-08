@@ -1,0 +1,31 @@
+# rule version: 1
+# 推测：读取敏感文件后一段时间内有外发。多步规则，任何路径上都输出 I，
+# 不得升档为 E1 或内容匹配。upgrade_if 只选择措辞模板：
+#   无代理           -> infer.temporal_no_proxy
+#   已比对但未匹配   -> infer.temporal_hash_miss
+#   其余             -> infer.temporal
+
+[rule]
+id = "sensitive_read_then_send"
+version = 1
+title = "读取敏感文件后有外发流量"
+evidence = "I"
+wording = "infer.temporal"
+severity = "notice"
+
+[[rule.match]]
+as = "a"
+record = "file_access"
+where = 'op = "access" and access in ["read","read_write"] and tag:sensitive'
+
+[[rule.match]]
+as = "b"
+record = "net_flow"
+where = 'bytes_up > 0 and not is_loopback:true'
+within = "10s"
+same = "session"
+
+[rule.emit]
+key = ["a.path", "b.domain"]
+upgrade_if = "content_match(a.path, b.flow)"
+params = ["proc_a", "t_a", "path", "ev_a", "delta", "proc_b", "dest", "bytes_up", "ev_b"]

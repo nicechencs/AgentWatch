@@ -1,0 +1,20 @@
+# rule version: 1
+# 事实：系统观测到的访问在 Agent 自报告中没有对应记录。
+# E3 接入（P5）后才有输入；本阶段只加载规则，不产生新事实。
+
+[rule]
+id = "self_report_mismatch"
+version = 1
+title = "自报告与观测不一致"
+evidence = "E1"
+wording = "fact.self_report_mismatch"
+severity = "notice"
+
+[[rule.match]]
+as = "a"
+record = "self_report_mismatch"
+where = ""
+
+[rule.emit]
+key = ["a.proc_uid", "a.path"]
+params = ["proc", "path"]

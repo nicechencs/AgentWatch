@@ -1,0 +1,19 @@
+# rule version: 1
+# 事实：归属链路中断。单步规则，输出 E1。措辞用 attr.break。
+
+[rule]
+id = "attribution_break"
+version = 1
+title = "归属链路中断"
+evidence = "E1"
+wording = "attr.break"
+severity = "notice"
+
+[[rule.match]]
+as = "a"
+record = "attribution_break"
+where = ""
+
+[rule.emit]
+key = ["a.proc_uid", "a.via"]
+params = ["proc", "via"]

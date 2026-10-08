@@ -1,0 +1,20 @@
+# Fixed wording templates (evidence-model §5). The key set must match zh.toml exactly.
+# Placeholders are {name}. A missing parameter is an error; render never emits a partial string.
+
+"fact.file_read" = "[E1] {proc} read `{path}` ({bytes})."
+"fact.file_opened_read" = "[E1] {proc} opened `{path}` for reading; bytes read unavailable ({na_reason})."
+"fact.sensitive_access" = "[E1] {proc} accessed sensitive path `{path}` (rule: {rule})."
+"fact.net_send" = "[{ev}] {proc} sent {bytes_up} to and received {bytes_down} from {dest}."
+"infer.temporal" = "[Inferred · temporal] {proc_a} read `{path}` at {t_a} ({ev_a}); within {delta}, {proc_b} sent {bytes_up} to {dest} ({ev_b}). **No content-level evidence that the file was uploaded.**"
+"infer.temporal_no_proxy" = "[Inferred · temporal] {proc_a} read `{path}` at {t_a} ({ev_a}); within {delta}, {proc_b} sent {bytes_up} to {dest} ({ev_b}). **No content-level evidence that the file was uploaded.** Proxy not enabled; content comparison not possible."
+"infer.temporal_hash_miss" = "[Inferred · temporal] {proc_a} read `{path}` at {t_a} ({ev_a}); within {delta}, {proc_b} sent {bytes_up} to {dest} ({ev_b}). **No content-level evidence that the file was uploaded.** Proxied request bodies were chunk-hashed; no match found."
+"evidence.content_match" = "[Content match] Request body sent by {proc} to `{url}` at {t} contains {matched}/{total} chunks identical to `{path}` (~{pct}% of file)."
+"fact.self_report_mismatch" = "[E1] {proc} accessed `{path}`, but no matching entry exists in the agent's self-report."
+"gap.generic" = "[Gap] {kinds} from {collector} may be incomplete between {from} and {to}: {reason}."
+"fact.mass_delete" = "[E1] {proc} deleted {count} files within {window}, above the threshold of {threshold}."
+"fact.exec_after_write" = "[E1] {proc} wrote `{path}`, and that path was executed within {within}. This states both observations, not that one caused the other."
+"attr.break" = "[Attribution break] {proc} delegated work via {via}; subsequent activity is outside this session and not counted."
+"ipc.channel" = "[{ev}] A {ipc_kind} channel `{name}` exists between {proc_a} and {proc_b}: {proc_a} sent {bytes_a_to_b} and received {bytes_b_to_a}."
+"delegation.chain" = "[Delegation chain · {ev_min}] Observed before {target_event}: {hops}. The chain takes its weakest hop ({ev_min}); this shows the channels and calls are linked in time and process, not what {agent_a} intended."
+"delegation.ambiguous" = "[Delegation chain · ambiguous] {n} calls to {server} overlapped when {target_event} occurred; it cannot be attributed to a single call."
+"infer.shared_artifact" = "[Inferred · shared file] {agent_a} modified `{path}` at {t_a}; {agent_b} read it at {t_b}. They may have exchanged information through this file; **no evidence that {agent_b}'s later activity was triggered by it.**"

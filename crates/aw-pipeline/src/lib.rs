@@ -24,18 +24,21 @@ pub mod aggregate;
 pub mod batcher;
 pub mod clock;
 pub mod config;
+pub mod content_match;
+pub mod degrade;
 pub mod enrich;
 pub mod gaps;
 pub mod ingress;
 pub mod limit;
 pub mod limits;
 pub mod output;
-pub mod degrade;
 pub mod pipeline;
 pub mod redact;
+pub mod rules;
 pub mod scope;
 pub mod sensitive;
 pub mod stage;
+pub mod wording;
 
 pub use aggregate::{summarize, FlowAcc, FlowGroupBy, FlowGroupKey, FlowSummary, NetAggregator};
 pub use batcher::{Batcher, ScriptedSink};
@@ -44,24 +47,26 @@ pub use config::{
     AggregateConfig, CorrelationConfig, DegradeConfig, LimitsConfig, PipelineConfig, RateLimit,
     RedactionConfig, SensitiveConfig, SensitiveRuleConfig, StoreConfig,
 };
+pub use content_match::{decide as decide_content_match, MatchConfig, SkipReason, Verdict};
+pub use degrade::{DegradeLadder, DegradeSample};
 pub use enrich::{
     ProcCache, ProcCacheConfig, ProcInfo, DEFAULT_CAPACITY as PROC_CACHE_CAPACITY,
     DEFAULT_LINGER_SECS,
 };
 pub use gaps::{dropped_from_failures, record_drops, GapMerger, DEFAULT_RETRY_BATCHES};
-pub use degrade::{DegradeLadder, DegradeSample};
 pub use ingress::{Ingress, IngressRx, DEFAULT_CAPACITY};
 pub use limits::Limiter;
-pub use redact::{Redactor, UNSAFE_NO_REDACT_FLAG};
-pub use output::{
-    DnsRec, FileAccessRec, FlowBucketRec, GapRec, NetFlowRec, Output, ProcessRec,
-};
-pub use sensitive::{PathGlob, Rules as SensitiveRules};
+pub use output::{DnsRec, FileAccessRec, FlowBucketRec, GapRec, NetFlowRec, Output, ProcessRec};
 pub use pipeline::Pipeline;
+pub use redact::{Redactor, UNSAFE_NO_REDACT_FLAG};
 pub use scope::{ScopeConfig, ScopeFilter, ScopeSet, ScopeUpdate, DEFAULT_PENDING_MS};
+pub use sensitive::{PathGlob, Rules as SensitiveRules};
 pub use stage::{
     AggregateStage, BatcherStage, CorrelateStage, DedupStage, EnrichStage, Forward, RedactStage,
     ScopeStage, Stage, Tail,
+};
+pub use wording::{
+    lint, lint_allowing, render, template_key_mismatch, Lang, RuleId, Violation, WordingError,
 };
 
 /// Empty marker so the daemon can name this crate before every stage is real.

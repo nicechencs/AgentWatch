@@ -1,0 +1,20 @@
+# 固定措辞模板（evidence-model §5）。键集合必须与 en.toml 完全一致。
+# 占位符用 {name}。渲染时缺任何一个参数都是错误，不输出半成品。
+
+"fact.file_read" = "【E1】{proc} 读取了 `{path}`（{bytes}）。"
+"fact.file_opened_read" = "【E1】{proc} 以读方式打开了 `{path}`；读取字节数不可得（{na_reason}）。"
+"fact.sensitive_access" = "【E1】{proc} 访问了敏感路径 `{path}`（规则：{rule}）。"
+"fact.net_send" = "【{ev}】{proc} 向 {dest} 发送了 {bytes_up}，接收了 {bytes_down}。"
+"infer.temporal" = "【推测·时序相关】{proc_a} 在 {t_a} 读取了 `{path}`（{ev_a}），之后 {delta} 内 {proc_b} 向 {dest} 发送了 {bytes_up}（{ev_b}）。**没有内容级证据表明该文件被上传。**"
+"infer.temporal_no_proxy" = "【推测·时序相关】{proc_a} 在 {t_a} 读取了 `{path}`（{ev_a}），之后 {delta} 内 {proc_b} 向 {dest} 发送了 {bytes_up}（{ev_b}）。**没有内容级证据表明该文件被上传。**本会话未启用代理，无法做内容比对。"
+"infer.temporal_hash_miss" = "【推测·时序相关】{proc_a} 在 {t_a} 读取了 `{path}`（{ev_a}），之后 {delta} 内 {proc_b} 向 {dest} 发送了 {bytes_up}（{ev_b}）。**没有内容级证据表明该文件被上传。**已对经过代理的请求体做分块哈希比对，未发现匹配。"
+"evidence.content_match" = "【内容匹配证据】{proc} 在 {t} 向 `{url}` 发送的请求体中，有 {matched}/{total} 个分块与 `{path}` 一致（约占文件 {pct}%）。"
+"fact.self_report_mismatch" = "【E1】系统观测到 {proc} 访问了 `{path}`，但 Agent 自报告中没有对应记录。"
+"gap.generic" = "【采集缺口】{from}–{to} 期间 {collector} 的 {kinds} 数据可能不完整：{reason}。"
+"fact.mass_delete" = "【E1】{proc} 在 {window} 内删除了 {count} 个文件，超过阈值 {threshold}。"
+"fact.exec_after_write" = "【E1】{proc} 写入了 `{path}`，之后 {within} 内该路径被执行。这是两次观测的合取，不说明两者有因果关系。"
+"attr.break" = "【归属中断】{proc} 通过 {via} 委托了操作，后续行为发生在会话之外，未纳入统计。"
+"ipc.channel" = "【{ev}】{proc_a} 与 {proc_b} 之间存在 {ipc_kind} 通道 `{name}`：{proc_a} 发送了 {bytes_a_to_b}，接收了 {bytes_b_to_a}。"
+"delegation.chain" = "【委托链路·{ev_min}】{target_event} 之前依次观测到：{hops}。链路等级取各跳中最弱的一级（{ev_min}）；这只说明这些通道与调用在时间和进程上相连，不说明 {agent_a} 的意图。"
+"delegation.ambiguous" = "【委托链路·无法区分】{target_event} 发生时，{server} 有 {n} 次调用同时在进行，无法区分它属于哪一次调用。"
+"infer.shared_artifact" = "【推测·共享文件】{agent_a} 在 {t_a} 修改了 `{path}`，{agent_b} 在 {t_b} 读取了该文件。这说明两者可能通过该文件交换信息；**没有证据表明 {agent_b} 的后续行为由此触发。**"

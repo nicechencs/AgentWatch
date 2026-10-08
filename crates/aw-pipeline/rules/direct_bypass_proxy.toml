@@ -1,0 +1,19 @@
+# rule version: 1
+# 事实：代理会话中出现未经代理的直连。单步规则，输出 E1。
+
+[rule]
+id = "direct_bypass_proxy"
+version = 1
+title = "代理会话中出现直连"
+evidence = "E1"
+wording = "fact.net_send"
+severity = "warn"
+
+[[rule.match]]
+as = "a"
+record = "net_flow"
+where = "direct:true"
+
+[rule.emit]
+key = ["a.remote.ip", "a.remote.port"]
+params = ["ev", "proc", "dest", "bytes_up", "bytes_down"]

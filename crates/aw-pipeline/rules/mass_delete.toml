@@ -1,0 +1,22 @@
+# rule version: 1
+# 事实：短时间内删除大量文件。阈值写在规则里，不写死在引擎里：
+# within 是窗口，threshold 是窗口内的删除次数，超过才输出。
+
+[rule]
+id = "mass_delete"
+version = 1
+title = "短时间内删除大量文件"
+evidence = "E1"
+wording = "fact.mass_delete"
+severity = "warn"
+
+[[rule.match]]
+as = "a"
+record = "file_access"
+where = 'op = "delete"'
+within = "10s"
+threshold = 50
+
+[rule.emit]
+key = ["a.proc_uid"]
+params = ["proc", "window", "count", "threshold"]

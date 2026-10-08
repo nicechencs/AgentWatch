@@ -2,6 +2,10 @@
 
 mod dns;
 mod proc_cache;
+mod domain;
 
 pub use dns::{ConnectDomain, DnsCache, DnsObs, MatchStep, DOMAIN_FIELD};
 pub use proc_cache::{ProcCache, ProcCacheConfig, ProcInfo, DEFAULT_CAPACITY, DEFAULT_LINGER_SECS};
+pub use domain::{
+    attribute_domain, Candidate, DnsObservations, DomainAttribution, DomainSource, FlowEndpoint,
+};

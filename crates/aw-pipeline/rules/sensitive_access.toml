@@ -1,0 +1,19 @@
+# rule version: 1
+# 事实：访问了敏感路径。单步规则，输出 E1。
+
+[rule]
+id = "sensitive_access"
+version = 1
+title = "访问了敏感路径"
+evidence = "E1"
+wording = "fact.sensitive_access"
+severity = "info"
+
+[[rule.match]]
+as = "a"
+record = "file_access"
+where = 'tag:sensitive'
+
+[rule.emit]
+key = ["a.path", "a.sensitive_rule"]
+params = ["proc", "path", "rule"]

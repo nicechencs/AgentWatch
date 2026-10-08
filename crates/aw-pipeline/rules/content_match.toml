@@ -1,0 +1,21 @@
+# rule version: 1
+# 内容匹配证据由 P3-PIPE-06 产生。本规则只负责措辞与去重，
+# 不重新判定哈希，也不升档其他规则。
+
+[rule]
+id = "content_match"
+version = 1
+title = "请求体与已读文件的分块哈希一致"
+evidence = "content_match"
+kind = "content_match"
+wording = "evidence.content_match"
+severity = "notice"
+
+[[rule.match]]
+as = "a"
+record = "content_match"
+where = ""
+
+[rule.emit]
+key = ["a.path", "a.url"]
+params = ["proc", "t", "url", "matched", "total", "path", "pct"]

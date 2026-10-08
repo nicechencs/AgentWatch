@@ -102,9 +102,7 @@ impl Redactor {
                     argv[index] = Arg::new(replaced);
                 }
             }
-            if index > 0
-                && basic_auth_flag(argv.get(index - 1).map(Arg::as_str), exe_base)
-            {
+            if index > 0 && basic_auth_flag(argv.get(index - 1).map(Arg::as_str), exe_base) {
                 if let Some(replaced) = after_colon(&current, "argv.basic_auth") {
                     argv[index] = Arg::new(replaced);
                 }
@@ -242,7 +240,10 @@ impl Redactor {
         for index in patterns.set.matches(&out).into_iter() {
             let rule = &patterns.rules[index];
             let replacement = self.mark(rule.id);
-            out = rule.regex.replace_all(&out, replacement.as_str()).into_owned();
+            out = rule
+                .regex
+                .replace_all(&out, replacement.as_str())
+                .into_owned();
         }
         out
     }
@@ -305,7 +306,10 @@ fn patterns() -> &'static Patterns {
             ("tok.openai", r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}\b"),
             ("tok.slack", r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"),
             ("tok.google_api", r"\bAIza[0-9A-Za-z_\-]{35}\b"),
-            ("tok.stripe", r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b"),
+            (
+                "tok.stripe",
+                r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b",
+            ),
             (
                 "tok.jwt",
                 r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
@@ -338,7 +342,8 @@ fn flag_equals(arg: &str) -> Option<String> {
         )
         .unwrap_or_else(|_| panic!("redaction rule argv.flag_secret_eq failed to compile"))
     });
-    rule.captures(arg).map(|caps| format!("{}=\u{00ab}redacted:argv.flag_secret_eq\u{00bb}", &caps[1]))
+    rule.captures(arg)
+        .map(|caps| format!("{}=\u{00ab}redacted:argv.flag_secret_eq\u{00bb}", &caps[1]))
 }
 
 fn secret_flag(arg: &str) -> bool {
@@ -375,7 +380,10 @@ fn curl_client(exe: Option<&str>) -> bool {
 }
 
 fn mysql_client(exe: Option<&str>) -> bool {
-    matches!(exe, Some("mysql" | "mysql.exe" | "mysqldump" | "mysqldump.exe"))
+    matches!(
+        exe,
+        Some("mysql" | "mysql.exe" | "mysqldump" | "mysqldump.exe")
+    )
 }
 
 fn mysql_password(arg: &str) -> Option<String> {
@@ -399,15 +407,33 @@ fn split_assign(arg: &str) -> Option<(&str, &str)> {
 
 fn env_name_kept(name: &str) -> bool {
     const KEEP: &[&str] = &[
-        "PATH", "HOME", "USER", "SHELL", "PWD", "LANG", "TERM", "HTTP_PROXY", "HTTPS_PROXY",
-        "NO_PROXY", "NODE_OPTIONS", "VIRTUAL_ENV", "CI",
+        "PATH",
+        "HOME",
+        "USER",
+        "SHELL",
+        "PWD",
+        "LANG",
+        "TERM",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "NODE_OPTIONS",
+        "VIRTUAL_ENV",
+        "CI",
     ];
     KEEP.iter().any(|kept| kept.eq_ignore_ascii_case(name))
 }
 
 fn env_name_is_secret(name: &str) -> bool {
     const WORDS: &[&str] = &[
-        "token", "secret", "key", "password", "passwd", "credential", "auth", "cookie",
+        "token",
+        "secret",
+        "key",
+        "password",
+        "passwd",
+        "credential",
+        "auth",
+        "cookie",
         "session",
     ];
     let lower = name.to_ascii_lowercase();
@@ -416,18 +442,37 @@ fn env_name_is_secret(name: &str) -> bool {
 
 fn header_whitelisted(name: &str) -> bool {
     const KEEP: &[&str] = &[
-        "host", "user-agent", "content-type", "content-length", "content-encoding", "accept",
-        "accept-encoding", "referer", "origin", "x-request-id", "server", "location",
+        "host",
+        "user-agent",
+        "content-type",
+        "content-length",
+        "content-encoding",
+        "accept",
+        "accept-encoding",
+        "referer",
+        "origin",
+        "x-request-id",
+        "server",
+        "location",
     ];
     KEEP.iter().any(|kept| kept.eq_ignore_ascii_case(name))
 }
 
 fn header_blacklisted(name: &str) -> bool {
     const BLOCK: &[&str] = &[
-        "authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key", "api-key",
-        "x-auth-token", "x-amz-security-token",
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key",
+        "api-key",
+        "x-auth-token",
+        "x-amz-security-token",
     ];
-    BLOCK.iter().any(|blocked| blocked.eq_ignore_ascii_case(name)) || env_name_is_secret(name)
+    BLOCK
+        .iter()
+        .any(|blocked| blocked.eq_ignore_ascii_case(name))
+        || env_name_is_secret(name)
 }
 
 fn query_name_secret(name: &str) -> bool {

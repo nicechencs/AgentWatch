@@ -1,0 +1,28 @@
+# rule version: 1
+# 事实汇总：写入新文件后又执行了同一路径。两步都是 E1，规则只陈述
+# 合取、不推断因果，所以用 kind = "fact_conjunction" 声明 E1。
+
+[rule]
+id = "new_executable_written_then_run"
+version = 1
+title = "写入新文件后执行了该文件"
+evidence = "E1"
+kind = "fact_conjunction"
+wording = "fact.exec_after_write"
+severity = "notice"
+
+[[rule.match]]
+as = "a"
+record = "file_access"
+where = 'op = "create"'
+
+[[rule.match]]
+as = "b"
+record = "file_access"
+where = 'op = "exec" and path = a.path'
+within = "300s"
+same = "session"
+
+[rule.emit]
+key = ["a.path"]
+params = ["proc", "path", "within"]

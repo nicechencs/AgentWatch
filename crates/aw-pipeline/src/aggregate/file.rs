@@ -19,9 +19,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use aw_core::{
-    EventKind, Evidence, FileAccessMode, IoVia, ProcUid, RawEvent, SessionId, Source,
-};
+use aw_core::{EventKind, Evidence, FileAccessMode, IoVia, ProcUid, RawEvent, SessionId, Source};
 
 use crate::config::AggregateConfig;
 use crate::gaps::weaker;
@@ -52,13 +50,7 @@ const DEFAULT_NOISE_PREFIXES: &[&str] = &[
 ];
 
 /// Built-in suffixes folded even when the directory is not a noise prefix.
-const DEFAULT_NOISE_SUFFIXES: &[&str] = &[
-    ".so",
-    ".dylib",
-    ".dll",
-    ".mo",
-    ".pyc",
-];
+const DEFAULT_NOISE_SUFFIXES: &[&str] = &[".so", ".dylib", ".dll", ".mo", ".pyc"];
 
 /// Open file-access rows and the handle → path table.
 ///
@@ -406,12 +398,7 @@ impl FileAggregator {
         self.insert(key, acc, out);
     }
 
-    fn on_close(
-        &mut self,
-        event: &RawEvent,
-        close: &aw_core::FileClose,
-        out: &mut Output,
-    ) {
+    fn on_close(&mut self, event: &RawEvent, close: &aw_core::FileClose, out: &mut Output) {
         let key = self.resolve(event, close.handle, close.path.as_deref());
         let Some(key) = key else {
             return;
@@ -567,12 +554,7 @@ impl FileAggregator {
         })
     }
 
-    fn resolve(
-        &self,
-        event: &RawEvent,
-        handle: Option<u64>,
-        path: Option<&str>,
-    ) -> Option<AccKey> {
+    fn resolve(&self, event: &RawEvent, handle: Option<u64>, path: Option<&str>) -> Option<AccKey> {
         let proc = event.proc.as_ref()?;
         if let Some(handle) = handle {
             if let Some(key) = self.handles.get(&(proc.uid, handle)) {
@@ -604,8 +586,7 @@ impl FileAggregator {
             }
         }
         if self.noise_suffixes.iter().any(|suffix| {
-            normalized.ends_with(suffix.as_str())
-                || normalized.contains(&format!("{suffix}."))
+            normalized.ends_with(suffix.as_str()) || normalized.contains(&format!("{suffix}."))
         }) {
             return Some(parent_dir(&normalized));
         }

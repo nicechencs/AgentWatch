@@ -69,6 +69,12 @@ pub fn lint_allowing(text: &str, allow: &[RuleId]) -> Vec<Violation> {
             continue;
         }
         for found in pattern.regex.find_iter(text) {
+            if pattern
+                .except
+                .is_some_and(|except| except(text, found.start()))
+            {
+                continue;
+            }
             hits.push(Violation {
                 rule: pattern.rule,
                 offset: found.start(),
@@ -103,6 +109,11 @@ struct Pattern {
     rule: RuleId,
     regex: Regex,
     suggestion: &'static str,
+    /// Drop a match the regex cannot express on its own.
+    ///
+    /// The `regex` crate has no look-around, so "安全" but not "不安全" is
+    /// decided here: `at` is the byte offset of the match.
+    except: Option<fn(&str, usize) -> bool>,
 }
 
 fn patterns() -> &'static [Pattern] {
@@ -137,7 +148,9 @@ fn compile_patterns() -> Vec<Pattern> {
         ),
         (
             RuleId::UnprovableNegative,
-            r"没有上传任何文件|\bno data leaked\b|(?<!不)安全",
+            // "安全" but not "不安全": `(?<!不)` is look-behind, which the regex
+            // crate rejects, so the prefix check lives in `not_after_bu`.
+            r"没有上传任何文件|\bno data leaked\b|安全",
             "gap.generic",
         ),
         (
@@ -172,13 +185,113 @@ fn compile_patterns() -> Vec<Pattern> {
             rule: *rule,
             regex: compile_or_panic(*rule, source),
             suggestion,
+            // Kept off the spec tuple: a fn pointer there trips clippy's
+            // type_complexity lint, and only one rule needs an exception.
+            except: (*rule == RuleId::UnprovableNegative)
+                .then_some(not_after_bu as fn(&str, usize) -> bool),
         })
         .collect()
+}
+
+/// True when the match at `at` is the "安全" alternative preceded by "不".
+///
+/// Other alternatives of the same rule ("没有上传任何文件", "no data leaked")
+/// are never excluded: only a match whose preceding char is 不 qualifies.
+fn not_after_bu(text: &str, at: usize) -> bool {
+    let Some(before) = text.get(..at) else {
+        return false;
+    };
+    before.ends_with('不')
 }
 
 fn compile_or_panic(rule: RuleId, source: &str) -> Regex {
     match Regex::new(source) {
         Ok(regex) => regex,
         Err(err) => panic!("wording lint rule {rule:?} failed to compile: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lint, lint_allowing, RuleId};
+
+    fn rules(text: &str) -> Vec<RuleId> {
+        lint(text).into_iter().map(|hit| hit.rule).collect()
+    }
+
+    #[test]
+    fn every_rule_compiles_and_matches_its_banned_phrase() {
+        // Compiling is the point: the previous "安全" pattern used look-behind,
+        // which the regex crate rejects, so the first call panicked.
+        assert_eq!(
+            rules("该进程上传了文件 report.pdf"),
+            vec![RuleId::UploadedFile]
+        );
+        assert_eq!(
+            rules("it uploaded file report.pdf"),
+            vec![RuleId::UploadedFile]
+        );
+        assert_eq!(rules("疑似泄露"), vec![RuleId::Intent]);
+        assert_eq!(rules("数据被窃取"), vec![RuleId::Intent]);
+        assert_eq!(rules("发生外泄"), vec![RuleId::Intent]);
+        assert_eq!(rules("data was exfiltrated"), vec![RuleId::Intent]);
+        assert_eq!(rules("the key leaked"), vec![RuleId::Intent]);
+        assert_eq!(rules("someone stole it"), vec![RuleId::Intent]);
+        assert_eq!(rules("访问了 evil.com"), vec![RuleId::BareEvilDomain]);
+        assert_eq!(rules("Agent 读取了配置"), vec![RuleId::AgentRead]);
+        assert_eq!(rules("Agent read the config"), vec![RuleId::AgentRead]);
+        assert_eq!(rules("没有上传任何文件"), vec![RuleId::UnprovableNegative]);
+        // "leaked" is also an Intent phrase, so this sentence hits both rules.
+        // Hits are ordered by byte offset, so "leaked" comes before the full phrase.
+        assert_eq!(
+            rules("no data leaked"),
+            vec![RuleId::UnprovableNegative, RuleId::Intent]
+        );
+        assert_eq!(rules("连接是安全的"), vec![RuleId::UnprovableNegative]);
+        assert_eq!(rules("读取了 0 字节"), vec![RuleId::ZeroBytes]);
+        assert_eq!(rules("read 0 bytes"), vec![RuleId::ZeroBytes]);
+        assert_eq!(rules("捕获了所有流量"), vec![RuleId::AllTraffic]);
+        assert_eq!(rules("saw all traffic"), vec![RuleId::AllTraffic]);
+        assert_eq!(
+            rules("A 让 B 窃取了密钥"),
+            vec![RuleId::InstructedSteal, RuleId::Intent]
+        );
+        assert_eq!(
+            rules("A instructed B to steal it"),
+            vec![RuleId::InstructedSteal]
+        );
+        assert_eq!(rules("A 通过 B 上传了数据"), vec![RuleId::UploadedVia]);
+        assert_eq!(rules("A uploaded data via B"), vec![RuleId::UploadedVia]);
+        assert_eq!(rules("内容与文件匹配"), vec![RuleId::ContentMatchPhrase]);
+        assert_eq!(
+            rules("chunks identical to the file"),
+            vec![RuleId::ContentMatchPhrase]
+        );
+        assert_eq!(
+            rules("content matches the file"),
+            vec![RuleId::ContentMatchPhrase]
+        );
+    }
+
+    #[test]
+    fn anquan_after_bu_is_not_a_safety_claim() {
+        assert!(lint("此操作不安全").is_empty());
+        assert!(lint("不安全").is_empty());
+    }
+
+    #[test]
+    fn content_match_phrase_is_allowed_only_when_named() {
+        let text = "内容与 report.pdf 匹配";
+        assert_eq!(rules(text), vec![RuleId::ContentMatchPhrase]);
+        assert!(lint_allowing(text, &[RuleId::ContentMatchPhrase]).is_empty());
+    }
+
+    #[test]
+    fn a_negative_phrase_is_still_caught_beside_anquan() {
+        // "不" only suppresses the "安全" alternative, not the rest of the rule.
+        assert_eq!(
+            rules("虽然不安全，但没有上传任何文件"),
+            vec![RuleId::UnprovableNegative]
+        );
     }
 }

@@ -6,11 +6,11 @@ import type { ConfigView, RedactionRule } from "@/api/types";
 import { Bytes } from "@/components/Bytes";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ErrorNote, Loading } from "@/components/QueryState";
-import { RelTime } from "@/components/RelTime";
 import { useAuth } from "@/lib/auth";
 import { useI18n } from "@/lib/i18n";
 import { usePrefs, type Theme, type TimeFormat } from "@/lib/prefs";
 import type { Lang } from "@/lib/i18n";
+import { ProxySection } from "@/features/settings/proxy/ProxySection";
 
 export function SettingsPage() {
   const { t } = useI18n();
@@ -29,7 +29,7 @@ export function SettingsPage() {
       <h1 className="text-base font-semibold">{t("settings.title")}</h1>
       <Storage config={config.data} used={stats.data ? stats.data.db_bytes + stats.data.wal_bytes : null} admin={admin} />
       <Privacy config={config.data} admin={admin} />
-      <Proxy config={config.data} />
+      <ProxySection config={config.data} admin={admin} />
       <Collectors config={config.data} />
       <Rules config={config.data} />
       <Appearance />
@@ -166,17 +166,6 @@ function Privacy({ config, admin }: { config: ConfigView; admin: boolean }) {
         {t("settings.addRule")}
       </button>
       {notice ? <p className="text-ink-soft">{notice}</p> : null}
-    </Section>
-  );
-}
-
-function Proxy({ config }: { config: ConfigView }) {
-  const { t } = useI18n();
-  return (
-    <Section title={t("settings.proxy")}>
-      <p className="text-ink-faint">{t("settings.proxyReadonly")}</p>
-      <p>{t("settings.caFingerprint")}：<span className="font-mono">{config.proxy.ca_fingerprint ?? t("common.none")}</span></p>
-      <p>{t("settings.caCreated")}：{config.proxy.ca_created_ns ? <RelTime ns={config.proxy.ca_created_ns} /> : t("common.none")}</p>
     </Section>
   );
 }

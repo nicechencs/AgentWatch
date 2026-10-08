@@ -12,6 +12,9 @@ import { EmptyNote, ErrorNote, Loading } from "@/components/QueryState";
 import { useI18n } from "@/lib/i18n";
 import { composedFilter, useSessionQuery } from "@/lib/session-query";
 import { TrafficChart } from "./TrafficChart";
+import { fetchHttp, groupByFlow, HTTP_PAGE_LIMIT, type HttpPage, type HttpRow } from "./http";
+import { FlowMarks, HttpTable } from "./HttpRows";
+import { fill, useNetStrings } from "./strings";
 
 type GroupBy = "domain" | "proc" | "ip" | "port";
 
@@ -32,6 +35,7 @@ export function NetworkPage() {
   const [openHttp, setOpenHttp] = useState<Set<number>>(new Set());
   const [selected, setSelected] = useState<NetFlow | null>(null);
   const filter = composedFilter(query);
+  const s = useNetStrings();
 
   const flows = useQuery({
     queryKey: ["flows", sid, filter, groupBy],
@@ -41,6 +45,14 @@ export function NetworkPage() {
     queryKey: ["traffic", sid, filter, query.from, query.to, groupBy],
     queryFn: () => api.traffic(sid, { filter, group_by: groupBy === "domain" ? "domain" : "proc", from: query.from || undefined, to: query.to || undefined }),
   });
+
+  // Third layer: loaded once any connection's HTTP row is opened.
+  const http = useQuery({
+    queryKey: ["http", sid],
+    queryFn: () => fetchHttp(sid, ""),
+    enabled: openHttp.size > 0,
+  });
+  const httpIndex = http.data ? groupByFlow(http.data.http) : null;
 
   const toggleQuick = (expr: string) => {
     const parts = query.f.split(/\s+/u).filter(Boolean);
@@ -77,13 +89,19 @@ export function NetworkPage() {
           ))}
           <span className="mx-1 text-ink-faint">|</span>
           {QUICK.map((item) => (
-            <button key={item.key} type="button" aria-pressed={query.f.includes(item.expr)} onClick={() => toggleQuick(item.expr)} className={`rounded border px-1.5 py-0.5 ${query.f.includes(item.expr) ? "border-ink" : "border-line text-ink-faint"}`}>
+            <button key={item.key} type="button" title={item.key === "direct" ? s.quickDirectTip : undefined} aria-pressed={query.f.includes(item.expr)} onClick={() => toggleQuick(item.expr)} className={`rounded border px-1.5 py-0.5 ${query.f.includes(item.expr) ? "border-ink" : "border-line text-ink-faint"}`}>
               {t(`net.quick.${item.key}`)}
             </button>
           ))}
           <abbr title={t("net.basis")} className="ml-auto cursor-help text-ink-faint no-underline">ⓘ</abbr>
         </div>
         <p className="px-3 py-1 text-[11px] text-ink-faint">{t("net.noPtr")}</p>
+        {http.data && http.data.http.length >= HTTP_PAGE_LIMIT ? (
+          <p className="px-3 py-1 text-[11px] text-ink-faint">{fill(s.httpTruncated, { count: HTTP_PAGE_LIMIT })}</p>
+        ) : null}
+        {httpIndex && httpIndex.unlinked > 0 ? (
+          <p className="px-3 py-1 text-[11px] text-ink-faint">{fill(s.httpUnlinked, { count: httpIndex.unlinked })}</p>
+        ) : null}
 
         {flows.isLoading ? <Loading /> : null}
         {flows.isError ? <ErrorNote message={flows.error instanceof Error ? flows.error.message : ""} onRetry={() => void flows.refetch()} /> : null}
@@ -104,6 +122,7 @@ export function NetworkPage() {
                 group={group}
                 open={openFlow.has(group.key)}
                 openHttp={openHttp}
+                http={{ page: http.data, rows: httpIndex?.byFlow, loading: http.isLoading, error: http.isError ? (http.error instanceof Error ? http.error.message : "") : null, retry: () => void http.refetch() }}
                 onToggle={() => toggle(openFlow, group.key, setOpenFlow)}
                 onToggleHttp={(id) => {
                   const next = new Set(openHttp);
@@ -122,17 +141,25 @@ export function NetworkPage() {
   );
 }
 
-function GroupRows({
-  group, open, openHttp, onToggle, onToggleHttp, onSelect,
+export interface HttpState {
+  page: HttpPage | undefined;
+  rows: Map<number, HttpRow[]> | undefined;
+  loading: boolean;
+  error: string | null;
+  retry: () => void;
+}
+
+export function GroupRows({
+  group, open, openHttp, http, onToggle, onToggleHttp, onSelect,
 }: {
   group: FlowGroup;
   open: boolean;
   openHttp: Set<number>;
+  http: HttpState;
   onToggle: () => void;
   onToggleHttp: (id: number) => void;
   onSelect: (flow: NetFlow) => void;
 }) {
-  const { t } = useI18n();
   return (
     <>
       <tr className="border-b border-line/60">
@@ -143,7 +170,7 @@ function GroupRows({
             {group.alt_count > 0 ? <span className="ml-1 text-ink-faint">(+{group.alt_count})</span> : null}
           </button>
           {group.inferred ? <span className="ml-1"><EvidenceBadge level="I" /></span> : null}
-          {group.direct ? <span className="ml-1 text-gap">{t("net.direct")}</span> : null}
+          {group.direct ? <FlowMarks flow={{ direct: true, via_proxy: false, proto: "tcp", remote_port: 0, na_reason: null }} /> : null}
         </td>
         <td className="px-3 py-1"><Bytes value={group.bytes_up} /></td>
         <td className="px-3 py-1"><Bytes value={group.bytes_down} /></td>
@@ -155,15 +182,16 @@ function GroupRows({
       </tr>
       {open
         ? group.flows.map((flow) => (
-            <FlowRows key={flow.id} flow={flow} httpOpen={openHttp.has(flow.id)} onToggleHttp={() => onToggleHttp(flow.id)} onSelect={() => onSelect(flow)} />
+            <FlowRows key={flow.id} flow={flow} http={http} httpOpen={openHttp.has(flow.id)} onToggleHttp={() => onToggleHttp(flow.id)} onSelect={() => onSelect(flow)} />
           ))
         : null}
     </>
   );
 }
 
-function FlowRows({ flow, httpOpen, onToggleHttp, onSelect }: { flow: NetFlow; httpOpen: boolean; onToggleHttp: () => void; onSelect: () => void }) {
+export function FlowRows({ flow, http, httpOpen, onToggleHttp, onSelect }: { flow: NetFlow; http: HttpState; httpOpen: boolean; onToggleHttp: () => void; onSelect: () => void }) {
   const { t } = useI18n();
+  const s = useNetStrings();
   return (
     <>
       <tr className="border-b border-line/40 text-ink-soft">
@@ -172,7 +200,8 @@ function FlowRows({ flow, httpOpen, onToggleHttp, onSelect }: { flow: NetFlow; h
             <ProcLabel pid={flow.proc?.pid} exe={flow.proc?.exe_name} />{" "}
             {flow.local_ip}:{flow.local_port} → {flow.remote_ip}:{flow.remote_port}
           </button>
-          <button type="button" onClick={onToggleHttp} className="ml-2 text-ink-faint">{httpOpen ? "▾" : "▸"} HTTP</button>
+          <FlowMarks flow={flow} />
+          <button type="button" aria-expanded={httpOpen} onClick={onToggleHttp} className="ml-2 text-ink-faint">{httpOpen ? "▾" : "▸"} HTTP</button>
         </td>
         <td className="px-3 py-1"><Bytes value={flow.bytes_up} naReason={flow.field_evidence?.bytes_up?.na_reason ?? flow.na_reason} /></td>
         <td className="px-3 py-1"><Bytes value={flow.bytes_down} naReason={flow.field_evidence?.bytes_down?.na_reason ?? flow.na_reason} /></td>
@@ -185,7 +214,17 @@ function FlowRows({ flow, httpOpen, onToggleHttp, onSelect }: { flow: NetFlow; h
       {httpOpen ? (
         <tr className="border-b border-line/40">
           <td colSpan={5} className="py-1 pl-14 pr-3 text-ink-faint">
-            {t("net.httpPlaceholder")} — {t("net.httpLater")}
+            {flow.direct ? (
+              <span>{s.markDirectTip}</span>
+            ) : http.loading ? (
+              <span>{s.httpLoading}</span>
+            ) : http.error !== null ? (
+              <ErrorNote message={http.error} onRetry={http.retry} />
+            ) : http.page?.reason === "no_proxy" ? (
+              <span>{t("net.httpPlaceholder")}</span>
+            ) : http.page ? (
+              <HttpTable rows={http.rows?.get(flow.id) ?? []} />
+            ) : null}
           </td>
         </tr>
       ) : null}

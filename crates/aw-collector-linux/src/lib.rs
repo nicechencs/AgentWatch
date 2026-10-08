@@ -22,6 +22,7 @@ mod maps;
 mod netdecode;
 mod probe;
 mod scope;
+mod sni;
 
 #[cfg(target_os = "linux")]
 mod collector;
@@ -80,6 +81,10 @@ pub use scope::{
     LaunchStep as ScopeLaunchStep, ProcRow, ProcScan, ScopeError, ScopeMap, SystemdPresence,
     ADOPT_TIMEOUT_SECS, CGROUP_NONEMPTY_NOTE, SLICE_NAME as SCOPE_SLICE_NAME, SOURCE_CGROUP_ESCAPE,
     V1_DOCTOR_HINT,
+};
+pub use sni::{
+    sni_enabled, FirstWrite, SniAttach, SniError, SniExtractor, SniSource, SNI_PREFIX_CAP,
+    SOURCE_AFPACKET_SNI, SOURCE_EBPF_SNI,
 };
 
 /// `1` once `build.rs` embeds an object. Today it is always `0`.

@@ -24,8 +24,13 @@ pub trait Stage {
     /// Handle one event. `next` is the following stage, or the end of the chain.
     fn process(&mut self, event: RawEvent, out: &mut Output, next: &mut dyn Stage);
 
-    /// Advance time-based state to `now_ns`. Placeholders do nothing.
-    fn tick(&mut self, now_ns: u64);
+    /// Advance time-based state to `now_ns`.
+    ///
+    /// `out` is where a windowed stage emits records a clock advance produced
+    /// (a UDP flow that went quiet, a bucket that closed). Placeholders ignore
+    /// both arguments. The clock is the caller's monotonic nanoseconds; this
+    /// method does not read the host clock.
+    fn tick(&mut self, now_ns: u64, out: &mut Output);
 }
 
 /// End of the chain. Does not forward and does not record.
@@ -35,7 +40,7 @@ pub struct Tail;
 impl Stage for Tail {
     fn process(&mut self, _event: RawEvent, _out: &mut Output, _next: &mut dyn Stage) {}
 
-    fn tick(&mut self, _now_ns: u64) {}
+    fn tick(&mut self, _now_ns: u64, _out: &mut Output) {}
 }
 
 /// Forwards every event. Used by Scope, Dedup, Enrich, Redact, Correlate, and Batcher.
@@ -47,7 +52,7 @@ impl Stage for Forward {
         next.process(event, out, &mut Tail);
     }
 
-    fn tick(&mut self, _now_ns: u64) {}
+    fn tick(&mut self, _now_ns: u64, _out: &mut Output) {}
 }
 
 /// Scope filter (P1-PIPE-02).
@@ -136,7 +141,7 @@ impl Stage for ScopeStage {
         }
     }
 
-    fn tick(&mut self, now_ns: u64) {
+    fn tick(&mut self, now_ns: u64, _out: &mut Output) {
         // Counting a timeout does not need `Output`. Releasing an in-scope hold
         // does, and that happens in `process` via [`ScopeFilter::take_ready`].
         self.filter.tick(now_ns);
@@ -154,8 +159,8 @@ impl Stage for DedupStage {
         self.inner.process(event, out, next);
     }
 
-    fn tick(&mut self, now_ns: u64) {
-        self.inner.tick(now_ns);
+    fn tick(&mut self, now_ns: u64, out: &mut Output) {
+        self.inner.tick(now_ns, out);
     }
 }
 
@@ -170,8 +175,8 @@ impl Stage for EnrichStage {
         self.inner.process(event, out, next);
     }
 
-    fn tick(&mut self, now_ns: u64) {
-        self.inner.tick(now_ns);
+    fn tick(&mut self, now_ns: u64, out: &mut Output) {
+        self.inner.tick(now_ns, out);
     }
 }
 
@@ -186,19 +191,47 @@ impl Stage for RedactStage {
         self.inner.process(event, out, next);
     }
 
-    fn tick(&mut self, now_ns: u64) {
-        self.inner.tick(now_ns);
+    fn tick(&mut self, now_ns: u64, out: &mut Output) {
+        self.inner.tick(now_ns, out);
     }
 }
 
-/// Aggregate placeholder.
+/// Network aggregate (P1-PIPE-04).
 ///
 /// Counts every input event into [`Output::events_seen`]. An event that is already a
 /// [`aw_core::EventKind::Gap`] is copied into [`Output::gaps`] with the same evidence
-/// and the same gap fields. Nothing else is emitted: no process, flow, bucket, or DNS
-/// record. Evidence is not raised. The event is still forwarded.
-#[derive(Debug, Default)]
-pub struct AggregateStage;
+/// and the same gap fields. `NetConnect` / `NetSend` / `NetRecv` / `NetClose` /
+/// `TlsSni` update [`crate::aggregate::NetAggregator`] and may emit
+/// [`crate::output::NetFlowRec`] and [`crate::output::FlowBucketRec`]. Evidence is
+/// not raised. The event is still forwarded. File aggregation is not this card.
+pub struct AggregateStage {
+    net: crate::aggregate::NetAggregator,
+}
+
+impl Default for AggregateStage {
+    fn default() -> Self {
+        Self::new(crate::config::AggregateConfig::default())
+    }
+}
+
+impl AggregateStage {
+    /// Bucket width from `cfg`. A zero width is treated as the documented 5 s.
+    pub fn new(cfg: crate::config::AggregateConfig) -> Self {
+        Self {
+            net: crate::aggregate::NetAggregator::new(cfg.bucket_secs),
+        }
+    }
+
+    /// In-memory group of the flows still open plus the ones already emitted.
+    ///
+    /// CLI live views call this. It does not read a clock and does not write.
+    pub fn summarize(
+        &self,
+        by: crate::aggregate::FlowGroupBy,
+    ) -> Vec<crate::aggregate::FlowSummary> {
+        self.net.summarize(by)
+    }
+}
 
 impl Stage for AggregateStage {
     fn process(&mut self, event: RawEvent, out: &mut Output, next: &mut dyn Stage) {
@@ -207,10 +240,13 @@ impl Stage for AggregateStage {
             out.gaps
                 .push(crate::output::GapRec::from_event(&event, gap));
         }
+        self.net.observe(&event, out);
         next.process(event, out, &mut Tail);
     }
 
-    fn tick(&mut self, _now_ns: u64) {}
+    fn tick(&mut self, now_ns: u64, out: &mut Output) {
+        self.net.tick(now_ns, out);
+    }
 }
 
 /// Correlate placeholder. Passthrough in P1. Does not emit findings.
@@ -224,8 +260,8 @@ impl Stage for CorrelateStage {
         self.inner.process(event, out, next);
     }
 
-    fn tick(&mut self, now_ns: u64) {
-        self.inner.tick(now_ns);
+    fn tick(&mut self, now_ns: u64, out: &mut Output) {
+        self.inner.tick(now_ns, out);
     }
 }
 
@@ -322,13 +358,14 @@ impl Stage for BatcherStage {
         }
     }
 
-    fn tick(&mut self, now_ns: u64) {
+    fn tick(&mut self, now_ns: u64, out: &mut Output) {
         self.now_ns = now_ns;
         if let Some(batch) = self.batch.as_mut() {
-            // No `Output` on tick. Gaps a time flush created are ingested
-            // back so the next successful write can store them.
             let emitted = batch.tick(now_ns);
             if !emitted.is_empty() {
+                // Keep the gaps on `out` as well as feeding them back, so a
+                // replay that ends on a time flush still shows them.
+                out.gaps.extend(emitted.iter().cloned());
                 let mut only = Output::empty();
                 only.gaps = emitted;
                 batch.ingest(&only, now_ns);

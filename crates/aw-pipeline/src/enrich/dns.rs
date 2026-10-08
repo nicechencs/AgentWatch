@@ -226,7 +226,9 @@ impl DnsCache {
 
         if let Some(session) = session_id {
             if let Some(found) = self.pick(
-                CacheScope::Session { session: Some(session) },
+                CacheScope::Session {
+                    session: Some(session),
+                },
                 ip,
                 at_ns,
                 |row| row.proc_uid.is_some() && row.proc_uid != proc_uid,
@@ -506,10 +508,7 @@ mod tests {
             None,
         );
         assert_eq!(found.domain, None);
-        assert_eq!(
-            domain_ev(&found),
-            &Evidence::NA(NaReason::NoDnsObserved)
-        );
+        assert_eq!(domain_ev(&found), &Evidence::NA(NaReason::NoDnsObserved));
     }
 
     #[test]
@@ -525,10 +524,7 @@ mod tests {
         );
         assert_eq!(found.domain, None);
         assert!(found.alt_domains.is_empty());
-        assert_eq!(
-            domain_ev(&found),
-            &Evidence::NA(NaReason::NoDnsObserved)
-        );
+        assert_eq!(domain_ev(&found), &Evidence::NA(NaReason::NoDnsObserved));
         assert_eq!(found.step, MatchStep::Miss);
     }
 

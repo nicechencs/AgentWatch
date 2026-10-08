@@ -124,10 +124,32 @@ pub struct NetFlowRec {
     pub start_ns: u64,
     /// Flow end. `None` if still open in this replay.
     pub end_ns: Option<u64>,
+    /// `true` only after a later proxy rewrite (P3) says this flow went through
+    /// the explicit proxy. Aggregate never sets this; the field is reserved.
+    pub via_proxy: bool,
+    /// `true` while the flow is still open and this row is a 30 s partial flush.
+    /// A closed flow is `false`.
+    pub partial: bool,
+    /// Platform cumulative bytes sent, from `NetClose.total_sent`. `None` when
+    /// the close did not carry a platform total.
+    pub platform_total_up: Option<u64>,
+    /// Platform cumulative bytes received, from `NetClose.total_recv`.
+    pub platform_total_down: Option<u64>,
+    /// Signed difference `platform_total_up - bytes_up` when the close carried a
+    /// total and the two disagreed by more than 5%. `None` otherwise. Not a
+    /// stand-in for "no bytes".
+    pub bytes_up_delta: Option<i64>,
+    /// Signed difference `platform_total_down - bytes_down` under the same rule.
+    pub bytes_down_delta: Option<i64>,
     /// Record evidence.
     pub evidence: Evidence,
+    /// Field-level evidence. Empty when every field matches the record level.
+    pub field_evidence: BTreeMap<String, Evidence>,
     /// Collector source.
     pub source: Source,
+    /// In-memory flow id assigned by aggregate. `None` on a record this stage
+    /// did not build.
+    pub flow_id: Option<u64>,
 }
 
 /// One `net_flow_buckets` row. Not produced by the passthrough aggregate.
@@ -146,8 +168,10 @@ pub struct FlowBucketRec {
     pub bytes_up: Option<u64>,
     /// Bytes received in the bucket. `None` if not measured.
     pub bytes_down: Option<u64>,
-    /// Record evidence.
+    /// Record evidence. `S` when every byte in the bucket came from a snapshot.
     pub evidence: Evidence,
+    /// Field-level evidence. A sampled bucket marks `bytes_up` and `bytes_down`.
+    pub field_evidence: BTreeMap<String, Evidence>,
 }
 
 /// One `dns` row. Not produced by the passthrough aggregate.

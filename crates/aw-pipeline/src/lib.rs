@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod aggregate;
 pub mod batcher;
 pub mod clock;
 pub mod config;
@@ -32,6 +33,7 @@ pub mod pipeline;
 pub mod scope;
 pub mod stage;
 
+pub use aggregate::{summarize, FlowAcc, FlowGroupBy, FlowGroupKey, FlowSummary, NetAggregator};
 pub use batcher::{Batcher, ScriptedSink};
 pub use clock::{InstantClock, PipelineClock, ReplayClock};
 pub use config::{
@@ -245,7 +247,7 @@ mod tests {
             next.process(event, out, &mut Tail);
         }
 
-        fn tick(&mut self, _now_ns: u64) {}
+        fn tick(&mut self, _now_ns: u64, _out: &mut Output) {}
     }
 
     fn process_event(seq: u64) -> RawEvent {

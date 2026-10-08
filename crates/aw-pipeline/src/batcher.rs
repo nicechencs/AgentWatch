@@ -22,6 +22,8 @@
 //! The clock is [`crate::stage::Stage::tick`]'s `now_ns` and each record's own
 //! monotonic timestamp. This module does not read the host clock.
 
+use std::collections::BTreeMap;
+
 use aw_core::{Evidence, GapKind, ProcUid, SessionId};
 use aw_store::{
     DnsRow, GapRow, NetFlowBucketRow, NetFlowRow, ProcessRow, RecordSink, StoreError, WriteBatch,
@@ -374,14 +376,15 @@ fn flow_row(flow: &NetFlowRec) -> Option<NetFlowRow> {
     let session_id = session_i64(flow.session_id)?;
     let proc_uid = flow.proc_uid.map(uid_bits)?;
     Some(NetFlowRow {
-        // The in-memory record has no flow id yet. A stable id is the later
-        // aggregate stage's job. This conversion uses a hash of the tuple so
-        // two identical observations upsert together, and does not invent a
-        // counter that would collide with a real id space. Callers that already
-        // know an id should not come through this path twice with different
-        // tuples. The hash is xxh-free: a simple mix, documented as not a
-        // database identity.
-        id: flow_id(flow),
+        // The aggregator assigns a stable id (P1-PIPE-04). Prefer it: a partial
+        // flush and the final row of the same flow must UPSERT onto one row.
+        // A record built without one falls back to a hash of the tuple. That
+        // hash is not a database identity, only a way to keep two identical
+        // observations from inserting twice.
+        id: flow
+            .flow_id
+            .and_then(|id| i64::try_from(id).ok())
+            .unwrap_or_else(|| flow_id(flow)),
         session_id,
         proc_uid,
         proto,
@@ -399,16 +402,16 @@ fn flow_row(flow: &NetFlowRec) -> Option<NetFlowRow> {
         end_ns: flow.end_ns.and_then(|ns| i64::try_from(ns).ok()),
         bytes_up: flow.bytes_up.and_then(|n| i64::try_from(n).ok()),
         bytes_down: flow.bytes_down.and_then(|n| i64::try_from(n).ok()),
-        via_proxy: 0,
+        via_proxy: i64::from(flow.via_proxy),
         direct: 0,
         preexisting: 0,
         is_loopback: 0,
         result: None,
-        platform_total_up: None,
-        platform_total_down: None,
+        platform_total_up: flow.platform_total_up.and_then(|n| i64::try_from(n).ok()),
+        platform_total_down: flow.platform_total_down.and_then(|n| i64::try_from(n).ok()),
         evidence: gaps::evidence_code(&flow.evidence).to_owned(),
         na_reason: gaps::na_reason_code(&flow.evidence).map(str::to_owned),
-        field_evidence: None,
+        field_evidence: field_evidence_json(&flow.field_evidence),
         source: flow.source.as_str().to_owned(),
     })
 }
@@ -496,7 +499,7 @@ fn start_how_name(how: aw_core::StartHow) -> &'static str {
     }
 }
 
-fn field_evidence_json(map: &std::collections::BTreeMap<String, Evidence>) -> Option<String> {
+fn field_evidence_json(map: &BTreeMap<String, Evidence>) -> Option<String> {
     if map.is_empty() {
         return None;
     }
@@ -635,7 +638,7 @@ mod tests {
             user_id: None,
             signer: None,
             evidence: Evidence::E1,
-            field_evidence: std::collections::BTreeMap::new(),
+            field_evidence: BTreeMap::new(),
             source: Source::new("test/proc"),
             agent: None,
         }
@@ -713,8 +716,16 @@ mod tests {
             bytes_down: None,
             start_ns: 5,
             end_ns: None,
+            via_proxy: false,
+            partial: false,
+            platform_total_up: None,
+            platform_total_down: None,
+            bytes_up_delta: None,
+            bytes_down_delta: None,
             evidence: Evidence::S,
+            field_evidence: BTreeMap::new(),
             source: Source::new("poll/net"),
+            flow_id: None,
         });
         let mut batcher = Batcher::with_defaults(ScriptedSink::failing(0), cfg_rows(10, 100));
         batcher.push_output(&out, 5);
@@ -724,6 +735,58 @@ mod tests {
         assert_eq!(row.bytes_down, None);
         assert_eq!(row.domain, None);
         assert_eq!(row.evidence, "S");
+        assert_eq!(row.via_proxy, 0);
+        assert_eq!(row.platform_total_up, None);
+        assert_eq!(row.field_evidence, None);
+    }
+
+    #[test]
+    fn aggregator_fields_reach_the_row() {
+        // A partial flush and the final row share the aggregator's flow id, so
+        // the store UPSERTs them onto one row instead of inserting two.
+        let mut out = Output::empty();
+        let mut field_evidence = BTreeMap::new();
+        field_evidence.insert("bytes_up".to_owned(), Evidence::S);
+        out.net_flows.push(NetFlowRec {
+            session_id: Some(SessionId(1)),
+            proc_uid: Some(ProcUid(3)),
+            proto: Some("tcp".to_owned()),
+            direction: Some("outbound".to_owned()),
+            local_ip: Some("127.0.0.1".to_owned()),
+            local_port: Some(1),
+            remote_ip: Some("203.0.113.10".to_owned()),
+            remote_port: Some(443),
+            domain: None,
+            domain_source: None,
+            sni: None,
+            bytes_up: Some(100),
+            bytes_down: None,
+            start_ns: 5,
+            end_ns: None,
+            via_proxy: true,
+            partial: true,
+            platform_total_up: Some(120),
+            platform_total_down: None,
+            bytes_up_delta: Some(20),
+            bytes_down_delta: None,
+            evidence: Evidence::E1,
+            field_evidence,
+            source: Source::new("test"),
+            flow_id: Some(7),
+        });
+        let mut batcher = Batcher::with_defaults(ScriptedSink::failing(0), cfg_rows(10, 100));
+        batcher.push_output(&out, 5);
+        batcher.flush(5);
+        let row = &batcher.sink.committed[0].net_flows[0];
+        assert_eq!(row.id, 7, "the aggregator id, not a hash of the tuple");
+        assert_eq!(row.via_proxy, 1);
+        assert_eq!(row.platform_total_up, Some(120));
+        assert_eq!(row.platform_total_down, None);
+        let evidence = row.field_evidence.as_deref().unwrap_or("");
+        assert!(
+            evidence.contains("bytes_up"),
+            "field evidence was dropped: {evidence}"
+        );
     }
 
     #[test]

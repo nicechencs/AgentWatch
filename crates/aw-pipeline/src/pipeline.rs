@@ -33,13 +33,14 @@ pub struct Pipeline {
 impl Pipeline {
     /// Passthrough pipeline with explicit defaults.
     pub fn new(cfg: PipelineConfig) -> Self {
+        let aggregate = AggregateStage::new(cfg.aggregate.clone());
         Self {
             cfg,
             scope: ScopeStage::default(),
             dedup: DedupStage::default(),
             enrich: EnrichStage::default(),
             redact: RedactStage::default(),
-            aggregate: AggregateStage,
+            aggregate,
             correlate: CorrelateStage::default(),
             batcher: BatcherStage::default(),
         }
@@ -62,20 +63,20 @@ impl Pipeline {
         for event in events {
             clock.advance_to(event.ts_mono_ns);
             let now = clock.now_ns();
-            pipeline.tick(now);
+            pipeline.tick(now, &mut out);
             pipeline.process(event, &mut out);
         }
         out
     }
 
-    fn tick(&mut self, now_ns: u64) {
-        self.scope.tick(now_ns);
-        self.dedup.tick(now_ns);
-        self.enrich.tick(now_ns);
-        self.redact.tick(now_ns);
-        self.aggregate.tick(now_ns);
-        self.correlate.tick(now_ns);
-        self.batcher.tick(now_ns);
+    fn tick(&mut self, now_ns: u64, out: &mut Output) {
+        self.scope.tick(now_ns, out);
+        self.dedup.tick(now_ns, out);
+        self.enrich.tick(now_ns, out);
+        self.redact.tick(now_ns, out);
+        self.aggregate.tick(now_ns, out);
+        self.correlate.tick(now_ns, out);
+        self.batcher.tick(now_ns, out);
     }
 
     fn process(&mut self, event: RawEvent, out: &mut Output) {
@@ -119,7 +120,7 @@ impl Stage for Chain<'_> {
         self.stage.process(event, out, self.next);
     }
 
-    fn tick(&mut self, now_ns: u64) {
-        self.stage.tick(now_ns);
+    fn tick(&mut self, now_ns: u64, out: &mut Output) {
+        self.stage.tick(now_ns, out);
     }
 }

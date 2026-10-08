@@ -1,11 +1,23 @@
-//! Injected read model for `sessions`, `timeline`, `procs`, `flows`, and `gaps`.
+//! Injected read model for `sessions`, `timeline`, `procs`, `flows`, `gaps`,
+//! `files`, `around`, and `search`.
 //!
 //! The daemon's HTTP API is still a stub (`aw-daemon` `api/routes.rs` answers
 //! `/health` and does not serve these paths). These commands therefore do not
 //! dial it. A [`QuerySource`] supplies the records. Production uses
 //! [`UnavailableSource`], which reports that the daemon query API is not
 //! connected. Tests use an in-memory source. `aw-cli` does not depend on
-//! `aw-store`; the shapes here mirror `aw_store::query` without importing it.
+//! `aw-store`; the shapes here mirror the `file_access` columns in storage.md
+//! and the `/files`, `/around`, and `/search` responses in api-and-cli §3
+//! without importing the store.
+//!
+//! The request each command would send, once the daemon serves it:
+//!
+//! - `GET /api/v1/sessions/{sid}/files?filter&group_by&sort&cursor&limit`
+//! - `GET /api/v1/sessions/{sid}/around?ref=<table>:<id>&window=<dur>`
+//! - `GET /api/v1/search?q&kind&since&limit`
+//!
+//! [`files_request`], [`around_request`], and [`search_request`] build those
+//! calls. Nothing in this module opens a socket.
 //!
 //! Unknown values stay [`Option::None`]. Renderers print `不可得`, never `0`
 //! or an empty string.
@@ -320,6 +332,258 @@ pub(crate) trait QuerySource {
     ///
     /// [`QueryError::NotFound`].
     fn gaps(&self, key: &str) -> Result<Vec<GapItem>, QueryError>;
+
+    /// File-access rows for one session (`GET /sessions/{sid}/files`).
+    ///
+    /// `group_by` is `path`, `dir`, `proc`, or `None`. `sort` is a column name
+    /// the command already checked, or `None` (time).
+    ///
+    /// # Errors
+    ///
+    /// [`QueryError::NotFound`] or [`QueryError::BadArgument`].
+    fn files(
+        &self,
+        key: &str,
+        query: &FileQuery,
+    ) -> Result<Vec<FileItem>, QueryError>;
+
+    /// Events around one record (`GET /sessions/{sid}/around`).
+    ///
+    /// # Errors
+    ///
+    /// [`QueryError::NotFound`] when the session or the reference is missing.
+    /// [`QueryError::BadArgument`] when `reference` is not `<table>:<id>`.
+    fn around(&self, key: &str, query: &AroundQuery) -> Result<AroundPage, QueryError>;
+
+    /// Cross-session search (`GET /search`).
+    ///
+    /// # Errors
+    ///
+    /// [`QueryError::BadArgument`] for an unknown `kind`.
+    /// [`QueryError::Unavailable`] when nothing is connected.
+    fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHit>, QueryError>;
+}
+
+/// One `file_access` row, or one group of them.
+///
+/// Byte columns are [`Option`]. `None` means the platform did not observe the
+/// count (storage.md: NULL). It is not zero. A sensitive hit keeps the rule id
+/// so the renderer can highlight the row; the path text is already redacted by
+/// the pipeline and is printed as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileItem {
+    /// Row id when ungrouped.
+    pub id: Option<i64>,
+    /// Process. Hex text when the API sent a string; the numeric form is the
+    /// store's signed integer. `None` when the group key is not the process.
+    pub proc_uid: Option<i64>,
+    /// `proc: {pid, exe_name}` from the API. Both sides stay optional.
+    pub proc_pid: Option<i64>,
+    /// Image basename. Not a path.
+    pub proc_exe: Option<String>,
+    /// `access`, `create`, `delete`, `rename`, or `exec`.
+    pub op: String,
+    /// Already-redacted path.
+    pub path: String,
+    /// Rename target, or unknown.
+    pub path_to: Option<String>,
+    /// Parent directory used when grouping by `dir`. `None` when unknown.
+    pub dir: Option<String>,
+    /// `read` / `write` / `read_write` / `exec` / `unknown`, or unknown.
+    pub access: Option<String>,
+    /// First observation, Unix nanoseconds.
+    pub first_ns: i64,
+    /// Open count. A counted zero is `Some(0)`; unknown is `None`.
+    pub opens: Option<i64>,
+    /// Bytes read. `None` is not observed.
+    pub bytes_read: Option<i64>,
+    /// Bytes written. `None` is not observed.
+    pub bytes_written: Option<i64>,
+    /// Open failed (errno / NTSTATUS). `None` means success or unknown result
+    /// was not reported; the renderer prints `不可得` only when the field is
+    /// absent, and `0` only when the API sent a literal zero.
+    pub result: Option<i64>,
+    /// Sensitive-path rule id. `None` means no rule matched.
+    pub sensitive_rule: Option<String>,
+    /// Record evidence. `None` for a group whose members differ.
+    pub evidence: Option<Evidence>,
+    /// Why a field is NA, when the row itself is NA.
+    pub na_reason: Option<String>,
+    /// Rows in the group. `1` when ungrouped.
+    pub count: i64,
+}
+
+/// Constraints for [`QuerySource::files`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FileQuery {
+    /// Filter expression, forwarded as `filter=`. Not compiled here.
+    pub filter: Option<String>,
+    /// `path`, `dir`, `proc`, or `None`.
+    pub group_by: Option<String>,
+    /// Sort field, or `None` for time order.
+    pub sort: Option<String>,
+}
+
+/// One row in an `around` window. The shape is a timeline event plus the
+/// table it came from, which is what `/around` returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AroundItem {
+    /// `<table>:<id>` of this neighbour, or of the anchor itself.
+    pub reference: String,
+    /// Unix nanoseconds.
+    pub ts_ns: i64,
+    /// Table name (`file_access`, `processes`, …).
+    pub table: String,
+    /// One-line summary already safe to print.
+    pub summary: String,
+    /// Record evidence.
+    pub evidence: Evidence,
+    /// `true` when this row is the record the user named.
+    pub anchor: bool,
+    /// `true` for a gap row.
+    pub is_gap: bool,
+    /// Sensitive-path rule id, when this neighbour is a file hit.
+    pub sensitive_rule: Option<String>,
+}
+
+/// The anchor plus its neighbours.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AroundPage {
+    /// Rows ordered by time. The anchor is included.
+    pub rows: Vec<AroundItem>,
+}
+
+/// Constraints for [`QuerySource::around`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AroundQuery {
+    /// `<table>:<id>`, as in `file_access:123`.
+    pub reference: String,
+    /// Window half-width in nanoseconds. The API query is `window=<dur>`.
+    pub window_ns: i64,
+}
+
+/// One cross-session hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SearchHit {
+    /// Session public id.
+    pub session: String,
+    /// Session label, or unknown.
+    pub session_name: Option<String>,
+    /// `file`, `proc`, or `url`.
+    pub kind: String,
+    /// `<table>:<id>` so `aw around` can open it.
+    pub reference: String,
+    /// Unix nanoseconds.
+    pub ts_ns: i64,
+    /// One-line summary already safe to print. No raw argv or URL.
+    pub summary: String,
+    /// Record evidence.
+    pub evidence: Evidence,
+    /// Sensitive-path rule id, when the hit is a file rule match.
+    pub sensitive_rule: Option<String>,
+}
+
+/// Constraints for [`QuerySource::search`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SearchQuery {
+    /// Free text or a filter expression. Sent as `q`.
+    pub text: String,
+    /// Inclusive lower bound, Unix nanoseconds, when `--since` resolved.
+    ///
+    /// The memory source reads this. Production never builds a source, so the
+    /// field looks unused to the bin target.
+    #[allow(dead_code)]
+    pub since_ns: Option<i64>,
+    /// `file`, `proc`, `url`, or `None` for every kind.
+    pub kind: Option<String>,
+}
+
+/// `GET /api/v1/sessions/{sid}/files` with the documented query keys.
+///
+/// `sid` is percent-encoded. Filter text is encoded too, so a space stays a
+/// space in the value and does not split the query.
+#[must_use]
+pub(crate) fn files_request(session: &str, query: &FileQuery) -> crate::client::ApiRequest {
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    if let Some(filter) = query.filter.as_deref() {
+        pairs.push(("filter", filter));
+    }
+    if let Some(group_by) = query.group_by.as_deref() {
+        pairs.push(("group_by", group_by));
+    }
+    if let Some(sort) = query.sort.as_deref() {
+        pairs.push(("sort", sort));
+    }
+    crate::client::ApiRequest::get_query(
+        &format!("/api/v1/sessions/{}/files", encode_path_segment(session)),
+        encode_query(&pairs),
+    )
+}
+
+/// `GET /api/v1/sessions/{sid}/around?ref=<table>:<id>&window=<dur>`.
+#[must_use]
+pub(crate) fn around_request(
+    session: &str,
+    reference: &str,
+    window: &str,
+) -> crate::client::ApiRequest {
+    crate::client::ApiRequest::get_query(
+        &format!(
+            "/api/v1/sessions/{}/around",
+            encode_path_segment(session)
+        ),
+        encode_query(&[("ref", reference), ("window", window)]),
+    )
+}
+
+/// `GET /api/v1/search?q&kind&since`.
+#[must_use]
+pub(crate) fn search_request(query: &SearchQuery, since: Option<&str>) -> crate::client::ApiRequest {
+    let mut pairs: Vec<(&str, &str)> = vec![("q", query.text.as_str())];
+    if let Some(kind) = query.kind.as_deref() {
+        pairs.push(("kind", kind));
+    }
+    if let Some(since) = since {
+        pairs.push(("since", since));
+    }
+    crate::client::ApiRequest::get_query("/api/v1/search", encode_query(&pairs))
+}
+
+/// Percent-encode one path segment. `@` in `@last` is left as-is: it is
+/// unreserved enough for this API and the daemon matches the literal.
+fn encode_path_segment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'@' => {
+                out.push(byte as char);
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// `k=v&k=v` with both sides percent-encoded.
+fn encode_query(pairs: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    for (index, (key, value)) in pairs.iter().enumerate() {
+        if index > 0 {
+            out.push('&');
+        }
+        out.push_str(&encode_path_segment(key));
+        out.push('=');
+        // Space becomes %20, not '+'. Filter expressions contain spaces.
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(byte as char);
+                }
+                other => out.push_str(&format!("%{other:02X}")),
+            }
+        }
+    }
+    out
 }
 
 /// Production source. Every method says the daemon query API is not connected.
@@ -398,6 +662,24 @@ impl QuerySource for UnavailableSource {
             detail: UNAVAILABLE.to_owned(),
         })
     }
+
+    fn files(&self, _: &str, _: &FileQuery) -> Result<Vec<FileItem>, QueryError> {
+        Err(QueryError::Unavailable {
+            detail: format!("{UNAVAILABLE}; GET /sessions/{{sid}}/files is not served yet"),
+        })
+    }
+
+    fn around(&self, _: &str, _: &AroundQuery) -> Result<AroundPage, QueryError> {
+        Err(QueryError::Unavailable {
+            detail: format!("{UNAVAILABLE}; GET /sessions/{{sid}}/around is not served yet"),
+        })
+    }
+
+    fn search(&self, _: &SearchQuery) -> Result<Vec<SearchHit>, QueryError> {
+        Err(QueryError::Unavailable {
+            detail: format!("{UNAVAILABLE}; GET /search is not served yet"),
+        })
+    }
 }
 
 /// In-memory sessions for tests. Mutations are visible to later calls on the
@@ -424,6 +706,12 @@ pub(crate) struct MemorySession {
     pub flows: Vec<FlowItem>,
     /// Gaps.
     pub gaps: Vec<GapItem>,
+    /// File-access rows. Grouping happens in [`MemorySource::files`].
+    pub files: Vec<FileItem>,
+    /// Neighbours `around` can return. The anchor is whichever row's reference matches.
+    pub around: Vec<AroundItem>,
+    /// Hits this session contributes to `search`.
+    pub search: Vec<SearchHit>,
 }
 
 #[cfg(test)]
@@ -625,6 +913,224 @@ impl QuerySource for MemorySource {
         let index = self.find(key)?;
         Ok(self.sessions[index].gaps.clone())
     }
+
+    fn files(&self, key: &str, query: &FileQuery) -> Result<Vec<FileItem>, QueryError> {
+        let index = self.find(key)?;
+        let mut rows = group_file_rows(&self.sessions[index].files, query.group_by.as_deref())?;
+        if let Some(filter) = query.filter.as_deref() {
+            if !filter.is_empty() {
+                rows.retain(|row| file_matches_filter(row, filter));
+            }
+        }
+        sort_file_rows(&mut rows, query.sort.as_deref())?;
+        Ok(rows)
+    }
+
+    fn around(&self, key: &str, query: &AroundQuery) -> Result<AroundPage, QueryError> {
+        let index = self.find(key)?;
+        let (table, id) = split_reference(&query.reference)?;
+        let _ = (table, id);
+        let rows = &self.sessions[index].around;
+        let anchor = rows.iter().find(|row| row.reference == query.reference);
+        let Some(anchor) = anchor else {
+            return Err(QueryError::NotFound {
+                session: format!("{key} {}", query.reference),
+            });
+        };
+        let start = anchor.ts_ns.saturating_sub(query.window_ns);
+        let end = anchor.ts_ns.saturating_add(query.window_ns);
+        let mut kept: Vec<AroundItem> = rows
+            .iter()
+            .filter(|row| row.ts_ns >= start && row.ts_ns <= end)
+            .cloned()
+            .collect();
+        kept.sort_by_key(|row| (row.ts_ns, row.reference.clone()));
+        Ok(AroundPage { rows: kept })
+    }
+
+    fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHit>, QueryError> {
+        if let Some(kind) = query.kind.as_deref() {
+            if !matches!(kind, "file" | "proc" | "url") {
+                return Err(QueryError::BadArgument {
+                    detail: format!("--kind `{kind}` is not file, proc, or url"),
+                });
+            }
+        }
+        let needle = query.text.to_ascii_lowercase();
+        let mut hits = Vec::new();
+        for session in &self.sessions {
+            for hit in &session.search {
+                if let Some(kind) = query.kind.as_deref() {
+                    if hit.kind != kind {
+                        continue;
+                    }
+                }
+                if let Some(since) = query.since_ns {
+                    if hit.ts_ns < since {
+                        continue;
+                    }
+                }
+                if !needle.is_empty()
+                    && !hit.summary.to_ascii_lowercase().contains(&needle)
+                    && hit.reference.to_ascii_lowercase() != needle
+                {
+                    continue;
+                }
+                hits.push(hit.clone());
+            }
+        }
+        hits.sort_by(|a, b| {
+            b.ts_ns
+                .cmp(&a.ts_ns)
+                .then_with(|| a.session.cmp(&b.session))
+        });
+        Ok(hits)
+    }
+}
+
+/// `<table>:<id>`. The id is numeric. Anything else is a usage error, not a lookup.
+pub(crate) fn split_reference(reference: &str) -> Result<(&str, i64), QueryError> {
+    let (table, id) = reference.split_once(':').ok_or_else(|| QueryError::BadArgument {
+        detail: format!("`{reference}` is not <table>:<id>"),
+    })?;
+    if table.is_empty() || !table.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        return Err(QueryError::BadArgument {
+            detail: format!("`{reference}` has an empty or illegal table name"),
+        });
+    }
+    let id = id.parse::<i64>().map_err(|_| QueryError::BadArgument {
+        detail: format!("`{reference}` has an id that is not an integer"),
+    })?;
+    Ok((table, id))
+}
+
+#[cfg(test)]
+fn group_file_rows(rows: &[FileItem], group_by: Option<&str>) -> Result<Vec<FileItem>, QueryError> {
+    let by = match group_by {
+        None | Some("") | Some("none") => return Ok(rows.to_vec()),
+        Some("path") => FileGroup::Path,
+        Some("dir") => FileGroup::Dir,
+        Some("proc") => FileGroup::Proc,
+        Some(other) => {
+            return Err(QueryError::BadArgument {
+                detail: format!("--group-by `{other}` is not path, dir, or proc"),
+            });
+        }
+    };
+    let mut grouped: Vec<(String, FileItem)> = Vec::new();
+    for row in rows {
+        let key = match by {
+            FileGroup::Path => format!("p:{}", row.path),
+            FileGroup::Dir => match &row.dir {
+                Some(dir) => format!("d:{dir}"),
+                None => "d:\u{0}".to_owned(),
+            },
+            FileGroup::Proc => row
+                .proc_uid
+                .map(|uid| format!("u:{uid}"))
+                .unwrap_or_else(|| "u:\u{0}".to_owned()),
+        };
+        if let Some((_, acc)) = grouped.iter_mut().find(|(existing, _)| existing == &key) {
+            acc.bytes_read = add_opt(acc.bytes_read, row.bytes_read);
+            acc.bytes_written = add_opt(acc.bytes_written, row.bytes_written);
+            acc.opens = add_opt(acc.opens, row.opens);
+            if row.first_ns < acc.first_ns {
+                acc.first_ns = row.first_ns;
+            }
+            acc.count = acc.count.saturating_add(row.count);
+            if acc.evidence != row.evidence {
+                acc.evidence = None;
+            }
+            if acc.sensitive_rule.is_none() {
+                acc.sensitive_rule.clone_from(&row.sensitive_rule);
+            }
+        } else {
+            grouped.push((
+                key,
+                FileItem {
+                    id: None,
+                    proc_uid: if by == FileGroup::Proc {
+                        row.proc_uid
+                    } else {
+                        None
+                    },
+                    proc_pid: if by == FileGroup::Proc { row.proc_pid } else { None },
+                    proc_exe: if by == FileGroup::Proc {
+                        row.proc_exe.clone()
+                    } else {
+                        None
+                    },
+                    op: row.op.clone(),
+                    path: if by == FileGroup::Dir {
+                        row.dir.clone().unwrap_or_default()
+                    } else {
+                        row.path.clone()
+                    },
+                    path_to: None,
+                    dir: row.dir.clone(),
+                    access: None,
+                    first_ns: row.first_ns,
+                    opens: row.opens,
+                    bytes_read: row.bytes_read,
+                    bytes_written: row.bytes_written,
+                    result: None,
+                    sensitive_rule: row.sensitive_rule.clone(),
+                    evidence: row.evidence.clone(),
+                    na_reason: row.na_reason.clone(),
+                    count: row.count,
+                },
+            ));
+        }
+    }
+    Ok(grouped.into_iter().map(|(_, row)| row).collect())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
+enum FileGroup {
+    Path,
+    Dir,
+    Proc,
+}
+
+#[cfg(test)]
+fn sort_file_rows(rows: &mut [FileItem], sort: Option<&str>) -> Result<(), QueryError> {
+    match sort {
+        None | Some("") | Some("time") => {
+            rows.sort_by_key(|row| (row.first_ns, row.id.unwrap_or(0)));
+        }
+        Some("bytes_read") | Some("read") => {
+            rows.sort_by(|a, b| cmp_bytes(a.bytes_read, b.bytes_read).reverse());
+        }
+        Some("bytes_written") | Some("write") => {
+            rows.sort_by(|a, b| cmp_bytes(a.bytes_written, b.bytes_written).reverse());
+        }
+        Some("opens") => rows.sort_by(|a, b| cmp_bytes(a.opens, b.opens).reverse()),
+        Some("path") => rows.sort_by(|a, b| a.path.cmp(&b.path)),
+        Some(other) => {
+            return Err(QueryError::BadArgument {
+                detail: format!(
+                    "--sort `{other}` is not time, path, opens, bytes_read, or bytes_written"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Substring match on path, op, and the sensitive rule id. Not the filter compiler.
+#[cfg(test)]
+fn file_matches_filter(row: &FileItem, filter: &str) -> bool {
+    let needle = filter.to_ascii_lowercase();
+    if needle.contains("tag:sensitive") || needle == "sensitive" {
+        return row.sensitive_rule.is_some();
+    }
+    row.path.to_ascii_lowercase().contains(&needle)
+        || row.op.to_ascii_lowercase().contains(&needle)
+        || row
+            .sensitive_rule
+            .as_deref()
+            .is_some_and(|rule| rule.to_ascii_lowercase().contains(&needle))
 }
 
 #[cfg(test)]
@@ -1144,6 +1650,9 @@ pub(crate) fn sample_source() -> MemorySource {
             detail: Some("ring full".to_owned()),
             evidence: Evidence::E1,
         }],
+        files: Vec::new(),
+        around: Vec::new(),
+        search: Vec::new(),
     });
     source
 }

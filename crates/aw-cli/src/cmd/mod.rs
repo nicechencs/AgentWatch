@@ -5,11 +5,14 @@
 //! Unreachable is exit 3. A 2xx health check followed by "not implemented" is
 //! exit 1, so a live daemon is never a silent success.
 
+mod around;
 mod attach;
+mod config;
 mod daemon;
 mod db;
 mod doctor;
 mod export;
+mod files;
 mod flows;
 mod gaps;
 mod procs;
@@ -17,6 +20,7 @@ mod ps;
 mod query;
 mod render;
 mod run;
+mod search;
 mod sessions;
 mod stop;
 mod timeline;
@@ -63,9 +67,10 @@ impl HttpFactory for LiveHttp {
 
 /// Parse `args` (without argv0), read `AW_TOKEN`, and dispatch.
 ///
-/// Query commands (`sessions`, `timeline`, `procs`, `flows`, `gaps`) read an
-/// injected [`QuerySource`]. The production source reports that the daemon
-/// query API is not connected. They do not probe `/health`.
+/// Query commands (`sessions`, `timeline`, `procs`, `flows`, `gaps`, `files`,
+/// `around`, `search`) read an injected [`QuerySource`]. The production source
+/// reports that the daemon query API is not connected. They do not probe
+/// `/health`. `db` and `config` call an injected API client instead of a store.
 ///
 /// # Errors
 ///
@@ -272,8 +277,8 @@ fn launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
 
 /// `sessions`, `timeline`, `procs`, `flows`, `gaps`. `None` for every other command.
 ///
-/// These do not open an HTTP transport. `files`, `http`, `findings`, `around`,
-/// and `search` stay on the health-probe path.
+/// These do not open an HTTP transport. `http` and `findings` stay on the
+/// health-probe path. `files`, `around`, and `search` are wired here (P2-CLI-01).
 fn query_command(
     command: &Command,
     json: bool,
@@ -315,6 +320,46 @@ fn query_command(
             source,
         )?)),
         Command::Gaps { session } => Ok(Some(gaps::run(session, json, source)?)),
+        Command::Files {
+            session,
+            filter,
+            group_by,
+            sort,
+        } => Ok(Some(files::run(
+            files::FilesArgs {
+                session,
+                filter: filter.as_deref(),
+                group_by: group_by.as_deref(),
+                sort: sort.as_deref(),
+                json,
+                color: false,
+            },
+            source,
+        )?)),
+        Command::Around {
+            session,
+            reference,
+            window,
+        } => Ok(Some(around::run(
+            around::AroundArgs {
+                session,
+                reference,
+                window: window.as_deref(),
+                json,
+                color: false,
+            },
+            source,
+        )?)),
+        Command::Search { text, since, kind } => Ok(Some(search::run(
+            search::SearchArgs {
+                text,
+                since: since.as_deref(),
+                kind: kind.as_deref(),
+                json,
+                color: false,
+            },
+            source,
+        )?)),
         _ => Ok(None),
     }
 }
@@ -383,16 +428,20 @@ fn ops_command(command: &Command, json: bool) -> Option<Outcome> {
                     yes: *yes,
                 },
             };
-            // No wall clock: a duration is subtracted from 0, which saturates.
-            // Tests that need a real cutoff call `db::run` with `FixedClock`.
+            // Production has no daemon client and no TTY. `vacuum` and `purge`
+            // therefore refuse unless the caller already passed `--yes` (purge)
+            // or is calling `db::run` from a test that injects both. Stats and
+            // migrate still answer from the unwired client (exit 3).
             Some(db::run(
                 op,
                 json,
                 &privilege,
                 &db::FixedClock(0),
-                &mut db::EmptyDb,
+                &mut db::UnwiredApi,
+                &mut db::NotInteractive,
             ))
         }
+        Command::Config(cmd) => Some(config::run(cmd, json, &mut config::UnwiredConfig)),
         _ => None,
     }
 }

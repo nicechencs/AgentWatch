@@ -1,12 +1,23 @@
-//! `aw db` (P1-CLI-04).
+//! `aw db` (P1-CLI-04, extended by P2-CLI-02).
 //!
-//! The CLI does not open SQLite. [`DbStore`] is the side-effect boundary:
-//! stats, vacuum, migrate, and purge are calls a test can record. The default
-//! store is empty and does not delete anything.
+//! The CLI does not open SQLite. P1 kept a [`DbStore`] so tests could record
+//! stats, vacuum, migrate, and purge without a daemon. P2 sends those same
+//! operations to the daemon:
+//!
+//! - `GET /api/v1/db/stats`
+//! - `POST /api/v1/db/vacuum`
+//! - `POST /api/v1/db/migrate` with `{ "dry_run": bool }`
+//! - `POST /api/v1/db/purge` with `{ "older_than"?, "all" }`
+//!
+//! [`DbApi`] is that boundary. [`UnwiredApi`] is what production uses until the
+//! daemon serves the routes: every call is exit 3, not an empty success that
+//! would claim the database was vacuumed or purged.
 //!
 //! `purge --all` needs an administrator ([`super::daemon::Privilege`]) and
 //! exits 4 otherwise. `purge --older-than` does not. Pinned sessions are never
-//! counted as removed.
+//! counted as removed. `vacuum` and `purge` are destructive: without a
+//! confirmation ([`Confirm`]) they exit 2, and a non-TTY with no `--yes`
+//! refuses rather than prompting.
 
 use serde_json::json;
 
@@ -16,8 +27,9 @@ use crate::output::{parse_time, DurationArg, TimeArg, TimeUnit};
 use super::daemon::Privilege;
 use super::Outcome;
 
-/// `db stats` numbers.
+/// `db stats` numbers. Read by [`run_store`], which the P1 tests call.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct DbStats {
     /// Logical database size. `None` when the store has no file.
     pub db_bytes: Option<u64>,
@@ -27,8 +39,9 @@ pub(crate) struct DbStats {
     pub pinned_sessions: u64,
 }
 
-/// What purge asked the store to do.
+/// What purge asked the store to do. The API path sends [`PurgeBody`] instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum PurgeRequest {
     /// `ended_ns` strictly before this instant. `None` duration is not used:
     /// the caller parses `--older-than` first.
@@ -50,7 +63,8 @@ pub(crate) struct PurgeResult {
 }
 
 /// Store operations. Implementations must not delete on any method other than
-/// [`purge`](Self::purge).
+/// [`purge`](Self::purge). Kept for the P1 tests; production uses [`DbApi`].
+#[allow(dead_code)]
 pub(crate) trait DbStore {
     /// Current counts.
     fn stats(&self) -> DbStats;
@@ -79,6 +93,7 @@ pub(crate) trait DbStore {
 
 /// Empty store. Every mutating call is a no-op note.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 pub(crate) struct EmptyDb;
 
 impl DbStore for EmptyDb {
@@ -149,8 +164,404 @@ pub(crate) enum DbOp {
     },
 }
 
-/// Run one `db` subcommand.
+/// Whether the user confirmed a destructive `db` command.
+///
+/// A TTY implementation may prompt. [`NotInteractive`] never prompts: the
+/// command must already carry `--yes` (purge) or it is refused. `vacuum` has
+/// no `--yes` flag in the command tree, so a non-TTY vacuum is refused until
+/// a caller passes [`Confirmed`].
+pub(crate) trait Confirm {
+    /// `true` when the operator agreed. Must not print argv, paths, or tokens.
+    fn confirm(&mut self, prompt: &str) -> bool;
+}
+
+/// Production confirmation. There is no TTY on this path, so the answer is no.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct NotInteractive;
+
+impl Confirm for NotInteractive {
+    fn confirm(&mut self, _prompt: &str) -> bool {
+        false
+    }
+}
+
+/// A caller that already agreed. Tests and a future `--yes` on vacuum use this.
+#[derive(Debug, Default, Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) struct Confirmed;
+
+impl Confirm for Confirmed {
+    fn confirm(&mut self, _prompt: &str) -> bool {
+        true
+    }
+}
+
+/// Daemon calls for `aw db`. Implementations must not open SQLite.
+pub(crate) trait DbApi {
+    /// `GET /api/v1/db/stats`.
+    ///
+    /// # Errors
+    ///
+    /// A daemon or transport failure. No path with a username.
+    fn stats(&mut self) -> Result<DbStatsView, DbApiError>;
+
+    /// `POST /api/v1/db/vacuum`.
+    ///
+    /// # Errors
+    ///
+    /// A daemon or transport failure.
+    fn vacuum(&mut self) -> Result<String, DbApiError>;
+
+    /// `POST /api/v1/db/migrate`. `dry_run` lists pending migrations.
+    ///
+    /// # Errors
+    ///
+    /// A daemon or transport failure.
+    fn migrate(&mut self, dry_run: bool) -> Result<MigrateReport, DbApiError>;
+
+    /// `POST /api/v1/db/purge`.
+    ///
+    /// # Errors
+    ///
+    /// A daemon or transport failure. The daemon, not this trait, decides
+    /// which sessions the caller may delete.
+    fn purge(&mut self, body: &PurgeBody) -> Result<PurgeResult, DbApiError>;
+}
+
+/// Why a `db` call did not return a document.
+///
+/// `Failed` and `Forbidden` are returned by a live client. [`UnwiredApi`] only
+/// returns `Unreachable`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum DbApiError {
+    /// Nothing is listening, or this build has no client.
+    Unreachable { detail: String },
+    /// The daemon answered, but not with the expected document.
+    Failed { detail: String },
+    /// Authenticated and refused. Exit 4.
+    Forbidden { detail: String },
+}
+
+impl std::fmt::Display for DbApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable { detail } => write!(f, "{detail}"),
+            Self::Failed { detail } => write!(f, "{detail}"),
+            Self::Forbidden { detail } => write!(f, "{detail}"),
+        }
+    }
+}
+
+/// `GET /db/stats` body. Unknown numbers stay `None`, not zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DbStatsView {
+    /// Logical size of the database file plus WAL, bytes.
+    pub db_bytes: Option<u64>,
+    /// WAL size, when the daemon reported it separately.
+    pub wal_bytes: Option<u64>,
+    /// Row counts keyed by table name. Absent tables are not invented.
+    pub tables: Vec<(String, u64)>,
+    /// Public id of the oldest ended session, or unknown.
+    pub oldest_session: Option<String>,
+    /// When that session ended, Unix nanoseconds.
+    pub oldest_ended_ns: Option<i64>,
+    /// `retention.max_age_days`.
+    pub max_age_days: Option<u64>,
+    /// `retention.max_db_bytes` (or the size-mb key converted by the daemon).
+    pub max_db_bytes: Option<u64>,
+    /// Sessions that are not pinned. Kept so the P1 counts still render.
+    pub sessions: u64,
+    /// Pinned sessions.
+    pub pinned_sessions: u64,
+}
+
+/// One pending or applied migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrationStep {
+    /// `NNNN` prefix.
+    pub version: String,
+    /// File name without the directory.
+    pub name: String,
+    /// `true` when this call did not apply it.
+    pub dry_run: bool,
+}
+
+/// `POST /db/migrate` body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrateReport {
+    /// Steps, in apply order.
+    pub steps: Vec<MigrationStep>,
+    /// One-line note when the daemon sent one.
+    pub detail: Option<String>,
+}
+
+/// JSON body of `POST /db/purge`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PurgeBody {
+    /// Duration text, forwarded as the user typed it. `None` for `--all`.
+    pub older_than: Option<String>,
+    /// `--all`.
+    pub all: bool,
+}
+
+/// Production client. No socket is opened: the query API for these routes is
+/// not wired in this build, and an empty success would claim a vacuum happened.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct UnwiredApi;
+
+const UNWIRED: &str = "daemon db API is not connected; GET /api/v1/db/stats is still a stub, so this command does not open the database. Start it with `aw daemon start`, or pass --no-daemon (polling collectors, all evidence S)";
+
+impl DbApi for UnwiredApi {
+    fn stats(&mut self) -> Result<DbStatsView, DbApiError> {
+        Err(DbApiError::Unreachable {
+            detail: UNWIRED.to_owned(),
+        })
+    }
+
+    fn vacuum(&mut self) -> Result<String, DbApiError> {
+        Err(DbApiError::Unreachable {
+            detail: UNWIRED.to_owned(),
+        })
+    }
+
+    fn migrate(&mut self, _: bool) -> Result<MigrateReport, DbApiError> {
+        Err(DbApiError::Unreachable {
+            detail: UNWIRED.to_owned(),
+        })
+    }
+
+    fn purge(&mut self, _: &PurgeBody) -> Result<PurgeResult, DbApiError> {
+        Err(DbApiError::Unreachable {
+            detail: UNWIRED.to_owned(),
+        })
+    }
+}
+
+/// Run one `db` subcommand against the daemon API.
 pub(crate) fn run(
+    op: DbOp,
+    json: bool,
+    privilege: &dyn Privilege,
+    clock: &dyn Clock,
+    api: &mut dyn DbApi,
+    confirm: &mut dyn Confirm,
+) -> Outcome {
+    match op {
+        DbOp::Stats => match api.stats() {
+            Ok(view) => stats_view_outcome(&view, json),
+            Err(err) => api_error(err, json),
+        },
+        DbOp::Vacuum => {
+            if !confirm.confirm(
+                "VACUUM rewrites the database and can take a long time. Continue?",
+            ) {
+                return super::error_outcome(
+                    exit::USAGE,
+                    "usage",
+                    "`db vacuum` rewrites the database; confirm on a terminal, or this non-interactive call is refused",
+                    json,
+                );
+            }
+            match api.vacuum() {
+                Ok(detail) => note("vacuum", &detail, json),
+                Err(err) => api_error(err, json),
+            }
+        }
+        DbOp::Migrate { dry_run } => match api.migrate(dry_run) {
+            Ok(report) => migrate_outcome(&report, json),
+            Err(err) => api_error(err, json),
+        },
+        DbOp::Purge {
+            older_than,
+            all,
+            yes,
+        } => purge_api(
+            PurgeArgs {
+                older_than: older_than.as_deref(),
+                all,
+                yes,
+                json,
+                privilege,
+                clock,
+            },
+            api,
+            confirm,
+        ),
+    }
+}
+
+struct PurgeArgs<'a> {
+    older_than: Option<&'a str>,
+    all: bool,
+    yes: bool,
+    json: bool,
+    privilege: &'a dyn Privilege,
+    clock: &'a dyn Clock,
+}
+
+fn purge_api(args: PurgeArgs<'_>, api: &mut dyn DbApi, confirm: &mut dyn Confirm) -> Outcome {
+    let PurgeArgs {
+        older_than,
+        all,
+        yes,
+        json,
+        privilege,
+        clock,
+    } = args;
+    if all && older_than.is_some() {
+        return super::error_outcome(
+            exit::USAGE,
+            "usage",
+            "`db purge` takes either --older-than or --all, not both",
+            json,
+        );
+    }
+    if !all && older_than.is_none() {
+        return super::error_outcome(
+            exit::USAGE,
+            "usage",
+            "`db purge` needs --older-than <dur> or --all",
+            json,
+        );
+    }
+    if let Some(text) = older_than {
+        // Validate before asking. A bad duration must not look like a refusal to confirm.
+        if let Err(detail) = older_than_cutoff(text, clock.now_ns()) {
+            return super::error_outcome(exit::USAGE, "usage", &detail, json);
+        }
+    }
+    if all && !privilege.is_admin() {
+        return super::error_outcome(
+            exit::PERMISSION,
+            "permission",
+            "administrator required for `db purge --all`; re-run in an administrator terminal or with sudo",
+            json,
+        );
+    }
+    let confirmed = yes
+        || confirm.confirm(
+            "purge deletes ended sessions. Pinned and active sessions stay. Continue?",
+        );
+    if !confirmed {
+        return super::error_outcome(
+            exit::USAGE,
+            "usage",
+            "`db purge` deletes sessions; pass --yes, or confirm on a terminal. A non-interactive call without --yes is refused",
+            json,
+        );
+    }
+    let body = PurgeBody {
+        older_than: older_than.map(str::to_owned),
+        all,
+    };
+    match api.purge(&body) {
+        Ok(result) => purge_outcome(&result, json),
+        Err(err) => api_error(err, json),
+    }
+}
+
+fn api_error(err: DbApiError, json: bool) -> Outcome {
+    let (code, machine) = match &err {
+        DbApiError::Unreachable { .. } => (exit::UNREACHABLE, "unreachable"),
+        DbApiError::Forbidden { .. } => (exit::PERMISSION, "permission"),
+        DbApiError::Failed { .. } => (exit::GENERAL, "db"),
+    };
+    super::error_outcome(code, machine, &err.to_string(), json)
+}
+
+fn stats_view_outcome(view: &DbStatsView, json: bool) -> Outcome {
+    let text = if json {
+        let tables: serde_json::Map<String, serde_json::Value> = view
+            .tables
+            .iter()
+            .map(|(name, count)| (name.clone(), serde_json::Value::from(*count)))
+            .collect();
+        format!(
+            "{}\n",
+            json!({
+                "db_bytes": view.db_bytes,
+                "wal_bytes": view.wal_bytes,
+                "tables": tables,
+                "oldest_session": view.oldest_session,
+                "oldest_ended_ns": view.oldest_ended_ns,
+                "retention": {
+                    "max_age_days": view.max_age_days,
+                    "max_db_bytes": view.max_db_bytes,
+                },
+                "sessions": view.sessions,
+                "pinned_sessions": view.pinned_sessions,
+            })
+        )
+    } else {
+        let bytes = match view.db_bytes {
+            Some(bytes) => bytes.to_string(),
+            None => "不可得".to_owned(),
+        };
+        let mut lines = format!(
+            "db_bytes {bytes}\nsessions {}\npinned_sessions {}\n",
+            view.sessions, view.pinned_sessions
+        );
+        for (name, count) in &view.tables {
+            lines.push_str(&format!("table {name} {count}\n"));
+        }
+        let oldest = view.oldest_session.as_deref().unwrap_or("不可得");
+        lines.push_str(&format!("oldest_session {oldest}\n"));
+        let age = match view.max_age_days {
+            Some(days) => days.to_string(),
+            None => "不可得".to_owned(),
+        };
+        lines.push_str(&format!("retention.max_age_days {age}\n"));
+        lines
+    };
+    Outcome {
+        code: exit::OK,
+        stdout: text.into_bytes(),
+        stderr: Vec::new(),
+    }
+}
+
+fn migrate_outcome(report: &MigrateReport, json: bool) -> Outcome {
+    let text = if json {
+        format!(
+            "{}\n",
+            json!({
+                "op": "migrate",
+                "steps": report.steps.iter().map(|step| json!({
+                    "version": step.version,
+                    "name": step.name,
+                    "dry_run": step.dry_run,
+                })).collect::<Vec<_>>(),
+                "detail": report.detail,
+            })
+        )
+    } else if report.steps.is_empty() {
+        let detail = report
+            .detail
+            .as_deref()
+            .unwrap_or("no pending migration");
+        format!("{detail}\n")
+    } else {
+        let mut lines = String::new();
+        for step in &report.steps {
+            let mark = if step.dry_run { "pending" } else { "applied" };
+            lines.push_str(&format!("{mark} {} {}\n", step.version, step.name));
+        }
+        lines
+    };
+    Outcome {
+        code: exit::OK,
+        stdout: text.into_bytes(),
+        stderr: Vec::new(),
+    }
+}
+
+/// Run one `db` subcommand against a [`DbStore`].
+///
+/// P1 tests call this. It confirms vacuum itself (the store trait has no
+/// prompt) and still requires `--yes` for purge, matching those tests.
+#[allow(dead_code)]
+pub(crate) fn run_store(
     op: DbOp,
     json: bool,
     privilege: &dyn Privilege,
@@ -183,6 +594,7 @@ pub(crate) fn run(
     }
 }
 
+#[allow(dead_code)]
 fn purge(
     older_than: Option<&str>,
     all: bool,
@@ -279,6 +691,7 @@ fn duration_ns(duration: DurationArg) -> Result<i64, String> {
         .ok_or_else(|| "duration overflowed nanoseconds".to_owned())
 }
 
+#[allow(dead_code)]
 fn stats_outcome(stats: &DbStats, json: bool) -> Outcome {
     let text = if json {
         format!(
@@ -346,7 +759,9 @@ fn note(op: &str, detail: &str, json: bool) -> Outcome {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{run, Clock, DbOp, DbStats, DbStore, FixedClock, PurgeRequest, PurgeResult};
+    use super::{
+        run_store, Clock, DbOp, DbStats, DbStore, FixedClock, PurgeRequest, PurgeResult,
+    };
     use crate::cmd::daemon::Privilege;
     use crate::exit;
 
@@ -484,7 +899,7 @@ mod tests {
     #[test]
     fn purge_older_than_zero_drops_ended_and_keeps_pinned() {
         let mut store = sample();
-        let outcome = run(
+        let outcome = run_store(
             DbOp::Purge {
                 older_than: Some("0s".to_owned()),
                 all: false,
@@ -524,7 +939,7 @@ mod tests {
     #[test]
     fn purge_all_without_admin_is_exit_4() {
         let mut store = sample();
-        let outcome = run(
+        let outcome = run_store(
             DbOp::Purge {
                 older_than: None,
                 all: true,
@@ -548,7 +963,7 @@ mod tests {
     #[test]
     fn purge_all_with_admin_leaves_only_pinned_and_active() {
         let mut store = sample();
-        let outcome = run(
+        let outcome = run_store(
             DbOp::Purge {
                 older_than: None,
                 all: true,
@@ -572,7 +987,7 @@ mod tests {
             ended_ns: Some(1),
             pinned: true,
         }]);
-        let outcome = run(DbOp::Stats, true, &Admin(false), &clock(), &mut store);
+        let outcome = run_store(DbOp::Stats, true, &Admin(false), &clock(), &mut store);
         assert_eq!(outcome.code, exit::OK);
         let text = String::from_utf8(outcome.stdout).expect("utf8");
         let value: serde_json::Value = serde_json::from_str(&text).expect("json");

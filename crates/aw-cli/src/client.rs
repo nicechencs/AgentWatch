@@ -50,9 +50,30 @@ impl ApiRequest {
     #[must_use]
     #[allow(dead_code)]
     pub fn post_json(path: &str, body: &Value) -> Self {
+        Self::json_method("POST", path, body)
+    }
+
+    /// `PUT <path>` with a JSON body. Used by `aw config set` (`PUT /config`).
+    #[must_use]
+    pub fn put_json(path: &str, body: &Value) -> Self {
+        Self::json_method("PUT", path, body)
+    }
+
+    /// `GET <path>?<query>`. `query` is the raw string without `?`.
+    #[must_use]
+    pub fn get_query(path: &str, query: impl Into<String>) -> Self {
+        Self {
+            method: "GET".to_owned(),
+            path: path.to_owned(),
+            query: query.into(),
+            body: Vec::new(),
+        }
+    }
+
+    fn json_method(method: &str, path: &str, body: &Value) -> Self {
         let bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
         Self {
-            method: "POST".to_owned(),
+            method: method.to_owned(),
             path: path.to_owned(),
             query: String::new(),
             body: bytes,

@@ -13,7 +13,8 @@ use aw_core::Evidence;
 use crate::output::{self, OutputMode, Row, Table};
 
 use super::query::{
-    opt_i64, opt_text, FlowItem, GapItem, ProcItem, SessionItem, SessionShow, TimelineItem,
+    opt_i64, opt_text, AroundItem, FileItem, FlowItem, GapItem, ProcItem, SearchHit, SessionItem,
+    SessionShow, TimelineItem,
 };
 
 /// Print a table, or the JSON document when `mode` is JSON.
@@ -526,4 +527,188 @@ pub(crate) fn gaps_json(rows: &[GapItem]) -> Value {
 /// One-line confirmation for a mutation (`rename`, `pin`, `delete`).
 pub(crate) fn mutation_json(action: &str, detail: &Value) -> Value {
     json!({ "action": action, "result": detail })
+}
+
+/// Byte cell for a file row. `None` is `n/a`, never `0` (P2-CLI-01).
+///
+/// A counted zero is still `0`: the API sent a number. Missing is the only
+/// case that becomes `n/a`.
+#[must_use]
+pub(crate) fn bytes_cell(value: Option<i64>) -> String {
+    match value {
+        Some(n) => n.to_string(),
+        None => "n/a".to_owned(),
+    }
+}
+
+/// File rows. A sensitive hit is wrapped in ANSI bold only when `color` is set.
+pub(crate) fn files_table(rows: &[FileItem], color: bool) -> Table {
+    Table {
+        headers: vec![
+            "time".to_owned(),
+            "proc".to_owned(),
+            "op".to_owned(),
+            "path".to_owned(),
+            "opens".to_owned(),
+            "read".to_owned(),
+            "write".to_owned(),
+            "sensitive".to_owned(),
+        ],
+        rows: rows
+            .iter()
+            .map(|row| {
+                let path = highlight_sensitive(&row.path, row.sensitive_rule.is_some(), color);
+                Row {
+                    cells: vec![
+                        row.first_ns.to_string(),
+                        proc_cell(row),
+                        row.op.clone(),
+                        path,
+                        opt_i64(row.opens),
+                        bytes_cell(row.bytes_read),
+                        bytes_cell(row.bytes_written),
+                        opt_text(row.sensitive_rule.as_deref()),
+                    ],
+                    evidence: evidence_or_na(row.evidence.as_ref()),
+                }
+            })
+            .collect(),
+    }
+}
+
+fn proc_cell(row: &FileItem) -> String {
+    match (&row.proc_exe, row.proc_pid, row.proc_uid) {
+        (Some(exe), Some(pid), _) => format!("{exe} {pid}"),
+        (Some(exe), None, _) => exe.clone(),
+        (None, _, Some(uid)) => uid.to_string(),
+        (None, _, None) => "不可得".to_owned(),
+    }
+}
+
+/// ANSI bold around `text` when the row hit a sensitive-path rule and the
+/// caller asked for color. A non-TTY caller passes `color = false` and gets
+/// the path unchanged.
+fn highlight_sensitive(text: &str, sensitive: bool, color: bool) -> String {
+    if sensitive && color {
+        format!("\u{1b}[1m{text}\u{1b}[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+pub(crate) fn files_json(rows: &[FileItem]) -> Value {
+    json!({
+        "files": rows.iter().map(|row| json!({
+            "id": row.id,
+            "proc_uid": row.proc_uid,
+            "proc": {
+                "pid": row.proc_pid,
+                "exe_name": row.proc_exe,
+            },
+            "op": row.op,
+            "path": row.path,
+            "path_to": row.path_to,
+            "dir": row.dir,
+            "access": row.access,
+            "first_ns": row.first_ns,
+            "opens": row.opens,
+            "bytes_read": row.bytes_read,
+            "bytes_written": row.bytes_written,
+            "result": row.result,
+            "sensitive_rule": row.sensitive_rule,
+            "na_reason": row.na_reason,
+            "count": row.count,
+            "evidence": row.evidence.as_ref().map(evidence_json),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Neighbours of one record. The anchor row is marked in the `anchor` column.
+pub(crate) fn around_table(rows: &[AroundItem], color: bool) -> Table {
+    Table {
+        headers: vec![
+            "time".to_owned(),
+            "ref".to_owned(),
+            "table".to_owned(),
+            "summary".to_owned(),
+            "anchor".to_owned(),
+        ],
+        rows: rows
+            .iter()
+            .map(|row| {
+                let summary = if row.is_gap {
+                    format!("{} {}", super::query::gap_marker(color), row.summary)
+                } else {
+                    highlight_sensitive(&row.summary, row.sensitive_rule.is_some(), color)
+                };
+                Row {
+                    cells: vec![
+                        row.ts_ns.to_string(),
+                        row.reference.clone(),
+                        row.table.clone(),
+                        summary,
+                        if row.anchor { "yes" } else { "no" }.to_owned(),
+                    ],
+                    evidence: row.evidence.clone(),
+                }
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn around_json(rows: &[AroundItem]) -> Value {
+    json!({
+        "events": rows.iter().map(|row| json!({
+            "ref": row.reference,
+            "ts_ns": row.ts_ns,
+            "table": row.table,
+            "summary": row.summary,
+            "anchor": row.anchor,
+            "gap": row.is_gap,
+            "sensitive_rule": row.sensitive_rule,
+            "evidence": evidence_json(&row.evidence),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Cross-session hits. Grouping by session is the caller's job; this prints
+/// one row per hit so `--json` length is the hit count.
+pub(crate) fn search_table(rows: &[SearchHit], color: bool) -> Table {
+    Table {
+        headers: vec![
+            "session".to_owned(),
+            "kind".to_owned(),
+            "time".to_owned(),
+            "ref".to_owned(),
+            "summary".to_owned(),
+        ],
+        rows: rows
+            .iter()
+            .map(|row| Row {
+                cells: vec![
+                    row.session.clone(),
+                    row.kind.clone(),
+                    row.ts_ns.to_string(),
+                    row.reference.clone(),
+                    highlight_sensitive(&row.summary, row.sensitive_rule.is_some(), color),
+                ],
+                evidence: row.evidence.clone(),
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn search_json(rows: &[SearchHit]) -> Value {
+    json!({
+        "hits": rows.iter().map(|row| json!({
+            "session": row.session,
+            "session_name": row.session_name,
+            "kind": row.kind,
+            "ref": row.reference,
+            "ts_ns": row.ts_ns,
+            "summary": row.summary,
+            "sensitive_rule": row.sensitive_rule,
+            "evidence": evidence_json(&row.evidence),
+        })).collect::<Vec<_>>(),
+    })
 }

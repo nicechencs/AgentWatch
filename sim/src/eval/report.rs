@@ -91,7 +91,9 @@ impl EvalReport {
         };
         out.push_str(&format!("bytes: session err {session}\n"));
         if !self.connections.is_empty() {
-            out.push_str("| connection | up truth | up got | up err | down truth | down got | down err |\n");
+            out.push_str(
+                "| connection | up truth | up got | up err | down truth | down got | down err |\n",
+            );
             out.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
             for row in &self.connections {
                 out.push_str(&format!(
@@ -146,7 +148,10 @@ impl EvalReport {
             }
         }
         if self.unparsed_export > 0 {
-            out.push_str(&format!("unparsed export lines: {}\n", self.unparsed_export));
+            out.push_str(&format!(
+                "unparsed export lines: {}\n",
+                self.unparsed_export
+            ));
         }
         for failure in &self.failures {
             out.push_str(&format!("FAIL: {failure}\n"));

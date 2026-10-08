@@ -152,7 +152,7 @@ $ aw run --proxy -- claude
 | GET | `/sessions` | 列表。参数：`?since&until&agent&active&q&cursor&limit` |
 | GET | `/sessions/{sid}` | 会话详情 + `stats` |
 | PATCH | `/sessions/{sid}` | `{name?, pinned?}` |
-| PATCH | `/findings/{id}` | `{user_state: open|acknowledged|dismissed}`（P3） |
+| PATCH | `/sessions/{sid}/findings/{id}` | body：`{user_state: "confirmed"\|"ignored"\|null}`。只接受这三个值。`null` 清除标记。写入 `user_state_by`（当前用户）和 `user_state_ns`（Unix 纳秒）。不属于该用户的会话或发现返回 404。 |
 | POST | `/sessions/{sid}/stop` | 停止监控 |
 | DELETE | `/sessions/{sid}` | 删除 |
 | GET | `/sessions/{sid}/summary` | 概览页数据：Top 目录、Top 域名、按类别计数、按证据等级计数、缺口摘要 |
@@ -165,7 +165,7 @@ $ aw run --proxy -- claude
 | GET | `/sessions/{sid}/flows/{id}/buckets` | 单流的时间序列 |
 | GET | `/sessions/{sid}/traffic` | 参数：`?group_by=domain\|proc&from&to&step`。返回流量时间序列（堆叠图） |
 | GET | `/sessions/{sid}/dns` | |
-| GET | `/sessions/{sid}/http` | |
+| GET | `/sessions/{sid}/http` | 参数：`?filter&cursor&limit&from&to&redact_paths&redact_hosts`。字段与 `http` 表一致，`proc_uid` 为十六进制，另附 `proc: {pid, exe_name}`。游标为 `ts_ns,id`。会话属于当前用户且 `proxy_enabled = 0` 时返回 200：`{"http":[],"reason":"no_proxy","next_cursor":null}`，不是 404。没有数据库的内存会话仍是 501。 |
 | GET | `/sessions/{sid}/agent-events` | E3 |
 | GET | `/sessions/{sid}/agents` | AgentInstance 列表与角色 |
 | PATCH | `/agents/{id}` | `{role?, label?}` 手工标注 |
@@ -177,10 +177,10 @@ $ aw run --proxy -- claude
 | GET | `/groups/{gid}` | 组详情与成员会话 |
 | DELETE | `/groups/{gid}` | 删除组（不删会话） |
 | GET | `/groups/{gid}/graph` | Agent 通信图（节点 + 边） |
-| GET | `/sessions/{sid}/findings` | 参数：`?lang`。返回的发现已按语言渲染 |
+| GET | `/sessions/{sid}/findings` | 参数：`?lang=zh\|en&min_severity=info\|notice\|warn&evidence=E1\|E2\|E3\|S\|I\|NA\|content_match&cursor&limit`。每条含 `wording_id`、`params`，以及 `wording::render` 生成的 `text`。渲染失败时 `text` 为 null，并带 `error`，不拼接替代句。`content_match` 按 `kind` 过滤，其余按 `evidence`。游标为 `first_ns,id`。 |
 | GET | `/sessions/{sid}/gaps` | |
 | GET | `/sessions/{sid}/around` | 参数：`?ref=file_access:123&window=10s` |
-| GET | `/sessions/{sid}/export` | 参数：`?format&filter&redact_paths&redact_hosts&lang`。流式下载 |
+| GET, POST | `/sessions/{sid}/export` | 参数：`?format&filter&redact_paths&redact_hosts&lang`。`format=md`（GET 或 POST）返回 `text/markdown`：会话信息、采集能力、缺口、按证据等级分组的发现（`content_match` 单独一节）、按流记录条数的域名、按访问行数的文件，文末固定附证据等级说明。未知字段写「不可得」并带原因。全文先过 `wording::lint`（内容匹配句只放行 `ContentMatchPhrase`）；有违规时 HTTP 422，body 为 `{"error":{"code":"wording_lint","violations":[...]}}`，不返回报告正文。其他 `format` 以及没有数据库的内存会话仍是 501。JSONL / CSV 不在本接口。 |
 | GET | `/sessions/{sid}/live` | SSE 实时事件流（已脱敏、已归属的记录增量） |
 | GET | `/search` | 参数：`?q&kind&since&limit`。跨会话搜索 |
 | GET/PUT | `/config` | 读取/修改配置（PUT 仅管理员） |

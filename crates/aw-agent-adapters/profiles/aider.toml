@@ -1,0 +1,18 @@
+# 匹配规则依据任务卡草案，未经 SPIKE-07 实测，待核对。
+# SPIKE-07 §5.5：没有工具级自报告。命令名文档上是 `aider`，常经由 python -m。
+# argv 只接受单独一个参数等于 aider（或路径以它结尾），避免普通 python 脚本命中。
+
+id = "aider"
+display = "Aider"
+
+[match]
+exe_names = ["aider", "aider.exe"]
+argv_regex = ['(?i)(^|[\\/])aider(\\.exe)?$']
+
+[children]
+role_regex = [
+    { role = "vcs", regex = '(?i)(^|[\\/])git(\\.exe)?$' },
+]
+
+# 无工具级渠道。空列表表示没有 E3 数据源。
+self_report = []

@@ -151,8 +151,7 @@ fn parse_args(args: Vec<String>) -> Result<Opts, String> {
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         let next = |flag: &str, iter: &mut std::vec::IntoIter<String>| -> Result<String, String> {
-            iter.next()
-                .ok_or_else(|| format!("{flag} needs a value"))
+            iter.next().ok_or_else(|| format!("{flag} needs a value"))
         };
         match arg.as_str() {
             "--truth" => truth = Some(std::path::PathBuf::from(next("--truth", &mut iter)?)),
@@ -316,8 +315,8 @@ pub fn parse_truth(text: &str) -> Result<Vec<TruthAction>, String> {
         if line.is_empty() {
             continue;
         }
-        let raw: RawTruth = serde_json::from_str(line)
-            .map_err(|err| format!("truth line {}: {err}", index + 1))?;
+        let raw: RawTruth =
+            serde_json::from_str(line).map_err(|err| format!("truth line {}: {err}", index + 1))?;
         if !raw.ok || flag_true(&raw, "skip") {
             continue;
         }
@@ -340,7 +339,11 @@ pub fn parse_truth(text: &str) -> Result<Vec<TruthAction>, String> {
                     bytes_up: None,
                     bytes_down: None,
                     short_lived: short,
-                    label: format!("proc pid={} id={}", raw.pid, raw.id.as_deref().unwrap_or("-")),
+                    label: format!(
+                        "proc pid={} id={}",
+                        raw.pid,
+                        raw.id.as_deref().unwrap_or("-")
+                    ),
                 });
             }
             "http_upload" | "http_download" | "udp_send" | "long_conn" => {
@@ -361,15 +364,20 @@ pub fn parse_truth(text: &str) -> Result<Vec<TruthAction>, String> {
                     label: format!(
                         "{} {}:{}",
                         raw.action,
-                        local_port.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-                        remote_port.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+                        local_port
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        remote_port
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "-".into())
                     ),
                 });
             }
             "dns_lookup" => {
-                let qname = raw.name.clone().ok_or_else(|| {
-                    format!("truth line {}: dns_lookup has no name", index + 1)
-                })?;
+                let qname = raw
+                    .name
+                    .clone()
+                    .ok_or_else(|| format!("truth line {}: dns_lookup has no name", index + 1))?;
                 rows.push(TruthAction {
                     category: Category::Dns,
                     pid: raw.pid,
@@ -413,7 +421,8 @@ fn is_short(id: &Option<String>, pid: Option<u32>, spawns: &[SpawnMeta], self_pi
     let pid = pid.unwrap_or(self_pid);
     spawns.iter().any(|spawn| {
         spawn.spawned_pid == Some(pid)
-            && (spawn.id.as_deref() == Some("short") || spawn.lifetime_ms.is_some_and(|ms| ms < 100))
+            && (spawn.id.as_deref() == Some("short")
+                || spawn.lifetime_ms.is_some_and(|ms| ms < 100))
     })
 }
 
@@ -441,7 +450,10 @@ fn number_u64(raw: &RawTruth, key: &str) -> Option<u64> {
 }
 
 fn ports_of(raw: &RawTruth) -> Result<(Option<u16>, Option<u16>), String> {
-    Ok((port_of(raw.local.as_deref()), port_of(raw.remote.as_deref())))
+    Ok((
+        port_of(raw.local.as_deref()),
+        port_of(raw.remote.as_deref()),
+    ))
 }
 
 fn port_of(addr: Option<&str>) -> Option<u16> {
@@ -556,11 +568,7 @@ fn rewrite_proc(mut value: serde_json::Value) -> serde_json::Value {
             obj.insert("proc_".to_string(), proc);
         }
         if obj.get("exe").is_none() {
-            if let Some(exe) = obj
-                .get("payload")
-                .and_then(|p| p.get("exe"))
-                .cloned()
-            {
+            if let Some(exe) = obj.get("payload").and_then(|p| p.get("exe")).cloned() {
                 obj.insert("exe".to_string(), exe);
             }
         }
@@ -622,7 +630,10 @@ mod unit {
         assert_eq!(proc.hit, 1);
         assert_eq!(proc.recall, Some(0.5));
         assert!(!report.passed);
-        assert!(report.unmatched_truth.iter().any(|item| item.contains("pid=21")));
+        assert!(report
+            .unmatched_truth
+            .iter()
+            .any(|item| item.contains("pid=21")));
     }
 
     #[test]
@@ -631,7 +642,11 @@ mod unit {
             "../../tests/fixtures/eval/export_byte_6pct.jsonl"
         ));
         let report = evaluate(&truth(), &export, &thresholds(), "windows").unwrap();
-        let up = report.connections.iter().find(|row| row.local_port == 40000).unwrap();
+        let up = report
+            .connections
+            .iter()
+            .find(|row| row.local_port == 40000)
+            .unwrap();
         assert_eq!(up.err_up, Some(0.06));
         assert!(!report.passed);
         assert!(report.failures.iter().any(|item| item.contains("6.0%")));

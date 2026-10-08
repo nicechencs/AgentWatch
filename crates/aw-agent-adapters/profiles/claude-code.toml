@@ -1,0 +1,22 @@
+# 匹配规则依据任务卡草案，未经 SPIKE-07 实测，待核对。
+# SPIKE-07（2026-10-07 文档调研）没有录到可用于识别的 argv；下面的路径只复述
+# process-tracking §7 的草案，不把它写成已证实的进程形态。
+# 渠道名来自同一篇文档调研（hooks、otel），不是本机实测。
+
+id = "claude-code"
+display = "Claude Code"
+
+[match]
+# 只认产品命令名。不把 node / python 放进 exe_names。
+exe_names = ["claude", "claude.exe"]
+# node 入口只在 argv 精确落到该包路径时才命中（与 exe_names 是“或”）。
+argv_regex = [
+    '(?i)(^|[\\/])@anthropic-ai[\\/]claude-code([\\/]|$)',
+    '(?i)(^|[\\/])claude-code[\\/]cli\.js$',
+]
+
+[children]
+# MCP 服务器名不在子进程 argv 里（SPIKE-07 §5.6）。这里不猜角色。
+role_regex = []
+
+self_report = ["hooks", "otel"]

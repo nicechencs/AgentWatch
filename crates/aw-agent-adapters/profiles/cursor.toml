@@ -1,0 +1,20 @@
+# 匹配规则依据任务卡草案，未经 SPIKE-07 实测，待核对。
+# SPIKE-07 §5.3：桌面应用是 Electron 宿主，exe 名未实测。只认产品名，
+# 不认 node，也不认 "Cursor Helper"（那是子进程，不是 Agent 根）。
+# `--type=` 只用于子进程角色，不参与 identify。
+
+id = "cursor"
+display = "Cursor"
+
+[match]
+exe_names = ["Cursor", "Cursor.exe", "cursor", "cursor.exe"]
+
+[children]
+role_regex = [
+    { role = "renderer", regex = '(?i)^--type=renderer$' },
+    { role = "utility", regex = '(?i)^--type=utility$' },
+    { role = "extension-host", regex = '(?i)^--type=extensionHost$' },
+]
+
+# SPIKE-07 确认有公开 hooks。没有一次性注入参数的记载，故不登记别的渠道。
+self_report = ["hooks"]

@@ -61,8 +61,8 @@ struct PlatformRow {
 
 impl Thresholds {
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = fs::read_to_string(path)
-            .map_err(|err| format!("read {}: {err}", path.display()))?;
+        let text =
+            fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
         Self::parse(&text)
     }
 

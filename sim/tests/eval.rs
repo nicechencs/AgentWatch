@@ -53,7 +53,10 @@ fn eval_missing_one_process_recall_is_one_half() {
         stdout.contains("| proc | 2 | 1 | 50.0% | 0 |"),
         "proc recall line missing:\n{stdout}"
     );
-    assert!(stdout.contains("pid=21"), "missed short process listed:\n{stdout}");
+    assert!(
+        stdout.contains("pid=21"),
+        "missed short process listed:\n{stdout}"
+    );
     assert!(stdout.contains("RESULT: FAIL"), "{stdout}");
 }
 
@@ -70,7 +73,10 @@ fn eval_byte_error_of_six_percent_fails() {
         stdout.contains("| proc | 2 | 2 | 100.0% | 0 |"),
         "both processes match:\n{stdout}"
     );
-    assert!(stdout.contains("6.0%"), "byte error should show 6.0%:\n{stdout}");
+    assert!(
+        stdout.contains("6.0%"),
+        "byte error should show 6.0%:\n{stdout}"
+    );
     assert!(stdout.contains("byte error"), "{stdout}");
     assert!(stdout.contains("RESULT: FAIL"), "{stdout}");
 }

@@ -1,0 +1,18 @@
+# 匹配规则依据任务卡草案，未经 SPIKE-07 实测，待核对。
+# SPIKE-07 §5.2：产品命令名是 `codex`，实际 exe 名与 argv 都未录到。
+# 不写未录制的包路径，也不用 CODEX_HOME（用户环境里很常见，会误伤普通进程）。
+
+id = "codex"
+display = "Codex CLI"
+
+[match]
+exe_names = ["codex", "codex.exe"]
+
+[children]
+# P5-AGENT-05 把 sandbox-exec 标成沙箱辅助进程。角色标注不影响 identify。
+role_regex = [
+    { role = "sandbox", regex = '(?i)(^|[\\/])sandbox-exec$' },
+]
+
+# 文档调研里的渠道。注入方式仍待验证，这里只登记名字。
+self_report = ["hooks", "otel"]

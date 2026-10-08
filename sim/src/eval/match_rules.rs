@@ -69,13 +69,23 @@ pub fn score_with(
                         net_used[index] = true;
                         net_hit += 1;
                         let err = connection_error(action, &export[index]);
-                        accumulate(&mut session_truth, &mut session_got, &mut session_comparable, &err);
+                        accumulate(
+                            &mut session_truth,
+                            &mut session_got,
+                            &mut session_comparable,
+                            &err,
+                        );
                         connections.push(err);
                     }
                     None => {
                         unmatched_truth.push(action.label.clone());
                         let err = connection_error(action, &ExportEvent::missing_conn());
-                        accumulate(&mut session_truth, &mut session_got, &mut session_comparable, &err);
+                        accumulate(
+                            &mut session_truth,
+                            &mut session_got,
+                            &mut session_comparable,
+                            &err,
+                        );
                         connections.push(err);
                     }
                 }
@@ -109,7 +119,10 @@ pub fn score_with(
         .iter()
         .filter(|event| event.kind == ExportKind::Gap)
         .map(|event| GapItem {
-            gap_kind: event.gap_kind.clone().unwrap_or_else(|| "unspecified".to_string()),
+            gap_kind: event
+                .gap_kind
+                .clone()
+                .unwrap_or_else(|| "unspecified".to_string()),
             affects: event.gap_affects.clone(),
             detail: event.gap_detail.clone(),
         })
@@ -230,10 +243,7 @@ fn exe_match(truth: Option<&str>, export: Option<&str>) -> bool {
 }
 
 fn exe_key(path: &str) -> String {
-    let name = path
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(path);
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     name.to_ascii_lowercase()
 }
 
@@ -295,7 +305,10 @@ fn qname_key(name: &str) -> String {
 }
 
 fn connection_error(action: &TruthAction, event: &ExportEvent) -> ConnectionError {
-    let (local_port, remote_port) = (action.local_port.unwrap_or(0), action.remote_port.unwrap_or(0));
+    let (local_port, remote_port) = (
+        action.local_port.unwrap_or(0),
+        action.remote_port.unwrap_or(0),
+    );
     let matched = event.kind == ExportKind::NetClose || event.kind == ExportKind::NetConnect;
     // A side with no truth bytes is not scored, so the collected count is not
     // shown either. `0` would read as a measurement of a transfer that did not happen.
@@ -348,18 +361,33 @@ fn describe_export(event: &ExportEvent) -> String {
     match event.kind {
         ExportKind::ProcessStart => format!(
             "process_start pid={} exe={}",
-            event.pid.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+            event
+                .pid
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".into()),
             event.exe.as_deref().unwrap_or("-")
         ),
         ExportKind::NetConnect => format!(
             "net_connect {}:{}",
-            event.local_port.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
-            event.remote_port.map(|n| n.to_string()).unwrap_or_else(|| "-".into())
+            event
+                .local_port
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".into()),
+            event
+                .remote_port
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".into())
         ),
         ExportKind::NetClose => format!(
             "net_close {}:{}",
-            event.local_port.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
-            event.remote_port.map(|n| n.to_string()).unwrap_or_else(|| "-".into())
+            event
+                .local_port
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".into()),
+            event
+                .remote_port
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".into())
         ),
         ExportKind::DnsQuery => format!("dns_query {}", event.qname.as_deref().unwrap_or("-")),
         ExportKind::Gap | ExportKind::Other => "export".to_string(),

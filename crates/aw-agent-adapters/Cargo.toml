@@ -4,10 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Agent profiles and self-reported hooks. Stub."
+description = "Agent profiles, process-shape identification, and the E3 source trait."
 
+# Versions already in Cargo.lock. Not workspace dependencies: root Cargo.toml is
+# out of scope for P5-AGENT-01. serde and toml are MIT OR Apache-2.0. regex is
+# MIT OR Apache-2.0. The lockfile has regex 1.13.1 (not 1.11.1).
+# toml's `parse` feature is what `toml::from_str` needs; same set as aw-daemon.
 [dependencies]
-aw-core = { workspace = true }
+serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive", "std"] }
+toml = { version = "0.8.23", default-features = false, features = ["parse"] }
+regex = { version = "1.13.1", default-features = false, features = ["std", "unicode", "perf"] }
 
 [lints]
 workspace = true

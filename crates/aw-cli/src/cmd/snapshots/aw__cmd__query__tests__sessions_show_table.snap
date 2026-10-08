@@ -1,0 +1,21 @@
+---
+source: crates/aw-cli/src/cmd/query.rs
+expression: rendered
+---
+field       value                                                          evidence
+name        demo                                                           E1 系统
+mode        launch                                                         E1 系统
+agent       example-agent                                                  E1 系统
+started_ns  1700000000000000000                                            E1 系统
+ended_ns    1700000060000000000                                            E1 系统
+pinned      no                                                             E1 系统
+processes   2                                                              E1 系统
+flows       3                                                              E1 系统
+dns         0                                                              E1 系统
+gaps        1                                                              E1 系统
+bytes_up    150                                                            E1 系统
+bytes_down  420                                                            E1 系统
+gap         fixture.proc overflow 1700000002000000000–1700000002500000000  E1 系统
+capability  CAP-PROC source fixture.proc                                   E1 系统
+capability  CAP-NET source fixture.net                                     E1 系统
+capability  CAP-DNS source 不可得                                          不可得

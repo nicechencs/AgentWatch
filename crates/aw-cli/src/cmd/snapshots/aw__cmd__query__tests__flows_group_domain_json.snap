@@ -1,0 +1,43 @@
+---
+source: crates/aw-cli/src/cmd/query.rs
+expression: body
+---
+{
+  "bytes_down": 420,
+  "bytes_total": 570,
+  "bytes_up": 150,
+  "flows": [
+    {
+      "bytes_down": 400,
+      "bytes_up": 150,
+      "count": 2,
+      "domain": "example.test",
+      "domain_evidence": {
+        "level": "E1"
+      },
+      "domain_source": "dns",
+      "evidence": null,
+      "id": null,
+      "local_port": null,
+      "proc_uid": null,
+      "remote_ip": null,
+      "remote_port": null
+    },
+    {
+      "bytes_down": 20,
+      "bytes_up": null,
+      "count": 1,
+      "domain": null,
+      "domain_evidence": null,
+      "domain_source": null,
+      "evidence": {
+        "level": "S"
+      },
+      "id": null,
+      "local_port": null,
+      "proc_uid": null,
+      "remote_ip": null,
+      "remote_port": null
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+---
+source: crates/aw-cli/src/cmd/query.rs
+expression: body
+---
+{
+  "sessions": [
+    {
+      "agent": "example-agent",
+      "ended_ns": 1700000060000000000,
+      "evidence": {
+        "level": "E1"
+      },
+      "id": "s-7k2m",
+      "mode": "launch",
+      "name": "demo",
+      "pinned": false,
+      "started_ns": 1700000000000000000
+    }
+  ]
+}

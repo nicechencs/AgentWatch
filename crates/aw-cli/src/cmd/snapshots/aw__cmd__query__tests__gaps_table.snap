@@ -1,0 +1,6 @@
+---
+source: crates/aw-cli/src/cmd/query.rs
+expression: rendered
+---
+id  collector     kind      affects  from_ns              to_ns                count   detail     evidence
+7   fixture.proc  overflow  proc     1700000002000000000  1700000002500000000  不可得  ring full  E1 系统

@@ -1,0 +1,8 @@
+---
+source: crates/aw-cli/src/cmd/query.rs
+expression: rendered
+---
+ts_ns                cat   id  proc    summary                              evidence
+1700000000000000000  proc  1   10      start pid 100 exe demo               E1 系统
+1700000001000000000  net   2   11      connect 203.0.113.10:443             E1 系统
+1700000002000000000  gap   3   不可得  [采集缺口] collector dropped events  E1 系统

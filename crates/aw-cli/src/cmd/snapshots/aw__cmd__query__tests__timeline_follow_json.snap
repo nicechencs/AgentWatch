@@ -1,0 +1,43 @@
+---
+source: crates/aw-cli/src/cmd/query.rs
+expression: body
+---
+{
+  "events": [
+    {
+      "cat": "proc",
+      "evidence": {
+        "level": "E1"
+      },
+      "gap": false,
+      "id": 1,
+      "proc_uid": 10,
+      "summary": "start pid 100 exe demo",
+      "ts_ns": 1700000000000000000
+    },
+    {
+      "cat": "net",
+      "evidence": {
+        "level": "E1"
+      },
+      "gap": false,
+      "id": 2,
+      "proc_uid": 11,
+      "summary": "connect 203.0.113.10:443",
+      "ts_ns": 1700000001000000000
+    },
+    {
+      "cat": "gap",
+      "evidence": {
+        "level": "E1"
+      },
+      "gap": true,
+      "id": 3,
+      "proc_uid": null,
+      "summary": "collector dropped events",
+      "ts_ns": 1700000002000000000
+    }
+  ],
+  "live_connected": false,
+  "note": "real-time /sessions/{sid}/live is not subscribed (真实订阅未接通); rows are the injected source"
+}

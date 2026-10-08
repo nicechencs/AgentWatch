@@ -1,0 +1,34 @@
+---
+source: crates/aw-cli/src/cmd/query.rs
+expression: body
+---
+{
+  "processes": [
+    {
+      "argv": "<redacted>",
+      "depth": 0,
+      "evidence": {
+        "level": "E1"
+      },
+      "exe": "demo",
+      "parent_uid": null,
+      "pid": 100,
+      "proc_uid": 10,
+      "redaction": "P1 脱敏为占位"
+    },
+    {
+      "argv": null,
+      "depth": 1,
+      "evidence": {
+        "level": "S"
+      },
+      "exe": "helper",
+      "parent_uid": 10,
+      "pid": 101,
+      "proc_uid": 11,
+      "redaction": "P1 脱敏为占位"
+    }
+  ],
+  "redaction": "P1 脱敏为占位",
+  "tree": true
+}

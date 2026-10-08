@@ -5,6 +5,17 @@
 //! Unreachable is exit 3. A 2xx health check followed by "not implemented" is
 //! exit 1, so a live daemon is never a silent success.
 
+mod daemon;
+mod db;
+mod doctor;
+mod export;
+mod flows;
+mod gaps;
+mod procs;
+mod query;
+mod render;
+mod sessions;
+mod timeline;
 mod tree;
 
 use std::io::{self, Write};
@@ -17,6 +28,7 @@ use crate::endpoint::{self, Endpoint, EndpointError, EndpointInput};
 use crate::exit::{self, from_http_status};
 use crate::output::OutputMode;
 
+use self::query::{QuerySource, UnavailableSource};
 use self::tree::{command_label, Cli, Command};
 
 /// What one invocation printed and which code it would exit with.
@@ -47,25 +59,32 @@ impl HttpFactory for LiveHttp {
 
 /// Parse `args` (without argv0), read `AW_TOKEN`, and dispatch.
 ///
+/// Query commands (`sessions`, `timeline`, `procs`, `flows`, `gaps`) read an
+/// injected [`QuerySource`]. The production source reports that the daemon
+/// query API is not connected. They do not probe `/health`.
+///
 /// # Errors
 ///
 /// Only a failure to write the outcome. The process exit code is [`Outcome::code`].
 pub(crate) fn execute_args(args: &[String]) -> io::Result<Outcome> {
     let env_token = EndpointInput::from_args(None, None, None).token_env;
-    execute_args_with(args, env_token, &mut LiveHttp)
+    let mut source = UnavailableSource;
+    execute_args_with(args, env_token, &mut LiveHttp, &mut source)
 }
 
-/// Same as [`execute_args`], with the token and HTTP factory injected.
+/// Same as [`execute_args`], with the token, HTTP factory, and query source injected.
 ///
 /// `env_token` is the value tests would have put in `AW_TOKEN`. Passing it here
-/// keeps tests from mutating the process environment.
+/// keeps tests from mutating the process environment. `source` answers the five
+/// query commands; other commands ignore it.
 pub(crate) fn execute_args_with(
     args: &[String],
     env_token: Option<String>,
     http: &mut dyn HttpFactory,
+    source: &mut dyn QuerySource,
 ) -> io::Result<Outcome> {
     match Cli::try_parse_from(std::iter::once("aw".to_owned()).chain(args.iter().cloned())) {
-        Ok(cli) => dispatch(cli, env_token, http),
+        Ok(cli) => dispatch(cli, env_token, http, source),
         Err(err) => Ok(usage_outcome(err)),
     }
 }
@@ -94,6 +113,7 @@ fn dispatch(
     cli: Cli,
     env_token: Option<String>,
     http: &mut dyn HttpFactory,
+    source: &mut dyn QuerySource,
 ) -> io::Result<Outcome> {
     let json = cli.json;
     // `--lang`, `-q`, and `-v` are part of the tree. This card does not branch on them.
@@ -103,6 +123,12 @@ fn dispatch(
 
     if let Command::Version { check } = &cli.command {
         return Ok(version_outcome(*check, json));
+    }
+    if let Some(outcome) = query_command(&cli.command, json, source)? {
+        return Ok(outcome);
+    }
+    if let Some(outcome) = ops_command(&cli.command, json) {
+        return Ok(outcome);
     }
     if let Some(detail) = usage_gap(&cli.command) {
         return Ok(error_outcome(exit::USAGE, "usage", &detail, json));
@@ -128,6 +154,133 @@ fn dispatch(
             json,
         )),
         Err(err) => Ok(client_outcome(err, &endpoint, json)),
+    }
+}
+
+/// `sessions`, `timeline`, `procs`, `flows`, `gaps`. `None` for every other command.
+///
+/// These do not open an HTTP transport. `files`, `http`, `findings`, `around`,
+/// and `search` stay on the health-probe path.
+fn query_command(
+    command: &Command,
+    json: bool,
+    source: &mut dyn QuerySource,
+) -> io::Result<Option<Outcome>> {
+    match command {
+        Command::Sessions(cmd) => Ok(Some(sessions::run(cmd, json, source)?)),
+        Command::Timeline {
+            session,
+            filter,
+            from,
+            to,
+            follow,
+            limit,
+        } => Ok(Some(timeline::run(
+            timeline::TimelineArgs {
+                session,
+                filter: filter.as_deref(),
+                from: from.as_deref(),
+                to: to.as_deref(),
+                follow: *follow,
+                limit: *limit,
+                json,
+                color: false,
+            },
+            source,
+        )?)),
+        Command::Procs { session, tree, .. } => Ok(Some(procs::run(session, *tree, json, source)?)),
+        Command::Flows {
+            session,
+            group_by,
+            sort,
+            ..
+        } => Ok(Some(flows::run(
+            session,
+            group_by.as_deref(),
+            sort.as_deref(),
+            json,
+            source,
+        )?)),
+        Command::Gaps { session } => Ok(Some(gaps::run(session, json, source)?)),
+        _ => Ok(None),
+    }
+}
+
+/// `export`, `doctor`, `daemon`, and `db` (P1-CLI-04).
+///
+/// These do not open an HTTP transport and do not touch a service manager or a
+/// database. Each command calls an injected trait; the production values are
+/// empty stubs. `None` for every other command.
+fn ops_command(command: &Command, json: bool) -> Option<Outcome> {
+    let privilege = daemon::NotAdmin;
+    match command {
+        Command::Export {
+            session,
+            format,
+            output,
+            filter,
+            redact_paths,
+            redact_hosts,
+            ..
+        } => Some(export::run(
+            export::ExportArgs {
+                session,
+                format: format.as_deref(),
+                output: output.as_deref(),
+                filter: filter.as_deref(),
+                redact_paths: *redact_paths,
+                redact_hosts: *redact_hosts,
+                json,
+            },
+            &mut export::EmptyExport,
+        )),
+        Command::Doctor { perf } => Some(doctor::run(*perf, json, &mut doctor::Unprobed)),
+        Command::Daemon(cmd) => {
+            let op = match cmd {
+                tree::DaemonCmd::Status => daemon::DaemonOp::Status,
+                tree::DaemonCmd::Start => daemon::DaemonOp::Start,
+                tree::DaemonCmd::Stop => daemon::DaemonOp::Stop,
+                tree::DaemonCmd::Restart => daemon::DaemonOp::Restart,
+                tree::DaemonCmd::Install => daemon::DaemonOp::Install,
+                tree::DaemonCmd::Uninstall { purge, check } => daemon::DaemonOp::Uninstall {
+                    purge: *purge,
+                    check: *check,
+                },
+                tree::DaemonCmd::Logs { follow } => daemon::DaemonOp::Logs { follow: *follow },
+            };
+            Some(daemon::run(
+                op,
+                json,
+                &privilege,
+                &mut daemon::PlannedControl,
+            ))
+        }
+        Command::Db(cmd) => {
+            let op = match cmd {
+                tree::DbCmd::Stats => db::DbOp::Stats,
+                tree::DbCmd::Vacuum => db::DbOp::Vacuum,
+                tree::DbCmd::Migrate { dry_run } => db::DbOp::Migrate { dry_run: *dry_run },
+                tree::DbCmd::Purge {
+                    older_than,
+                    all,
+                    yes,
+                } => db::DbOp::Purge {
+                    older_than: older_than.clone(),
+                    all: *all,
+                    yes: *yes,
+                },
+            };
+            // No wall clock: a duration is subtracted from 0, which saturates.
+            // Tests that need a real cutoff call `db::run` with `FixedClock`.
+            Some(db::run(
+                op,
+                json,
+                &privilege,
+                &db::FixedClock(0),
+                &mut db::EmptyDb,
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -326,7 +479,9 @@ mod tests {
 
     fn run(args: &[&str], env_token: Option<&str>, http: &mut Script) -> Outcome {
         let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
-        execute_args_with(&owned, env_token.map(str::to_owned), http).expect("dispatch")
+        let mut source = super::query::UnavailableSource;
+        execute_args_with(&owned, env_token.map(str::to_owned), http, &mut source)
+            .expect("dispatch")
     }
 
     fn text(bytes: &[u8]) -> String {
@@ -390,11 +545,16 @@ mod tests {
             Some(TOKEN),
             &mut http,
         );
+        // `sessions` is a query command. It does not probe `/health`; the
+        // production source reports that the daemon query API is not connected.
         assert_eq!(outcome.code, exit::GENERAL);
         let err = text(&outcome.stderr);
-        assert!(err.contains("sessions list"), "{err}");
+        assert!(
+            err.contains("not connected") || err.contains("stub"),
+            "{err}"
+        );
         assert!(!err.contains(TOKEN), "{err}");
-        assert_eq!(http.opened, 1);
+        assert_eq!(http.opened, 0);
     }
 
     #[test]
@@ -456,6 +616,8 @@ mod tests {
     #[test]
     fn json_errors_use_the_machine_code() {
         let mut http = script(200, r#"{"status":"ok"}"#);
+        // `doctor` is implemented (P1-CLI-04) and does not probe `/health`.
+        // A still-stub command keeps the machine error code.
         let outcome = run(
             &[
                 "--json",
@@ -463,7 +625,7 @@ mod tests {
                 "http://127.0.0.1:7456",
                 "--token",
                 TOKEN,
-                "doctor",
+                "ps",
             ],
             None,
             &mut http,

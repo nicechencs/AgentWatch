@@ -1,0 +1,21 @@
+---
+source: crates/aw-cli/src/cmd/query.rs
+expression: body
+---
+{
+  "gaps": [
+    {
+      "affects": "proc",
+      "collector": "fixture.proc",
+      "count": null,
+      "detail": "ring full",
+      "evidence": {
+        "level": "E1"
+      },
+      "from_ns": 1700000002000000000,
+      "id": 7,
+      "kind": "overflow",
+      "to_ns": 1700000002500000000
+    }
+  ]
+}

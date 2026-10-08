@@ -292,6 +292,13 @@ pub fn parse_time(text: &str) -> Result<TimeArg, String> {
         let duration = parse_duration(rest)?;
         return Ok(TimeArg::FromSessionStart(duration));
     }
+    // A bare duration (`0s`, `30d`) is the same shape as relative-to-now. `db purge
+    // --older-than` uses it. Callers that only accept RFC 3339 or `+` still see a
+    // `BeforeNow` and can refuse it.
+    if looks_like_duration(text) {
+        let duration = parse_duration(text)?;
+        return Ok(TimeArg::BeforeNow(duration));
+    }
     if let Some(rest) = text.strip_prefix('-') {
         // A leading `-` on an RFC 3339 date does not happen (years are positive).
         // `-10m` is a duration. `-` plus digits and a unit is relative-to-now.

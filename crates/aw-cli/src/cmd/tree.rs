@@ -5,8 +5,6 @@
 //! same flag is also described there as the session name ("same as run"); one
 //! flag cannot be both, so the session name is left for P1-CLI-02.
 
-#![allow(dead_code)]
-
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]

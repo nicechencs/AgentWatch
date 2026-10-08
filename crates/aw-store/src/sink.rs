@@ -326,6 +326,11 @@ impl<'a> SqliteSink<'a> {
         if store.is_read_only() {
             return Err(StoreError::ReadOnly);
         }
+        // 0003–0005, then 0006/0007. `apply_file_schema` returns once
+        // `file_access` exists, so the http step is separate: without it a
+        // database already at version 5 would never gain `http` or `findings`.
+        apply_file_schema(store)?;
+        crate::migrate::apply_http_schema(store)?;
         Ok(Self {
             store,
             write_mode: WriteMode::Normal,

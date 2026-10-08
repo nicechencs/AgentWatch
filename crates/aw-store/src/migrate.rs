@@ -53,7 +53,20 @@ pub const MIGRATION_0004: &str = include_str!("../migrations/0004_timeline_file.
 /// FTS5 trigram index over path, argv, and URL. storage.md §3.2.
 pub const MIGRATION_0005: &str = include_str!("../migrations/0005_fts.sql");
 
+/// `http` and `findings`, including `user_state*`. storage.md §3.
+/// Does not touch the timeline view; that rebuild is [`MIGRATION_0007`] because
+/// the view reads `file_access`, which a P1 database does not have.
+pub const MIGRATION_0006: &str = include_str!("../migrations/0006_http_findings.sql");
+
+/// Rebuilds the `timeline` view so the `http` and `finding` branches are present.
+/// Requires `file_access` (0003) and `http` / `findings` (0006).
+pub const MIGRATION_0007: &str = include_str!("../migrations/0007_timeline_http.sql");
+
 /// Version after [`MIGRATION_0003`], [`MIGRATION_0004`], and [`MIGRATION_0005`].
+///
+/// [`MIGRATION_0006`] and [`MIGRATION_0007`] are not part of this number.
+/// 0007 reads `file_access`, so it cannot run on a database that stopped at
+/// version 1. [`apply_http_schema`] runs the pair on its own.
 pub const FILE_SCHEMA_VERSION: u32 = 5;
 
 /// Scripts [`Store::open`] does not apply on its own.
@@ -67,6 +80,75 @@ pub fn file_schema_scripts() -> [(u32, &'static str); 3] {
         (4, MIGRATION_0004),
         (5, MIGRATION_0005),
     ]
+}
+
+/// `http`, `findings`, and the timeline rebuild that reads both.
+///
+/// [`MIGRATION_0007`] selects from `file_access`, so the caller applies
+/// [`file_schema_scripts`] first. [`apply_http_schema`] does that check.
+pub fn http_schema_scripts() -> [(u32, &'static str); 2] {
+    [(6, MIGRATION_0006), (7, MIGRATION_0007)]
+}
+
+/// Version after [`MIGRATION_0006`] and [`MIGRATION_0007`].
+pub const HTTP_SCHEMA_VERSION: u32 = 7;
+
+/// Apply [`http_schema_scripts`] when `http` is not there yet.
+///
+/// `file_access` must already exist: 0007's view reads it. A database that has
+/// not applied [`file_schema_scripts`] gets [`StoreError::VersionMismatch`]
+/// rather than a view that fails to create. A database that already has `http`
+/// is left alone, including its `schema_version`.
+pub fn apply_http_schema(store: &mut Store) -> Result<(), StoreError> {
+    if store.is_read_only() {
+        return Err(StoreError::ReadOnly);
+    }
+    let conn = store.connection();
+    if table_present(conn, "http", "probe_http")? {
+        return Ok(());
+    }
+    if !table_present(conn, "file_access", "probe_file_access")? {
+        return Err(StoreError::VersionMismatch {
+            expected: FILE_SCHEMA_VERSION,
+            found: Some(store.schema_version()?),
+        });
+    }
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|err| StoreError::sqlite("begin_http_schema", err))?;
+    let applied = (|| {
+        for (version, sql) in http_schema_scripts() {
+            tx.execute_batch(sql)
+                .map_err(|err| StoreError::sqlite("migrate_http_schema", err))?;
+            tx.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![version.to_string()],
+            )
+            .map_err(|err| StoreError::sqlite("migrate_http_schema_version", err))?;
+        }
+        Ok::<(), StoreError>(())
+    })();
+    match applied {
+        Ok(()) => tx
+            .commit()
+            .map_err(|err| StoreError::sqlite("commit_http_schema", err)),
+        Err(err) => {
+            drop(tx);
+            Err(err)
+        }
+    }
+}
+
+fn table_present(conn: &Connection, name: &str, op: &'static str) -> Result<bool, StoreError> {
+    let found: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .map_err(|err| StoreError::sqlite(op, err))?;
+    Ok(found > 0)
 }
 
 const META_VERSION: &str = "schema_version";

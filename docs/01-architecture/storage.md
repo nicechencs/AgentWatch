@@ -269,10 +269,11 @@ CREATE TABLE findings (
   dedup_key       TEXT NOT NULL,
   refs            TEXT NOT NULL,                 -- JSON：[{table, id}] 依据记录
   caveats         TEXT,                          -- JSON：[{gap_id}|{text_id}]
-  -- 以下 3 列由 P3-STORE-01 迁移加入
-  user_state      TEXT CHECK (user_state IN ('open','acknowledged','dismissed')),
-  user_state_by   TEXT,
-  user_state_ns   INTEGER,
+  -- 以下 3 列由 P3-STORE-01 迁移加入。NULL = 用户尚未标记。
+  -- 取值与 ui.md §3.8 的「已确认 / 忽略」一致，不是 open/acknowledged/dismissed。
+  user_state      TEXT CHECK (user_state IN ('confirmed','ignored')),
+  user_state_by   TEXT,                          -- 标记操作者
+  user_state_ns   INTEGER,                       -- 标记时间，Unix 纳秒
   UNIQUE (session_id, rule_id, dedup_key)
 );
 CREATE INDEX idx_find_session ON findings(session_id, first_ns);

@@ -1,4 +1,4 @@
-//! One eslogger JSON object → a process start, a process exit, or a loss.
+//! One eslogger JSON object → a process event, a file event, or a loss.
 //!
 //! Paths that macos.md §1.1 names (all of them still marked 【待验证 SPIKE-03】):
 //!
@@ -27,6 +27,7 @@ use aw_core::{
 };
 use serde_json::Value;
 
+use super::file::FileSubscription;
 use super::loss::{LossDetector, SequenceLoss};
 
 /// `macos.eslogger/<probe>`. Probe names match the eslogger event (`exec`, `fork`, `exit`).
@@ -138,6 +139,10 @@ pub struct LineDecoder {
     loss: LossDetector,
     /// Next `RawEvent::seq` this decoder will stamp. Not eslogger's `seq_num`.
     next_seq: u64,
+    /// File events this decoder will emit. Process events are unaffected.
+    /// Default is [`FileSubscription::macos_default`]: open, close, create,
+    /// unlink, rename, truncate. No `write`, no `mmap`.
+    files: FileSubscription,
 }
 
 impl LineDecoder {
@@ -149,16 +154,32 @@ impl LineDecoder {
         Self {
             loss: LossDetector::new(),
             next_seq: 1,
+            files: FileSubscription::macos_default(),
         }
+    }
+
+    /// Replace the file subscription. Process events keep their own paths.
+    ///
+    /// An event the subscription does not include is skipped, not parsed into a
+    /// gap: the collector asked eslogger not to send it. A line that arrives
+    /// anyway (a stale child, a version that spells the name differently) is
+    /// still a parse gap, via the `other` arm of [`Self::push_inner`].
+    pub fn set_files(&mut self, files: FileSubscription) {
+        self.files = files;
+    }
+
+    /// File subscription currently in effect.
+    pub const fn files(&self) -> FileSubscription {
+        self.files
     }
 
     /// Decode `line`.
     ///
-    /// On success the `Vec` holds the process event and, before it, one
+    /// On success the `Vec` holds the process or file event and, before it, one
     /// [`EventKind::Gap`] per counter that jumped (`seq_num`, then
-    /// `global_seq_num`). An unparsable line or an event name other than
-    /// `exec` / `fork` / `exit` becomes a single `Gap{parse_error}` — the line
-    /// is not dropped.
+    /// `global_seq_num`). An unparsable line, or an event name that is neither
+    /// a P1 process event nor a subscribed file event, becomes a single
+    /// `Gap{parse_error}` — the line is not dropped.
     ///
     /// `ts_mono_ns` and `ts_wall_ns` are the daemon clock, supplied by the
     /// caller. eslogger's `mach_time` / `time` conversion is 【待验证 SPIKE-03】
@@ -204,7 +225,48 @@ impl LineDecoder {
         let global = u64_at(&value, &["global_seq_num"]);
 
         let mut out = Vec::new();
-        if let Some(name) = event_name.as_deref() {
+        self.observe_loss(
+            event_name.as_deref(),
+            seq_num,
+            global,
+            ts_mono_ns,
+            ts_wall_ns,
+            &mut out,
+        );
+
+        match event_name.as_deref() {
+            Some("exec") => out.push(self.decode_exec(&value, ts_mono_ns, ts_wall_ns)),
+            Some("fork") => out.push(self.decode_fork(&value, ts_mono_ns, ts_wall_ns)),
+            Some("exit") => out.push(self.decode_exit(&value, ts_mono_ns, ts_wall_ns)),
+            Some(name) if self.files.accepts(name) => {
+                out.extend(self.decode_file(&value, name, self.files, ts_mono_ns, ts_wall_ns));
+            }
+            Some(other) => out.push(self.parse_gap(
+                ts_mono_ns,
+                ts_wall_ns,
+                &format!("eslogger event `{other}` is not a subscribed process or file event"),
+            )),
+            None => {
+                out.push(self.parse_gap(ts_mono_ns, ts_wall_ns, "eslogger line has no event name"))
+            }
+        }
+        out
+    }
+
+    /// Record a hole in `seq_num` (per event name) and `global_seq_num`.
+    ///
+    /// A missing counter is not a hole. The first value of each stream is a
+    /// baseline. Both rules live in [`LossDetector`].
+    fn observe_loss(
+        &mut self,
+        event_name: Option<&str>,
+        seq_num: Option<u64>,
+        global: Option<u64>,
+        ts_mono_ns: u64,
+        ts_wall_ns: i64,
+        out: &mut Vec<EsEvent>,
+    ) {
+        if let Some(name) = event_name {
             if let Some(seq) = seq_num {
                 if let Some(loss) = self.loss.observe_seq(name, seq) {
                     out.push(self.loss_gap(ts_mono_ns, ts_wall_ns, &loss));
@@ -216,20 +278,6 @@ impl LineDecoder {
                 out.push(self.loss_gap(ts_mono_ns, ts_wall_ns, &loss));
             }
         }
-
-        let built = match event_name.as_deref() {
-            Some("exec") => self.decode_exec(&value, ts_mono_ns, ts_wall_ns),
-            Some("fork") => self.decode_fork(&value, ts_mono_ns, ts_wall_ns),
-            Some("exit") => self.decode_exit(&value, ts_mono_ns, ts_wall_ns),
-            Some(other) => self.parse_gap(
-                ts_mono_ns,
-                ts_wall_ns,
-                &format!("eslogger event `{other}` is not a P1 process event"),
-            ),
-            None => self.parse_gap(ts_mono_ns, ts_wall_ns, "eslogger line has no event name"),
-        };
-        out.push(built);
-        out
     }
 
     fn decode_exec(&mut self, value: &Value, ts_mono_ns: u64, ts_wall_ns: i64) -> EsEvent {
@@ -628,7 +676,7 @@ impl LineDecoder {
         empty_side(Some(event))
     }
 
-    fn alloc_seq(&mut self) -> u64 {
+    pub(super) fn alloc_seq(&mut self) -> u64 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         seq
@@ -640,7 +688,7 @@ impl LineDecoder {
 /// Always `None` until SPIKE-03 confirms `pidversion` and the start-time path.
 /// `pid` is accepted so the call site already has the shape the spike will fill;
 /// it is not hashed on its own.
-fn proc_uid_from_token(_pid: u32) -> Option<ProcUid> {
+pub(super) fn proc_uid_from_token(_pid: u32) -> Option<ProcUid> {
     None
 }
 
@@ -753,11 +801,11 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-fn es_version(value: &Value) -> Option<i64> {
+pub(super) fn es_version(value: &Value) -> Option<i64> {
     i64_at(value, &["version"]).or_else(|| i64_at(value, &["event", "version"]))
 }
 
-fn string_at(value: &Value, path: &[&str]) -> Option<String> {
+pub(super) fn string_at(value: &Value, path: &[&str]) -> Option<String> {
     match pointer(value, path) {
         Some(Value::String(s)) => Some(s.clone()),
         _ => None,
@@ -778,7 +826,7 @@ fn string_list_at(value: &Value, path: &[&str]) -> Option<Vec<String>> {
     Some(out)
 }
 
-fn u32_at(value: &Value, path: &[&str]) -> Option<u32> {
+pub(super) fn u32_at(value: &Value, path: &[&str]) -> Option<u32> {
     i64_at(value, path).and_then(|n| u32::try_from(n).ok())
 }
 
@@ -800,7 +848,7 @@ fn i64_at(value: &Value, path: &[&str]) -> Option<i64> {
     }
 }
 
-fn pointer<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+pub(super) fn pointer<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     let mut cur = value;
     for key in path {
         cur = cur.as_object()?.get(*key)?;

@@ -24,8 +24,10 @@ mod endpoint_security;
 pub use endpoint_security::MacosCollector;
 
 pub use eslogger::{
-    decode_line, pid_in_scope, AuditToken, EsEvent, LineAction, LineDecoder, LossDetector,
-    PidFilter, ProbeError, ResponsibleToken, SequenceKind, SequenceLoss,
+    apply_subscribe_open, decode_line, pid_in_scope, AuditToken, BudgetDecision, EsEvent,
+    FileSubscription, LineAction, LineDecoder, LossDetector, OpenBudget, OpenIntent, PidFilter,
+    ProbeError, ResponsibleToken, SequenceKind, SequenceLoss, SubscribeOpen, BYTES_NA,
+    DEFAULT_CPU_PERCENT, DEFAULT_SUSTAIN, FILE_EVENTS,
 };
 
 pub use nettop::{

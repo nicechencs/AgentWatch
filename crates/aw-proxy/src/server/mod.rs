@@ -12,6 +12,7 @@
 //! gap is the absence of a response event, not a forged success.
 
 mod backend;
+mod mitm;
 
 use std::fmt;
 use std::io;
@@ -23,6 +24,7 @@ use std::time::Duration;
 use aw_core::{RawEvent, SessionId};
 
 pub use backend::{Accepted, BackendError, BackendOutput, MetadataBackend, ProxyBackend};
+pub use mitm::{MitmError, MitmOutput, MitmProxy};
 
 use crate::inject::ProxyOnReject;
 

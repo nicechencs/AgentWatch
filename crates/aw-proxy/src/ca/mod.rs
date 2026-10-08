@@ -146,6 +146,9 @@ impl fmt::Debug for LoadedCa {
 struct LeafEntry {
     dns: String,
     cert_pem: String,
+    /// Leaf private key, PKCS#8 DER. Stays in memory so the MITM listener can
+    /// terminate TLS. Never written to disk and never printed.
+    pkcs8: Zeroizing<Vec<u8>>,
     expires_unix: i64,
 }
 
@@ -363,6 +366,7 @@ impl<P: KeyProtector> CaStore<P> {
             return Ok(LeafCert {
                 dns_name: hit.dns.clone(),
                 cert_pem: hit.cert_pem.clone(),
+                key_pkcs8: hit.pkcs8.clone(),
                 expires_unix: hit.expires_unix,
             });
         }
@@ -380,6 +384,7 @@ impl<P: KeyProtector> CaStore<P> {
         self.leaves.push_back(LeafEntry {
             dns: issued.dns_name.clone(),
             cert_pem: issued.cert_pem.clone(),
+            pkcs8: issued.key_pkcs8.clone(),
             expires_unix: issued.expires_unix,
         });
         Ok(issued)
@@ -417,15 +422,18 @@ impl<P: KeyProtector> CaStore<P> {
     }
 }
 
-/// A leaf certificate PEM. No private key leaves this crate through [`Debug`]:
-/// the key lives only inside the cache entry's PEM, which is the certificate,
-/// and the leaf private key is not retained (this build does not terminate TLS).
+/// A leaf certificate plus the key that terminates TLS for it.
+///
+/// The key stays in memory and is never written to disk. [`Debug`] prints neither
+/// the PEM nor the key, only the name length and the expiry.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LeafCert {
     /// The DNS name it was issued for. Not printed by [`Debug`].
     pub dns_name: String,
     /// Certificate PEM. Public.
     pub cert_pem: String,
+    /// Leaf private key, PKCS#8 DER. Not printed by [`Debug`].
+    pub key_pkcs8: Zeroizing<Vec<u8>>,
     /// Unix seconds.
     pub expires_unix: i64,
 }
@@ -629,12 +637,13 @@ fn issue_leaf(
     let leaf = params
         .signed_by(&leaf_key, issuer, &ca_key_pair)
         .map_err(|err| CaError::Issue(err.to_string()))?;
-    // The leaf private key is dropped here. This build does not terminate TLS,
-    // so retaining it would only enlarge the secret surface. See `server`.
-    drop(leaf_key);
+    // The key stays in memory so `server::mitm` can build a rustls ServerConfig.
+    // It is zeroized on drop and is not part of the on-disk CA material.
+    let key_pkcs8 = Zeroizing::new(leaf_key.serialize_der());
     Ok(LeafCert {
         dns_name: dns_name.to_owned(),
         cert_pem: leaf.pem(),
+        key_pkcs8,
         expires_unix: now_unix.saturating_add(LEAF_LIFETIME_SECS),
     })
 }

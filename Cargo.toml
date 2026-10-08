@@ -41,6 +41,26 @@ aw-collector-windows = { path = "crates/aw-collector-windows" }
 aw-collector-macos = { path = "crates/aw-collector-macos" }
 aw-collector-poll = { path = "crates/aw-collector-poll" }
 aw-agent-adapters = { path = "crates/aw-agent-adapters" }
+# P3-PROXY-02. Versions are pinned; member crates use `{ workspace = true }`.
+# hudsucker 0.25.0: MIT OR Apache-2.0. MITM HTTP(S) proxy named by
+# network-attribution §5 and ADR-0006. `default-features = false` drops the
+# `rcgen-ca` feature: its certificate cache issues 365-day leaves, which
+# contradicts the 7-day leaf lifetime in aw-proxy. `rustls-client` is enabled
+# instead so upstream connections verify against the Mozilla roots. The
+# `webpki-roots` crate that pulls in is MPL-2.0 and is already in Cargo.lock
+# through aw-proxy itself; `cargo deny` accepts it.
+hudsucker = { version = "0.25.0", default-features = false, features = ["http2", "rustls-client"] }
+# tokio 1.24.2: MIT. Matches the version hudsucker 0.25 resolves. Only the
+# runtime, TCP, and time features — no process, signal, or filesystem helpers.
+tokio = { version = "1.24.2", default-features = false, features = ["rt-multi-thread", "net", "time", "macros"] }
+# http 1.x: MIT OR Apache-2.0. Request and response types hudsucker re-exports
+# are built on this crate; aw-proxy names them directly when recording metadata.
+http = "1"
+# hyper 1.7: MIT. Body type shared with hudsucker. No client or server features.
+hyper = { version = "1.7", default-features = false }
+# http-body-util 0.1: MIT. `BodyExt::collect` to count request and response
+# bytes without retaining them.
+http-body-util = "0.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

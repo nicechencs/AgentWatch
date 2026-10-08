@@ -58,7 +58,10 @@ impl fmt::Display for ProbeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedOs { major: Some(major) } => {
-                write!(f, "eslogger needs macOS 13 or newer; this system reports {major}")
+                write!(
+                    f,
+                    "eslogger needs macOS 13 or newer; this system reports {major}"
+                )
             }
             Self::UnsupportedOs { major: None } => {
                 f.write_str("eslogger needs macOS 13 or newer; the OS version could not be read")
@@ -67,11 +70,14 @@ impl fmt::Display for ProbeError {
             Self::FullDiskAccessDenied { hint } => {
                 write!(f, "eslogger was refused by TCC (Full Disk Access): {hint}")
             }
-            Self::BinaryMissing => {
-                f.write_str("eslogger was not found at /usr/bin/eslogger")
-            }
-            Self::Exited { status: Some(status) } => {
-                write!(f, "eslogger exited (status {status}); a restart gap is required")
+            Self::BinaryMissing => f.write_str("eslogger was not found at /usr/bin/eslogger"),
+            Self::Exited {
+                status: Some(status),
+            } => {
+                write!(
+                    f,
+                    "eslogger exited (status {status}); a restart gap is required"
+                )
             }
             Self::Exited { status: None } => {
                 f.write_str("eslogger exited (status unavailable); a restart gap is required")

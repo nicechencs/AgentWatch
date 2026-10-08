@@ -170,7 +170,12 @@ impl LineDecoder {
     /// the `Ok` value, because a collector must not discard an unreadable line
     /// by failing the whole read loop. The `Result` is kept so a later macOS
     /// caller can still use `?` if the sink rejects the events.
-    pub fn push(&mut self, line: &str, ts_mono_ns: u64, ts_wall_ns: i64) -> Result<Vec<EsEvent>, DecodeError> {
+    pub fn push(
+        &mut self,
+        line: &str,
+        ts_mono_ns: u64,
+        ts_wall_ns: i64,
+    ) -> Result<Vec<EsEvent>, DecodeError> {
         Ok(self.push_inner(line, ts_mono_ns, ts_wall_ns))
     }
 
@@ -193,8 +198,8 @@ impl LineDecoder {
             )];
         }
 
-        let event_name = string_at(&value, &[EVENT_KEY])
-            .or_else(|| string_at(&value, &["event_type"]));
+        let event_name =
+            string_at(&value, &[EVENT_KEY]).or_else(|| string_at(&value, &["event_type"]));
         let seq_num = u64_at(&value, &["seq_num"]);
         let global = u64_at(&value, &["global_seq_num"]);
 
@@ -221,11 +226,7 @@ impl LineDecoder {
                 ts_wall_ns,
                 &format!("eslogger event `{other}` is not a P1 process event"),
             ),
-            None => self.parse_gap(
-                ts_mono_ns,
-                ts_wall_ns,
-                "eslogger line has no event name",
-            ),
+            None => self.parse_gap(ts_mono_ns, ts_wall_ns, "eslogger line has no event name"),
         };
         out.push(built);
         out
@@ -730,8 +731,7 @@ fn backup_gap(seq: u64, ts_mono_ns: u64, ts_wall_ns: i64) -> RawEvent {
 ///
 /// Use [`LineDecoder`] when holes across lines matter.
 pub fn decode_line(line: &str, ts_mono_ns: u64, ts_wall_ns: i64) -> Vec<EsEvent> {
-    LineDecoder::new()
-        .push_inner(line, ts_mono_ns, ts_wall_ns)
+    LineDecoder::new().push_inner(line, ts_mono_ns, ts_wall_ns)
 }
 
 /// `push` does not fail today: a bad line is a parse gap inside `Ok`.
@@ -784,14 +784,18 @@ fn u32_at(value: &Value, path: &[&str]) -> Option<u32> {
 
 fn u64_at(value: &Value, path: &[&str]) -> Option<u64> {
     match pointer(value, path)? {
-        Value::Number(n) => n.as_u64().or_else(|| n.as_i64().and_then(|v| u64::try_from(v).ok())),
+        Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|v| u64::try_from(v).ok())),
         _ => None,
     }
 }
 
 fn i64_at(value: &Value, path: &[&str]) -> Option<i64> {
     match pointer(value, path)? {
-        Value::Number(n) => n.as_i64().or_else(|| n.as_u64().and_then(|v| i64::try_from(v).ok())),
+        Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_u64().and_then(|v| i64::try_from(v).ok())),
         _ => None,
     }
 }

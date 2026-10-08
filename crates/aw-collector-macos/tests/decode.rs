@@ -132,10 +132,7 @@ fn pid_outside_the_scope_is_dropped_before_parse() {
         !filter.contains(200),
         "the exec subject is the out-of-scope pid"
     );
-    assert_eq!(
-        filter.classify(&line),
-        aw_collector_macos::LineAction::Drop
-    );
+    assert_eq!(filter.classify(&line), aw_collector_macos::LineAction::Drop);
     // In-scope subject is kept.
     let inside = r#"{"event":"exec","process":{"pid":100}}"#;
     assert_eq!(
@@ -157,7 +154,15 @@ fn missing_fields_are_na_not_defaults() {
     assert!(decoded.responsible.is_none());
     assert!(decoded.start_time_ns.is_none());
     let event = decoded.event.as_ref().expect("raw");
-    for field in ["exe", "argv", "cwd", "ppid", "start_time_ns", "pidversion", "es_version"] {
+    for field in [
+        "exe",
+        "argv",
+        "cwd",
+        "ppid",
+        "start_time_ns",
+        "pidversion",
+        "es_version",
+    ] {
         assert_eq!(
             event.field_evidence.get(field),
             Some(&Evidence::NA(NaReason::CollectorUnavailable)),

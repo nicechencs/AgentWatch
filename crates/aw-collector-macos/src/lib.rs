@@ -13,6 +13,8 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 mod eslogger;
+mod nettop;
+mod pktap;
 
 #[cfg(target_os = "macos")]
 mod endpoint_security;
@@ -23,4 +25,12 @@ pub use endpoint_security::MacosCollector;
 pub use eslogger::{
     decode_line, pid_in_scope, AuditToken, EsEvent, LineAction, LineDecoder, LossDetector,
     PidFilter, ProbeError, ResponsibleToken, SequenceKind, SequenceLoss,
+};
+
+pub use nettop::{
+    parse_nettop, sampling_note, NetSample, NettopDecoder, NettopEvent, NettopRow, ProcessScope,
+    SAMPLING_NOTE, SOURCE_NETTOP_FLOW,
+};
+pub use pktap::{
+    decode_dns, DecodedPktap, DnsPacket, GlobalDnsCache, PktapClock, PktapEvent, SOURCE_PKTAP_DNS,
 };

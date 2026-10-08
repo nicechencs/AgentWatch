@@ -269,7 +269,11 @@ fn optional(tier: Tier) -> &'static [ProbeId] {
 /// when nothing privileged attached, or when the caller has no privilege.
 /// Each failed mount becomes a `Gap` with `GapKind::Unsupported` (or
 /// `Permission`). The count is `None`: a failed mount is not a counted loss.
-pub fn select_tier(host: &mut dyn ProbeHost, request: TierRequest, privilege: Privilege) -> TierDecision {
+pub fn select_tier(
+    host: &mut dyn ProbeHost,
+    request: TierRequest,
+    privilege: Privilege,
+) -> TierDecision {
     if privilege == Privilege::Unprivileged {
         let requested = match request {
             TierRequest::Force(Tier::Poll) | TierRequest::Auto => None,

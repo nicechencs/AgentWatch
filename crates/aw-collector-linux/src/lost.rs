@@ -36,7 +36,9 @@ pub fn lost_gap(previous: LostSample, current: LostSample) -> Option<Gap> {
         previous.mono_ns,
         current.mono_ns,
         Some(delta),
-        Some(format!("{delta} event(s) lost by the ring buffer since the previous read")),
+        Some(format!(
+            "{delta} event(s) lost by the ring buffer since the previous read"
+        )),
     ))
 }
 

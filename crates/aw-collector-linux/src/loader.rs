@@ -110,9 +110,7 @@ pub struct AyaUnavailable;
 #[cfg(target_os = "linux")]
 impl core::fmt::Display for AyaUnavailable {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(
-            "Aya loader is not linked (P1-LNX-01); no eBPF program is embedded yet",
-        )
+        f.write_str("Aya loader is not linked (P1-LNX-01); no eBPF program is embedded yet")
     }
 }
 

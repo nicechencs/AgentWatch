@@ -14,6 +14,7 @@
 
 mod decode;
 mod dns_parse;
+mod legacy;
 mod loader;
 mod lost;
 mod maps;
@@ -34,6 +35,13 @@ pub use decode::proc::{
     SOURCE_EXIT as SOURCE_EBPF_EXIT, SOURCE_FORK,
 };
 pub use dns_parse::{parse_dns, DnsParse, DnsParseInput, ParsedAnswer, ParsedDns};
+pub use legacy::{
+    attribute_dns, counter_evidence, decode_proc, decode_sock_delta, diff_sock, inode_na,
+    lookup_inode, open_legacy, pid_for_inode, CounterStep, DnsPacket, InodeLookup, InodeOwner,
+    KnownSocket, LegacyError, LegacySource, ProcConnectorEvent, ProcSkip, ProcWhat, SockDelta,
+    SockSample, UnavailableLegacy, FIELD_ARGV, FIELD_PROC, SOURCE_AF_PACKET, SOURCE_PROC_CONNECTOR,
+    SOURCE_SOCK_DIAG,
+};
 pub use loader::{classify_attach_error, BpfLoader, EmbeddedProgram, LoaderConfig};
 pub use lost::{lost_gap, LostSample, LOST_SOURCE};
 pub use maps::{

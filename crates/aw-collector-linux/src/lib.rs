@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+mod decode;
 mod loader;
 mod lost;
 mod maps;
@@ -23,6 +24,13 @@ mod collector;
 #[cfg(target_os = "linux")]
 pub use collector::LinuxCollector;
 
+pub use decode::proc::{
+    argv_bytes as ebpf_argv_bytes, decode_proc as decode_ebpf_proc,
+    encode_proc as encode_ebpf_proc, CwdRead, DecodeContext as ProcDecodeContext, ProcDecodeError,
+    ProcDecoded, ProcRecord, SessionCgroups, ARGV_CAP, FILENAME_CAP, HEADER_LEN as PROC_HEADER_LEN,
+    KIND_CGROUP, KIND_EXEC, KIND_EXIT, KIND_FORK, SOURCE_CGROUP, SOURCE_EXEC as SOURCE_EBPF_EXEC,
+    SOURCE_EXIT as SOURCE_EBPF_EXIT, SOURCE_FORK,
+};
 pub use loader::{classify_attach_error, BpfLoader, EmbeddedProgram, LoaderConfig};
 pub use lost::{lost_gap, LostSample, LOST_SOURCE};
 pub use maps::{

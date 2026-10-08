@@ -62,6 +62,13 @@ pub const MIGRATION_0006: &str = include_str!("../migrations/0006_http_findings.
 /// Requires `file_access` (0003) and `http` / `findings` (0006).
 pub const MIGRATION_0007: &str = include_str!("../migrations/0007_timeline_http.sql");
 
+/// `http.field_evidence` and `http.na_reason` for a URL that is NA.
+///
+/// `net_flows.via_proxy` and `net_flows.direct` are not touched: 0001 already
+/// created both. [`apply_proxy_schema`] runs each ALTER only when the column
+/// is missing, because SQLite has no `ADD COLUMN IF NOT EXISTS`.
+pub const MIGRATION_0008: &str = include_str!("../migrations/0008_proxy_flow_marks.sql");
+
 /// Version after [`MIGRATION_0003`], [`MIGRATION_0004`], and [`MIGRATION_0005`].
 ///
 /// [`MIGRATION_0006`] and [`MIGRATION_0007`] are not part of this number.
@@ -92,6 +99,12 @@ pub fn http_schema_scripts() -> [(u32, &'static str); 2] {
 
 /// Version after [`MIGRATION_0006`] and [`MIGRATION_0007`].
 pub const HTTP_SCHEMA_VERSION: u32 = 7;
+
+/// Version after [`MIGRATION_0008`].
+///
+/// Not part of [`HTTP_SCHEMA_VERSION`]. A database that stores `http` but never
+/// records a proxy URL reason stays at 7. [`apply_proxy_schema`] advances this.
+pub const PROXY_SCHEMA_VERSION: u32 = 8;
 
 /// Apply [`http_schema_scripts`] when `http` is not there yet.
 ///
@@ -138,6 +151,123 @@ pub fn apply_http_schema(store: &mut Store) -> Result<(), StoreError> {
             Err(err)
         }
     }
+}
+
+/// Add `http.field_evidence` and `http.na_reason` when they are not there yet.
+///
+/// `http` must already exist ([`apply_http_schema`]). A database without it
+/// gets [`StoreError::VersionMismatch`] rather than an ALTER against a missing
+/// table. A column that is already present is skipped; the other column is
+/// still added. `schema_version` moves to [`PROXY_SCHEMA_VERSION`] only when
+/// this call adds at least one column. A database that already has both is
+/// left alone, including its version.
+///
+/// `net_flows.via_proxy` and `net_flows.direct` are not added here. 0001
+/// created them. `direct` and `via_proxy` are already filter fields
+/// ([`crate::query::compile`]).
+pub fn apply_proxy_schema(store: &mut Store) -> Result<(), StoreError> {
+    if store.is_read_only() {
+        return Err(StoreError::ReadOnly);
+    }
+    let conn = store.connection();
+    if !table_present(conn, "http", "probe_http_proxy")? {
+        return Err(StoreError::VersionMismatch {
+            expected: HTTP_SCHEMA_VERSION,
+            found: Some(store.schema_version()?),
+        });
+    }
+    let need_field = !column_present(conn, "http", "field_evidence", "probe_http_field_evidence")?;
+    let need_na = !column_present(conn, "http", "na_reason", "probe_http_na_reason")?;
+    if !need_field && !need_na {
+        return Ok(());
+    }
+    let field_sql = alter_statement(MIGRATION_0008, "field_evidence");
+    let na_sql = alter_statement(MIGRATION_0008, "na_reason");
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|err| StoreError::sqlite("begin_proxy_schema", err))?;
+    let applied = (|| {
+        // Statements are the two ALTERs in MIGRATION_0008, in that order.
+        // Running the whole script would fail once either column already exists.
+        if need_field {
+            let sql = field_sql.ok_or(StoreError::BadSchemaVersion {
+                found: Some("field_evidence".to_owned()),
+            })?;
+            tx.execute_batch(sql)
+                .map_err(|err| StoreError::sqlite("migrate_http_field_evidence", err))?;
+        }
+        if need_na {
+            let sql = na_sql.ok_or(StoreError::BadSchemaVersion {
+                found: Some("na_reason".to_owned()),
+            })?;
+            tx.execute_batch(sql)
+                .map_err(|err| StoreError::sqlite("migrate_http_na_reason", err))?;
+        }
+        tx.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![PROXY_SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|err| StoreError::sqlite("migrate_proxy_schema_version", err))?;
+        Ok::<(), StoreError>(())
+    })();
+    match applied {
+        Ok(()) => tx
+            .commit()
+            .map_err(|err| StoreError::sqlite("commit_proxy_schema", err)),
+        Err(err) => {
+            drop(tx);
+            Err(err)
+        }
+    }
+}
+
+/// The single `ALTER TABLE http ADD COLUMN <name> ...;` line inside `script`.
+///
+/// `name` is a fixed column from this migration, not user input. `None` means
+/// the script no longer contains that add, which is a broken build rather than
+/// a database that should be altered with a hand-written statement.
+fn alter_statement<'a>(script: &'a str, column: &str) -> Option<&'a str> {
+    let needle = format!("ADD COLUMN {column} ");
+    for line in script.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains(&needle) {
+            return Some(trimmed);
+        }
+    }
+    None
+}
+
+fn column_present(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    op: &'static str,
+) -> Result<bool, StoreError> {
+    // `table` is a fixed name from this crate, not user input. PRAGMA does not
+    // accept a placeholder for the table, so it is checked against the two
+    // names this migration is allowed to look at.
+    let pragma = match table {
+        "http" => "PRAGMA table_info(http)",
+        "net_flows" => "PRAGMA table_info(net_flows)",
+        _ => {
+            return Err(StoreError::sqlite(
+                op,
+                rusqlite::Error::InvalidParameterName(table.to_owned()),
+            ))
+        }
+    };
+    let mut stmt = conn
+        .prepare(pragma)
+        .map_err(|err| StoreError::sqlite(op, err))?;
+    let mut rows = stmt.query([]).map_err(|err| StoreError::sqlite(op, err))?;
+    while let Some(row) = rows.next().map_err(|err| StoreError::sqlite(op, err))? {
+        let name: String = row.get(1).map_err(|err| StoreError::sqlite(op, err))?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn table_present(conn: &Connection, name: &str, op: &'static str) -> Result<bool, StoreError> {

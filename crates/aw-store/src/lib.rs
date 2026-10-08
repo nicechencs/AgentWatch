@@ -36,7 +36,10 @@ pub use findings::{upsert_finding, FindingRef, FindingRow, MAX_REFS};
 pub use fts::{read_mode as read_fts_mode, set_mode as set_fts_mode, FtsMode, FtsSource};
 pub use http::{insert_http, HttpRow};
 pub use migrate::FILE_SCHEMA_VERSION;
-pub use migrate::{apply_http_schema, OpenStatus, Store, HTTP_SCHEMA_VERSION, SCHEMA_VERSION};
+pub use migrate::{
+    apply_http_schema, apply_proxy_schema, OpenStatus, Store, HTTP_SCHEMA_VERSION,
+    PROXY_SCHEMA_VERSION, SCHEMA_VERSION,
+};
 pub use query::{
     around, around_sql, compile_predicate, compile_store_expr, delete_session, dns_events,
     ensure_timeline, files, flow_buckets, flows, gaps, keyset_suffix, list_sessions, parse_filter,

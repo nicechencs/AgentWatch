@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --ink: 28 31 36;
+  --ink-soft: 78 84 94;
+  --ink-faint: 138 144 154;
+  --paper: 250 250 248;
+  --paper-raised: 255 255 255;
+  --paper-sunken: 240 240 237;
+  --line: 214 214 210;
+  --accent: 31 111 120;
+  --gap: 196 92 74;
+  --sensitive: 154 106 32;
+  color-scheme: light;
+}
+
+.dark {
+  --ink: 230 231 234;
+  --ink-soft: 176 180 188;
+  --ink-faint: 120 125 134;
+  --paper: 24 26 30;
+  --paper-raised: 32 35 40;
+  --paper-sunken: 18 20 23;
+  --line: 54 58 66;
+  --accent: 120 190 198;
+  --gap: 224 138 122;
+  --sensitive: 214 176 96;
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: rgb(var(--paper));
+  color: rgb(var(--ink));
+  font-family: theme("fontFamily.sans");
+  font-size: 14px;
+}
+
+/* The virtualised lists size their own scroll area. */
+.scroll-thin {
+  scrollbar-width: thin;
+}

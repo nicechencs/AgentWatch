@@ -21,10 +21,14 @@
 
 #![allow(dead_code, unused_imports)]
 
+mod agent;
+mod launch;
 mod orch;
 mod provider;
 mod sink;
 
+pub use agent::{annotate_session, AgentAnnotation, AnnotationBasis};
+pub use launch::{launch_hints, prepare_proxy, LaunchProxy, LaunchProxyError};
 pub use orch::{
     process_exit, process_file_placeholder, AdoptRequest, AttachOptions, EndReason, LaunchRequest,
     SessionError, SessionMode, SessionOrchestrator, SessionRecord, SessionStatus, SessionSummary,

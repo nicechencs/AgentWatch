@@ -53,7 +53,11 @@ impl FanoutSink {
 
     /// `session` should receive events whose process pid is `pid`.
     pub fn watch_pid(&mut self, session: SessionId, pid: u32) {
-        if let Some((_, sessions)) = self.watchers.iter_mut().find(|(watched, _)| *watched == pid) {
+        if let Some((_, sessions)) = self
+            .watchers
+            .iter_mut()
+            .find(|(watched, _)| *watched == pid)
+        {
             if !sessions.contains(&session) {
                 sessions.push(session);
             }

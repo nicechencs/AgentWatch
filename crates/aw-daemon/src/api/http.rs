@@ -239,7 +239,11 @@ fn parse_request(buf: &[u8], listen_port: u16) -> Option<HttpRequest> {
 }
 
 fn write_response(stream: &mut TcpStream, response: &ApiResponse) -> std::io::Result<()> {
-    let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, reason(response.status));
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\n",
+        response.status,
+        reason(response.status)
+    );
     head.push_str("connection: close\r\n");
     // Security headers. No CORS header is ever added.
     head.push_str("content-security-policy: default-src 'self'\r\n");
@@ -271,10 +275,7 @@ fn maybe_gzip(headers: &std::collections::BTreeMap<String, String>, body: &[u8])
     // pre-set) and the body looks like a static asset the client can take
     // compressed. Routes set `x-aw-gzip: accept` when the request's
     // Accept-Encoding contained gzip. The header is stripped before write.
-    let wants = headers
-        .get("x-aw-gzip")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    let wants = headers.get("x-aw-gzip").map(|v| v == "1").unwrap_or(false);
     if !wants || body.len() < 64 {
         return body.to_vec();
     }

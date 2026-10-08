@@ -699,7 +699,11 @@ impl<S: ScopeProvider, K: SessionSink> SessionOrchestrator<S, K> {
         Ok(())
     }
 
-    fn snapshot_event(&mut self, id: SessionId, row: &SnapshotProc) -> Result<RawEvent, SessionError> {
+    fn snapshot_event(
+        &mut self,
+        id: SessionId,
+        row: &SnapshotProc,
+    ) -> Result<RawEvent, SessionError> {
         // `start_time_ns` is i64 in the schema, so a missing observation cannot
         // be `None`. `None` from the snapshot becomes `NA(preexisting)` below.
         // The payload holds 0 only together with the NA mark below. Readers
@@ -767,7 +771,9 @@ impl<S: ScopeProvider, K: SessionSink> SessionOrchestrator<S, K> {
                 from_ns,
                 to_ns,
                 None,
-                Some("daemon restarted; the session was not observed during this stretch".to_owned()),
+                Some(
+                    "daemon restarted; the session was not observed during this stretch".to_owned(),
+                ),
             )),
         })
         .map_err(|err| SessionError::Event(err.to_string()))
@@ -823,7 +829,12 @@ impl<S: ScopeProvider, K: SessionSink> SessionOrchestrator<S, K> {
 }
 
 /// Exit event a test (or a mock collector) feeds back in.
-pub fn process_exit(pid: u32, uid: ProcUid, ts_mono_ns: u64, seq: u64) -> Result<RawEvent, SessionError> {
+pub fn process_exit(
+    pid: u32,
+    uid: ProcUid,
+    ts_mono_ns: u64,
+    seq: u64,
+) -> Result<RawEvent, SessionError> {
     RawEvent::try_new(RawEventParts {
         seq,
         ts_mono_ns,

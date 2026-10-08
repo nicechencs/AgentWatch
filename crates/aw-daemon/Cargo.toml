@@ -41,6 +41,11 @@ tracing-core = { version = "0.1.36", default-features = false, features = ["std"
 # TLS stays off so ring/webpki are not pulled; the dev server is loopback HTTP.
 # rusqlite is not a direct dependency: naming Connection would duplicate the
 # copy aw-store already links.
+# P3-DAEMON-01. Same pin as aw-store (0.32.1, bundled, MIT). aw-store does not
+# export a list/patch for `http` or `findings`. The daemon reads those tables
+# through `Store::connection()` and must name the same `Connection` type.
+# Not added to workspace.dependencies: root Cargo.toml is out of scope.
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 rust-embed = { version = "8.7.2", default-features = false, features = ["include-exclude"] }
 flate2 = { version = "1.1.2", default-features = false, features = ["rust_backend"] }
 ureq = { version = "3.3.0", default-features = false }

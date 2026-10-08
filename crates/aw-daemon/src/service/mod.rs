@@ -16,6 +16,7 @@
 
 mod plan;
 mod render;
+pub mod windows;
 
 #[cfg(test)]
 mod tests;

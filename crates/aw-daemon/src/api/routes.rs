@@ -286,7 +286,9 @@ impl LiveHub {
         let Some(buf) = self.buffers.get(session_id) else {
             return (Vec::new(), false);
         };
-        let lagged = buf.front().is_some_and(|first| first.seq > after.saturating_add(1));
+        let lagged = buf
+            .front()
+            .is_some_and(|first| first.seq > after.saturating_add(1));
         let rows = buf.iter().filter(|row| row.seq > after).collect();
         (rows, lagged)
     }
@@ -851,10 +853,13 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                         })
                     })
                     .collect();
-                ApiResponse::json(200, &json!({
-                    "sessions": rows,
-                    "next_cursor": page.next_cursor,
-                }))
+                ApiResponse::json(
+                    200,
+                    &json!({
+                        "sessions": rows,
+                        "next_cursor": page.next_cursor,
+                    }),
+                )
             }
             Err(err) => from_backend(err),
         };
@@ -968,7 +973,9 @@ fn parse_age_ns(raw: &str) -> Option<i64> {
     if raw.is_empty() {
         return None;
     }
-    let split = raw.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(raw.len());
+    let split = raw
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(raw.len());
     let (num, unit) = raw.split_at(split);
     let n = num.parse::<i64>().ok()?;
     if n < 0 {
@@ -1041,7 +1048,9 @@ fn session_sub(
     let store_configured = state.query.db_path.is_some();
     let live = method == "GET" && tail == "live";
     if !tail.is_empty() && (memory.is_none() || store_configured || live) {
-        if let Some(response) = session_query_route(state, method, &sid, tail, caller, query) {
+        if let Some(response) =
+            session_query_route(state, method, &sid, tail, caller, query, body)
+        {
             return response;
         }
     }
@@ -1091,6 +1100,9 @@ fn session_sub(
         (method, tail),
         ("GET", "http") | ("GET", "findings") | ("GET", "agent-events")
     ) {
+        // Store-backed reads are handled in `session_query_route`. This 501 is
+        // the stub path: no database, or a memory session that did not enter
+        // that function. Do not answer it with an empty list.
         return not_implemented(tail);
     }
 
@@ -1256,11 +1268,9 @@ fn from_backend(err: QueryBackendError) -> ApiResponse {
         QueryBackendError::Filter { offset, message } => {
             error_at(400, "bad_filter", &message, offset)
         }
-        QueryBackendError::BadArgument { name, expected } => error_response(
-            400,
-            "bad_argument",
-            &format!("{name}: expected {expected}"),
-        ),
+        QueryBackendError::BadArgument { name, expected } => {
+            error_response(400, "bad_argument", &format!("{name}: expected {expected}"))
+        }
         QueryBackendError::NotFound => error_response(404, "not_found", "session not found"),
         QueryBackendError::Unimplemented { what } => not_implemented(what),
         QueryBackendError::Store(message) => error_response(500, "store", &message),
@@ -1271,9 +1281,9 @@ fn list_query(raw: &str) -> Result<ListQuery, ApiResponse> {
     let pairs = query_pairs(raw);
     let limit = match pairs.get("limit").map(String::as_str) {
         None => 100,
-        Some(text) => text.parse::<i64>().map_err(|_| {
-            error_response(400, "bad_argument", "limit: expected an integer")
-        })?,
+        Some(text) => text
+            .parse::<i64>()
+            .map_err(|_| error_response(400, "bad_argument", "limit: expected an integer"))?,
     };
     if limit <= 0 || limit > MAX_PAGE {
         return Err(error_response(
@@ -1288,7 +1298,13 @@ fn list_query(raw: &str) -> Result<ListQuery, ApiResponse> {
         to_ns: optional_i64(&pairs, "to")?,
         cats: pairs
             .get("cats")
-            .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect())
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
             .unwrap_or_default(),
         group_by: pairs.get("group_by").cloned(),
         sort: pairs.get("sort").cloned(),
@@ -1299,7 +1315,9 @@ fn list_query(raw: &str) -> Result<ListQuery, ApiResponse> {
         since_ns: optional_i64(&pairs, "since")?,
         until_ns: optional_i64(&pairs, "until")?,
         agent: pairs.get("agent").cloned(),
-        active_only: pairs.get("active").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+        active_only: pairs
+            .get("active")
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
         buckets: optional_i64(&pairs, "buckets")?,
         tree: pairs.get("tree").is_some_and(|v| v == "1"),
         reference: pairs.get("ref").cloned(),
@@ -1339,10 +1357,9 @@ fn percent_decode(raw: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(hex) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
-                16,
-            ) {
+            if let Ok(hex) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 out.push(hex);
                 i += 3;
                 continue;
@@ -1376,6 +1393,7 @@ fn session_query_route(
     tail: &str,
     caller: &Caller,
     query: &str,
+    body: &[u8],
 ) -> Option<ApiResponse> {
     let parsed = match list_query(query) {
         Ok(q) => q,
@@ -1405,9 +1423,79 @@ fn session_query_route(
             Ok(Some(())) => ApiResponse::json(200, &json!({ "stopped": sid })),
             Err(err) => from_backend(err),
         },
-        _ => return session_tail_more(state, method, sid, tail, user, &parsed),
+        _ => {
+            return session_p3_route(
+                state,
+                &P3Route {
+                    method,
+                    sid,
+                    tail,
+                    caller,
+                    raw_query: query,
+                    body,
+                    parsed: &parsed,
+                },
+            )
+        }
     };
     Some(response)
+}
+
+struct P3Route<'a> {
+    method: &'a str,
+    sid: &'a str,
+    tail: &'a str,
+    caller: &'a Caller,
+    raw_query: &'a str,
+    body: &'a [u8],
+    parsed: &'a ListQuery,
+}
+
+/// P3-DAEMON-01 tails. Appended after the P2 match so those arms stay in order.
+///
+/// Returns `None` when this is not an http, findings, or Markdown export
+/// request. The caller then keeps the existing 501 path, including
+/// `GET .../export` with no `format=md` and every memory-stub session that
+/// never entered `session_query_route`.
+fn session_p3_route(state: &ApiState, route: &P3Route<'_>) -> Option<ApiResponse> {
+    let P3Route {
+        method,
+        sid,
+        tail,
+        caller,
+        raw_query,
+        body,
+        parsed,
+    } = *route;
+    if state.query.db_path.is_none() {
+        return session_tail_more(state, method, sid, tail, &caller.user_id, parsed);
+    }
+    if method == "GET" && tail == "http" {
+        return Some(super::http_events::get_http(state, caller, sid, raw_query));
+    }
+    if method == "GET" && tail == "findings" {
+        return Some(super::findings::get_findings(state, caller, sid, raw_query));
+    }
+    if method == "PATCH" {
+        if let Some(id) = tail.strip_prefix("findings/") {
+            if !id.is_empty() && !id.contains('/') {
+                return Some(super::findings::patch_finding(state, caller, sid, id, body));
+            }
+        }
+    }
+    if (method == "GET" || method == "POST") && tail == "export" && export_format_is_md(raw_query) {
+        return Some(crate::export::markdown::export_markdown(
+            state, caller, sid, raw_query,
+        ));
+    }
+    session_tail_more(state, method, sid, tail, &caller.user_id, parsed)
+}
+
+fn export_format_is_md(raw_query: &str) -> bool {
+    raw_query.split('&').any(|part| {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        key == "format" && (value == "md" || value == "markdown")
+    })
 }
 
 fn session_tail_more(
@@ -1428,7 +1516,11 @@ fn session_tail_more(
                 let id = match id_text.parse::<i64>() {
                     Ok(id) => id,
                     Err(_) => {
-                        return Some(error_response(400, "bad_argument", "flow id: expected an integer"))
+                        return Some(error_response(
+                            400,
+                            "bad_argument",
+                            "flow id: expected an integer",
+                        ))
                     }
                 };
                 return Some(map_opt(state.query.flow_buckets(user, sid, id)));
@@ -1476,9 +1568,10 @@ fn timeline_json(page: &aw_store::TimelinePage) -> serde_json::Value {
 }
 
 fn live_snapshot(state: &ApiState, sid: &str, caller: &Caller, query: &ListQuery) -> ApiResponse {
-    let visible = state.sessions.iter().any(|row| {
-        row.id == sid && (caller.admin || row.user_id == caller.user_id)
-    });
+    let visible = state
+        .sessions
+        .iter()
+        .any(|row| row.id == sid && (caller.admin || row.user_id == caller.user_id));
     // A store-backed session is not in the stub vec. Visibility was already
     // checked by `session_sub` only for stub rows. When the stub does not know
     // the id, still serve the hub: the store check below hides foreign ids
@@ -1510,7 +1603,10 @@ fn live_snapshot(state: &ApiState, sid: &str, caller: &Caller, query: &ListQuery
                 continue;
             }
         }
-        body.push_str(&format!("id: {}\nevent: record\ndata: {}\n\n", row.seq, row.body));
+        body.push_str(&format!(
+            "id: {}\nevent: record\ndata: {}\n\n",
+            row.seq, row.body
+        ));
         last = row.seq;
     }
     if last == after && !lagged {
@@ -1645,7 +1741,11 @@ fn static_asset(state: &ApiState, req: &HttpRequest) -> ApiResponse {
         "content-type".to_owned(),
         crate::assets::content_type(&file.path).to_owned(),
     );
-    let accept = req.headers.get("accept-encoding").map(String::as_str).unwrap_or("");
+    let accept = req
+        .headers
+        .get("accept-encoding")
+        .map(String::as_str)
+        .unwrap_or("");
     if accept.to_ascii_lowercase().contains("gzip") {
         headers.insert("x-aw-gzip".to_owned(), "1".to_owned());
     }

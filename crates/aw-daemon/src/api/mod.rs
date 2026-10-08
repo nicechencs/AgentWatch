@@ -14,8 +14,13 @@
 mod auth;
 mod http;
 mod openapi;
+mod proxy;
 mod query;
 mod routes;
+mod http_events;
+mod findings;
+
+pub(crate) use findings::share;
 
 pub(crate) use http::{HttpServer, DEFAULT_HTTP_PORT};
 pub(crate) use query::StoreQuery;

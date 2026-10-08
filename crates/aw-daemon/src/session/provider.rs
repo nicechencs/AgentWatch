@@ -349,7 +349,11 @@ impl MockScope {
             .is_some_and(|pids| pids.contains(&pid))
     }
 
-    fn descendants(&self, root_pid: u32, include_late: bool) -> Result<Vec<SnapshotProc>, ProviderError> {
+    fn descendants(
+        &self,
+        root_pid: u32,
+        include_late: bool,
+    ) -> Result<Vec<SnapshotProc>, ProviderError> {
         let root_known = self.table.iter().any(|row| row.pid == root_pid);
         if !root_known {
             return Err(ProviderError::RootNotFound { pid: root_pid });
@@ -398,10 +402,15 @@ impl ScopeProvider for MockScope {
         if let Some(message) = self.fail_prepare.take() {
             return Err(ProviderError::Failed { message });
         }
-        let text = format!("ticket-{session}-{n}", session = session.0, n = self.next_ticket);
+        let text = format!(
+            "ticket-{session}-{n}",
+            session = session.0,
+            n = self.next_ticket
+        );
         self.next_ticket = self.next_ticket.saturating_add(1);
         let ticket = LaunchTicket::new(text)?;
-        self.open_tickets.insert(ticket.as_str().to_owned(), session.0);
+        self.open_tickets
+            .insert(ticket.as_str().to_owned(), session.0);
         Ok(PreparedLaunch { ticket })
     }
 
@@ -462,8 +471,7 @@ impl ScopeProvider for MockScope {
         session: SessionId,
         root_pid: u32,
     ) -> Result<Vec<SnapshotProc>, ProviderError> {
-        self.log
-            .push(ScopeAction::Rescan { session, root_pid });
+        self.log.push(ScopeAction::Rescan { session, root_pid });
         let members = self.descendants(root_pid, true)?;
         let pids: Vec<u32> = members.iter().map(|row| row.pid).collect();
         self.held.insert(session.0, pids);

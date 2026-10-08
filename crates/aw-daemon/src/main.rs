@@ -18,13 +18,19 @@ use config::{config_schema_pretty, load_selected, ConfigError};
 use runtime::{emit_sensitive_probe, run_foreground, RuntimeError};
 
 mod api;
+// Markdown export (P3-DAEMON-01). Routes call it; it uses `api::share`.
+mod export;
 // Embedded UI. `main` does not serve it yet; `api` looks assets up. Naming the
 // module here keeps `assets.rs` in the binary without a dead_code warning when
 // nothing in `main` calls it.
 mod assets;
+// File-content hashing (P3-PIPE-06). Not called from `main`; named so the
+// module is part of the binary and clippy sees it. The session path calls
+// `file_hasher::hash_file` once a proxied read is correlated.
 mod capabilities;
 mod collectors;
 mod config;
+mod file_hasher;
 mod paths;
 mod runtime;
 mod service;
@@ -34,6 +40,9 @@ mod supervisor;
 fn main() -> ExitCode {
     // Keeps the collector crates linked. No platform collector is started here.
     let _ = collectors::wired();
+    // Keeps the file hasher linked. The pointer is never called, so nothing is
+    // opened or read at startup. The session correlator will call it for real.
+    let _keep: fn(&std::path::Path, &file_hasher::HashFileLimits) -> _ = file_hasher::hash_file;
     // Keeps the UI embed linked. `false` when `ui/dist` was absent at build time.
     let _ = assets::dist_was_present();
 

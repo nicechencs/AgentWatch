@@ -18,7 +18,13 @@ fn launch() -> LaunchRequest {
     }
 }
 
-fn proc(uid: u64, pid: u32, ppid: Option<u32>, parent: Option<u64>, start_ns: Option<u64>) -> SnapshotProc {
+fn proc(
+    uid: u64,
+    pid: u32,
+    ppid: Option<u32>,
+    parent: Option<u64>,
+    start_ns: Option<u64>,
+) -> SnapshotProc {
     SnapshotProc {
         uid: ProcUid(uid),
         pid,
@@ -275,10 +281,7 @@ fn interleaved_live_event_is_kept_once() {
         .count();
     // One snapshot injection plus one live event. Not two live copies.
     assert_eq!(for_child, 2);
-    let live = delivered
-        .iter()
-        .filter(|event| event.seq == 50)
-        .count();
+    let live = delivered.iter().filter(|event| event.seq == 50).count();
     assert_eq!(live, 1);
 }
 
@@ -354,7 +357,8 @@ fn two_sessions_attached_to_one_process_both_receive_its_events() {
 
     // The second session is a second orchestrator only if the provider is shared.
     // One orchestrator, one provider: stage the same pid again for another attach.
-    orch.provider_mut().add_proc(proc(5, 50, None, None, Some(1)));
+    orch.provider_mut()
+        .add_proc(proc(5, 50, None, None, Some(1)));
     let b = orch
         .begin_attach(AttachOptions {
             root_pid: 50,
@@ -378,8 +382,22 @@ fn two_sessions_attached_to_one_process_both_receive_its_events() {
     };
     assert_eq!(seqs(a.id), vec![77]);
     assert_eq!(seqs(b.id), vec![77]);
-    assert_eq!(orch.sink().events_of(a.id).iter().filter(|e| e.seq == 77).count(), 1);
-    assert_eq!(orch.sink().events_of(b.id).iter().filter(|e| e.seq == 77).count(), 1);
+    assert_eq!(
+        orch.sink()
+            .events_of(a.id)
+            .iter()
+            .filter(|e| e.seq == 77)
+            .count(),
+        1
+    );
+    assert_eq!(
+        orch.sink()
+            .events_of(b.id)
+            .iter()
+            .filter(|e| e.seq == 77)
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -455,12 +473,16 @@ fn empty_ticket_is_an_error() {
 #[test]
 fn provider_actions_return_result_not_a_sentinel() {
     let mut provider = MockScope::new();
-    let missing = provider.attach(SessionId(1), 1, &AttachOptions {
-        root_pid: 1,
-        follow_children: true,
-        duration_ns: None,
-        until_exit: None,
-    });
+    let missing = provider.attach(
+        SessionId(1),
+        1,
+        &AttachOptions {
+            root_pid: 1,
+            follow_children: true,
+            duration_ns: None,
+            until_exit: None,
+        },
+    );
     assert!(missing.is_err());
     let killed = provider.terminate(1234);
     assert!(killed.is_err());

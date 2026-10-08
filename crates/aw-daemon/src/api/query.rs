@@ -25,8 +25,8 @@ use std::sync::Mutex;
 use aw_store::{
     around, delete_session, dns_events, files, flow_buckets, flows, gaps, list_sessions,
     patch_session, process_detail, process_tree, search, session_by_public_id, session_summary,
-    stop_session, timeline, timeline_histogram, traffic, CompileCtx, Cursor, FileGroupBy, FileQuery,
-    FlowQuery, FtsMode, ProcessNode, PurgeScope, QueryError, Retention, RetentionConfig,
+    stop_session, timeline, timeline_histogram, traffic, CompileCtx, Cursor, FileGroupBy,
+    FileQuery, FlowQuery, FtsMode, ProcessNode, PurgeScope, QueryError, Retention, RetentionConfig,
     SessionFilter, SessionListItem, SessionSummary, Store, StoreError, StoreExpr, TimelinePage,
     TimelineQuery,
 };
@@ -267,8 +267,11 @@ pub trait SessionQuery {
     ) -> Result<Option<serde_json::Value>, QueryBackendError>;
 
     /// `GET /sessions/{sid}/gaps`.
-    fn gaps(&self, user_id: &str, sid: &str)
-        -> Result<Option<serde_json::Value>, QueryBackendError>;
+    fn gaps(
+        &self,
+        user_id: &str,
+        sid: &str,
+    ) -> Result<Option<serde_json::Value>, QueryBackendError>;
 
     /// `GET /sessions/{sid}/around`.
     fn around(
@@ -298,10 +301,15 @@ pub trait SessionQuery {
     ) -> Result<serde_json::Value, QueryBackendError>;
 
     /// `POST /db/vacuum`. Admin only.
-    fn db_vacuum(&self, user_id: &str, admin: bool) -> Result<serde_json::Value, QueryBackendError>;
+    fn db_vacuum(&self, user_id: &str, admin: bool)
+        -> Result<serde_json::Value, QueryBackendError>;
 
     /// `POST /db/migrate`. Admin only.
-    fn db_migrate(&self, user_id: &str, admin: bool) -> Result<serde_json::Value, QueryBackendError>;
+    fn db_migrate(
+        &self,
+        user_id: &str,
+        admin: bool,
+    ) -> Result<serde_json::Value, QueryBackendError>;
 }
 
 /// Default backend. Opens a short-lived [`Store`] per call so the writer is
@@ -379,8 +387,7 @@ impl StoreQuery {
         if let Some(id) = self.remembered(sid) {
             return Ok(Some(id));
         }
-        let found =
-            session_by_public_id(store.connection(), user_id, sid).map_err(map_query)?;
+        let found = session_by_public_id(store.connection(), user_id, sid).map_err(map_query)?;
         if let Some(id) = found {
             self.remember(sid, id);
         }
@@ -576,7 +583,8 @@ impl SessionQuery for StoreQuery {
         let Some(id) = self.resolve_id(&store, user_id, sid)? else {
             return Ok(None);
         };
-        let detail = process_detail(store.connection(), user_id, id, proc_uid).map_err(map_query)?;
+        let detail =
+            process_detail(store.connection(), user_id, id, proc_uid).map_err(map_query)?;
         let Some(detail) = detail else {
             return Ok(None);
         };
@@ -647,9 +655,9 @@ impl SessionQuery for StoreQuery {
             sort: query.sort.as_deref(),
         };
         let rows = flows(store.connection(), user_id, id, q).map_err(map_query)?;
-        Ok(rows.map(|rows| {
-            serde_json::json!({ "flows": rows.iter().map(flow_json).collect::<Vec<_>>() })
-        }))
+        Ok(rows.map(
+            |rows| serde_json::json!({ "flows": rows.iter().map(flow_json).collect::<Vec<_>>() }),
+        ))
     }
 
     fn flow_buckets(
@@ -751,9 +759,9 @@ impl SessionQuery for StoreQuery {
             return Ok(None);
         };
         let rows = gaps(store.connection(), user_id, id).map_err(map_query)?;
-        Ok(rows.map(|rows| {
-            serde_json::json!({ "gaps": rows.iter().map(gap_json).collect::<Vec<_>>() })
-        }))
+        Ok(rows.map(
+            |rows| serde_json::json!({ "gaps": rows.iter().map(gap_json).collect::<Vec<_>>() }),
+        ))
     }
 
     fn around(
@@ -769,10 +777,12 @@ impl SessionQuery for StoreQuery {
                 expected: "<table>:<id>".to_owned(),
             });
         };
-        let ref_id = id_text.parse::<i64>().map_err(|_| QueryBackendError::BadArgument {
-            name: "ref".to_owned(),
-            expected: "<table>:<id>".to_owned(),
-        })?;
+        let ref_id = id_text
+            .parse::<i64>()
+            .map_err(|_| QueryBackendError::BadArgument {
+                name: "ref".to_owned(),
+                expected: "<table>:<id>".to_owned(),
+            })?;
         let window_ns = parse_window_ns(query.window.as_deref())?;
         let Some(store) = self.open()? else {
             return Ok(None);
@@ -845,7 +855,11 @@ impl SessionQuery for StoreQuery {
         Ok(serde_json::json!({ "hits": hits, "fts_enabled": fts }))
     }
 
-    fn db_stats(&self, _user_id: &str, admin: bool) -> Result<serde_json::Value, QueryBackendError> {
+    fn db_stats(
+        &self,
+        _user_id: &str,
+        admin: bool,
+    ) -> Result<serde_json::Value, QueryBackendError> {
         let Some(path) = self.db_path.clone() else {
             return Ok(serde_json::json!({
                 "db_bytes": null,
@@ -967,7 +981,14 @@ impl SessionQuery for StoreQuery {
         }
         let mut store = self.open_mut()?;
         aw_store::apply_file_schema(&mut store).map_err(map_store)?;
-        Ok(serde_json::json!({ "file_schema_version": aw_store::FILE_SCHEMA_VERSION }))
+        // 0006/0007 are not inside `apply_file_schema`: that function returns as
+        // soon as `file_access` exists, so a database already at version 5 would
+        // never reach `http` and `findings`.
+        aw_store::apply_http_schema(&mut store).map_err(map_store)?;
+        Ok(serde_json::json!({
+            "file_schema_version": aw_store::FILE_SCHEMA_VERSION,
+            "http_schema_version": aw_store::HTTP_SCHEMA_VERSION,
+        }))
     }
 }
 
@@ -1084,14 +1105,18 @@ fn parse_cursor(raw: Option<&str>) -> Result<Option<Cursor>, QueryBackendError> 
             expected: "<ts_ns>,<id>".to_owned(),
         });
     };
-    let ts_ns = ts.parse::<i64>().map_err(|_| QueryBackendError::BadArgument {
-        name: "cursor".to_owned(),
-        expected: "<ts_ns>,<id>".to_owned(),
-    })?;
-    let id = id.parse::<i64>().map_err(|_| QueryBackendError::BadArgument {
-        name: "cursor".to_owned(),
-        expected: "<ts_ns>,<id>".to_owned(),
-    })?;
+    let ts_ns = ts
+        .parse::<i64>()
+        .map_err(|_| QueryBackendError::BadArgument {
+            name: "cursor".to_owned(),
+            expected: "<ts_ns>,<id>".to_owned(),
+        })?;
+    let id = id
+        .parse::<i64>()
+        .map_err(|_| QueryBackendError::BadArgument {
+            name: "cursor".to_owned(),
+            expected: "<ts_ns>,<id>".to_owned(),
+        })?;
     Ok(Some(Cursor { ts_ns, id }))
 }
 
@@ -1136,7 +1161,10 @@ fn find_node(nodes: &[ProcessNode], proc_uid: i64) -> Option<&ProcessNode> {
     None
 }
 
-fn process_detail_json(detail: &aw_store::ProcessDetail, children: &[ProcessNode]) -> serde_json::Value {
+fn process_detail_json(
+    detail: &aw_store::ProcessDetail,
+    children: &[ProcessNode],
+) -> serde_json::Value {
     serde_json::json!({
         "proc_uid": format!("{:x}", detail.proc_uid as u64),
         "pid": detail.pid,
@@ -1174,7 +1202,10 @@ fn process_image_json(image: &aw_store::ProcessImage) -> serde_json::Value {
 /// `TrafficSeries`: one label per window, each direction a one-element array.
 /// A NULL sum stays NULL inside that array; it is not rewritten as 0.
 fn traffic_json(buckets: Vec<aw_store::TrafficBucket>) -> serde_json::Value {
-    let labels: Vec<String> = buckets.iter().map(|bucket| bucket.bucket_ns.to_string()).collect();
+    let labels: Vec<String> = buckets
+        .iter()
+        .map(|bucket| bucket.bucket_ns.to_string())
+        .collect();
     let points: Vec<serde_json::Value> = buckets
         .iter()
         .map(|bucket| {
@@ -1371,11 +1402,11 @@ fn fold_expr(expr: &aw_core::Expr) -> StoreExpr {
 
 fn fold_field(name: &str) -> aw_store::StoreField {
     use aw_store::StoreField::{
-        Access, Agent, Argv, Bare, BytesDown, BytesRead, BytesUp, BytesWritten, Channel, Cwd,
-        Direct, Dir, Domain, Evidence, Exe, FileOp, Host, Ip, IpcKind, Kind, LocalPort, Method,
-        Other, Path, Peer, Pid, Port, Proc, ProcUid, Proto, Qname, Qtype, Rcode, RemoteIp,
-        RemotePort, ReqBytes, RespBytes, Rule, Severity, Source, Status, Subtree, Tag, Target,
-        Time, Tool, Url, ViaProxy,
+        Access, Agent, Argv, Bare, BytesDown, BytesRead, BytesUp, BytesWritten, Channel, Cwd, Dir,
+        Direct, Domain, Evidence, Exe, FileOp, Host, Ip, IpcKind, Kind, LocalPort, Method, Other,
+        Path, Peer, Pid, Port, Proc, ProcUid, Proto, Qname, Qtype, Rcode, RemoteIp, RemotePort,
+        ReqBytes, RespBytes, Rule, Severity, Source, Status, Subtree, Tag, Target, Time, Tool, Url,
+        ViaProxy,
     };
     match name {
         "" => Bare,
@@ -1447,12 +1478,13 @@ fn fold_value(value: &aw_core::Value) -> aw_store::StoreValue {
     match value {
         aw_core::Value::Text(text) => aw_store::StoreValue::Text(text.clone()),
         aw_core::Value::Number(n) => aw_store::StoreValue::Number(*n),
-        aw_core::Value::RelativeTime { from_session_start, nanos } => {
-            aw_store::StoreValue::RelativeTime {
-                from_session_start: *from_session_start,
-                nanos: *nanos,
-            }
-        }
+        aw_core::Value::RelativeTime {
+            from_session_start,
+            nanos,
+        } => aw_store::StoreValue::RelativeTime {
+            from_session_start: *from_session_start,
+            nanos: *nanos,
+        },
         aw_core::Value::Bool(b) => aw_store::StoreValue::Bool(*b),
     }
 }

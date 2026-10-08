@@ -10,10 +10,16 @@ mod client;
 mod cmd;
 mod endpoint;
 mod exit;
-// Not called from `main` until a later card wires `aw run`. The state machine is tested.
-#[allow(dead_code)]
 mod launch;
 mod output;
+
+// P1-MAC-03. `launch/mod.rs` does not declare this file (P1-CLI-02 owns that
+// module and will add `#[cfg(target_os = "macos")] mod unix_macos;`). The path
+// attribute compiles the state machine into the test binary on every host,
+// including Windows, without touching `launch/mod.rs`.
+#[cfg(test)]
+#[path = "launch/unix_macos.rs"]
+mod launch_unix_macos;
 
 use std::io::{self, Write};
 use std::process::ExitCode;

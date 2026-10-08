@@ -15,6 +15,7 @@
 mod eslogger;
 mod nettop;
 mod pktap;
+mod scope;
 
 #[cfg(target_os = "macos")]
 mod endpoint_security;
@@ -33,4 +34,8 @@ pub use nettop::{
 };
 pub use pktap::{
     decode_dns, DecodedPktap, DnsPacket, GlobalDnsCache, PktapClock, PktapEvent, SOURCE_PKTAP_DNS,
+};
+pub use scope::{
+    attach_snapshot, on_attribution, on_fork, on_unknown_pid, ChildList, ForkParent, ScopeAction,
+    ScopeSet, SnapshotError, LAUNCHD_PID, LINK_BROKEN_NOTE, PENDING_HOLD,
 };

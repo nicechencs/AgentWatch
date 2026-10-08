@@ -10,6 +10,15 @@ description = "aw: command-line client. Talks to the daemon over its API."
 name = "aw"
 path = "src/main.rs"
 
+# P1-LNX-04. A lib target so `launch/unix_linux.rs` compiles and its tests run
+# before P1-CLI-02 adds `mod unix_linux` to `launch/mod.rs` (that file is owned
+# by the other card and must not gain a `mod` line from this one). The `aw` bin
+# does not link this lib. Delete this target once `launch/mod.rs` registers the
+# module; `src/lib.rs` re-exports only the Linux launch state machine.
+[lib]
+name = "aw_cli"
+path = "src/lib.rs"
+
 [dependencies]
 aw-core = { workspace = true }
 # Pinned in this crate (not workspace.dependencies): root Cargo.toml is out of

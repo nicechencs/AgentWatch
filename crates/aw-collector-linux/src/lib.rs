@@ -20,6 +20,7 @@ mod lost;
 mod maps;
 mod netdecode;
 mod probe;
+mod scope;
 
 #[cfg(target_os = "linux")]
 mod collector;
@@ -55,6 +56,16 @@ pub use netdecode::{
 pub use probe::{
     all_probes, parse_collector_arg, select_tier, MountFailure, MountResult, PermissionError,
     Privilege, ProbeHost, ProbeId, ScriptedHost, Tier, TierDecision, TierRequest,
+};
+pub use scope::{
+    cleanup_cgroup, escape_gap, run_attach, run_launch as run_scope_launch, scope_cgroups_map,
+    scope_pids_map, session_dir, v1_doctor_hint, AdoptWait as ScopeAdoptWait, AttachOutcome,
+    AttachRequest, AttachStep, CgroupCreatePath as ScopeCgroupCreatePath, CgroupHost,
+    CgroupVersion, CleanupOutcome, EscapeObservation, LaunchIdentity as ScopeLaunchIdentity,
+    LaunchOutcome as ScopeLaunchOutcome, LaunchPhase, LaunchRequest as ScopeLaunchRequest,
+    LaunchStep as ScopeLaunchStep, ProcRow, ProcScan, ScopeError, ScopeMap, SystemdPresence,
+    ADOPT_TIMEOUT_SECS, CGROUP_NONEMPTY_NOTE, SLICE_NAME as SCOPE_SLICE_NAME, SOURCE_CGROUP_ESCAPE,
+    V1_DOCTOR_HINT,
 };
 
 /// `1` once `build.rs` embeds an object. Today it is always `0`.

@@ -372,7 +372,11 @@ impl FlowAcc {
             bytes_down: self.bytes_down,
             start_ns: self.first,
             end_ns: if partial { None } else { Some(self.last) },
+            // No proxy session is attached to aggregate. Both flags mean "not
+            // rewritten here", not "unknown". A later `apply_proxy_plan` is what
+            // sets them from a real `ProxySession`.
             via_proxy: false,
+            direct: false,
             partial,
             platform_total_up: None,
             platform_total_down: None,

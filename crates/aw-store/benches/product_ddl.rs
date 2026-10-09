@@ -88,6 +88,7 @@ fn sample_batch() -> WriteBatch {
         net_flows: Vec::new(),
         net_flow_buckets: Vec::new(),
         dns: Vec::new(),
+        http: Vec::new(),
         gaps: Vec::new(),
     };
     for i in 0..ROWS {

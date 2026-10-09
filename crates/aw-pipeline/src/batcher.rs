@@ -26,10 +26,12 @@ use std::collections::BTreeMap;
 
 use aw_core::{Evidence, GapKind, ProcUid, SessionId};
 use aw_store::{
-    DnsRow, GapRow, NetFlowBucketRow, NetFlowRow, ProcessRow, RecordSink, StoreError, WriteBatch,
+    DnsRow, GapRow, HttpRow, NetFlowBucketRow, NetFlowRow, ProcessRow, RecordSink, StoreError,
+    WriteBatch,
 };
 
 use crate::config::StoreConfig;
+use crate::enrich::{self, FlowMark, ProxySession};
 use crate::gaps::{self, GapMerger, DEFAULT_RETRY_BATCHES, PIPELINE_COLLECTOR};
 use crate::output::{DnsRec, FlowBucketRec, GapRec, NetFlowRec, Output, ProcessRec};
 
@@ -95,9 +97,22 @@ impl<S: RecordSink> Batcher<S> {
     /// Append records. Flushes when the open batch reaches `batch_max_rows`.
     ///
     /// `now_ns` is the pipeline clock. A record with no timestamp of its own
-    /// uses it for the batch-age check.
+    /// uses it for the batch-age check. No proxy session is attached.
     pub fn push_output(&mut self, out: &Output, now_ns: u64) -> Vec<GapRec> {
-        self.ingest(out, now_ns);
+        self.push_output_with_proxy(out, None, now_ns)
+    }
+
+    /// [`Self::push_output`] with an optional proxy session.
+    ///
+    /// `None` keeps the previous behaviour. `Some` calls [`enrich::plan`] before
+    /// the flows are turned into rows.
+    pub fn push_output_with_proxy(
+        &mut self,
+        out: &Output,
+        proxy: Option<&ProxySession>,
+        now_ns: u64,
+    ) -> Vec<GapRec> {
+        self.ingest_with_proxy(out, proxy, now_ns);
         let mut emitted = Vec::new();
         if self.should_flush_rows() {
             emitted.extend(self.flush(now_ns));
@@ -106,7 +121,25 @@ impl<S: RecordSink> Batcher<S> {
     }
 
     /// Convert `out` into the open batch. Does not flush.
+    ///
+    /// No proxy session: flow flags are whatever the record already carries.
+    /// Aggregate leaves `via_proxy` and `direct` false, which means "not rewritten".
     pub fn ingest(&mut self, out: &Output, now_ns: u64) {
+        self.ingest_with_proxy(out, None, now_ns);
+    }
+
+    /// Same as [`Self::ingest`], and when `proxy` is `Some` runs
+    /// [`enrich::plan`] on the flows before they become rows.
+    ///
+    /// `None` does not invent observations. Marks are applied to a copy of each
+    /// flow; `out` is not changed. A [`FlowMark::ProxyUpstream`] flow is not
+    /// inserted: its bytes stay out of the session's `net_flows`.
+    pub fn ingest_with_proxy(
+        &mut self,
+        out: &Output,
+        proxy: Option<&ProxySession>,
+        now_ns: u64,
+    ) {
         for gap in &out.gaps {
             if let Some(closed) = self.gaps.observe(gap.clone()) {
                 self.enqueue_gap(&closed, now_ns);
@@ -118,9 +151,34 @@ impl<S: RecordSink> Batcher<S> {
                 None => self.note_skipped_depth(proc.start_ns),
             }
         }
-        for flow in &out.net_flows {
-            if let Some(row) = flow_row(flow) {
-                self.push_flow(row, flow.start_ns);
+        match proxy {
+            None => {
+                for flow in &out.net_flows {
+                    if let Some(row) = flow_row(flow) {
+                        self.push_flow(row, flow.start_ns);
+                    }
+                }
+            }
+            Some(session) => {
+                let planned = plan_flows(session, &out.net_flows);
+                for (index, marked) in planned.flows.iter().enumerate() {
+                    // `None` is the proxy's own upstream. Not a session net row.
+                    let Some(flow) = marked else {
+                        continue;
+                    };
+                    let ts = out
+                        .net_flows
+                        .get(index)
+                        .map(|rec| rec.start_ns)
+                        .unwrap_or(flow.start_ns);
+                    if let Some(row) = flow_row(flow) {
+                        self.push_flow(row, ts);
+                    }
+                }
+                for row in planned.http {
+                    let ts = u64::try_from(row.ts_ns).unwrap_or(now_ns);
+                    self.push_http(row, ts);
+                }
             }
         }
         for bucket in &out.flow_buckets {
@@ -286,6 +344,12 @@ impl<S: RecordSink> Batcher<S> {
         self.open_rows = self.open_rows.saturating_add(1);
     }
 
+    fn push_http(&mut self, row: HttpRow, ts_ns: u64) {
+        self.note_time(ts_ns);
+        self.open.http.push(row);
+        self.open_rows = self.open_rows.saturating_add(1);
+    }
+
     fn note_time(&mut self, ts_ns: u64) {
         if self.open_since_ns.is_none() {
             self.open_since_ns = Some(ts_ns);
@@ -332,6 +396,7 @@ fn dropped_rows(batch: &WriteBatch) -> u64 {
         + batch.net_flows.len()
         + batch.net_flow_buckets.len()
         + batch.dns.len()
+        + batch.http.len()
         + batch.gaps.len();
     u64::try_from(n).unwrap_or(u64::MAX)
 }
@@ -403,7 +468,12 @@ fn flow_row(flow: &NetFlowRec) -> Option<NetFlowRow> {
         bytes_up: flow.bytes_up.and_then(|n| i64::try_from(n).ok()),
         bytes_down: flow.bytes_down.and_then(|n| i64::try_from(n).ok()),
         via_proxy: i64::from(flow.via_proxy),
-        direct: 0,
+        // `direct` is NOT NULL. `0` here is the record's own `false`: either no
+        // proxy session judged the flow, or `plan` judged it not direct. It is
+        // not a stand-in for "unknown".
+        direct: i64::from(flow.direct),
+        // Not filled by this card. `0` is the schema default ("not marked"), not
+        // an observation of preexisting or loopback.
         preexisting: 0,
         is_loopback: 0,
         result: None,
@@ -478,6 +548,136 @@ fn gap_row(gap: &GapRec) -> GapRow {
         count: gap.count.and_then(|n| i64::try_from(n).ok()),
         detail: gap.detail.clone(),
     }
+}
+
+/// One flow after [`enrich::plan`], or the original when the mark says to leave it.
+///
+/// `None` is a proxy-upstream flow: it must not become a session `net_flows` row.
+fn apply_mark(flow: &NetFlowRec, mark: &FlowMark) -> Option<NetFlowRec> {
+    match mark {
+        FlowMark::Unchanged => Some(flow.clone()),
+        FlowMark::ProxyUpstream => None,
+        FlowMark::ViaProxy(_) => {
+            let mut rec = flow.clone();
+            // Rewrites remote only when the mark carried that field. Does not
+            // assign `bytes_up` / `bytes_down` from the proxy body length.
+            // A rewritten flow is not a direct bypass, even if the record arrived
+            // with `direct` already set.
+            enrich::apply_via_proxy(&mut rec, mark);
+            rec.direct = false;
+            Some(rec)
+        }
+        FlowMark::Direct(_) => {
+            let mut rec = flow.clone();
+            rec.direct = true;
+            rec.via_proxy = false;
+            // `net_flows` has no `quic` column. UDP/443 is `NA(quic)` on the URL
+            // field; other direct flows are `NA(direct_bypass_proxy)`.
+            enrich::note_url_na(&mut rec.field_evidence, mark);
+            Some(rec)
+        }
+    }
+}
+
+struct Planned {
+    /// Same order as the input. `None` is excluded from session net stats.
+    flows: Vec<Option<NetFlowRec>>,
+    /// Attributions that carried a non-empty redacted URL. A missing URL is not
+    /// a row: `http.url` is `NOT NULL`, and `""` is not `NA`.
+    http: Vec<HttpRow>,
+}
+
+fn plan_flows(session: &ProxySession, flows: &[NetFlowRec]) -> Planned {
+    let inputs: Vec<_> = flows.iter().map(enrich::LoopbackFlow::from_rec).collect();
+    let planned = enrich::plan(session, &inputs);
+    let excluded: std::collections::BTreeSet<usize> = planned
+        .excluded_from_session_stats
+        .iter()
+        .copied()
+        .collect();
+    let marked = flows
+        .iter()
+        .enumerate()
+        .map(|(index, flow)| {
+            let mark = planned.flows.get(index)?;
+            let rec = apply_mark(flow, mark)?;
+            if excluded.contains(&index) {
+                return None;
+            }
+            Some(rec)
+        })
+        .collect();
+    Planned {
+        flows: marked,
+        http: planned.http.iter().filter_map(http_row).collect(),
+    }
+}
+
+/// `http` row for an attribution that has a redacted URL.
+///
+/// `None` when `url` is absent or empty. That absence is `NA` on the flow
+/// (`note_url_na`), not an empty `http.url`. `field_evidence` and `na_reason`
+/// are set when `flow_id` could not be tied to a flow; both stay unset (SQL
+/// NULL) when there is nothing to add.
+fn http_row(attr: &enrich::HttpAttribution) -> Option<HttpRow> {
+    let url = attr.url.clone().filter(|url| !url.is_empty())?;
+    let host = host_of(&url)?;
+    // `http.method` is `NOT NULL`. A tunnel with a URL but no request line is
+    // `-`, the store's documented stand-in. `""` would claim an empty method
+    // was observed, and dropping the row would drop a URL that was observed.
+    let method = attr
+        .method
+        .clone()
+        .filter(|method| !method.is_empty())
+        .unwrap_or_else(|| "-".to_owned());
+    let session_id = i64::try_from(attr.session_id.0).ok()?;
+    let mut field_evidence = BTreeMap::new();
+    if let Some(reason) = &attr.flow_na {
+        field_evidence.insert("flow_id".to_owned(), Evidence::NA(reason.clone()));
+    }
+    let na_reason = gaps::na_reason_code(&attr.evidence)
+        .or_else(|| attr.flow_na.as_ref().map(gaps::na_name_of));
+    Some(HttpRow {
+        id: None,
+        session_id,
+        proc_uid: attr.proc_uid.map(uid_bits),
+        flow_id: attr.flow_id.and_then(|id| i64::try_from(id).ok()),
+        ts_ns: i64::try_from(attr.ts_ns).unwrap_or(i64::MAX),
+        method,
+        url,
+        host,
+        http_version: None,
+        status: None,
+        req_headers: None,
+        resp_headers: None,
+        req_body_bytes: attr.req_body_bytes.and_then(|n| i64::try_from(n).ok()),
+        resp_body_bytes: attr.resp_body_bytes.and_then(|n| i64::try_from(n).ok()),
+        content_type: None,
+        duration_ms: None,
+        error: None,
+        evidence: gaps::evidence_code(&attr.evidence).to_owned(),
+        field_evidence: field_evidence_json(&field_evidence),
+        na_reason: na_reason.map(str::to_owned),
+        source: "proxy/mitm".to_owned(),
+    })
+}
+
+/// Host from a redacted URL. `None` when there is no host; the row is skipped.
+/// The URL is not logged.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = if let Some(inside) = host.strip_prefix('[') {
+        let inside = inside.split(']').next().unwrap_or("");
+        if inside.is_empty() {
+            return None;
+        }
+        format!("[{inside}]")
+    } else {
+        host.split(':').next().unwrap_or("").to_owned()
+    };
+    (!host.is_empty()).then_some(host)
 }
 
 fn session_i64(id: Option<SessionId>) -> Option<i64> {
@@ -717,6 +917,7 @@ mod tests {
             start_ns: 5,
             end_ns: None,
             via_proxy: false,
+            direct: false,
             partial: false,
             platform_total_up: None,
             platform_total_down: None,
@@ -764,6 +965,7 @@ mod tests {
             start_ns: 5,
             end_ns: None,
             via_proxy: true,
+            direct: false,
             partial: true,
             platform_total_up: Some(120),
             platform_total_down: None,

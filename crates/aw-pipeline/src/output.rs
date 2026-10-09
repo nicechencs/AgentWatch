@@ -131,9 +131,19 @@ pub struct NetFlowRec {
     pub start_ns: u64,
     /// Flow end. `None` if still open in this replay.
     pub end_ns: Option<u64>,
-    /// `true` only after a later proxy rewrite (P3) says this flow went through
-    /// the explicit proxy. Aggregate never sets this; the field is reserved.
+    /// `true` only after a proxy rewrite says this flow went through the explicit
+    /// proxy. Aggregate leaves it `false`: there is no proxy session on that path,
+    /// which is "not rewritten", not "unknown".
     pub via_proxy: bool,
+    /// `true` when a proxy session was on and this flow is a non-loopback TCP/UDP
+    /// connect that did not use the proxy (network-attribution §5.3).
+    ///
+    /// Aggregate and a batcher with no [`crate::enrich::ProxySession`] leave this
+    /// `false`. That is "no proxy session judged this flow", not "unknown whether
+    /// it bypassed". A judged bypass is `true`; a judged via-proxy or unchanged
+    /// flow stays `false`. There is no `quic` column on `net_flows`; UDP/443 is
+    /// recorded as `NA(quic)` on [`Self::field_evidence`] under `url`.
+    pub direct: bool,
     /// `true` while the flow is still open and this row is a 30 s partial flush.
     /// A closed flow is `false`.
     pub partial: bool,

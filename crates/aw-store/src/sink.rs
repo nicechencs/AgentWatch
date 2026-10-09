@@ -20,6 +20,7 @@ use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use crate::error::StoreError;
 use crate::file_access::{self, FileAccessRow};
 use crate::fts::{self, FtsMode, FtsSource};
+use crate::http::{self, HttpRow};
 use crate::migrate::{self, Store};
 use crate::retention::WriteMode;
 
@@ -54,6 +55,10 @@ pub struct WriteBatch {
     pub net_flow_buckets: Vec<NetFlowBucketRow>,
     /// DNS queries. `proc_uid` may be NULL.
     pub dns: Vec<DnsRow>,
+    /// Proxy HTTP rows that already have a redacted URL. Written after flows so
+    /// `flow_id` can point at a row in the same batch. Empty when `plan` produced
+    /// none. A missing URL is not a row here: `http.url` is `NOT NULL`.
+    pub http: Vec<HttpRow>,
     /// Observation gaps. `session_id` may be NULL for a global gap.
     pub gaps: Vec<GapRow>,
 }
@@ -352,6 +357,13 @@ impl RecordSink for SqliteSink<'_> {
             // file row or indexed argv, which is what the P1 reopen test asserts.
             apply_file_schema(self.store)?;
         }
+        if !batch.http.is_empty() {
+            // 0006 creates `http`. 0008 adds nullable `field_evidence` and
+            // `na_reason`, which `insert_http` binds. Both run before the batch
+            // transaction so the ALTER is not nested inside it.
+            crate::migrate::apply_http_schema(self.store)?;
+            crate::migrate::apply_proxy_schema(self.store)?;
+        }
         let fts = if file_schema_present(self.store.connection())? {
             fts::read_mode(self.store.connection())?
         } else {
@@ -400,6 +412,7 @@ fn batch_has_detail(batch: &WriteBatch) -> bool {
         || !batch.net_flows.is_empty()
         || !batch.net_flow_buckets.is_empty()
         || !batch.dns.is_empty()
+        || !batch.http.is_empty()
 }
 
 fn image_has_argv(rows: &[ProcessImageRow]) -> bool {
@@ -467,7 +480,15 @@ fn write_all(tx: &Transaction<'_>, batch: &WriteBatch, fts: FtsMode) -> Result<(
     write_flows(tx, &batch.net_flows)?;
     write_buckets(tx, &batch.net_flow_buckets)?;
     write_dns(tx, &batch.dns)?;
+    write_http(tx, &batch.http)?;
     write_gaps(tx, &batch.gaps)?;
+    Ok(())
+}
+
+fn write_http(tx: &Transaction<'_>, rows: &[HttpRow]) -> Result<(), StoreError> {
+    for row in rows {
+        http::insert_http(tx, row)?;
+    }
     Ok(())
 }
 
@@ -898,6 +919,8 @@ mod tests {
             end_ns: None,
             bytes_up,
             bytes_down: None,
+            // Judged, not unknown: this fixture is a loopback flow that did not
+            // go through the proxy and is not a direct bypass. `0` means "no".
             via_proxy: 0,
             direct: 0,
             preexisting: 0,

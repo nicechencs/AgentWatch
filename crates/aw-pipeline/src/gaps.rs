@@ -334,6 +334,11 @@ pub fn na_reason_code(evidence: &Evidence) -> Option<&'static str> {
     }
 }
 
+/// Wire name of one [`NaReason`]. Same strings as [`na_reason_code`].
+pub fn na_name_of(reason: &NaReason) -> &'static str {
+    na_name(reason)
+}
+
 fn na_name(reason: &NaReason) -> &'static str {
     match reason {
         NaReason::EsNoReadEvent => "es_no_read_event",

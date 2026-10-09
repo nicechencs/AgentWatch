@@ -27,11 +27,15 @@ pub struct HttpRow {
     pub flow_id: Option<i64>,
     /// Request time, Unix nanoseconds.
     pub ts_ns: i64,
-    /// HTTP method. Required.
+    /// HTTP method. Required by the DDL. A tunnel with no request line is `-`,
+    /// not `""`.
     pub method: String,
-    /// Redacted URL. Required. Not logged.
+    /// Redacted URL. Required by the DDL (`NOT NULL`), so this is `String` and
+    /// not `Option`. A flow whose URL is `NA` is not inserted: `""` would claim
+    /// an empty URL was observed. The reason stays on `net_flows.field_evidence`.
+    /// Not logged.
     pub url: String,
-    /// Host header or URL host. Required.
+    /// Host header or URL host. Required. Not `""`.
     pub host: String,
     /// `HTTP/1.1` / `HTTP/2`, or unknown.
     pub http_version: Option<String>,
@@ -53,6 +57,15 @@ pub struct HttpRow {
     pub error: Option<String>,
     /// `E1|E2|E3|S|I|NA`.
     pub evidence: String,
+    /// JSON field evidence. `None` inserts NULL. An empty string is not written:
+    /// "no extra field evidence" is NULL, not `""`.
+    ///
+    /// Direct and QUIC flows have no URL column they can leave empty (`url` is
+    /// `NOT NULL`). `NA(direct_bypass_proxy)` / `NA(quic)` lives here under `url`.
+    pub field_evidence: Option<String>,
+    /// Why the row is `NA`, when `evidence` is `NA`. `None` inserts NULL.
+    /// Not `""`, and not `0`.
+    pub na_reason: Option<String>,
     /// Collector source string.
     pub source: String,
 }
@@ -60,21 +73,33 @@ pub struct HttpRow {
 /// Insert one `http` row and, when the FTS table exists, its URL.
 ///
 /// The FTS flag is `schema_meta.storage.fts`, read here. Absent means on.
-/// An empty `url` is still stored (the DDL says `NOT NULL`) but is not indexed:
-/// an empty string is not a document. A database without `fts_text` (0005 not
-/// applied) stores the row and skips the index.
+/// An empty `url` is rejected: the column is `NOT NULL`, and `""` is not an NA
+/// reason. `field_evidence` and `na_reason` bind as NULL when the caller passes
+/// `None`. A database without `fts_text` (0005 not applied) stores the row and
+/// skips the index.
 pub fn insert_http(conn: &Connection, row: &HttpRow) -> Result<(), StoreError> {
+    // `url` / `host` are `NOT NULL`. An empty string is not an NA reason; the
+    // reason belongs in `na_reason` / `field_evidence`, and a row with no URL
+    // should not be built. Reject it rather than store `""`.
+    if row.url.is_empty() || row.host.is_empty() {
+        return Err(StoreError::sqlite(
+            "insert_http",
+            rusqlite::Error::InvalidParameterName(
+                "url is empty; an absent URL is not stored as \"\"".into(),
+            ),
+        ));
+    }
     conn.execute(
         "INSERT INTO http (
             id, session_id, proc_uid, flow_id, ts_ns, method, url, host,
             http_version, status, req_headers, resp_headers,
             req_body_bytes, resp_body_bytes, content_type, duration_ms, error,
-            evidence, source
+            evidence, field_evidence, na_reason, source
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
             ?9, ?10, ?11, ?12,
             ?13, ?14, ?15, ?16, ?17,
-            ?18, ?19
+            ?18, ?19, ?20, ?21
          )",
         params![
             row.id,
@@ -95,6 +120,8 @@ pub fn insert_http(conn: &Connection, row: &HttpRow) -> Result<(), StoreError> {
             row.duration_ms,
             row.error,
             row.evidence,
+            row.field_evidence,
+            row.na_reason,
             row.source,
         ],
     )
@@ -104,11 +131,7 @@ pub fn insert_http(conn: &Connection, row: &HttpRow) -> Result<(), StoreError> {
             Some(id) => id,
             None => conn.last_insert_rowid(),
         };
-        let text = if row.url.is_empty() {
-            None
-        } else {
-            Some(row.url.as_str())
-        };
+        let text = Some(row.url.as_str());
         let fts = fts::read_mode(conn)?;
         fts::upsert(conn, fts, FtsSource::Http, src_id, text)?;
     }

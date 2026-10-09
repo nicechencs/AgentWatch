@@ -10,6 +10,7 @@
 pub mod ca;
 pub mod hash;
 pub mod inject;
+pub mod protocols;
 pub mod record;
 pub mod server;
 
@@ -21,6 +22,10 @@ pub use ca::{
 pub use inject::{
     hint_for_exe, plan_injection, refuse_attach_proxy, ExeHint, Injection, Overwrite,
     ProxyOnReject, ATTACH_REFUSES_PROXY, EXE_HINTS,
+};
+pub use protocols::{
+    identify_http, plan_loopback, HttpInput, LoopbackTapPlan, ParseGap, PlanError, ProtocolExtract,
+    ProtocolKind, SseCount, A2A_METHODS, PREFIX_CAP, SOURCE_A2A, SOURCE_MCP,
 };
 pub use record::{
     filter_headers, record_exchange, redact_url, to_events, RecordedExchange, RequestMeta,

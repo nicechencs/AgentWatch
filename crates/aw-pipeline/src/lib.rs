@@ -25,6 +25,7 @@ pub mod batcher;
 pub mod clock;
 pub mod config;
 pub mod content_match;
+pub mod correlate;
 pub mod degrade;
 pub mod enrich;
 pub mod gaps;
@@ -48,6 +49,13 @@ pub use config::{
     RedactionConfig, SensitiveConfig, SensitiveRuleConfig, StoreConfig,
 };
 pub use content_match::{decide as decide_content_match, MatchConfig, SkipReason, Verdict};
+pub use correlate::{
+    align as align_self_report, align_with_evidence as align_self_report_with_evidence, AlignError,
+    AlignOutput, Alignment, Annotation, EvidencedObservation, FileAccessObs, Finding, GapInterval,
+    NetObs, Observation, ObservationKind, ProcessStartObs, SelfReport, SelfReportSummary,
+    SummaryKey, ToolKind, Unclassified, UnclassifiedReason, WindowConfig, DEFAULT_WINDOW_NS,
+    INCOMPLETE_SELF_REPORT, UNOBSERVED, WORDING_ID,
+};
 pub use degrade::{DegradeLadder, DegradeSample};
 pub use enrich::{
     ProcCache, ProcCacheConfig, ProcInfo, DEFAULT_CAPACITY as PROC_CACHE_CAPACITY,

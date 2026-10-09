@@ -1,0 +1,31 @@
+# P6-SIM-01, mcp_chain variant: tap not enabled.
+#
+# Same limits as mcp_chain.toml. This runner cannot wrap stdio MCP and
+# cannot POST the file it just read. A content-hash hit must not be claimed.
+# Tool name is NA because --mcp-tap is not applied by the scenario runner.
+#
+# Difference from mcp_chain.toml: this variant does not pretend a tap was
+# enabled. It has no exec stand-in for a wrapped server command, and it
+# does not pass --mcp-tap (the runner would reject that flag). The child
+# only reads runner bait and POSTs runner bait to 127.0.0.1. There is no
+# tools/call, no method, and no tool name to record.
+#
+# No expect section. The runner writes truth lines for the actions below
+# and does not check ipc, byte-error, or chain assertions.
+
+name = "mcp_chain_notap"
+description = "未启用 tap：子进程读取诱饵后向 127.0.0.1 POST；工具名不可得"
+
+[setup]
+files = [
+  { path = "work/bait/read_file.bin", size = 256, content = "random" },
+]
+server = { http = true }
+
+[[step]]
+action = "spawn"
+id = "server_child"
+steps = [
+  { action = "read_file", id = "read_bait", path = "work/bait/read_file.bin" },
+  { action = "http_upload", id = "loopback_post", url = "http://127.0.0.1:{http_port}/upload", bytes = 256 },
+]

@@ -1,0 +1,60 @@
+# P6-SIM-01, multi_agent. Scenario half only.
+#
+# What the task card asked for, and what this runner cannot do
+# (sim/src/exec.rs implements only: spawn, exec, read_file, write_file,
+# create, delete, rename, http_upload, http_download, dns_lookup, udp_send,
+# long_conn, repeat, sleep):
+#
+# - No pipe, Unix-socket, named-pipe, or loopback-TCP *pairing* action.
+#   `spawn` starts a child process; it does not connect the child's stdio
+#   to the parent with a byte pipe the scenario can size. `long_conn` and
+#   `http_*` open one TCP client to 127.0.0.1. The listener is `sim serve`,
+#   not a second agent process, so a loopback exchange is not two agent
+#   endpoints. This file does not claim an IPC recall rate, a byte error,
+#   or an agent_links row. Those collectors are not in this runner.
+# - No truth / expect section. The runner writes one JSONL line per finished
+#   action (process start via spawn_enter, plus ok/error). It does not read
+#   assertions from the scenario. Inventing an [[expect]] table would be an
+#   unknown key or a claim the run cannot check.
+# - Shared file: the child writes bait with `write_file` (runner-generated
+#   bait bytes, not a user file) and a later independent process reads that
+#   path. That is a file action pair under the temp sim root. It is not a
+#   shared_artifact edge and not a content-hash hit.
+#
+# What this file does perform, all under the temp sim root:
+#   parent --spawn--> child (write bait, then loopback HTTP)
+#   parent --spawn--> a second process that is not a child of the first
+#                     (read the bait the first child wrote)
+# Loopback only. Hostnames stay on api.agentwatch.test.
+
+name = "multi_agent"
+description = "父进程派生一个子进程和另一个独立进程；无 IPC 配对动作，不声称通道召回"
+
+[setup]
+files = [
+  # Runner bait under the temp root. Not a user file.
+  { path = "work/shared/note.bin", size = 256, content = "random" },
+]
+server = { http = true, dns = true }
+
+# Child stand-in. Writes bait, then one loopback POST. The POST is a client
+# to sim serve, not a pipe to the parent.
+[[step]]
+action = "spawn"
+id = "child"
+steps = [
+  { action = "write_file", id = "child_write_bait", path = "work/shared/child-out.bin", bytes = 128 },
+  { action = "http_upload", id = "child_loopback", url = "http://127.0.0.1:{http_port}/upload", bytes = 128 },
+  { action = "dns_lookup", id = "child_dns", name = "api.agentwatch.test" },
+]
+
+# Second process, spawned by the parent, not by the child. Reads the bait
+# the child wrote. Content is runner bait.
+[[step]]
+action = "spawn"
+id = "other"
+steps = [
+  { action = "read_file", id = "other_read_child_bait", path = "work/shared/child-out.bin" },
+  { action = "read_file", id = "other_read_setup", path = "work/shared/note.bin" },
+  { action = "exec", id = "other_exec", argv = ["--version"] },
+]

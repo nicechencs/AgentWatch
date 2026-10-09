@@ -1,0 +1,47 @@
+# P6-SIM-01, mcp_chain. Scenario half only.
+#
+# What the task card asked for, and what this runner cannot do
+# (sim/src/exec.rs implements only: spawn, exec, read_file, write_file,
+# create, delete, rename, http_upload, http_download, dns_lookup, udp_send,
+# long_conn, repeat, sleep):
+#
+# - This runner cannot wrap stdio MCP. There is no mcp-tap action, no
+#   JSON-RPC framing, and no `tools/call` record. A content-hash hit must
+#   not be claimed: `http_upload` sends `http_step::bait_body(bytes)`, not
+#   the bytes `read_file` just read, and no action POSTs a file.
+# - Tool name is NA. `--mcp-tap` is not applied by the scenario runner
+#   (`sim run` rejects unknown flags). This file does not set that flag
+#   and does not invent a tap key. See mcp_chain_notap.toml for the variant
+#   that states the tap was not enabled; the two files differ by that
+#   comment and by this file's extra `exec` stand-in for a wrapped server
+#   command. Neither file enables a tap.
+# - No delegation chain, no agent_links, no 4-hop assertion. The runner
+#   does not read an expect section. Process start and the read/HTTP
+#   actions are what a later collector could observe; this scenario does
+#   not grade them.
+#
+# Stand-in that does run, under the temp sim root, loopback only:
+#   parent spawns a child; the child reads runner bait, then POSTs to
+#   127.0.0.1. The POST body is runner bait of the same length, not the
+#   file contents.
+
+name = "mcp_chain"
+description = "子进程读取诱饵后向 127.0.0.1 POST；不能包装 MCP stdio，不声称内容哈希命中"
+
+[setup]
+files = [
+  # Runner bait. The path is relative to the temp sim root, not a user home.
+  { path = "work/bait/read_file.bin", size = 256, content = "random" },
+]
+server = { http = true }
+
+[[step]]
+action = "spawn"
+id = "server_child"
+steps = [
+  # Closest stand-in for "a wrapped server command". argv-echo exits 0.
+  # It is not an MCP server and not a tap.
+  { action = "exec", id = "server_argv", argv = ["--version"] },
+  { action = "read_file", id = "read_bait", path = "work/bait/read_file.bin" },
+  { action = "http_upload", id = "loopback_post", url = "http://127.0.0.1:{http_port}/upload", bytes = 256 },
+]

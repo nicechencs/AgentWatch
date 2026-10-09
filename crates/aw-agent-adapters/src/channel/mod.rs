@@ -1,9 +1,10 @@
 //! E3 source trait and the hook dispatch registry (P5-AGENT-01, P5-AGENT-02).
 //!
-//! This module has no I/O. Concrete adapters (`src/agents/<id>/`) are later tasks.
-//! They register a [`HookParser`]; until then [`parse_hook`] returns an empty list
-//! for every agent id, including ones this build has never heard of.
+//! This module has no I/O. Built-in parsers for `claude-code`, `codex`, and
+//! `cursor` are installed on the first [`parse_hook`] call. An unknown agent id,
+//! including `aider` (no confirmed hook schema), still parses to an empty list.
 
+mod parse;
 mod registry;
 mod summary;
 
@@ -11,6 +12,7 @@ use std::fmt;
 
 use serde_json::Value;
 
+pub use parse::install_builtin_parsers;
 pub use registry::{parse_hook, register_hook, HookRegistry};
 pub use summary::{bound_tool_call, MAX_CALL_BYTES};
 

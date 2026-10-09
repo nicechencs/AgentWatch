@@ -1,10 +1,10 @@
 //! Agent-id → [`HookParser`] table.
 //!
-//! P5-AGENT-03 and later cards insert parsers. This card ships an empty table.
-//! A miss is an empty `Vec`, never an error: the hook process must exit 0 even
-//! when the agent id is unknown.
+//! Built-in parsers are installed on the first [`parse_hook`] call, so a daemon
+//! that only calls [`parse_hook`] still sees them. A miss is an empty `Vec`,
+//! never an error: the hook process must exit 0 even when the agent id is unknown.
 
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Once, OnceLock, RwLock};
 
 use serde_json::Value;
 
@@ -42,6 +42,7 @@ pub fn register_hook(parser: Box<dyn HookParser>) {
 /// an empty `Vec`. The agent id comparison is exact and case-sensitive: profile
 /// ids are already lowercase (`claude-code`).
 pub fn parse_hook(agent: &str, payload: &Value) -> Vec<AgentToolCall> {
+    ensure_builtins();
     let guard = match table().read() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -50,6 +51,17 @@ pub fn parse_hook(agent: &str, payload: &Value) -> Vec<AgentToolCall> {
         Some(parser) => parser.parse_hook(payload),
         None => Vec::new(),
     }
+}
+
+/// Install `claude-code`, `codex`, and `cursor` once, before the first lookup.
+///
+/// [`super::register_hook`] replaces by id, so a parser registered after this
+/// still wins. One registered before the first [`parse_hook`] is replaced by
+/// the built-in: call [`super::parse::install_builtin_parsers`] (or
+/// [`parse_hook`]) first, then register the override.
+fn ensure_builtins() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(super::parse::install_builtin_parsers);
 }
 
 /// The table itself, named so daemon code can talk about "the registry" without

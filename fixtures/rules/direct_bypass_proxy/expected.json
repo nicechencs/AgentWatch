@@ -1,0 +1,1 @@
+{"findings":[{"count":1,"error":null,"evidence":"E1","first_ns":1000000000,"kind":"fact","last_ns":1000000000,"refs":[{"id":1,"table":"net_flow"}],"rule_id":"direct_bypass_proxy","rule_version":1,"severity":"warn","text":"【E1】placeholder 向 api.agentwatch.test 发送了 128，接收了 0。","wording_id":"fact.net_send"}]}

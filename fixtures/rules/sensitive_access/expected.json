@@ -1,0 +1,1 @@
+{"findings":[{"count":1,"error":null,"evidence":"E1","first_ns":1000000000,"kind":"fact","last_ns":1000000000,"refs":[{"id":1,"table":"file_access"}],"rule_id":"sensitive_access","rule_version":1,"severity":"info","text":"【E1】placeholder 访问了敏感路径 `/tmp/placeholder/home/«redacted:path»/id_rsa`（规则：ssh-keys）。","wording_id":"fact.sensitive_access"}]}

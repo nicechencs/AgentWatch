@@ -1,0 +1,2 @@
+{"record":"self_report_mismatch","id":1,"ts_ns":1000000000,"session":1,"proc_uid":10,"fields":{"path":"/tmp/placeholder/work/notes.txt"},"params":{"proc":"placeholder","path":"/tmp/placeholder/work/notes.txt"}}
+{"record":"file_access","id":2,"ts_ns":2000000000,"session":1,"proc_uid":10,"fields":{"op":"access","path":"/tmp/placeholder/work/notes.txt"},"params":{"proc":"placeholder","path":"/tmp/placeholder/work/notes.txt"}}

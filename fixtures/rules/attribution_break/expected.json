@@ -1,0 +1,1 @@
+{"findings":[{"count":1,"error":null,"evidence":"E1","first_ns":1000000000,"kind":"fact","last_ns":1000000000,"refs":[{"id":1,"table":"attribution_break"}],"rule_id":"attribution_break","rule_version":1,"severity":"notice","text":"【归属中断】placeholder 通过 shell 委托了操作，后续行为发生在会话之外，未纳入统计。","wording_id":"attr.break"}]}

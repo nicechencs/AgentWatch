@@ -1,0 +1,2 @@
+{"record":"attribution_break","id":1,"ts_ns":1000000000,"session":1,"proc_uid":10,"fields":{"via":"shell"},"params":{"proc":"placeholder","via":"shell"}}
+{"record":"net_flow","id":2,"ts_ns":2000000000,"session":1,"proc_uid":10,"fields":{"domain":"api.agentwatch.test"},"numbers":{"bytes_up":64},"bools":{"is_loopback":false},"params":{"proc":"placeholder","dest":"api.agentwatch.test","bytes_up":"64"}}

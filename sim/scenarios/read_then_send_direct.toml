@@ -1,0 +1,32 @@
+# P3-SIM-01, no-proxy path of read_then_send.
+#
+# Same read, then the same POST to the local test server, with no proxy in the
+# scenario. `sim run` does not start the MITM proxy (that is aw-proxy), so this
+# file records the direct path by omission: there is no proxy step and no
+# proxy flag to set. A collector that later observes the flow should mark it
+# direct; this scenario does not invent that mark.
+#
+# Expected correlation wording, once a session exists, is infer.temporal_no_proxy
+# (推测). This file does not assert that. It only performs the actions.
+#
+# Loopback only. The bait path is relative to the temp sim root.
+
+name = "read_then_send_direct"
+description = "未启用代理：读取诱饵文件后直连本地测试服务器 POST"
+
+[setup]
+files = [
+  { path = "home/.ssh/id_rsa", size = 412, content = "random" },
+]
+server = { http = true }
+
+[[step]]
+action = "read_file"
+id = "read_bait"
+path = "home/.ssh/id_rsa"
+
+[[step]]
+action = "http_upload"
+id = "upload_direct"
+url = "http://127.0.0.1:{http_port}/upload"
+bytes = 412

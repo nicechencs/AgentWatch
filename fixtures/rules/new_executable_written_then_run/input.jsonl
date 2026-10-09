@@ -1,0 +1,4 @@
+{"record":"file_access","id":1,"ts_ns":1000000000,"session":1,"proc_uid":10,"fields":{"op":"create","path":"/tmp/placeholder/work/tool"},"params":{"proc":"placeholder","path":"/tmp/placeholder/work/tool"}}
+{"record":"file_access","id":2,"ts_ns":2000000000,"session":1,"proc_uid":11,"fields":{"op":"exec","path":"/tmp/placeholder/work/tool"},"params":{"proc":"placeholder","path":"/tmp/placeholder/work/tool"}}
+{"record":"file_access","id":3,"ts_ns":3000000000,"session":1,"proc_uid":10,"fields":{"op":"create","path":"/tmp/placeholder/work/other"},"params":{"proc":"placeholder","path":"/tmp/placeholder/work/other"}}
+{"record":"file_access","id":4,"ts_ns":4000000000,"session":1,"proc_uid":11,"fields":{"op":"exec","path":"/tmp/placeholder/work/unrelated"},"params":{"proc":"placeholder","path":"/tmp/placeholder/work/unrelated"}}

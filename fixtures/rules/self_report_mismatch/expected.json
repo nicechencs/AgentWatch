@@ -1,0 +1,1 @@
+{"findings":[{"count":1,"error":null,"evidence":"E1","first_ns":1000000000,"kind":"fact","last_ns":1000000000,"refs":[{"id":1,"table":"self_report_mismatch"}],"rule_id":"self_report_mismatch","rule_version":1,"severity":"notice","text":"【E1】系统观测到 placeholder 访问了 `/tmp/placeholder/work/notes.txt`，但 Agent 自报告中没有对应记录。","wording_id":"fact.self_report_mismatch"}]}

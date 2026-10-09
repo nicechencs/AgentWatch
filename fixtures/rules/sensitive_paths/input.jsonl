@@ -1,0 +1,2 @@
+{"record":"file_access","id":1,"ts_ns":1000000000,"session":1,"proc_uid":10,"fields":{"op":"access","access":"read","path":"/tmp/placeholder/home/.ssh/id_rsa"},"params":{"proc":"placeholder","path":"/tmp/placeholder/home/.ssh/id_rsa","rule":"ssh-keys"},"tags":["sensitive.ssh-keys"]}
+{"record":"file_access","id":2,"ts_ns":2000000000,"session":1,"proc_uid":10,"fields":{"op":"access","access":"read","path":"/tmp/placeholder/home/.ssh/id_rsa.pub"},"params":{"proc":"placeholder","path":"/tmp/placeholder/home/.ssh/id_rsa.pub"}}

@@ -1,0 +1,38 @@
+# P3-SIM-01. Read a bait file, then POST to the local test server.
+#
+# Two paths the runner can express today:
+#   read_then_send.toml        proxy session, overlapping-content intent
+#   read_then_send_direct.toml no proxy, the same read then a direct send
+#
+# `sim run` has no `--variant` flag (see sim/src/main.rs), so the third shape
+# the task card names (`miss`: unrelated body) is not a separate file. The
+# upload body is `http_step::bait_body(bytes)`, not the bytes just read, and
+# the runner has no action that POSTs a file. Truth lines therefore cannot
+# claim a content-hash hit. Whether the bytes overlap is for a later collector
+# and the content matcher (P3-PIPE-06), not for this scenario.
+#
+# The server listens on 127.0.0.1 only. `{http_port}` is filled by `sim run`.
+# The bait path is relative to the temp sim root, never a real home directory.
+
+name = "read_then_send"
+description = "读取诱饵文件后向本地测试服务器 POST（代理会话；内容是否重叠由采集器判断）"
+
+[setup]
+files = [
+  { path = "home/.ssh/id_rsa", size = 412, content = "random" },
+]
+server = { http = true }
+
+# Read the bait. 412 bytes, same size as the file_ops bait.
+[[step]]
+action = "read_file"
+id = "read_bait"
+path = "home/.ssh/id_rsa"
+
+# POST to the local listener. Body length matches the bait so a later matcher
+# has a size to compare; the body itself is the runner's bait pattern.
+[[step]]
+action = "http_upload"
+id = "upload_local"
+url = "http://127.0.0.1:{http_port}/upload"
+bytes = 412

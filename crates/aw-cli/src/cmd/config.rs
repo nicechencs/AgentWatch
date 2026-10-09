@@ -149,6 +149,118 @@ impl ConfigApi for UnwiredConfig {
     }
 }
 
+/// Production client for `GET`/`PUT /api/v1/config`.
+///
+/// [`UnwiredConfig`] stays for tests. `schema` and `rules` have no daemon
+/// route; those methods return [`ConfigError::Failed`] naming the missing
+/// route instead of an empty document.
+pub(crate) struct HttpConfigApi {
+    endpoint: crate::endpoint::Endpoint,
+}
+
+impl HttpConfigApi {
+    /// Bind to `endpoint`. Does not connect.
+    #[must_use]
+    pub(crate) fn new(endpoint: crate::endpoint::Endpoint) -> Self {
+        Self { endpoint }
+    }
+
+    fn call(&self, request: &crate::client::ApiRequest) -> Result<Value, ConfigError> {
+        let transport =
+            crate::client::LoopbackHttp::new(&self.endpoint).map_err(client_to_config)?;
+        let mut client = crate::client::Client::new(self.endpoint.clone(), transport);
+        let reply = client.call(request).map_err(client_to_config)?;
+        reply.json().ok_or_else(|| ConfigError::Failed {
+            detail: "daemon returned a non-JSON body".to_owned(),
+        })
+    }
+}
+
+impl ConfigApi for HttpConfigApi {
+    fn show(&mut self, effective: bool) -> Result<ConfigDoc, ConfigError> {
+        let body = self.call(&show_request(effective, None))?;
+        let value = match body.get("config") {
+            Some(value) => value.clone(),
+            None => body,
+        };
+        Ok(ConfigDoc { value, effective })
+    }
+
+    fn get(&mut self, key: &str) -> Result<Value, ConfigError> {
+        let body = self.call(&show_request(true, Some(key)))?;
+        // The daemon ignores `?key=` and returns the whole in-memory document.
+        // Walk it. A missing key is not `null` invented by this process.
+        let root = body.get("config").unwrap_or(&body);
+        lookup_key(root, key)
+    }
+
+    fn set(&mut self, key: &str, value: &Value) -> Result<ConfigDoc, ConfigError> {
+        let body = self.call(&set_request(key, value))?;
+        // PUT replaces the in-memory document with the body and answers
+        // `{ "applied": "memory" }`. That is not the new document. Re-read it.
+        let _ = body;
+        self.show(false)
+    }
+
+    fn schema(&mut self) -> Result<Value, ConfigError> {
+        // `GET /api/v1/config/schema` is not a route. Do not print `{}`.
+        Err(ConfigError::Failed {
+            detail: "GET /api/v1/config/schema is not served; this command does not invent a schema".to_owned(),
+        })
+    }
+
+    fn rules(&mut self) -> Result<Vec<RuleInfo>, ConfigError> {
+        // `GET /api/v1/rules` is not a route. `rules list` does not use this
+        // client (it loads files offline). A call that does reach here must
+        // not claim there are no rules.
+        Err(ConfigError::Failed {
+            detail: "GET /api/v1/rules is not served; this command does not invent an empty rule list".to_owned(),
+        })
+    }
+}
+
+fn lookup_key(root: &Value, key: &str) -> Result<Value, ConfigError> {
+    let mut current = root;
+    for part in key.split('.') {
+        match current.get(part) {
+            Some(child) => current = child,
+            None => {
+                return Err(ConfigError::Invalid {
+                    detail: format!("config has no key `{key}`"),
+                });
+            }
+        }
+    }
+    Ok(current.clone())
+}
+
+fn client_to_config(err: crate::client::ClientError) -> ConfigError {
+    match &err {
+        crate::client::ClientError::Unreachable { .. } => ConfigError::Unreachable {
+            detail: clip_config(&err.to_string()),
+        },
+        crate::client::ClientError::Status { status: 401 | 403, .. } => ConfigError::Forbidden {
+            detail: clip_config(&err.to_string()),
+        },
+        crate::client::ClientError::Status { status: 400, .. } => ConfigError::Invalid {
+            detail: clip_config(&err.to_string()),
+        },
+        crate::client::ClientError::Status { .. } | crate::client::ClientError::Transport { .. } => {
+            ConfigError::Failed {
+                detail: clip_config(&err.to_string()),
+            }
+        }
+    }
+}
+
+fn clip_config(text: &str) -> String {
+    let mut out: String = text.chars().take(240).collect();
+    if text.chars().count() > 240 {
+        out.push('…');
+    }
+    out
+}
+
 /// `GET /api/v1/config` with the `effective` and `key` query this command uses.
 #[must_use]
 pub(crate) fn show_request(effective: bool, key: Option<&str>) -> crate::client::ApiRequest {

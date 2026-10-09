@@ -271,9 +271,12 @@ pub(crate) struct DbStatsView {
     /// `retention.max_db_bytes` (or the size-mb key converted by the daemon).
     pub max_db_bytes: Option<u64>,
     /// Sessions that are not pinned. Kept so the P1 counts still render.
-    pub sessions: u64,
-    /// Pinned sessions.
-    pub pinned_sessions: u64,
+    ///
+    /// `None` when the daemon did not split pinned from unpinned. The text
+    /// renderer prints `不可得`; it is not zero.
+    pub sessions: Option<u64>,
+    /// Pinned sessions. `None` when the daemon did not report the split.
+    pub pinned_sessions: Option<u64>,
 }
 
 /// One pending or applied migration.
@@ -336,6 +339,249 @@ impl DbApi for UnwiredApi {
             detail: UNWIRED.to_owned(),
         })
     }
+}
+
+/// Production client. `GET /api/v1/db/stats`, `POST /api/v1/db/vacuum`,
+/// `POST /api/v1/db/migrate`, `POST /api/v1/db/purge`.
+///
+/// [`UnwiredApi`] stays for tests. This type is what `execute_args` builds.
+pub(crate) struct HttpDbApi {
+    endpoint: crate::endpoint::Endpoint,
+}
+
+impl HttpDbApi {
+    /// Bind to `endpoint`. Does not connect.
+    #[must_use]
+    pub(crate) fn new(endpoint: crate::endpoint::Endpoint) -> Self {
+        Self { endpoint }
+    }
+
+    fn call(&self, request: &crate::client::ApiRequest) -> Result<serde_json::Value, DbApiError> {
+        let transport = crate::client::LoopbackHttp::new(&self.endpoint).map_err(client_to_db)?;
+        let mut client = crate::client::Client::new(self.endpoint.clone(), transport);
+        let reply = client.call(request).map_err(client_to_db)?;
+        reply.json().ok_or_else(|| DbApiError::Failed {
+            detail: "daemon returned a non-JSON body".to_owned(),
+        })
+    }
+}
+
+impl DbApi for HttpDbApi {
+    fn stats(&mut self) -> Result<DbStatsView, DbApiError> {
+        let body = self.call(&crate::client::ApiRequest::get("/api/v1/db/stats"))?;
+        if body.get("available") == Some(&serde_json::Value::Bool(false)) {
+            let reason = body
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("db stats are not available for this caller");
+            return Err(DbApiError::Failed {
+                detail: clip_db(reason),
+            });
+        }
+        let tables = match body.get("tables") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(rows)) => rows
+                .iter()
+                .map(table_count)
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(DbApiError::Failed {
+                    detail: "field `tables` is not an array".to_owned(),
+                });
+            }
+        };
+        let oldest = body.get("oldest_session");
+        let (oldest_session, oldest_ended_ns) = match oldest {
+            None | Some(serde_json::Value::Null) => (None, None),
+            Some(value) => (
+                opt_db_string(value, "public_id")?,
+                opt_db_i64(value, "ended_ns")?,
+            ),
+        };
+        let retention = body.get("retention");
+        let (max_age_days, max_db_bytes) = match retention {
+            None | Some(serde_json::Value::Null) => (None, None),
+            Some(value) => (
+                opt_db_u64(value, "max_age_days")?,
+                opt_db_u64(value, "max_db_bytes")?,
+            ),
+        };
+        // `sessions` on this view is the unpinned count. The daemon sends a
+        // table row count, which includes pinned rows, so it is not that
+        // number. Leave both counts unset rather than print the table size as
+        // "unpinned". The table line still shows `sessions`.
+        Ok(DbStatsView {
+            db_bytes: opt_db_u64(&body, "db_bytes")?,
+            wal_bytes: opt_db_u64(&body, "wal_bytes")?,
+            tables,
+            oldest_session,
+            oldest_ended_ns,
+            max_age_days,
+            max_db_bytes,
+            sessions: None,
+            pinned_sessions: None,
+        })
+    }
+
+    fn vacuum(&mut self) -> Result<String, DbApiError> {
+        let body = self.call(&crate::client::ApiRequest::post_json(
+            "/api/v1/db/vacuum",
+            &json!({}),
+        ))?;
+        Ok(body
+            .get("ok")
+            .map(|_| "vacuum recorded".to_owned())
+            .unwrap_or_else(|| "vacuum returned no ok field".to_owned()))
+    }
+
+    fn migrate(&mut self, dry_run: bool) -> Result<MigrateReport, DbApiError> {
+        let body = self.call(&crate::client::ApiRequest::post_json(
+            "/api/v1/db/migrate",
+            &json!({ "dry_run": dry_run }),
+        ))?;
+        // The daemon applies the schema and returns version numbers, not a step
+        // list. A missing version is not reported as "no pending migration".
+        let mut steps = Vec::new();
+        for (key, name) in [
+            ("file_schema_version", "file"),
+            ("http_schema_version", "http"),
+            ("proxy_schema_version", "proxy"),
+            ("agent_schema_version", "agent"),
+        ] {
+            if let Some(version) = body.get(key) {
+                let text = match version {
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::String(text) => text.clone(),
+                    _ => {
+                        return Err(DbApiError::Failed {
+                            detail: format!("field `{key}` is not a version"),
+                        });
+                    }
+                };
+                steps.push(MigrationStep {
+                    version: text,
+                    name: name.to_owned(),
+                    dry_run,
+                });
+            }
+        }
+        if steps.is_empty() && body.get("steps").is_none() {
+            return Err(DbApiError::Failed {
+                detail: "response is missing schema version fields".to_owned(),
+            });
+        }
+        Ok(MigrateReport {
+            steps,
+            detail: opt_db_string(&body, "detail")?,
+        })
+    }
+
+    fn purge(&mut self, body: &PurgeBody) -> Result<PurgeResult, DbApiError> {
+        let payload = json!({
+            "older_than": body.older_than,
+            "all": body.all,
+        });
+        let value = self.call(&crate::client::ApiRequest::post_json(
+            "/api/v1/db/purge",
+            &payload,
+        ))?;
+        let rows = match value.get("purged") {
+            Some(serde_json::Value::Array(rows)) => rows,
+            Some(_) => {
+                return Err(DbApiError::Failed {
+                    detail: "field `purged` is not an array".to_owned(),
+                });
+            }
+            None => {
+                return Err(DbApiError::Failed {
+                    detail: "response is missing field `purged`".to_owned(),
+                });
+            }
+        };
+        let mut removed = Vec::new();
+        for row in rows {
+            match row.get("public_id").and_then(serde_json::Value::as_str) {
+                Some(text) if !text.is_empty() => removed.push(text.to_owned()),
+                _ => {
+                    return Err(DbApiError::Failed {
+                        detail: "field `purged` entry is missing `public_id`".to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(PurgeResult {
+            removed,
+            // The daemon does not list the sessions it kept.
+            kept: Vec::new(),
+        })
+    }
+}
+
+fn table_count(value: &serde_json::Value) -> Result<(String, u64), DbApiError> {
+    let name = value
+        .get("table")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| DbApiError::Failed {
+            detail: "field `tables` entry is missing `table`".to_owned(),
+        })?;
+    let rows = opt_db_u64(value, "rows")?.ok_or_else(|| DbApiError::Failed {
+        detail: "field `tables` entry is missing `rows`".to_owned(),
+    })?;
+    Ok((name.to_owned(), rows))
+}
+
+fn opt_db_string(value: &serde_json::Value, name: &str) -> Result<Option<String>, DbApiError> {
+    match value.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) if text.is_empty() => Ok(None),
+        Some(serde_json::Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(DbApiError::Failed {
+            detail: format!("field `{name}` is not a string"),
+        }),
+    }
+}
+
+fn opt_db_i64(value: &serde_json::Value, name: &str) -> Result<Option<i64>, DbApiError> {
+    match value.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(other) => other.as_i64().map(Some).ok_or_else(|| DbApiError::Failed {
+            detail: format!("field `{name}` is not an integer"),
+        }),
+    }
+}
+
+fn opt_db_u64(value: &serde_json::Value, name: &str) -> Result<Option<u64>, DbApiError> {
+    match value.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(other) => other.as_u64().map(Some).ok_or_else(|| DbApiError::Failed {
+            detail: format!("field `{name}` is not an integer"),
+        }),
+    }
+}
+
+fn client_to_db(err: crate::client::ClientError) -> DbApiError {
+    match &err {
+        crate::client::ClientError::Unreachable { .. } => DbApiError::Unreachable {
+            detail: clip_db(&err.to_string()),
+        },
+        crate::client::ClientError::Status { status: 401 | 403, .. } => DbApiError::Forbidden {
+            detail: clip_db(&err.to_string()),
+        },
+        crate::client::ClientError::Status { .. } | crate::client::ClientError::Transport { .. } => {
+            DbApiError::Failed {
+                detail: clip_db(&err.to_string()),
+            }
+        }
+    }
+}
+
+fn clip_db(text: &str) -> String {
+    let mut out: String = text.chars().take(240).collect();
+    if text.chars().count() > 240 {
+        out.push('…');
+    }
+    out
 }
 
 /// Run one `db` subcommand against the daemon API.
@@ -496,10 +742,15 @@ fn stats_view_outcome(view: &DbStatsView, json: bool) -> Outcome {
             Some(bytes) => bytes.to_string(),
             None => "不可得".to_owned(),
         };
-        let mut lines = format!(
-            "db_bytes {bytes}\nsessions {}\npinned_sessions {}\n",
-            view.sessions, view.pinned_sessions
-        );
+        let sessions = match view.sessions {
+            Some(n) => n.to_string(),
+            None => "不可得".to_owned(),
+        };
+        let pinned = match view.pinned_sessions {
+            Some(n) => n.to_string(),
+            None => "不可得".to_owned(),
+        };
+        let mut lines = format!("db_bytes {bytes}\nsessions {sessions}\npinned_sessions {pinned}\n");
         for (name, count) in &view.tables {
             lines.push_str(&format!("table {name} {count}\n"));
         }

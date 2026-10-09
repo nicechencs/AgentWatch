@@ -59,6 +59,12 @@ impl ApiRequest {
         Self::json_method("PUT", path, body)
     }
 
+    /// `PATCH` or another JSON method. Used by session rename and pin.
+    #[must_use]
+    pub fn json_method_public(method: &str, path: &str, body: &Value) -> Self {
+        Self::json_method(method, path, body)
+    }
+
     /// `GET <path>?<query>`. `query` is the raw string without `?`.
     #[must_use]
     pub fn get_query(path: &str, query: impl Into<String>) -> Self {

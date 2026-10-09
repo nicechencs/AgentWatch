@@ -718,7 +718,7 @@ pub(crate) fn findings_request(
 
 /// Percent-encode one path segment. `@` in `@last` is left as-is: it is
 /// unreserved enough for this API and the daemon matches the literal.
-fn encode_path_segment(text: &str) -> String {
+pub(crate) fn encode_path_segment(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
         match byte {
@@ -732,7 +732,7 @@ fn encode_path_segment(text: &str) -> String {
 }
 
 /// `k=v&k=v` with both sides percent-encoded.
-fn encode_query(pairs: &[(&str, &str)]) -> String {
+pub(crate) fn encode_query(pairs: &[(&str, &str)]) -> String {
     let mut out = String::new();
     for (index, (key, value)) in pairs.iter().enumerate() {
         if index > 0 {

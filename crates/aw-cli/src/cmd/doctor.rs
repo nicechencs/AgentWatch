@@ -50,6 +50,10 @@ pub(crate) struct HostFacts {
     /// Kernel or OS version string. Not a hostname.
     pub version: String,
     /// Whether this process holds the privilege a native collector needs.
+    ///
+    /// `false` when the daemon did not say. That is this machine's report, not
+    /// a claim that the daemon probed and found the process unprivileged. The
+    /// collector row carries the daemon's reason.
     pub privileged: bool,
 }
 
@@ -90,6 +94,186 @@ impl DoctorSource for Unprobed {
             categories: default_categories(),
         }
     }
+}
+
+/// Production source. `GET /api/v1/doctor` says the request path does not probe
+/// collectors. That is mapped onto the same NA categories [`Unprobed`] prints,
+/// with the daemon's reason on the collector row. Categories the daemon does
+/// not list stay NA; they are not dropped.
+///
+/// [`Unprobed`] stays for tests and for a daemon this process could not reach.
+/// A failed call does not invent an "ok" collector.
+pub(crate) struct HttpDoctor {
+    endpoint: crate::endpoint::Endpoint,
+}
+
+impl HttpDoctor {
+    /// Bind to `endpoint`. Does not connect.
+    #[must_use]
+    pub(crate) fn new(endpoint: crate::endpoint::Endpoint) -> Self {
+        Self { endpoint }
+    }
+}
+
+impl DoctorSource for HttpDoctor {
+    fn report(&mut self) -> DoctorReport {
+        let fetched = (|| {
+            let transport = crate::client::LoopbackHttp::new(&self.endpoint)?;
+            let mut client = crate::client::Client::new(self.endpoint.clone(), transport);
+            let reply = client.call(&crate::client::ApiRequest::get("/api/v1/doctor"))?;
+            reply.json().ok_or_else(|| crate::client::ClientError::Transport {
+                detail: "daemon returned a non-JSON body".to_owned(),
+            })
+        })();
+        match fetched {
+            Ok(body) => report_from_doctor_json(&body),
+            Err(err) => {
+                let mut report = Unprobed.report();
+                let detail = clip_doctor(&err.to_string());
+                if let Some(probe) = report.collectors.first_mut() {
+                    probe.detail = Some(detail);
+                }
+                report
+            }
+        }
+    }
+}
+
+fn report_from_doctor_json(body: &Value) -> DoctorReport {
+    let probed = body.get("probed").and_then(Value::as_bool).unwrap_or(false);
+    let reason = body
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned);
+    let mut collectors = match body.get("collectors") {
+        Some(Value::Array(rows)) => rows.iter().filter_map(collector_from_json).collect(),
+        _ => Vec::new(),
+    };
+    if collectors.is_empty() {
+        collectors.push(CollectorProbe {
+            name: "none".to_owned(),
+            status: if probed {
+                "ok".to_owned()
+            } else {
+                "unavailable".to_owned()
+            },
+            detail: reason.or_else(|| {
+                Some("daemon doctor listed no collectors".to_owned())
+            }),
+        });
+    }
+    let mut categories = default_categories();
+    if let Some(Value::Array(rows)) = body.get("categories") {
+        for row in rows {
+            let Some(name) = row.get("category").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(slot) = categories.iter_mut().find(|item| item.category == name) else {
+                // Unknown categories are not added: the report's row set is the
+                // matrix this command prints. Leaving them out is NA-by-absence
+                // of a slot, not a dropped known row.
+                continue;
+            };
+            slot.source = row
+                .get("source")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned);
+            if let Some(code) = row.get("evidence").and_then(Value::as_str) {
+                if let Some(evidence) = evidence_from_code(code) {
+                    slot.evidence = evidence;
+                }
+            }
+            if let Some(fix) = row.get("fix").and_then(Value::as_str) {
+                if !fix.is_empty() {
+                    slot.fix = Some(fix.to_owned());
+                }
+            }
+        }
+    }
+    let host = body.get("host").unwrap_or(body);
+    DoctorReport {
+        host: HostFacts {
+            os: host
+                .get("os")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| std::env::consts::OS.to_owned()),
+            version: host
+                .get("version")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| "unknown".to_owned()),
+            privileged: host
+                .get("privileged")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        },
+        collectors,
+        categories,
+    }
+}
+
+fn collector_from_json(value: &Value) -> Option<CollectorProbe> {
+    let name = value.get("name").and_then(Value::as_str)?;
+    if name.is_empty() {
+        return None;
+    }
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .unwrap_or("unavailable");
+    let detail = value
+        .get("detail")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned);
+    Some(CollectorProbe {
+        name: name.to_owned(),
+        status: status.to_owned(),
+        detail,
+    })
+}
+
+fn evidence_from_code(text: &str) -> Option<Evidence> {
+    let (level, reason) = text.split_once('(').unwrap_or((text, ""));
+    match level.trim() {
+        "E1" => Some(Evidence::E1),
+        "E2" => Some(Evidence::E2),
+        "E3" => Some(Evidence::E3),
+        "S" => Some(Evidence::S),
+        "I" => Some(Evidence::I),
+        "NA" => {
+            let reason = reason.trim().trim_end_matches(')').trim();
+            let parsed = if reason.is_empty() {
+                NaReason::CollectorUnavailable
+            } else {
+                parse_na(reason)
+            };
+            Some(Evidence::NA(parsed))
+        }
+        _ => None,
+    }
+}
+
+fn parse_na(text: &str) -> NaReason {
+    match text {
+        "collector_unavailable" => NaReason::CollectorUnavailable,
+        "tls_no_proxy" => NaReason::TlsNoProxy,
+        _ => NaReason::Unknown,
+    }
+}
+
+fn clip_doctor(text: &str) -> String {
+    let mut out: String = text.chars().take(240).collect();
+    if text.chars().count() > 240 {
+        out.push('…');
+    }
+    out
 }
 
 /// Categories in capability-matrix order, all unavailable.

@@ -17,6 +17,7 @@ mod nettop;
 mod pktap;
 mod scope;
 mod sni;
+mod tier;
 
 #[cfg(target_os = "macos")]
 mod endpoint_security;
@@ -46,6 +47,10 @@ pub use sni::{
     handshake_sni, pid_in_session, unattributed_dns, GapNote, GapReason, SniError, UnattributedDns,
     DNS_UNATTRIBUTED, EVIDENCE_INFERRED, MDNS_RESPONDER as SNI_MDNS_RESPONDER, SOURCE_PKTAP_SNI,
     TCPDUMP_ARGS, TCPDUMP_BIN, UNATTRIBUTED_REASON,
+};
+pub use tier::{
+    capabilities as tier_capabilities, parse_tier_config, select_tier, tier_changed, Probe, Tier,
+    TierChange, TierChoice, TierConfig, TierError,
 };
 
 #[cfg(target_os = "macos")]

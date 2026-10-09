@@ -19,8 +19,9 @@ mod flows;
 mod gaps;
 mod hook;
 mod http;
-mod mcp_tap;
 mod http_source;
+mod mcp_tap;
+mod merge;
 mod procs;
 mod proxy;
 mod ps;
@@ -106,6 +107,9 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
         return Ok(outcome);
     }
     if let Some(outcome) = mcp_tap_command(&cli) {
+        return Ok(outcome);
+    }
+    if let Some(outcome) = merge_command(&cli) {
         return Ok(outcome);
     }
     if let Some(outcome) = proxy_command(&cli.command, json) {
@@ -243,6 +247,9 @@ fn dispatch(
     if let Some(outcome) = mcp_tap_command(&cli) {
         return Ok(outcome);
     }
+    if let Some(outcome) = merge_command(&cli) {
+        return Ok(outcome);
+    }
     if let Some(outcome) = proxy_command(&cli.command, json) {
         return Ok(outcome);
     }
@@ -304,6 +311,20 @@ fn hook_command(cli: &Cli, env_token: Option<&str>) -> Option<Outcome> {
         env_session.as_deref(),
         &input,
     ))
+}
+
+/// `aw merge` (P6-STORE-02). Reads two local JSONL files. Does not probe `/health`.
+fn merge_command(cli: &Cli) -> Option<Outcome> {
+    let Command::Merge { a, b, output, nat } = &cli.command else {
+        return None;
+    };
+    Some(merge::run(merge::MergeArgs {
+        a,
+        b,
+        output: output.as_deref(),
+        nat: nat.as_deref(),
+        json: cli.json,
+    }))
 }
 
 /// `aw mcp-tap` (P6-AGENT-01). An empty command stays on the usage path.

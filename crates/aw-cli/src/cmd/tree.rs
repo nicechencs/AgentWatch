@@ -272,6 +272,9 @@ pub(crate) enum Command {
         b: String,
         #[arg(short, long)]
         output: Option<String>,
+        /// NAT 映射，每行 `ip:port -> ip:port`，或一个 JSON 对象。缺省表示不改写。
+        #[arg(long)]
+        nat: Option<String>,
     },
     /// 接收 Agent hook 事件
     Hook {

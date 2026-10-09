@@ -21,6 +21,7 @@ path = "src/lib.rs"
 
 [dependencies]
 aw-core = { workspace = true }
+aw-store = { workspace = true }
 aw-pipeline = { workspace = true }
 aw-proxy = { workspace = true }
 # Path crate already in the workspace. Not a new third-party dependency.

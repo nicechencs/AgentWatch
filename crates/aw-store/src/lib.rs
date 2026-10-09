@@ -11,12 +11,13 @@
 
 mod agent_events;
 mod error;
-mod inter_agent;
 mod export;
 mod file_access;
 mod findings;
 mod fts;
 mod http;
+mod inter_agent;
+mod merge;
 mod migrate;
 mod query;
 mod retention;
@@ -31,12 +32,6 @@ pub use agent_events::{
     insert_agent_event, insert_self_report_gap, session_id_by_public, store_agent_event,
     AgentEventInsert,
 };
-pub use inter_agent::{
-    insert_agent_instance, insert_agent_link, insert_agent_rpc, insert_ipc_channel,
-    insert_watch_group, store_agent_instance, store_agent_link, store_agent_rpc,
-    store_ipc_channel, store_watch_group, AgentInstanceInsert, AgentLinkInsert, AgentRpcInsert,
-    IpcChannelInsert, WatchGroupInsert,
-};
 pub use error::StoreError;
 pub use export::{
     redact_host_field, redact_host_text, redact_user_paths, write_csv_zip, write_jsonl,
@@ -47,6 +42,13 @@ pub use file_access::FileAccessRow;
 pub use findings::{upsert_finding, FindingRef, FindingRow, MAX_REFS};
 pub use fts::{read_mode as read_fts_mode, set_mode as set_fts_mode, FtsMode, FtsSource};
 pub use http::{insert_http, HttpRow};
+pub use inter_agent::{
+    insert_agent_instance, insert_agent_link, insert_agent_rpc, insert_ipc_channel,
+    insert_watch_group, store_agent_instance, store_agent_link, store_agent_rpc, store_ipc_channel,
+    store_watch_group, AgentInstanceInsert, AgentLinkInsert, AgentRpcInsert, IpcChannelInsert,
+    WatchGroupInsert,
+};
+pub use merge::{merge_exports, ClockSkew, MergeError, MergeReport, MergeRequest};
 pub use migrate::FILE_SCHEMA_VERSION;
 pub use migrate::{
     apply_agent_schema, apply_http_schema, apply_inter_agent_schema, apply_proxy_schema,

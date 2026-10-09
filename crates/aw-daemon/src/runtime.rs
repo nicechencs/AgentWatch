@@ -38,6 +38,7 @@ use tracing_core::Metadata;
 use crate::api::{ApiState, HttpServer, OtlpRegistry, StoreQuery, DEFAULT_HTTP_PORT};
 use crate::config::{resolve_data_dir, ConfigWarning, DaemonConfig};
 use crate::paths::ensure_data_dir;
+use crate::sample::HostSampler;
 
 /// Lock file inside the data directory.
 pub const LOCK_FILE_NAME: &str = "agentwatchd.lock";
@@ -56,6 +57,10 @@ pub const LOG_KEEP: usize = 5;
 
 /// How often the foreground loop looks for the stop file.
 const POLL: Duration = Duration::from_millis(50);
+
+/// How often that loop also takes a poll sample. A divisor of the wait so a
+/// sample is not late by more than one stop-file poll.
+const SAMPLE_EVERY_POLLS: u32 = 5;
 
 const SHUTDOWN_STOP_COLLECTORS: &str = "shutdown: stop collectors";
 const SHUTDOWN_FLUSH: &str = "shutdown: flush pipeline";
@@ -485,10 +490,23 @@ pub fn run_foreground(
         }
     };
 
+    // Poll only. No ETW, eBPF, or eslogger. The sampler attaches to pid 1 so
+    // the host source refreshes the process table; launch scope would not.
+    // See `sample.rs`. A machine where pid 1's identity cannot be hashed does
+    // not start sampling — that is logged, and the stop loop still runs.
+    let mut sampler = HostSampler::new(data_dir.join("agentwatch.db"));
+    sampler.start();
+    let mut polls_until_sample: u32 = SAMPLE_EVERY_POLLS;
+
     while !stop.is_set() {
         if stop_path.is_file() {
             stop.request();
             break;
+        }
+        polls_until_sample = polls_until_sample.saturating_sub(1);
+        if polls_until_sample == 0 {
+            sampler.tick();
+            polls_until_sample = SAMPLE_EVERY_POLLS;
         }
         thread::sleep(POLL);
     }
@@ -497,6 +515,12 @@ pub fn run_foreground(
     if let Some(server) = http.as_mut() {
         server.shutdown();
     }
+
+    // The sampler is stopped before the shutdown lines. One last tick flushes
+    // the delta, then the collector is stopped. The three lines below stay in
+    // this order: tests match them.
+    sampler.flush();
+    sampler.stop();
 
     // Order is part of the acceptance test. Do not reorder these lines.
     tracing::info!("{}", SHUTDOWN_STOP_COLLECTORS);

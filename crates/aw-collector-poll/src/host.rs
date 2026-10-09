@@ -21,7 +21,7 @@ use crate::source::{
 /// Reads the process table through `sysinfo`.
 ///
 /// Not `Debug`: the inner [`System`] retains command lines.
-pub(crate) struct HostProcessSource {
+pub struct HostProcessSource {
     system: System,
     /// `None` refreshes every process. `Some` refreshes only those pids, and an
     /// empty slice refreshes nothing.
@@ -140,7 +140,7 @@ fn row_from_process(process: &sysinfo::Process) -> ProcessRow {
 /// declares net as `NA` instead of emitting a gap on every tick.
 ///
 /// Not `Debug`: a failed spawn must not be formatted with the command line.
-pub(crate) struct HostConnectionSource {
+pub struct HostConnectionSource {
     unavailable: Option<NaReason>,
 }
 

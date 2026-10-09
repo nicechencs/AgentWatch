@@ -33,6 +33,7 @@ mod config;
 mod file_hasher;
 mod paths;
 mod runtime;
+mod sample;
 mod service;
 mod session;
 mod supervisor;

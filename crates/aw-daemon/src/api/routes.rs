@@ -2299,10 +2299,59 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or("s-1")
             .to_owned();
+        // These two answer 200 and say the data was not collected. That is not
+        // a 501, and it is not an empty success.
+        let doctor = dispatch(
+            &mut state,
+            &req(
+                "GET",
+                "/api/v1/doctor",
+                Some("127.0.0.1:7456"),
+                Some(&alice),
+                b"",
+            ),
+        );
+        assert_eq!(doctor.status, 200);
+        assert_eq!(
+            json_body(&doctor).get("probed").and_then(Value::as_bool),
+            Some(false)
+        );
+        let processes = dispatch(
+            &mut state,
+            &req(
+                "GET",
+                "/api/v1/processes",
+                Some("127.0.0.1:7456"),
+                Some(&alice),
+                b"",
+            ),
+        );
+        assert_eq!(processes.status, 200);
+        assert_eq!(
+            json_body(&processes)
+                .get("available")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        // No database is configured on this state, so stats are null, not 0.
+        let stats = dispatch(
+            &mut state,
+            &req(
+                "GET",
+                "/api/v1/db/stats",
+                Some("127.0.0.1:7456"),
+                Some(&alice),
+                b"",
+            ),
+        );
+        assert_eq!(stats.status, 200, "{}", String::from_utf8_lossy(&stats.body));
+        let stats_body = json_body(&stats);
+        assert!(stats_body.get("db_bytes").is_some_and(Value::is_null), "{stats_body}");
+        assert_eq!(
+            stats_body.get("scope").and_then(Value::as_str),
+            Some("unconfigured")
+        );
         let cases = [
-            ("GET", "/api/v1/doctor", "doctor"),
-            ("GET", "/api/v1/processes", "processes"),
-            ("GET", "/api/v1/db/stats", "db_stats"),
             ("GET", &format!("/api/v1/sessions/{id}/export"), "export"),
             ("GET", &format!("/api/v1/sessions/{id}/flows"), "flows"),
             (

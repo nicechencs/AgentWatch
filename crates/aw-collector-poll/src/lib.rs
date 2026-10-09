@@ -29,6 +29,9 @@ pub use netstat::parse_netstat_ano;
 pub use poll::{
     PollCollector, PollConfig, PollError, DEFAULT_CONN_INTERVAL, DEFAULT_PROC_INTERVAL,
 };
+// The daemon's foreground sampler has to name `PollCollector`'s type
+// parameters. The host adapters stay unconstructed outside `with_host`.
+pub use host::{HostConnectionSource, HostProcessSource};
 pub use source::{
     ConnectionRow, ConnectionSnapshot, ConnectionSource, ProcessRow, ProcessSnapshot,
     ProcessSource, ProcessStartTime, StaticConnectionSource, StaticProcessSource,

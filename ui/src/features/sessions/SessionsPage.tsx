@@ -97,7 +97,11 @@ export function SessionsPage() {
         <button
           type="button"
           disabled={picked.size !== 2}
-          title={t("sessions.compareDisabled")}
+          title={picked.size === 2 ? t("sessions.compare") : t("sessions.compareNeedTwo")}
+          onClick={() => {
+            const [first, second] = [...picked];
+            if (first && second) void navigate({ to: "/compare", search: { a: first, b: second } });
+          }}
           className="ml-auto rounded border border-line px-2 py-1 disabled:text-ink-faint"
         >
           {t("sessions.compare")}

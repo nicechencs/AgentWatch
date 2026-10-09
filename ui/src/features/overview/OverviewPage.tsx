@@ -1,13 +1,16 @@
 import type { ReactNode } from "react";
-import { useNavigate, useParams } from "@tanstack/react-router";
-import { useQuery } from "@tanstack/react-query";
+import { Link, useNavigate, useParams } from "@tanstack/react-router";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { api } from "@/api/client";
 import type { SessionSummary, TopEntry } from "@/api/types";
+import { allFindings, findingsQueryOptions } from "@/features/findings/api";
+import type { Finding } from "@/features/findings/types";
 import { Bytes } from "@/components/Bytes";
 import { Count } from "@/components/Count";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { ErrorNote, Loading } from "@/components/QueryState";
 import { useI18n } from "@/lib/i18n";
+import { usePrefs } from "@/lib/prefs";
 import { useSessionQuery } from "@/lib/session-query";
 
 export function OverviewPage() {
@@ -27,7 +30,9 @@ export function OverviewPage() {
 
 function Overview({ summary, filter }: { summary: SessionSummary; filter: string }) {
   const { t } = useI18n();
+  const { lang } = usePrefs();
   const navigate = useNavigate();
+  const findings = useInfiniteQuery(findingsQueryOptions(summary.session.public_id, lang));
   const { session } = summary;
   const approx = summary.approximate;
   const reason = summary.approximate_reason;
@@ -90,11 +95,15 @@ function Overview({ summary, filter }: { summary: SessionSummary; filter: string
       <div className="mt-4 grid gap-4 lg:grid-cols-2">
         <section className="rounded border border-line p-3">
           <h2 className="text-sm font-medium">{t("overview.findings")}</h2>
-          <p className="mt-2 text-xs">
-            {t("overview.findingsEmpty")}
-            {summary.gap_count > 0 ? <span className="text-ink-faint"> · {t("overview.findingsEmptyGaps", { count: summary.gap_count })}</span> : null}
-          </p>
-          <p className="mt-1 text-[11px] text-ink-faint">{t("overview.findingsLater")}</p>
+          <FindingsPreview
+            loading={findings.isLoading}
+            failed={findings.isError}
+            message={findings.error instanceof Error ? findings.error.message : ""}
+            onRetry={() => void findings.refetch()}
+            items={allFindings(findings.data?.pages)}
+            sid={session.public_id}
+            gapCount={summary.gap_count}
+          />
         </section>
 
         <TopTable
@@ -120,6 +129,48 @@ function Overview({ summary, filter }: { summary: SessionSummary; filter: string
           render={(row) => <Count value={row.count} />}
         />
       </div>
+    </div>
+  );
+}
+
+const PREVIEW = 5;
+
+function FindingsPreview({
+  loading, failed, message, onRetry, items, sid, gapCount,
+}: {
+  loading: boolean;
+  failed: boolean;
+  message: string;
+  onRetry: () => void;
+  items: Finding[];
+  sid: string;
+  gapCount: number;
+}) {
+  const { t } = useI18n();
+  if (loading) return <p className="mt-2 text-xs text-ink-faint">{t("common.loading")}</p>;
+  if (failed) return <ErrorNote message={message} onRetry={onRetry} />;
+  if (items.length === 0) {
+    return (
+      <p className="mt-2 text-xs">
+        {t("overview.findingsEmpty")}
+        {gapCount > 0 ? <span className="text-ink-faint"> · {t("overview.findingsEmptyGaps", { count: gapCount })}</span> : null}
+      </p>
+    );
+  }
+  const shown = items.slice(0, PREVIEW);
+  return (
+    <div className="mt-2">
+      <ul className="space-y-1 text-xs">
+        {shown.map((finding) => (
+          <li key={finding.id} className="truncate">
+            <span className="mr-1 text-ink-faint">{finding.evidence}</span>
+            {finding.text ?? t("common.unavailable")}
+          </li>
+        ))}
+      </ul>
+      <Link to="/s/$sid/findings" params={{ sid }} search={{}} className="mt-2 inline-block text-[11px] underline">
+        {t("overview.findingsOpen", { count: items.length })}
+      </Link>
     </div>
   );
 }

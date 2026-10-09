@@ -17,6 +17,9 @@ export function AppShell() {
           <Link to="/search" search={{ q: undefined, kind: undefined }} activeProps={{ className: "text-xs text-ink" }}>
             {t("nav.search")}
           </Link>
+          <Link to="/compare" search={{ a: undefined, b: undefined }} activeProps={{ className: "text-xs text-ink" }}>
+            {t("nav.compare")}
+          </Link>
           <Link to="/settings" activeProps={{ className: "text-xs text-ink" }}>
             {t("nav.settings")}
           </Link>

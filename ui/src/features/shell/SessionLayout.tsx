@@ -17,6 +17,7 @@ const TABS = [
   { to: "/s/$sid/files", key: "nav.files" },
   { to: "/s/$sid/network", key: "nav.network" },
   { to: "/s/$sid/findings", key: "nav.findings" },
+  { to: "/s/$sid/self-report", key: "nav.selfReport" },
   { to: "/s/$sid/gaps", key: "nav.gaps" },
 ] as const;
 

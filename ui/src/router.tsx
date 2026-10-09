@@ -14,6 +14,8 @@ import { GapsPage } from "@/features/gaps/GapsPage";
 import { FindingsPage } from "@/features/findings/FindingsPage";
 import { SettingsPage } from "@/features/settings/SettingsPage";
 import { SearchPage } from "@/features/search/SearchPage";
+import { SelfReportPage } from "@/features/self-report/SelfReportPage";
+import { ComparePage } from "@/features/compare/ComparePage";
 
 const text = (value: unknown) => (typeof value === "string" ? value : undefined);
 
@@ -59,6 +61,19 @@ const settingsRoute = createRoute({
   getParentRoute: () => shellRoute,
   path: "/settings",
   component: SettingsPage,
+});
+
+const compareRoute = createRoute({
+  getParentRoute: () => shellRoute,
+  path: "/compare",
+  validateSearch: (raw: Record<string, unknown>) => ({
+    a: text(raw.a),
+    b: text(raw.b),
+  }),
+  component: function CompareRoute() {
+    const { a, b } = compareRoute.useSearch();
+    return <ComparePage initialA={a} initialB={b} />;
+  },
 });
 
 const sessionRoute = createRoute({
@@ -110,6 +125,12 @@ const findingsRoute = createRoute({
   component: FindingsPage,
 });
 
+const selfReportRoute = createRoute({
+  getParentRoute: () => sessionRoute,
+  path: "/self-report",
+  component: SelfReportPage,
+});
+
 // Pages owned by later phases: present in the information architecture, but
 // not built here. They redirect to the overview so a shared link still lands.
 const laterRoute = createRoute({
@@ -122,7 +143,7 @@ const laterRoute = createRoute({
 });
 
 const routeTree = RootRoute.addChildren([
-    shellRoute.addChildren([indexRoute, newRoute, searchRoute, settingsRoute]),
+    shellRoute.addChildren([indexRoute, newRoute, searchRoute, settingsRoute, compareRoute]),
     sessionRoute.addChildren([
       overviewRoute,
       timelineRoute,
@@ -130,6 +151,7 @@ const routeTree = RootRoute.addChildren([
       filesRoute,
       networkRoute,
       findingsRoute,
+      selfReportRoute,
       gapsRoute,
       laterRoute,
     ]),

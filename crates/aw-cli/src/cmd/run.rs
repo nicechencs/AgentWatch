@@ -7,18 +7,20 @@
 //! target's exit code comes back unchanged.
 //!
 //! `--self-report`, `--mcp-tap`, and `--unsafe-no-redact` are refused with a
-//! pointer at the later card. `--proxy` is accepted as a request and then
-//! refused by [`proxy_unavailable`]: this build plans the environment
-//! ([`aw_proxy::plan_injection`]) but does not open a listener or launch the
-//! target, because the daemon session API is not connected. Nothing here
-//! disables redaction.
+//! pointer at the later card. `--proxy` is a launch-mode injection plan
+//! ([`aw_proxy::plan_injection`]): this process does not open a listener,
+//! because the daemon has no "open a proxy and return its port" call and has
+//! no tokio runtime to host [`aw_proxy::MitmProxy`]. The plan names the
+//! variables and whether each one overwrites; it does not invent a port.
+//! Nothing here disables redaction, writes a shell rc, or touches a
+//! certificate store.
 //!
 //! Command text, environment values, and the working directory are inputs to
 //! the launcher. They are not written to stdout, stderr, or an error string.
 
 use std::io::{self, Write};
 
-use aw_proxy::{hint_for_exe, plan_injection, ProxyOnReject};
+use aw_proxy::{plan_injection, Injection, ProxyOnReject};
 
 use serde_json::{json, Value};
 
@@ -60,7 +62,7 @@ pub(crate) struct RunArgs<'a> {
 }
 
 /// Later-card flags. Present means the command stops before any launch,
-/// except the proxy pair, which is checked by [`proxy_unavailable`] first.
+/// except the proxy pair, which [`proxy_plan`] turns into an injection plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeferredFlags<'a> {
     /// `--proxy`.
@@ -220,8 +222,26 @@ pub(crate) fn run(
     launcher: &mut dyn Launcher,
     summary: &mut dyn SessionSummary,
 ) -> Outcome {
-    if let Some(detail) = proxy_unavailable(args, deferred) {
-        return super::error_outcome(exit::GENERAL, "not_available", &detail, args.json);
+    let planned = match proxy_plan(args, deferred) {
+        Ok(planned) => planned,
+        Err(detail) => {
+            return super::error_outcome(exit::USAGE, "usage", &detail, args.json);
+        }
+    };
+    // The production launcher does not create the child (P1-WIN-04 is still the
+    // unverified stub). Printing the plan and then calling it would turn a
+    // successful plan into a launch error, so a proxy plan stops here. No
+    // process is created, which is also what the child-start gap requires.
+    if let Some(plan) = &planned {
+        let mut stderr = Vec::new();
+        if let Err(err) = write_proxy_plan(&mut stderr, plan) {
+            return super::error_outcome(exit::GENERAL, "proxy", &err.to_string(), args.json);
+        }
+        return Outcome {
+            code: exit::GENERAL,
+            stdout: Vec::new(),
+            stderr,
+        };
     }
     if let Some(detail) = deferred_reason(deferred) {
         return super::error_outcome(exit::GENERAL, "not_available", &detail, args.json);
@@ -283,45 +303,116 @@ pub(crate) fn run(
     }
 }
 
-/// `--proxy` is implemented as a plan, not a launch.
+/// Why a launch-mode `--proxy` plan has no port.
 ///
-/// The message still contains `P3/P5` and `--proxy` so the existing refusal
-/// check keeps passing: nothing is launched, and the daemon is not contacted.
-/// A bad `--proxy-on-reject` value is named. A known Electron-family argv0 adds
-/// the static hint. The hint does not include the command's other arguments.
-fn proxy_unavailable(args: &RunArgs<'_>, flags: DeferredFlags) -> Option<String> {
+/// `aw run` returns in this process. The daemon session helper
+/// `prepare_proxy` only plans an environment for a port the caller already
+/// holds, and the daemon runtime has no tokio runtime, so
+/// [`aw_proxy::MitmProxy::bind`] cannot run there either. Binding in the CLI
+/// would leave a listener whose events nobody reads. The plan therefore
+/// records that no port exists.
+const PROXY_PORT_UNBOUND: &str = "监听未启动，没有可用端口";
+
+/// One line on stderr. Says the child was not started and nothing on the
+/// system was changed. Does not claim the listener is missing from this build.
+const PROXY_PLAN_NOTE: &str = "子进程启动尚未接入，本次只给出注入计划，没有设置系统代理，没有改证书库";
+
+/// `<session_tmp>` is the directory a later card will pass to
+/// [`aw_proxy::write_session_material`]. These are the planned paths only.
+const SESSION_CA_PEM: &str = "<session_tmp>/ca.pem";
+const SESSION_BUNDLE_PEM: &str = "<session_tmp>/bundle.pem";
+
+/// A launch-mode injection plan. Holds no environment values.
+struct ProxyPlan {
+    /// Parsed `--proxy-on-reject`. Default `fail` when the flag was absent.
+    on_reject: ProxyOnReject,
+    /// Names, overwrite marks, and the static hint. Values stay inside.
+    injection: Injection,
+}
+
+/// Turn a launch-mode `--proxy` into a plan, or refuse the flag.
+///
+/// `Ok(None)` means the command did not ask for a proxy. `Err` is a usage
+/// error: `--proxy-on-reject` without `--proxy`, or a value other than
+/// `fail` / `tunnel`. Exit code is [`crate::exit::USAGE`], the same code the
+/// other bad arguments of this command use.
+///
+/// No listener is bound, so the port `plan_injection` writes into its proxy
+/// URL is discarded before the plan is kept. [`write_proxy_plan`] prints
+/// [`PROXY_PORT_UNBOUND`] and never a loopback URL. `NO_PROXY` still comes from
+/// [`plan_injection`]; this function does not rewrite it.
+fn proxy_plan(args: &RunArgs<'_>, flags: DeferredFlags) -> Result<Option<ProxyPlan>, String> {
     if !flags.proxy && !flags.proxy_on_reject {
-        return None;
+        return Ok(None);
     }
     if flags.proxy_on_reject && !flags.proxy {
-        return Some(
-            "`--proxy-on-reject` 需要同时指定 `--proxy`。P3/P5 的监听尚未接入，nothing was launched"
-                .to_owned(),
-        );
+        return Err("`--proxy-on-reject` 需要同时指定 `--proxy`".to_owned());
     }
-    if let Some(text) = flags.proxy_on_reject_value {
-        if ProxyOnReject::parse(text).is_none() {
-            return Some(
-                "`--proxy-on-reject` 只接受 fail 或 tunnel。P3/P5 的监听尚未接入，nothing was launched。--proxy 未启动"
-                    .to_owned(),
-            );
-        }
-    }
-    // The plan is computed so a bad path would surface here. The port is 0 only
-    // as "no listener was bound", and the plan is not printed (it would contain
-    // a URL). Hints do not contain the URL either.
+    let on_reject = match flags.proxy_on_reject_value {
+        None => ProxyOnReject::Fail,
+        Some(text) => ProxyOnReject::parse(text)
+            .ok_or_else(|| "`--proxy-on-reject` 只接受 fail 或 tunnel".to_owned())?,
+    };
     let exe = args.command.first().map(String::as_str);
-    let _plan = plan_injection(0, "ca.pem", "bundle.pem", &[], exe);
-    let mut message = String::from(
-        "--proxy is not available in this build (P3/P5 提供); nothing was launched. 监听端口尚未接入 daemon",
-    );
-    if let Some(exe) = exe {
-        if let Some(hint) = hint_for_exe(exe) {
-            message.push(' ');
-            message.push_str(hint);
-        }
+    // `plan_injection` takes a port and writes it into the proxy URL. Nothing
+    // is listening, so that URL is not a plan this process may keep: drop every
+    // value and keep the names, the overwrite marks, and the hint. `NO_PROXY`
+    // is still produced by `plan_injection` (appended, not replaced); this
+    // function does not build its own value.
+    let raw = plan_injection(0, SESSION_CA_PEM, SESSION_BUNDLE_PEM, &[], exe);
+    let injection = Injection {
+        vars: raw
+            .vars
+            .into_iter()
+            .map(|(name, _value)| (name, String::new()))
+            .collect(),
+        overwritten: raw.overwritten,
+        hints: raw.hints,
+    };
+    Ok(Some(ProxyPlan {
+        on_reject,
+        injection,
+    }))
+}
+
+/// Print the plan. Variable values are not written: [`Injection`]'s `Debug`
+/// already lists names only, and this follows that.
+fn write_proxy_plan(out: &mut dyn Write, plan: &ProxyPlan) -> io::Result<()> {
+    writeln!(out, "[aw] {PROXY_PLAN_NOTE}")?;
+    writeln!(out, "[aw] 代理端口：{PROXY_PORT_UNBOUND}。未绑定的端口不会被印成可用代理")?;
+    writeln!(
+        out,
+        "[aw] --proxy-on-reject {}。CA 计划路径 {SESSION_CA_PEM}，bundle 计划路径 {SESSION_BUNDLE_PEM}。证书库未修改",
+        plan.on_reject.as_str()
+    )?;
+    let names: Vec<&str> = plan
+        .injection
+        .vars
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let overwritten: Vec<&str> = plan
+        .injection
+        .overwritten
+        .iter()
+        .map(|row| row.name.as_str())
+        .collect();
+    writeln!(out, "[aw] 注入变量（仅名称）: {}", names.join(", "))?;
+    if overwritten.is_empty() {
+        writeln!(out, "[aw] 覆盖: 无（调用方没有传入已有环境）")?;
+    } else {
+        writeln!(out, "[aw] 覆盖: {}", overwritten.join(", "))?;
     }
-    Some(message)
+    writeln!(
+        out,
+        "[aw] NO_PROXY 由注入计划生成：已有值则追加 localhost,127.0.0.1,::1，否则只写这三项。不在此处另写一套"
+    )?;
+    for hint in &plan.injection.hints {
+        // The hint says the operator must add `--proxy-server` themselves.
+        // Nothing here appends it to argv.
+        writeln!(out, "[aw] {hint}")?;
+    }
+    Ok(())
 }
 
 fn deferred_reason(flags: DeferredFlags) -> Option<String> {
@@ -723,8 +814,10 @@ mod tests {
         );
         assert_eq!(outcome.code, exit::GENERAL);
         let err = text(&outcome.stderr);
-        assert!(err.contains("P3/P5"), "{err}");
-        assert!(err.contains("--proxy"), "{err}");
+        assert!(err.contains("注入计划"), "{err}");
+        assert!(err.contains("监听未启动"), "{err}");
+        assert!(!err.contains("127.0.0.1:0"), "{err}");
+        assert!(!err.contains("not available in this build"), "{err}");
         assert!(launcher.sampling_seen.is_none(), "launcher must not run");
     }
 

@@ -10,9 +10,20 @@
 //! them, and it does not read anything past that prefix.
 //!
 //! When the kernel cannot read user memory at `tcp_sendmsg`, [`SniAttach::attach`]
-//! returns [`SniError::FallbackNeeded`]. The caller then either switches to
-//! AF_PACKET (`source = linux.afpacket/sni`) or records a gap. This module does
-//! neither: it does not open a packet socket.
+//! returns [`SniError::FallbackNeeded`]. [`SniAttach::start`] is the collector
+//! entry that records that refusal as a [`aw_core::Gap`]: Aya is not linked and
+//! `sni.bpf.c` is not built, so `tcp_sendmsg` was not attached. The gap is
+//! `GapKind::Unsupported` (the existing "this collector cannot do this" variant)
+//! with `detail` `sni_attach_unavailable`. It is not a `tls_sni` event and it is
+//! not evidence that a hostname was seen.
+//!
+//! AF_PACKET is not opened here. `socket(AF_PACKET)` needs `CAP_NET_RAW` and a
+//! libc binding this crate does not have, and a failed open on a non-Linux host
+//! would be a different fact from "the privileged runtime has not been written".
+//! The fallback stays with the privileged runtime. [`SniExtractor`] still accepts
+//! a prefix the caller already copied and stamps `linux.afpacket/sni` on it.
+//! This module never invents an empty prefix to stand in for a packet it did
+//! not read.
 //!
 //! Only a process the caller has already placed in the session is accepted.
 //! A prefix whose tgid is not in that set produces nothing.
@@ -23,8 +34,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use aw_core::{
     tls::{parse_client_hello, ClientHelloInfo, ParseError},
-    EventKind, Evidence, FlowKey, L4Proto, NaReason, ProcRef, ProcUid, RawEvent, SessionId, Source,
-    TlsSni, SCHEMA_VERSION,
+    EventKind, Evidence, FlowKey, Gap, GapKind, L4Proto, NaReason, ProcRef, ProcUid, RawEvent,
+    SessionId, Source, TlsSni, SCHEMA_VERSION,
 };
 
 /// `linux.ebpf/tcp_sendmsg_sni`. The task card names this string.
@@ -33,6 +44,22 @@ pub const SOURCE_EBPF_SNI: &str = "linux.ebpf/tcp_sendmsg_sni";
 /// `linux.afpacket/sni`. Used only when the caller takes the fallback path.
 /// This module never opens the socket that would produce it.
 pub const SOURCE_AFPACKET_SNI: &str = "linux.afpacket/sni";
+
+/// `linux.ebpf/tcp_sendmsg_sni` stamped on the attach gap.
+///
+/// The probe name is the one that was *not* attached. The event kind is `gap`,
+/// so this source does not claim a ClientHello was observed.
+pub const SOURCE_SNI_GAP: &str = SOURCE_EBPF_SNI;
+
+/// `Gap.detail` when [`SniAttach::start`] cannot load the probe.
+///
+/// Aya is not linked and `sni.bpf.c` is not compiled, so `tcp_sendmsg` is not
+/// attached. This is a collector limitation ([`GapKind::Unsupported`]), not a
+/// hostname that happened to be missing. A later privileged runtime that
+/// actually calls `socket(AF_PACKET)` and fails records a *different* detail,
+/// `afpacket_unavailable`. This crate does not open that socket, so it does
+/// not emit that string.
+pub const SNI_ATTACH_UNAVAILABLE: &str = "sni_attach_unavailable";
 
 /// Bytes the probe is allowed to copy from the first write. linux.md §2.3.
 pub const SNI_PREFIX_CAP: usize = 1024;
@@ -77,9 +104,10 @@ impl SniSource {
 pub enum SniError {
     /// `bpf_probe_read_user` is not available at this attach point.
     ///
-    /// The caller decides what happens next: open an AF_PACKET socket and feed
-    /// its first payload back with [`SniSource::AfPacket`], or write a gap.
-    /// This variant carries no bytes and does not name a process.
+    /// [`SniAttach::start`] turns this into a [`aw_core::Gap`]. A caller that
+    /// already holds a copied prefix can still feed it back with
+    /// [`SniSource::AfPacket`]. This variant carries no bytes and does not name
+    /// a process. Opening `AF_PACKET` is not this crate's job.
     FallbackNeeded {
         /// Why the kernel read was refused, as reported by the loader.
         reason: String,
@@ -309,8 +337,16 @@ fn unspec() -> SocketAddr {
 /// Stand-in for the kprobe this task does not attach.
 ///
 /// [`Self::attach`] never loads `sni.bpf.c`. Aya is not linked, and the crate's
-/// [`crate::loader::BpfLoader`] stub refuses every attach. Calling this reports
-/// [`SniError::FallbackNeeded`] so the caller can choose AF_PACKET or a gap.
+/// [`crate::loader::BpfLoader`] stub refuses every attach. [`Self::start`] is
+/// what the collector calls: it turns that refusal into one [`aw_core::Gap`]
+/// instead of leaving the missing SNI silent.
+///
+/// AF_PACKET is intentionally not attempted. The socket needs `CAP_NET_RAW`
+/// and a libc binding, neither of which belongs in this unprivileged crate.
+/// A privileged runtime that later opens the socket and fails must record its
+/// own gap with detail `afpacket_unavailable`, distinct from
+/// [`SNI_ATTACH_UNAVAILABLE`]. It must not invent an empty first-write to look
+/// like a packet was read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SniAttach {
     enabled: bool,
@@ -347,4 +383,74 @@ impl SniAttach {
                 .to_owned(),
         })
     }
+
+    /// Collector entry for the SNI probe.
+    ///
+    /// Config off (`None` or `Some(false)`) returns nothing: SNI was not asked
+    /// for, so there is no silent loss to record.
+    ///
+    /// Config on always returns one gap. [`Self::attach`] cannot succeed in
+    /// this crate, and the refusal is `GapKind::Unsupported` with detail
+    /// [`SNI_ATTACH_UNAVAILABLE`]. The event evidence is E1 because the gap
+    /// itself was observed. The hostname was not: there is no `tls_sni` event,
+    /// and nothing here is stamped E1 as a seen name.
+    ///
+    /// `seq` is the caller's next sequence number. `mono_ns` is the collector
+    /// clock at the refusal; `wall_ns` is `None` when the caller has no wall
+    /// clock, and the field is then `NA(collector_unavailable)` rather than
+    /// epoch 0 presented as a real time.
+    ///
+    /// This does not open an `AF_PACKET` socket. See the type-level note.
+    #[must_use]
+    pub fn start(&self, seq: u64, mono_ns: u64, wall_ns: Option<i64>) -> Option<RawEvent> {
+        if !self.enabled {
+            return None;
+        }
+        let Err(SniError::FallbackNeeded { reason }) = self.attach() else {
+            // `attach` is infallibly `FallbackNeeded` today. A later task that
+            // makes it succeed must not report a gap for a probe that loaded.
+            return None;
+        };
+        Some(attach_gap(seq, mono_ns, wall_ns, &reason))
+    }
+}
+
+/// One gap for a probe that was not attached.
+///
+/// `reason` is the loader text from [`SniError::FallbackNeeded`]. It is folded
+/// into `detail` after the stable token [`SNI_ATTACH_UNAVAILABLE`], so a reader
+/// can match the token without parsing the sentence. The count is `None`: no
+/// event was counted, and `0` would mean "we counted zero losses".
+fn attach_gap(seq: u64, mono_ns: u64, wall_ns: Option<i64>, reason: &str) -> RawEvent {
+    let wall_missing = wall_ns.is_none();
+    let source = Source::new(SOURCE_SNI_GAP);
+    let gap = Gap::new(
+        source.clone(),
+        GapKind::Unsupported,
+        vec!["net".to_owned()],
+        mono_ns,
+        mono_ns,
+        None,
+        Some(format!("{SNI_ATTACH_UNAVAILABLE}: {reason}")),
+    );
+    let mut event = RawEvent {
+        v: SCHEMA_VERSION,
+        seq,
+        ts_mono_ns: mono_ns,
+        ts_wall_ns: wall_ns.unwrap_or(0),
+        session_id: None,
+        proc: None,
+        source,
+        // The gap is a fact about the collector. It is not a fact about a hostname.
+        evidence: Evidence::E1,
+        field_evidence: std::collections::BTreeMap::new(),
+        kind: EventKind::Gap(gap),
+    };
+    event.mark_na("proc", NaReason::CollectorUnavailable);
+    event.mark_na("count", NaReason::CollectorUnavailable);
+    if wall_missing {
+        event.mark_na("ts_wall_ns", NaReason::CollectorUnavailable);
+    }
+    let _ = event.check();
+    event
 }

@@ -351,6 +351,10 @@ pub fn run_launch<A: JobApi>(
 /// that is measured, this type refuses every step with
 /// [`LaunchError::NotVerified`] instead of calling Win32 from a default test
 /// or from an unwired command.
+///
+/// This type is the test stub. Production uses [`CommandJobApi`] via
+/// [`production`]. Do not replace this impl with a live spawn: the
+/// "does not create a process" test depends on the refusal.
 #[cfg(target_os = "windows")]
 #[derive(Debug, Default)]
 pub struct UnverifiedJobApi;
@@ -395,6 +399,167 @@ impl JobApi for UnverifiedJobApi {
         Err(LaunchError::NotVerified {
             step: "WaitForSingleObject",
         })
+    }
+}
+
+/// Why [`CommandJobApi`] does not call `AssignProcessToJobObject`.
+///
+/// `aw-cli` is covered by the workspace `forbid(unsafe_code)` lint, and it does
+/// not depend on the `windows` crate (that dependency belongs to
+/// `aw-collector-windows`). `CreateJobObjectW`, `AssignProcessToJobObject`,
+/// `SetInformationJobObject(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)`, and
+/// `ResumeThread` are unsafe FFI. They are not called from this crate, and
+/// `std::process::Command` cannot pass `CREATE_SUSPENDED` or
+/// `CREATE_NEW_PROCESS_GROUP`.
+///
+/// Spawning first and killing afterwards would let the target run outside a
+/// Job. This type therefore does not spawn. [`JOB_UNAVAILABLE`] is returned
+/// from `create_suspended` before `CreateProcess`. Breakaway is not set,
+/// because no Job exists to set it on. Nothing here claims the process is in
+/// a Job.
+#[cfg(target_os = "windows")]
+const JOB_UNAVAILABLE: &str = "Job assignment is unavailable in aw-cli: the windows crate is not a dependency and unsafe Win32 is forbidden, so CreateProcessW(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP), CreateJobObjectW, AssignProcessToJobObject, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, and ResumeThread were not called; no process was created and no process is in a Job";
+
+/// Production [`JobApi`] for Windows.
+///
+/// Does not spawn. `create_suspended` checks that the program name is non-empty
+/// and that a file with that name exists when the name contains a path
+/// separator, then returns [`LaunchError::JobFailed`] with [`JOB_UNAVAILABLE`].
+/// A missing program is [`LaunchError::CreateFailed`]. argv is not written to
+/// a log or to an error `Display`.
+///
+/// The trait's later steps exist so a caller that somehow holds a pid can still
+/// refuse to resume it. They do not create a Job.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Default)]
+pub struct CommandJobApi {
+    /// Pid this object would own. Production never sets it: spawn does not run.
+    child: Option<std::process::Child>,
+}
+
+/// Production Windows launcher. Only compiled on Windows.
+///
+/// On any other OS this function does not exist, so a non-Windows binary
+/// cannot construct the API and cannot spawn.
+#[cfg(target_os = "windows")]
+#[must_use]
+pub fn production() -> CommandJobApi {
+    CommandJobApi::default()
+}
+
+#[cfg(target_os = "windows")]
+impl CommandJobApi {
+    fn child_mut(&mut self) -> Result<&mut std::process::Child, LaunchError> {
+        self.child.as_mut().ok_or_else(|| LaunchError::WaitFailed {
+            detail: "no child exists for this step".to_owned(),
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl JobApi for CommandJobApi {
+    fn create_suspended(&mut self, request: &LaunchRequest) -> Result<u32, LaunchError> {
+        if request.identity != LaunchIdentity::CallingUser {
+            return Err(LaunchError::CreateFailed {
+                detail: "only the calling user may launch; SYSTEM is not a path".to_owned(),
+            });
+        }
+        let Some((program, _args)) = request.command.split_first() else {
+            return Err(LaunchError::EmptyCommand);
+        };
+        if program.is_empty() {
+            return Err(LaunchError::CreateFailed {
+                detail: "CreateProcess program name is empty".to_owned(),
+            });
+        }
+        // A path-shaped program that is not a file fails the way CreateProcess
+        // would, without starting anything. A bare name is not searched: PATH
+        // lookup plus a later Job failure would still be a spawn, and this
+        // build must not spawn a process it cannot put in a Job.
+        let path = std::path::Path::new(program);
+        if path.components().count() > 1 && !path.is_file() {
+            return Err(LaunchError::CreateFailed {
+                detail: "CreateProcess program path is not a file".to_owned(),
+            });
+        }
+        // No `Command::spawn`. CREATE_SUSPENDED cannot be set, so a running
+        // child would sit outside a Job until terminate. Refuse first.
+        let _ = self.child.take();
+        Err(LaunchError::JobFailed {
+            detail: JOB_UNAVAILABLE.to_owned(),
+        })
+    }
+
+    fn create_job_and_assign(
+        &mut self,
+        pid: u32,
+        allow_breakaway: bool,
+    ) -> Result<(), LaunchError> {
+        // No Job is created. `allow_breakaway` is not applied: setting
+        // JOB_OBJECT_LIMIT_BREAKAWAY_OK requires a Job, and this build has none.
+        let _ = (pid, allow_breakaway);
+        Err(LaunchError::JobFailed {
+            detail: JOB_UNAVAILABLE.to_owned(),
+        })
+    }
+
+    fn handoff_and_adopt(&mut self, pid: u32) -> Result<AdoptWait, LaunchError> {
+        let child_pid = self.child_mut()?.id();
+        if child_pid != pid {
+            return Ok(AdoptWait::Failed {
+                detail: "pid does not match the spawned child".to_owned(),
+            });
+        }
+        // Reached only if a future caller skips the job failure. Still not a
+        // Job handoff: there is no handle to duplicate into the daemon.
+        Ok(AdoptWait::Adopted)
+    }
+
+    fn resume(&mut self, pid: u32) -> Result<(), LaunchError> {
+        let child_pid = self.child_mut()?.id();
+        if child_pid != pid {
+            return Err(LaunchError::WaitFailed {
+                detail: "pid does not match the spawned child".to_owned(),
+            });
+        }
+        // The child was never suspended, so ResumeThread is not called and
+        // must not be reported as having run. `run_launch` only calls this
+        // after a successful assign, which this type does not return.
+        Err(LaunchError::WaitFailed {
+            detail: "ResumeThread was not called; the process was not suspended and is not in a Job".to_owned(),
+        })
+    }
+
+    fn terminate(&mut self, pid: u32) -> Result<(), LaunchError> {
+        let child = self.child_mut()?;
+        if child.id() != pid {
+            return Err(LaunchError::WaitFailed {
+                detail: "pid does not match the spawned child".to_owned(),
+            });
+        }
+        child.kill().map_err(|err| LaunchError::WaitFailed {
+            detail: format!("TerminateProcess via Child::kill failed: {err}"),
+        })?;
+        // Reap so the pid does not stay a zombie if the caller then returns
+        // the job error. A wait error after a successful kill is still a
+        // terminated child; the original job error is what `run_launch` returns.
+        let _ = child.wait();
+        Ok(())
+    }
+
+    fn wait_exit(&mut self, pid: u32) -> Result<i32, LaunchError> {
+        let child = self.child_mut()?;
+        if child.id() != pid {
+            return Err(LaunchError::WaitFailed {
+                detail: "pid does not match the spawned child".to_owned(),
+            });
+        }
+        match child.wait() {
+            Ok(status) => Ok(status.code().unwrap_or(-1)),
+            Err(err) => Err(LaunchError::WaitFailed {
+                detail: format!("WaitForSingleObject via Child::wait failed: {err}"),
+            }),
+        }
     }
 }
 

@@ -21,6 +21,13 @@
 //! it records the calls and stops. The default tests pass a fake. They do not
 //! fork and they do not write `/sys/fs/cgroup`.
 //!
+//! [`LocalCgroupHost`] is the production host. It is not a [`CgroupLaunch`]: the
+//! state machine above still talks to a daemon (`adopt`, `scope_cgroups`), and
+//! this CLI does not. The host creates a session directory under the caller's
+//! own cgroup when that parent is delegated and writable, then moves the child
+//! into `cgroup.procs`. If that setup fails it returns an error and does not
+//! exec the target. It does not call `systemd-run`.
+//!
 //! # Identity
 //!
 //! The target runs as the user who invoked `aw`. [`LaunchIdentity::CallingUser`]
@@ -656,6 +663,269 @@ impl CgroupLaunch for UnverifiedCgroupLaunch {
             step: "wait for child",
         })
     }
+}
+
+/// Production cgroup v2 host for `aw run` on Linux.
+///
+/// Scope-or-fail. The target is exec'd only after a session directory exists
+/// under a user-delegated parent and the child pid has been written to
+/// `cgroup.procs`. A probe, mkdir, or write failure returns
+/// [`LaunchError`] and does not start the target (or kills a child that was
+/// spawned only so its pid could be moved, when that move fails).
+///
+/// There is no `pre_exec` hook: `aw-cli` forbids `unsafe` and does not depend
+/// on `nix` or `libc`. The child is spawned with `std::process::Command`, then
+/// its pid is written to `cgroup.procs`. That write is not atomic with exec.
+/// The gap is named on [`LaunchResult::detail`]; it is not hidden.
+///
+/// `systemd-run` is not invoked. The directory is `<parent>/agentwatch-<id>`,
+/// where `<parent>` is this process's cgroup from `/proc/self/cgroup`.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct LocalCgroupHost;
+
+/// What a finished [`LocalCgroupHost`] launch reports.
+///
+/// `detail` names the cgroup path and the post-spawn move window. It does not
+/// contain argv or environment values.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchResult {
+    /// The child's exit code, unchanged. `None` when the process was signaled
+    /// and left no code; that is not a stand-in of `0`.
+    pub code: Option<i32>,
+    /// Pid the OS assigned.
+    pub pid: u32,
+    /// Session directory that received the pid.
+    pub cgroup_path: String,
+    /// Fixed note: the pid was written after `Command` had already started.
+    pub detail: String,
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+impl LocalCgroupHost {
+    /// Launch `program` with `args` inside a new cgroup-v2 session directory.
+    ///
+    /// `env_pairs` are applied to the child only. The current process's
+    /// environment is inherited and then overridden by those pairs. Values are
+    /// not logged.
+    ///
+    /// # Errors
+    ///
+    /// [`LaunchError::CgroupV1NoLaunch`] on cgroup v1 or an unreadable hierarchy.
+    /// [`LaunchError::CreateFailed`] when the parent is not a delegated,
+    /// user-writable cgroup (`cgroup mkdir`). [`LaunchError::WriteProcsFailed`]
+    /// when `cgroup.procs` rejects the pid; the child is then killed.
+    /// [`LaunchError::ForkFailed`] when `Command` could not start. No error
+    /// variant includes argv.
+    pub fn launch(
+        &self,
+        program: &std::ffi::OsStr,
+        args: &[std::ffi::OsString],
+        cwd: Option<&str>,
+        env_pairs: &[(String, String)],
+        session_id: u64,
+    ) -> Result<LaunchResult, LaunchError> {
+        let parent = delegated_parent()?;
+        let session = parent.join(format!("agentwatch-{session_id}"));
+        if let Err(err) = std::fs::create_dir(&session) {
+            return Err(LaunchError::CreateFailed {
+                detail: format!("cgroup mkdir {}: {err}", session.display()),
+            });
+        }
+        let mut child = std::process::Command::new(program);
+        child.args(args);
+        if let Some(dir) = cwd {
+            child.current_dir(dir);
+        }
+        for (key, value) in env_pairs {
+            child.env(key, value);
+        }
+        let spawned = match child.spawn() {
+            Ok(spawned) => spawned,
+            Err(err) => {
+                let _ = std::fs::remove_dir(&session);
+                return Err(LaunchError::ForkFailed {
+                    detail: format!("spawn failed before cgroup move: {err}"),
+                });
+            }
+        };
+        move_and_wait(spawned, &session)
+    }
+}
+
+/// Read-only probe. `Err` is [`LaunchError::CgroupV1NoLaunch`] for v1 and for
+/// a hierarchy this process cannot identify. It does not create a directory.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn delegated_parent() -> Result<std::path::PathBuf, LaunchError> {
+    let version = read_cgroup_version();
+    if version != CgroupVersion::V2 {
+        return Err(LaunchError::CgroupV1NoLaunch);
+    }
+    let relative = self_cgroup_relative().map_err(|detail| LaunchError::CreateFailed {
+        detail: format!("cgroup mkdir: parent cgroup is not readable: {detail}"),
+    })?;
+    let parent = std::path::Path::new("/sys/fs/cgroup").join(relative);
+    if !parent.is_dir() {
+        return Err(LaunchError::CreateFailed {
+            detail: format!(
+                "cgroup mkdir: parent {} is not a directory",
+                parent.display()
+            ),
+        });
+    }
+    // subtree_control must be enabled by an ancestor (delegation). An empty
+    // file means this cgroup cannot host a child domain the caller may use.
+    // The file is world-readable on a typical v2 mount; absence is a refusal.
+    let subtree = parent.join("cgroup.subtree_control");
+    let enabled = std::fs::read_to_string(&subtree).map_err(|err| LaunchError::CreateFailed {
+        detail: format!(
+            "cgroup mkdir: {} is not delegated ({err})",
+            subtree.display()
+        ),
+    })?;
+    if enabled.split_whitespace().next().is_none() {
+        return Err(LaunchError::CreateFailed {
+            detail: format!(
+                "cgroup mkdir: {} has no delegated controllers",
+                subtree.display()
+            ),
+        });
+    }
+    // A directory that is not user-writable cannot take agentwatch-<id>.
+    // Do not fall through to an unscoped spawn.
+    if !dir_writable(&parent) {
+        return Err(LaunchError::CreateFailed {
+            detail: format!(
+                "cgroup mkdir: {} is not writable by this user",
+                parent.display()
+            ),
+        });
+    }
+    Ok(parent)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn dir_writable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let mode = meta.mode();
+    let uid = nix_like_uid();
+    let gid = nix_like_gid();
+    (meta.uid() == uid && (mode & 0o200) != 0)
+        || (meta.gid() == gid && (mode & 0o020) != 0)
+        || (mode & 0o002) != 0
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn nix_like_uid() -> u32 {
+    // std has no getuid without the libc crate. /proc/self/status is the
+    // same number the kernel would return, and it needs no new dependency.
+    proc_status_id("Uid:").unwrap_or(u32::MAX)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn nix_like_gid() -> u32 {
+    proc_status_id("Gid:").unwrap_or(u32::MAX)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn proc_status_id(label: &str) -> Option<u32> {
+    let text = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = text.lines().find(|line| line.starts_with(label))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Unified hierarchy when `/proc/self/cgroup` is `0::...` and the v2 mount
+/// exposes `cgroup.controllers`. Anything else is not v2.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn read_cgroup_version() -> CgroupVersion {
+    let Ok(text) = std::fs::read_to_string("/proc/self/cgroup") else {
+        return CgroupVersion::Unknown;
+    };
+    let unified = text.lines().any(|line| line.starts_with("0::"));
+    let controllers = std::path::Path::new("/sys/fs/cgroup/cgroup.controllers");
+    if unified && controllers.is_file() {
+        CgroupVersion::V2
+    } else if text.lines().any(|line| {
+        let mut parts = line.split(':');
+        let hierarchy = parts.next();
+        let controllers = parts.next();
+        matches!(hierarchy, Some(id) if id != "0")
+            && matches!(controllers, Some(name) if !name.is_empty())
+    }) {
+        CgroupVersion::V1
+    } else {
+        CgroupVersion::Unknown
+    }
+}
+
+/// Path relative to the cgroup v2 mount. `0::/agent` becomes `agent`.
+/// An empty relative path is the mount root, which is not a user delegation.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn self_cgroup_relative() -> Result<std::path::PathBuf, String> {
+    let text = std::fs::read_to_string("/proc/self/cgroup")
+        .map_err(|err| format!("read /proc/self/cgroup: {err}"))?;
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("0::"))
+        .ok_or_else(|| "no unified hierarchy line".to_owned())?;
+    let rest = line
+        .strip_prefix("0::")
+        .ok_or_else(|| "unified line has no path".to_owned())?;
+    let trimmed = rest.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Err("process is in the cgroup root, which is not a user delegation".to_owned());
+    }
+    if trimmed.contains("..") {
+        return Err("cgroup path contains '..'".to_owned());
+    }
+    Ok(std::path::PathBuf::from(trimmed))
+}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+fn move_and_wait(
+    mut spawned: std::process::Child,
+    session: &std::path::Path,
+) -> Result<LaunchResult, LaunchError> {
+    let pid = spawned.id();
+    let procs = session.join("cgroup.procs");
+    let write = std::fs::write(&procs, format!("{pid}"));
+    if let Err(err) = write {
+        let _ = spawned.kill();
+        let _ = spawned.wait();
+        let _ = std::fs::remove_dir(session);
+        return Err(LaunchError::WriteProcsFailed {
+            detail: format!("cgroup.procs {}: {err}", procs.display()),
+        });
+    }
+    let status = spawned.wait().map_err(|err| LaunchError::WaitFailed {
+        detail: format!("wait failed: {err}"),
+    })?;
+    let code = status.code();
+    let _ = std::fs::remove_dir(session);
+    Ok(LaunchResult {
+        code,
+        pid,
+        cgroup_path: session.display().to_string(),
+        detail: format!(
+            "pid written to {} after spawn; the move is not atomic with exec (gap)",
+            procs.display()
+        ),
+    })
 }
 
 #[cfg(test)]

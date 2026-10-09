@@ -405,7 +405,9 @@ mod tests {
         let text = String::from_utf8(outcome.stdout).expect("utf8");
         assert!(text.contains("AgentWatch"), "{text}");
         assert!(text.contains("--yes"), "{text}");
-        assert!(!text.contains("sc.exe"), "{text}");
+        // The hint may name `sc.exe` as the command an administrator would run.
+        // Naming it is not running it: the control was not asked to apply anything.
+        assert!(text.contains("does not run it"), "{text}");
         assert!(control.seen.is_empty());
     }
 

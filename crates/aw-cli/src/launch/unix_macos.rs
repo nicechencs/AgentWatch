@@ -344,6 +344,10 @@ pub fn run_launch<A: SpawnApi>(
 /// `POSIX_SPAWN_START_SUSPENDED` is 【待验证】. Until a macOS host measures it,
 /// this type refuses every step with [`LaunchError::NotVerified`] instead of
 /// calling libc from a default test or from an unwired command.
+///
+/// This type is the test stub. Production on macOS uses [`PosixSpawnApi`] via
+/// [`production`]. Do not replace this impl with a live spawn: the
+/// "does not create a process" test depends on the refusal.
 #[derive(Debug, Default)]
 pub struct UnverifiedSpawnApi;
 
@@ -383,6 +387,213 @@ impl SpawnApi for UnverifiedSpawnApi {
     fn wait_exit(&mut self, _pid: u32) -> Result<i32, LaunchError> {
         Err(LaunchError::NotVerified { step: "waitpid" })
     }
+}
+
+/// Honest limit of [`PosixSpawnApi`].
+///
+/// `POSIX_SPAWN_START_SUSPENDED` needs an Apple-specific attribute
+/// (`posix_spawnattr_setflags` with a flag that is not in a crate this binary
+/// already depends on). `aw-cli` has no `libc` dependency and the workspace
+/// forbids `unsafe`. This build therefore does not set the flag and does not
+/// call `fork` plus a wait pipe either (that is also `unsafe`).
+///
+/// The child is spawned with [`std::process::Command`] and starts running.
+/// Grandchild scope is a collector concern and is not claimed here. This is
+/// not E1 scope.
+#[cfg(target_os = "macos")]
+const NO_SUSPEND_NOTE: &str =
+    "suspension was not applied; no job/suspension on this build; POSIX_SPAWN_START_SUSPENDED was not set; grandchild scope is not claimed";
+
+/// Production [`SpawnApi`] for macOS.
+///
+/// `spawn_suspended` starts the child with [`std::process::Command`] and
+/// returns [`LaunchError::SpawnFailed`] whose detail is [`NO_SUSPEND_NOTE`]
+/// only when spawn itself fails to be the honest path — see the method. On
+/// success the pid is returned and [`Self::detail`] carries the note so a
+/// caller can print it. The method does **not** return [`LaunchError::Unsupported`]:
+/// that would fall through to `fork_and_wait_pipe`, and this build cannot
+/// fork-and-wait without `unsafe`. A plain spawn whose detail says suspension
+/// was not applied is the honest result.
+///
+/// `adopt` returns [`AdoptWait::Adopted`] with no daemon round-trip. That is
+/// not a scope claim. The collector does not learn the pid from this type.
+///
+/// argv is the `Command` program and its arguments. It is not written to a
+/// log or to an error `Display`.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct PosixSpawnApi {
+    child: Option<std::process::Child>,
+    /// Set after a successful spawn. Says suspension was not applied.
+    detail: Option<&'static str>,
+}
+
+/// Production macOS launcher. Only compiled on macOS.
+///
+/// On any other OS this function does not exist, so a non-macOS binary cannot
+/// construct the API and cannot spawn through it.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn production() -> PosixSpawnApi {
+    PosixSpawnApi {
+        child: None,
+        detail: None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl PosixSpawnApi {
+    /// Note from the last successful spawn.
+    ///
+    /// `Some` means the child is running and suspension was **not** applied.
+    /// `None` means no child has been spawned yet.
+    #[must_use]
+    pub fn detail(&self) -> Option<&'static str> {
+        self.detail
+    }
+
+    fn child_mut(&mut self) -> Result<&mut std::process::Child, LaunchError> {
+        self.child.as_mut().ok_or_else(|| LaunchError::ContinueFailed {
+            detail: "no child exists for this step".to_owned(),
+        })
+    }
+
+    fn spawn_command(&mut self, request: &LaunchRequest) -> Result<u32, LaunchError> {
+        if request.identity != LaunchIdentity::CallingUser {
+            return Err(LaunchError::SpawnFailed {
+                detail: "only the calling user may launch; root is not a path".to_owned(),
+            });
+        }
+        let Some((program, args)) = request.command.split_first() else {
+            return Err(LaunchError::EmptyCommand);
+        };
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        cmd.stdin(std::process::Stdio::inherit());
+        cmd.stdout(std::process::Stdio::inherit());
+        cmd.stderr(std::process::Stdio::inherit());
+        match cmd.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                self.child = Some(child);
+                self.detail = Some(NO_SUSPEND_NOTE);
+                Ok(pid)
+            }
+            Err(err) => Err(LaunchError::SpawnFailed {
+                // `err` is an io::Error. Its Display is the OS message, not argv.
+                detail: format!("posix_spawn via Command failed: {err}; {NO_SUSPEND_NOTE}"),
+            }),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl SpawnApi for PosixSpawnApi {
+    fn spawn_suspended(&mut self, request: &LaunchRequest) -> Result<u32, LaunchError> {
+        // Not POSIX_SPAWN_START_SUSPENDED. The child runs immediately.
+        // Returning Unsupported would ask `run_launch` to fork-and-wait, which
+        // this build also cannot do. The spawn detail records the missing flag.
+        self.spawn_command(request)
+    }
+
+    fn fork_and_wait_pipe(&mut self, request: &LaunchRequest) -> Result<u32, LaunchError> {
+        // Same Command spawn. There is no pipe and no pre-exec wait. Callers
+        // that land here (only if `spawn_suspended` returned Unsupported, which
+        // this type does not) still must not claim the child is blocked.
+        self.spawn_command(request)
+    }
+
+    fn adopt(&mut self, pid: u32) -> Result<AdoptWait, LaunchError> {
+        let child_pid = self.child_mut()?.id();
+        if child_pid != pid {
+            return Ok(AdoptWait::Failed {
+                detail: "pid does not match the spawned child".to_owned(),
+            });
+        }
+        // No daemon. Accepting locally lets `run_launch` wait for the exit
+        // code. It does not put the pid in a scope and is not E1.
+        Ok(AdoptWait::Adopted)
+    }
+
+    fn sigcont(&mut self, pid: u32) -> Result<(), LaunchError> {
+        let child_pid = self.child_mut()?.id();
+        if child_pid != pid {
+            return Err(LaunchError::ContinueFailed {
+                detail: "pid does not match the spawned child".to_owned(),
+            });
+        }
+        // The child was not suspended, so SIGCONT is not sent. `Ok` here means
+        // "nothing to continue", not "the process was suspended and then
+        // continued". [`Self::detail`] is `Some(NO_SUSPEND_NOTE)` after spawn
+        // and is the only place that fact is recorded. Killing the child here
+        // would hide its real exit code.
+        Ok(())
+    }
+
+    fn release_pipe(&mut self, pid: u32) -> Result<(), LaunchError> {
+        let child_pid = self.child_mut()?.id();
+        if child_pid != pid {
+            return Err(LaunchError::ContinueFailed {
+                detail: "pid does not match the spawned child".to_owned(),
+            });
+        }
+        Err(LaunchError::ContinueFailed {
+            detail: "no pipe was held; suspension was not applied".to_owned(),
+        })
+    }
+
+    fn terminate(&mut self, pid: u32) -> Result<(), LaunchError> {
+        let child = self.child_mut()?;
+        if child.id() != pid {
+            return Err(LaunchError::ContinueFailed {
+                detail: "pid does not match the spawned child".to_owned(),
+            });
+        }
+        child.kill().map_err(|err| LaunchError::ContinueFailed {
+            detail: format!("kill failed: {err}"),
+        })?;
+        let _ = child.wait();
+        Ok(())
+    }
+
+    fn wait_exit(&mut self, pid: u32) -> Result<i32, LaunchError> {
+        let child = self.child_mut()?;
+        if child.id() != pid {
+            return Err(LaunchError::ContinueFailed {
+                detail: "pid does not match the spawned child".to_owned(),
+            });
+        }
+        match child.wait() {
+            Ok(status) => Ok(status.code().unwrap_or(-1)),
+            Err(err) => Err(LaunchError::ContinueFailed {
+                detail: format!("waitpid via Child::wait failed: {err}"),
+            }),
+        }
+    }
+}
+
+/// Run `command` and wait. Suspension is not applied.
+///
+/// Returns the child's exit code, its pid, and [`NO_SUSPEND_NOTE`]. The note
+/// is not an E1 scope claim. Grandchild tracking is the collector's job.
+///
+/// This is a plain method, not [`crate`]'s `UnixLauncher`, so the test-only
+/// include of this file (parent is the crate root, not `launch`) still
+/// compiles. `aw run` calls it from `cmd/run.rs` on macOS.
+///
+/// # Errors
+///
+/// [`LaunchError`] from the state machine. A spawn failure happens before a
+/// pid exists. Adopt failure terminates the child inside [`run_launch`].
+#[cfg(target_os = "macos")]
+pub fn launch_command(
+    api: &mut PosixSpawnApi,
+    command: Vec<String>,
+    no_daemon: bool,
+) -> Result<(i32, u32, Option<&'static str>, bool), LaunchError> {
+    let request = LaunchRequest::new(command)?;
+    let finished = run_launch(api, &request)?;
+    Ok((finished.code, finished.pid, api.detail, no_daemon))
 }
 
 /// Scripted [`SpawnApi`] for tests. Holds no pid and starts no process.

@@ -1,10 +1,12 @@
 //! Platform launchers for `aw run` (P1-WIN-04, P1-CLI-02).
 //!
-//! Windows calls [`windows::run_launch`]. Other targets have no launcher in this
-//! crate yet: P1-LNX-04 and P1-MAC-03 own `launch/unix_linux.rs` and
-//! `launch/unix_macos.rs`. Those files are not referenced here. The non-Windows
-//! path is the [`UnixLauncher`] trait. Its production value returns
-//! [`LaunchDispatchError::NotImplemented`] and starts nothing.
+//! Windows calls [`windows::run_launch`]. Production on Windows is
+//! [`windows::production`]: Job assignment is unavailable in this crate, so no
+//! process is created. macOS uses [`unix_macos`] (cfg-gated); that launcher
+//! spawns with `Command` and does not claim suspension. Linux production uses
+//! [`unix_linux::LocalCgroupHost`] (cfg-gated): a delegated cgroup v2 directory,
+//! or a structured error and no child. [`UnsupportedUnixLauncher`] remains the
+//! production value on every other non-Windows target.
 //!
 //! Ctrl-C forwarding lives on the launcher trait (`forward_interrupt`). Tests
 //! pass a fake and never send a real signal.
@@ -14,10 +16,21 @@
 #[allow(dead_code)]
 mod windows;
 
-// P1-LNX-04 (`unix_linux.rs`) and P1-MAC-03 (`unix_macos.rs`) are not declared
-// here. Those files are owned by the other cards. Non-Windows `aw run` goes
-// through [`UnixLauncher`]; [`UnsupportedUnixLauncher`] is the production value
-// until those cards replace it.
+// P1-MAC-03. macOS `aw run` needs [`unix_macos::production`], which does not
+// exist on other targets, so the module is cfg-gated to macOS. Linux is the
+// `unix_linux` module below, also cfg-gated.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[path = "unix_macos.rs"]
+mod unix_macos;
+
+// Linux production `aw run` uses [`unix_linux::LocalCgroupHost`]. The module is
+// cfg-gated so non-Linux builds do not compile the host. [`UnverifiedCgroupLaunch`]
+// stays the test double inside that file; this module does not construct it.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[path = "unix_linux.rs"]
+mod unix_linux;
 
 #[allow(unused_imports)]
 pub use windows::{
@@ -28,6 +41,24 @@ pub use windows::{
 /// Present only on Windows. The stub refuses every step; it does not call Win32.
 #[cfg(target_os = "windows")]
 pub use windows::UnverifiedJobApi;
+
+/// Present only on Windows. [`windows::production`] is the `Command` launcher.
+/// Job assignment is unavailable; see that function.
+#[cfg(target_os = "windows")]
+#[allow(unused_imports)]
+pub use windows::production;
+
+/// Present only on macOS. [`unix_macos::production`] spawns with `Command` and
+/// records that suspension was not applied. It does not claim E1 scope.
+#[cfg(target_os = "macos")]
+#[allow(unused_imports)]
+pub use unix_macos::{launch_command, production};
+
+/// Present only on Linux. [`unix_linux::LocalCgroupHost`] creates a cgroup v2
+/// session directory when the caller is delegated, and refuses otherwise.
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+pub use unix_linux::LocalCgroupHost;
 
 /// What `aw run` asks a platform launcher to do.
 ///
@@ -167,7 +198,8 @@ impl UnixLauncher for UnsupportedUnixLauncher {
 /// Run `spec` on Windows through [`run_launch`].
 ///
 /// Uses `api` for every Win32 step. The production caller passes
-/// [`UnverifiedJobApi`], which refuses the first step and creates no process.
+/// [`windows::production`], which refuses before `CreateProcess` because Job
+/// assignment is unavailable. [`UnverifiedJobApi`] remains the test stub.
 /// The target identity is always [`windows::LaunchIdentity::CallingUser`].
 ///
 /// # Errors

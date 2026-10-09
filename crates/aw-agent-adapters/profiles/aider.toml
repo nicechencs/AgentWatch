@@ -1,21 +1,24 @@
 # 匹配规则依据任务卡草案，未经 SPIKE-07 实测，待核对。
 # SPIKE-07 §5.5：没有工具级自报告。命令名文档上是 `aider`，常经由 python -m。
-# argv 只接受单独一个参数等于 aider（或路径以它结尾），避免普通 python 脚本命中。
+# argv 正则按单个参数匹配：参数本身是 aider，或路径以 /aider、\aider 结尾。
+# `python -m aider` 的模块名是单独一个参数，因此命中；
+# `python script.py`、路径里只是含有 aider 的脚本（例如 /opt/aider/run.py）不命中。
 
 id = "aider"
 display = "Aider"
+
+# 无工具级渠道。空列表表示没有 E3 数据源，只有系统观测。
+# 必须放在任何表头之前。写在 [match] 或 [children] 后面且不换表头时，TOML 会把它收进该表。
+self_report = []
 
 [match]
 exe_names = ["aider", "aider.exe"]
 argv_regex = ['(?i)(^|[\\/])aider(\\.exe)?$']
 
 [children]
+# git 子进程标为 vcs。角色标注不参与 identify。
+# 文件名是 git 或 git.exe。`(^|[\\/])` 允许前面有目录。
+# 不用 `$`：Windows argv 常是 `...\git.exe` 后再接子命令，整条参数不以 git 结尾。
 role_regex = [
-    { role = "vcs", regex = '(?i)(^|[\\/])git(\\.exe)?$' },
-    { role = "mcp_server", regex = '(?i)(^|[\\/])mcp-server-[^\\/]+$' },
-    { role = "mcp_server", regex = '(?i)(^|[\\/])npx(@[^\\/]+)?$' },
-    { role = "mcp_server", regex = '(?i)@modelcontextprotocol[\\/]' },
+    { role = "vcs", regex = '(?i)(^|[\\/])git(\\.exe)?([\\/]|$)' },
 ]
-
-# 无工具级渠道。空列表表示没有 E3 数据源。
-self_report = []

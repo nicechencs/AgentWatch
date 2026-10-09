@@ -18,6 +18,10 @@ const BUILTINS: &[(&str, &str)] = &[
     ("codex.toml", include_str!("../profiles/codex.toml")),
     ("cursor.toml", include_str!("../profiles/cursor.toml")),
     ("aider.toml", include_str!("../profiles/aider.toml")),
+    (
+        "python-generic.toml",
+        include_str!("../profiles/python-generic.toml"),
+    ),
 ];
 
 /// Why a profile file was refused. The file name is always included.

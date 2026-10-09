@@ -1,21 +1,33 @@
-# 匹配规则依据任务卡草案，未经 SPIKE-07 实测，待核对。
-# SPIKE-07 §5.2：产品命令名是 `codex`，实际 exe 名与 argv 都未录到。
-# 不写未录制的包路径，也不用 CODEX_HOME（用户环境里很常见，会误伤普通进程）。
+# 匹配规则依据任务卡与文档调研，未经本机实测。
+# SPIKE-07 §5.2（2026-10-07）：产品命令名是 `codex`，实际 exe 名与 argv 都未录到。
+# 不写未录制的包路径，也不用 CODEX_HOME（只表示状态目录存在，会误伤普通进程）。
+#
+# 沙箱辅助进程（2026-10-09 核对）：
+# - macOS Seatbelt：learn.chatgpt.com/docs/agent-approvals-security 写明用 sandbox-exec。
+# - Linux 默认：learn.chatgpt.com/docs/sandboxing 写明用 bwrap（bubblewrap）。
+# - 捆绑的 Linux helper：Codex main 的 codex-rs/linux-sandbox README 写明可执行文件名
+#   是 codex-linux-sandbox。公开沙箱页只说 “bundled helper”，没有这个文件名。
+# 角色标注不是 identify，也不是“已经证实这是沙箱”。
+# child_role 对每个 argv 元素单独匹配，所以这里只认文件名，不认目录。
 
 id = "codex"
 display = "Codex CLI"
+
+# hooks：字段够用，但文档没有不改用户配置的注入方式。
+# otel：端点在用户级 config.toml 的 [otel]，不在环境变量里。本卡只做注入计划，不写配置。
+# transcript 不登记：读会话记录要先写 ADR，本卡不做。
+self_report = ["hooks", "otel"]
 
 [match]
 exe_names = ["codex", "codex.exe"]
 
 [children]
-# P5-AGENT-05 把 sandbox-exec 标成沙箱辅助进程。角色标注不影响 identify。
+# 先匹配的规则生效。sandbox-exec / bwrap / codex-linux-sandbox 都标成 sandbox。
 role_regex = [
-    { role = "sandbox", regex = '(?i)(^|[\\/])sandbox-exec$' },
-    { role = "mcp_server", regex = '(?i)(^|[\\/])mcp-server-[^\\/]+$' },
-    { role = "mcp_server", regex = '(?i)(^|[\\/])npx(@[^\\/]+)?$' },
-    { role = "mcp_server", regex = '(?i)@modelcontextprotocol[\\/]' },
+    { role = "sandbox", regex = '(?i)^sandbox-exec(\.exe)?$' },
+    { role = "sandbox", regex = '(?i)^bwrap(\.exe)?$' },
+    { role = "sandbox", regex = '(?i)^codex-linux-sandbox(\.exe)?$' },
+    { role = "mcp_server", regex = '(?i)^mcp-server-[^/\\\\]+$' },
+    { role = "mcp_server", regex = '(?i)^npx(@[^/\\\\]+)?$' },
+    { role = "mcp_server", regex = '(?i)@modelcontextprotocol[/\\\\]' },
 ]
-
-# 文档调研里的渠道。注入方式仍待验证，这里只登记名字。
-self_report = ["hooks", "otel"]

@@ -1,23 +1,29 @@
-# 匹配规则依据任务卡草案，未经 SPIKE-07 实测，待核对。
-# SPIKE-07 §5.3：桌面应用是 Electron 宿主，exe 名未实测。只认产品名，
-# 不认 node，也不认 "Cursor Helper"（那是子进程，不是 Agent 根）。
-# `--type=` 只用于子进程角色，不参与 identify。
+# 匹配规则依据任务卡 P5-AGENT-06，未经真机录制，待核对。
+# SPIKE-07 索引状态仍是「未开始」（docs/06-research/README.md）。
+# 正文 §5.3（2026-10-07 文档调研）写过公开 hooks，但没有一次性注入路径，
+# 也没有录到进程树。本卡按任务卡写 self_report = []：只做识别和归属，不接入 E3。
+# 只认产品名。不认 node，也不认 "Cursor Helper"（那是子进程，不是 Agent 根）。
+# `--type=` 只用于子进程角色，不参与 identify。角色名是形态标注，不是已证实的职责。
 
 id = "cursor"
 display = "Cursor"
+
+# 空列表：本卡不登记 E3 渠道。见 cursor-notes.md。
+# 放在 [children] 之前。写在 [children] 后面且不换表头时，TOML 会把它收进 children。
+self_report = []
 
 [match]
 exe_names = ["Cursor", "Cursor.exe", "cursor", "cursor.exe"]
 
 [children]
+# 顺序即优先级：更具体的 --type= 在前。终端 shell 没有公开的进程名记载，
+# 只标常见 shell 文件名，不把它写成“Cursor 的终端一定是这个进程”。
 role_regex = [
+    { role = "extension-host", regex = '(?i)^--type=extensionHost$' },
     { role = "renderer", regex = '(?i)^--type=renderer$' },
     { role = "utility", regex = '(?i)^--type=utility$' },
-    { role = "extension-host", regex = '(?i)^--type=extensionHost$' },
+    { role = "terminal-shell", regex = '(?i)(^|[\\/])(bash|zsh|fish|sh|pwsh|powershell|cmd)(\.exe)?$' },
     { role = "mcp_server", regex = '(?i)(^|[\\/])mcp-server-[^\\/]+$' },
     { role = "mcp_server", regex = '(?i)(^|[\\/])npx(@[^\\/]+)?$' },
     { role = "mcp_server", regex = '(?i)@modelcontextprotocol[\\/]' },
 ]
-
-# SPIKE-07 确认有公开 hooks。没有一次性注入参数的记载，故不登记别的渠道。
-self_report = ["hooks"]

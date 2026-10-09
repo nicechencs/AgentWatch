@@ -1,0 +1,20 @@
+# 通用 Python Agent。不参与 --agent auto。
+# 只在用户显式指定 --agent python-generic 时由调用方选用本 profile。
+# 匹配规则故意匹配不到任何进程：exe 名不是真实解释器，也不写 argv 正则。
+# identify() 因此不会把普通 python 进程标成 python-generic。
+#
+# SPIKE-04 结论未填。代理变量组合见
+# crates/aw-agent-adapters/src/agents/python_generic/，并标了【待验证】。
+# 这类 Agent 没有 E3 数据，只有系统观测。
+# self_report 放在 [children] 之前，避免被收进 children 表。
+self_report = []
+
+id = "python-generic"
+display = "Python (generic)"
+
+[match]
+# 哨兵：不是任何真实解释器名。不写 argv_regex，避免一条宽正则误伤普通进程。
+exe_names = ["__agentwatch_python_generic_manual_only__"]
+
+[children]
+role_regex = []

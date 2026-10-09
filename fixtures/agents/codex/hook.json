@@ -1,0 +1,14 @@
+{
+  "note": "Synthetic Codex hook object. Field names follow SPIKE-07 §5.2 (2026-10-07 document survey), not a captured stdin. The command is a placeholder. tool_response and the prompt-like field must not be copied into summary.",
+  "hook_event_name": "PreToolUse",
+  "session_id": "synthetic-session",
+  "tool_name": "Bash",
+  "tool_use_id": "synthetic-call",
+  "tool_input": {
+    "command": "true",
+    "content": "synthetic-body-not-stored"
+  },
+  "tool_response": {
+    "output": "synthetic-output-not-stored"
+  }
+}

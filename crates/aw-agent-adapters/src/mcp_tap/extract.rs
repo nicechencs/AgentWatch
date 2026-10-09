@@ -172,7 +172,8 @@ pub fn extract(frame: &str, direction: &str, req_bytes: u64) -> Result<RpcExtrac
     if frame.trim().is_empty() {
         return Err(ExtractGap::Empty);
     }
-    if frame.len() > MAX_FRAME_BYTES || req_bytes > u64::try_from(MAX_FRAME_BYTES).unwrap_or(u64::MAX)
+    if frame.len() > MAX_FRAME_BYTES
+        || req_bytes > u64::try_from(MAX_FRAME_BYTES).unwrap_or(u64::MAX)
     {
         return Err(ExtractGap::Oversize);
     }

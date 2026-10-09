@@ -1,0 +1,92 @@
+{
+  "note": "Synthetic process shapes for P5-AGENT-05. Not a recording. SPIKE-07 did not capture a live Codex argv. Paths are placeholders and contain no home directory, host name, or prompt.",
+  "cases": [
+    {
+      "id": "codex-exe",
+      "expect": "codex",
+      "proc": {
+        "pid": 4100,
+        "exe_name": "codex",
+        "argv": ["codex"],
+        "env_keys": []
+      },
+      "ancestors": []
+    },
+    {
+      "id": "codex-exe-windows",
+      "expect": "codex",
+      "proc": {
+        "pid": 4101,
+        "exe_name": "codex.exe",
+        "argv": ["codex.exe", "exec"],
+        "env_keys": []
+      },
+      "ancestors": []
+    },
+    {
+      "id": "node-not-codex",
+      "expect": null,
+      "proc": {
+        "pid": 4102,
+        "exe_name": "node",
+        "argv": ["node", "server.js"],
+        "env_keys": ["CODEX_HOME"]
+      },
+      "ancestors": []
+    },
+    {
+      "id": "sandbox-exec-child",
+      "expect_role": "sandbox",
+      "proc": {
+        "pid": 4103,
+        "exe_name": "sandbox-exec",
+        "argv": ["sandbox-exec", "-p", "(version 1)"],
+        "env_keys": []
+      },
+      "ancestors": [
+        {
+          "pid": 4100,
+          "exe_name": "codex",
+          "argv": ["codex"],
+          "env_keys": []
+        }
+      ]
+    },
+    {
+      "id": "bwrap-child",
+      "expect_role": "sandbox",
+      "proc": {
+        "pid": 4104,
+        "exe_name": "bwrap",
+        "argv": ["bwrap", "--ro-bind", "/usr", "/usr"],
+        "env_keys": []
+      },
+      "ancestors": [
+        {
+          "pid": 4100,
+          "exe_name": "codex",
+          "argv": ["codex"],
+          "env_keys": []
+        }
+      ]
+    },
+    {
+      "id": "codex-linux-sandbox-child",
+      "expect_role": "sandbox",
+      "proc": {
+        "pid": 4105,
+        "exe_name": "codex-linux-sandbox",
+        "argv": ["codex-linux-sandbox"],
+        "env_keys": []
+      },
+      "ancestors": [
+        {
+          "pid": 4100,
+          "exe_name": "codex",
+          "argv": ["codex"],
+          "env_keys": []
+        }
+      ]
+    }
+  ]
+}

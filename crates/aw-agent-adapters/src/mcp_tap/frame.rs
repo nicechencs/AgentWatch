@@ -35,6 +35,12 @@ impl FrameError {
             Self::Oversize { len } => len,
         }
     }
+
+    /// True when the refused frame had no bytes. An oversize frame is never empty.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// One completed line, or a refusal to parse it.
@@ -88,7 +94,9 @@ impl Splitter {
             if self.buf.len() >= MAX_FRAME_BYTES {
                 // The cap is exceeded by this byte. Drop what was buffered and
                 // count it, plus this byte. Do not keep the content.
-                self.skipped = u64::try_from(self.buf.len()).unwrap_or(u64::MAX).saturating_add(1);
+                self.skipped = u64::try_from(self.buf.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1);
                 self.buf.clear();
                 self.skipping = true;
                 continue;

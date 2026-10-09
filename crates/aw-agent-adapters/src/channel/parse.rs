@@ -178,12 +178,7 @@ fn one_call(
     let call_id = non_empty_id(obj, &["tool_use_id"]);
     let summary = command_summary(command);
     vec![AgentToolCall::new(
-        agent,
-        session,
-        tool,
-        phase,
-        summary,
-        call_id,
+        agent, session, tool, phase, summary, call_id,
     )]
 }
 
@@ -259,6 +254,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::parse_hook;
@@ -278,7 +274,10 @@ mod tests {
         assert_eq!(calls.len(), 1);
         let call = &calls[0];
         assert_eq!(call.tool, "Bash");
-        assert_eq!(call.summary.get("command").and_then(Value::as_str), Some("echo hi"));
+        assert_eq!(
+            call.summary.get("command").and_then(Value::as_str),
+            Some("echo hi")
+        );
         let rendered = serde_json::to_string(&call.summary).expect("summary");
         assert!(!rendered.contains("secret-body"), "{rendered}");
         assert!(!rendered.contains("secret-output"), "{rendered}");
@@ -286,7 +285,8 @@ mod tests {
 
     #[test]
     fn missing_tool_name_and_unknown_agent_are_empty() {
-        let no_tool = payload(r#"{"hook_event_name":"PostToolUse","tool_input":{"command":"true"}}"#);
+        let no_tool =
+            payload(r#"{"hook_event_name":"PostToolUse","tool_input":{"command":"true"}}"#);
         assert!(parse_hook("claude-code", &no_tool).is_empty());
         assert!(parse_hook("aider", &no_tool).is_empty());
         assert!(parse_hook("claude-code", &Value::Null).is_empty());
@@ -303,7 +303,11 @@ mod tests {
             "tool_input": { "command": command }
         });
         let calls = parse_hook("codex", &body);
-        let kept = calls[0].summary.get("command").and_then(Value::as_str).expect("command");
+        let kept = calls[0]
+            .summary
+            .get("command")
+            .and_then(Value::as_str)
+            .expect("command");
         assert_eq!(kept.chars().count(), 256);
     }
 
@@ -317,7 +321,10 @@ mod tests {
         );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].tool, "Shell");
-        assert_eq!(calls[0].summary.get("command").and_then(Value::as_str), Some("ls"));
+        assert_eq!(
+            calls[0].summary.get("command").and_then(Value::as_str),
+            Some("ls")
+        );
         let rendered = serde_json::to_string(&calls[0].summary).expect("summary");
         assert!(!rendered.contains("secret-listing"), "{rendered}");
         assert!(!rendered.contains("/tmp/placeholder"), "{rendered}");

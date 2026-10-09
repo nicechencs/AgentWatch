@@ -12,6 +12,9 @@ exe_names = ["codex", "codex.exe"]
 # P5-AGENT-05 把 sandbox-exec 标成沙箱辅助进程。角色标注不影响 identify。
 role_regex = [
     { role = "sandbox", regex = '(?i)(^|[\\/])sandbox-exec$' },
+    { role = "mcp_server", regex = '(?i)(^|[\\/])mcp-server-[^\\/]+$' },
+    { role = "mcp_server", regex = '(?i)(^|[\\/])npx(@[^\\/]+)?$' },
+    { role = "mcp_server", regex = '(?i)@modelcontextprotocol[\\/]' },
 ]
 
 # 文档调研里的渠道。注入方式仍待验证，这里只登记名字。

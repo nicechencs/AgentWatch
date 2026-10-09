@@ -16,7 +16,12 @@ argv_regex = [
 ]
 
 [children]
-# MCP 服务器名不在子进程 argv 里（SPIKE-07 §5.6）。这里不猜角色。
-role_regex = []
+# MCP 服务器名不在子进程 argv 里（SPIKE-07 §5.6）。下面只标命令行形态，
+# 不把命中当成“已经证实这是 MCP”。identify 不读 role_regex。
+role_regex = [
+    { role = "mcp_server", regex = '(?i)(^|[\\/])mcp-server-[^\\/]+$' },
+    { role = "mcp_server", regex = '(?i)(^|[\\/])npx(@[^\\/]+)?$' },
+    { role = "mcp_server", regex = '(?i)@modelcontextprotocol[\\/]' },
+]
 
 self_report = ["hooks", "otel"]

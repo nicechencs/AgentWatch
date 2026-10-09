@@ -4,6 +4,7 @@
 //! clock, and neither stores file content, URLs, or headers.
 
 mod file;
+pub mod ipc;
 mod net;
 
 pub use file::{FileAggregator, BYTES_READ_FIELD, BYTES_WRITTEN_FIELD, DEFAULT_STATE_CAP};

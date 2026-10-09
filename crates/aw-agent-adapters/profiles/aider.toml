@@ -12,6 +12,9 @@ argv_regex = ['(?i)(^|[\\/])aider(\\.exe)?$']
 [children]
 role_regex = [
     { role = "vcs", regex = '(?i)(^|[\\/])git(\\.exe)?$' },
+    { role = "mcp_server", regex = '(?i)(^|[\\/])mcp-server-[^\\/]+$' },
+    { role = "mcp_server", regex = '(?i)(^|[\\/])npx(@[^\\/]+)?$' },
+    { role = "mcp_server", regex = '(?i)@modelcontextprotocol[\\/]' },
 ]
 
 # 无工具级渠道。空列表表示没有 E3 数据源。

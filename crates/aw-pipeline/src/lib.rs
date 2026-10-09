@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agents;
 pub mod aggregate;
 pub mod batcher;
 pub mod clock;
@@ -30,6 +31,7 @@ pub mod degrade;
 pub mod enrich;
 pub mod gaps;
 pub mod ingress;
+pub mod ipc;
 pub mod limit;
 pub mod limits;
 pub mod output;
@@ -41,6 +43,11 @@ pub mod sensitive;
 pub mod stage;
 pub mod wording;
 
+pub use agents::{
+    apply_label, argv_looks_like_mcp, consider_start, exe_file_name, role_from_profile,
+    AgentInstanceDraft, AgentRole, AgentTree, Considered, MatchBasis, NotInstanceReason,
+    ProcessObservation, ProfileRoleTable, RoleRule, EVIDENCE, SOURCE,
+};
 pub use aggregate::{summarize, FlowAcc, FlowGroupBy, FlowGroupKey, FlowSummary, NetAggregator};
 pub use batcher::{Batcher, ScriptedSink};
 pub use clock::{InstantClock, PipelineClock, ReplayClock};
@@ -63,6 +70,12 @@ pub use enrich::{
 };
 pub use gaps::{dropped_from_failures, record_drops, GapMerger, DEFAULT_RETRY_BATCHES};
 pub use ingress::{Ingress, IngressRx, DEFAULT_CAPACITY};
+pub use ipc::{
+    bucket_index as ipc_bucket_index, is_self_reported_tool, strongest_evidence, AgentLink,
+    ChannelKey, DecodedEvent, EndpointId, ExternalPeer, InstanceId, IpcAggregator, IpcBucket,
+    IpcChannel, LinkKind, LinkRef, PairedOpen, ProcInstance, SpawnEdge, WatchFinding, BUCKET_NS,
+    WATCH_GROUP_KIND, WATCH_GROUP_TEXT,
+};
 pub use limits::Limiter;
 pub use output::{DnsRec, FileAccessRec, FlowBucketRec, GapRec, NetFlowRec, Output, ProcessRec};
 pub use pipeline::Pipeline;

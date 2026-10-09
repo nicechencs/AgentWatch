@@ -5,19 +5,25 @@
 //! name, argv, the immediate parent's name, and whether an environment
 //! variable name exists. It does not read files, process memory, or env values.
 //!
-//! Concrete E3 adapters (`src/agents/<id>/`) are later tasks. This crate
-//! declares [`SelfReportSource`] and the [`parse_hook`] registry. No adapter
-//! is registered yet, so every agent id parses to an empty list.
+//! Built-in E3 hook parsers for `claude-code`, `codex`, and `cursor` are
+//! installed on the first [`parse_hook`] call ([`install_builtin_parsers`]).
+//! `aider` has no confirmed hook schema and is not registered. An unknown
+//! agent id still parses to an empty list.
 
 #![forbid(unsafe_code)]
 
 mod channel;
 mod identify;
+pub mod mcp_tap;
 mod profile;
 
 pub use channel::{
-    bound_tool_call, parse_hook, register_hook, ChannelError, HookParser, HookRegistry,
-    SelfReportSource, SessionHandle, MAX_CALL_BYTES,
+    bound_tool_call, install_builtin_parsers, parse_hook, register_hook, ChannelError, HookParser,
+    HookRegistry, SelfReportSource, SessionHandle, MAX_CALL_BYTES,
+};
+pub use mcp_tap::{
+    extract, push_frames, ArgType, ExtractGap, FrameError, FrameOutcome, RpcExtract, Splitter,
+    DIR_C2S, DIR_S2C, MAX_FRAME_BYTES, MAX_KEY_SCALARS,
 };
 pub use identify::{identify, identify_with, AgentMatch, Inference, MatchHit, ProcInfo};
 pub use profile::{

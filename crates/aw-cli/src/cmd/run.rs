@@ -1,13 +1,18 @@
 //! `aw run` (P1-CLI-02).
 //!
 //! Starts the target as the calling user through an injected [`Launcher`], then
-//! prints a session summary. The production launcher does not create a process:
-//! on Windows it uses the unverified Job stub, and on other targets it reports
-//! that P1-LNX-04 / P1-MAC-03 have not landed. Tests pass a fake and assert the
-//! target's exit code comes back unchanged.
+//! prints a session summary. On Windows the production launcher is
+//! [`launch::production`]: Job assignment is unavailable, so no process is
+//! created. On macOS it spawns with `Command` and says suspension was not
+//! applied. On Linux [`launch::LocalCgroupHost`] places the child in a delegated
+//! cgroup v2 directory, or returns an error and starts nothing. Tests pass a
+//! fake and assert the target's exit code comes back unchanged.
 //!
-//! `--self-report`, `--mcp-tap`, and `--unsafe-no-redact` are refused with a
-//! pointer at the later card. `--proxy` is a launch-mode injection plan
+//! `--self-report` and `--unsafe-no-redact` are refused with a pointer at the
+//! later card. `--mcp-tap` is refused on its own: no per-agent MCP config
+//! injection exists (SPIKE-09), so `aw run` does not rewrite a config and does
+//! not launch. The manual wrapper is `aw mcp-tap -- <cmd>`. `--proxy` is a
+//! launch-mode injection plan
 //! ([`aw_proxy::plan_injection`]): this process does not open a listener,
 //! because the daemon has no "open a proxy and return its port" call and has
 //! no tokio runtime to host [`aw_proxy::MitmProxy`]. The plan names the
@@ -170,9 +175,13 @@ pub(crate) trait Launcher {
     fn forward_interrupt(&mut self, pid: u32) -> Result<(), LaunchDispatchError>;
 }
 
-/// Windows production launcher. The Job API is the unverified stub, so the
-/// first step returns [`crate::launch::LaunchError::NotVerified`] and no
-/// process is created.
+/// Windows production launcher.
+///
+/// Uses [`launch::production`]. Job assignment is unavailable in this crate
+/// (`forbid(unsafe_code)`, no `windows` dependency), so no process is created.
+/// The error is [`crate::launch::LaunchError::JobFailed`] and does not claim a
+/// Job. A real suspended `CreateProcess` needs the `windows` crate, which is
+/// out of scope for `aw-cli`.
 #[cfg(target_os = "windows")]
 #[derive(Debug, Default)]
 pub(crate) struct PlatformLauncher;
@@ -180,7 +189,7 @@ pub(crate) struct PlatformLauncher;
 #[cfg(target_os = "windows")]
 impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
-        let mut api = launch::UnverifiedJobApi;
+        let mut api = launch::production();
         launch::dispatch_windows(&mut api, spec)
     }
 
@@ -193,12 +202,75 @@ impl Launcher for PlatformLauncher {
     }
 }
 
-/// Non-Windows production launcher. Names the cards that will provide it.
-#[cfg(not(target_os = "windows"))]
+/// Linux production launcher.
+///
+/// [`launch::LocalCgroupHost`] creates the session directory and moves the
+/// child into it. A cgroup failure is returned and the target is not left
+/// running outside the scope. Other non-Windows, non-macOS targets keep
+/// [`launch::UnsupportedUnixLauncher`].
+#[cfg(target_os = "linux")]
 #[derive(Debug, Default)]
 pub(crate) struct PlatformLauncher;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+impl Launcher for PlatformLauncher {
+    fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
+        let Some((program, args)) = spec.command.split_first() else {
+            return Err(LaunchDispatchError::NotImplemented {
+                detail: "launch command is empty".to_owned(),
+            });
+        };
+        let argv: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+        let host = launch::LocalCgroupHost;
+        match host.launch(
+            std::ffi::OsStr::new(program),
+            &argv,
+            spec.cwd.as_deref(),
+            &spec.env,
+            session_token(),
+        ) {
+            Ok(done) => Ok(Launched {
+                // A signalled child has no exit code. That is not success.
+                code: done.code.unwrap_or(exit::GENERAL),
+                pid: done.pid,
+                note: Some(POST_SPAWN_MOVE_NOTE),
+                sampling: spec.no_daemon,
+            }),
+            Err(err) => Err(LaunchDispatchError::NotImplemented {
+                detail: err.to_string(),
+            }),
+        }
+    }
+
+    fn forward_interrupt(&mut self, _pid: u32) -> Result<(), LaunchDispatchError> {
+        Err(LaunchDispatchError::NotImplemented {
+            detail: "interrupt forwarding is not wired; the child is waited without a signal forwarder".to_owned(),
+        })
+    }
+}
+
+/// Fixed sentence for the post-spawn cgroup move. Not a claim about the target.
+#[cfg(target_os = "linux")]
+const POST_SPAWN_MOVE_NOTE: &str = "子进程在写入 cgroup.procs 之前已经启动，这段窗口记为缺口";
+
+/// Session directory suffix. Not a stored id; unique for one launch.
+#[cfg(target_os = "linux")]
+fn session_token() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1)
+}
+
+/// Non-Linux, non-Windows, non-macOS production launcher.
+///
+/// Names the cards that will provide a real Unix launcher.
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+#[derive(Debug, Default)]
+pub(crate) struct PlatformLauncher;
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
         let mut inner = launch::UnsupportedUnixLauncher;
@@ -208,6 +280,43 @@ impl Launcher for PlatformLauncher {
     fn forward_interrupt(&mut self, pid: u32) -> Result<(), LaunchDispatchError> {
         let mut inner = launch::UnsupportedUnixLauncher;
         inner.forward_interrupt(pid)
+    }
+}
+
+/// macOS production launcher.
+///
+/// [`launch::production`] spawns the child with `Command`. Suspension is not
+/// applied: `POSIX_SPAWN_START_SUSPENDED` is not available without `unsafe` or
+/// an extra crate. The returned note says so. This is not E1 scope, and
+/// grandchild tracking is left to the collector.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+pub(crate) struct PlatformLauncher;
+
+#[cfg(target_os = "macos")]
+impl Launcher for PlatformLauncher {
+    fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
+        let mut api = launch::production();
+        let (code, pid, note, sampling) =
+            launch::launch_command(&mut api, spec.command.clone(), spec.no_daemon).map_err(
+                |err| LaunchDispatchError::NotImplemented {
+                    detail: err.to_string(),
+                },
+            )?;
+        Ok(Launched {
+            code,
+            pid,
+            note,
+            sampling,
+        })
+    }
+
+    fn forward_interrupt(&mut self, _pid: u32) -> Result<(), LaunchDispatchError> {
+        // No process group was created. A signal would need libc, which this
+        // crate does not link. Do not claim the interrupt was forwarded.
+        Err(LaunchDispatchError::NotImplemented {
+            detail: "interrupt forwarding is unavailable; no process group was created and libc is not linked".to_owned(),
+        })
     }
 }
 
@@ -228,9 +337,8 @@ pub(crate) fn run(
             return super::error_outcome(exit::USAGE, "usage", &detail, args.json);
         }
     };
-    // The production launcher does not create the child (P1-WIN-04 is still the
-    // unverified stub). Printing the plan and then calling it would turn a
-    // successful plan into a launch error, so a proxy plan stops here. No
+    // A proxy plan stops here. Printing it and then launching would turn a
+    // successful plan into a launch, and this process has no listener. No
     // process is created, which is also what the child-start gap requires.
     if let Some(plan) = &planned {
         let mut stderr = Vec::new();
@@ -416,12 +524,18 @@ fn write_proxy_plan(out: &mut dyn Write, plan: &ProxyPlan) -> io::Result<()> {
 }
 
 fn deferred_reason(flags: DeferredFlags) -> Option<String> {
+    // `--mcp-tap` on `aw run` is not a generic missing feature. SPIKE-09 has no
+    // verified per-agent MCP config injection, so this process must not rewrite
+    // a config and must not launch. The wrapper itself is `aw mcp-tap`.
+    if flags.mcp_tap {
+        return Some(
+            "--mcp-tap on `aw run` is not applied: no per-agent MCP config injection is implemented (SPIKE-09); `aw mcp-tap -- <cmd>` is the manual wrapper. nothing was launched"
+                .to_owned(),
+        );
+    }
     let mut which = Vec::new();
     if flags.self_report {
         which.push("--self-report");
-    }
-    if flags.mcp_tap {
-        which.push("--mcp-tap");
     }
     if flags.unsafe_no_redact {
         which.push("--unsafe-no-redact");

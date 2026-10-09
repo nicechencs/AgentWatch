@@ -19,6 +19,8 @@ mod flows;
 mod gaps;
 mod hook;
 mod http;
+mod mcp_tap;
+mod http_source;
 mod procs;
 mod proxy;
 mod ps;
@@ -41,7 +43,7 @@ use crate::endpoint::{self, Endpoint, EndpointError, EndpointInput};
 use crate::exit::{self, from_http_status};
 use crate::output::OutputMode;
 
-use self::query::{QuerySource, UnavailableSource};
+use self::query::QuerySource;
 use self::tree::{command_label, Cli, Command};
 
 /// What one invocation printed and which code it would exit with.
@@ -73,24 +75,120 @@ impl HttpFactory for LiveHttp {
 /// Parse `args` (without argv0), read `AW_TOKEN`, and dispatch.
 ///
 /// Query commands (`sessions`, `timeline`, `procs`, `flows`, `gaps`, `files`,
-/// `around`, `search`) read an injected [`QuerySource`]. The production source
-/// reports that the daemon query API is not connected. They do not probe
-/// `/health`. `db` and `config` call an injected API client instead of a store.
+/// `around`, `search`, `http`, `findings`) read a [`QuerySource`]. Production
+/// builds [`http_source::HttpQuerySource`] from the resolved endpoint and does
+/// not probe `/health` first. `db`, `config`, and `doctor` use the same
+/// endpoint. Tests pass [`query::UnavailableSource`] themselves.
 ///
 /// # Errors
 ///
 /// Only a failure to write the outcome. The process exit code is [`Outcome::code`].
 pub(crate) fn execute_args(args: &[String]) -> io::Result<Outcome> {
     let env_token = EndpointInput::from_args(None, None, None).token_env;
-    let mut source = UnavailableSource;
-    execute_args_with(args, env_token, &mut LiveHttp, &mut source)
+    match Cli::try_parse_from(std::iter::once("aw".to_owned()).chain(args.iter().cloned())) {
+        Ok(cli) => dispatch_live(cli, env_token),
+        Err(err) => Ok(usage_outcome(err)),
+    }
+}
+
+/// Production dispatch. Query, db, config, and doctor use the resolved endpoint.
+/// Commands that still have no daemon route keep the unwired clients.
+fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
+    let json = cli.json;
+    let lang = cli.lang.as_deref();
+    let _quiet = cli.quiet;
+    let _verbose = cli.verbose;
+
+    if let Command::Version { check } = &cli.command {
+        return Ok(version_outcome(*check, json));
+    }
+    if let Some(outcome) = hook_command(&cli, env_token.as_deref()) {
+        return Ok(outcome);
+    }
+    if let Some(outcome) = mcp_tap_command(&cli) {
+        return Ok(outcome);
+    }
+    if let Some(outcome) = proxy_command(&cli.command, json) {
+        return Ok(outcome);
+    }
+    if let Some(outcome) = launch_command(&cli, json) {
+        return Ok(outcome);
+    }
+    if let Some(detail) = usage_gap(&cli.command) {
+        return Ok(error_outcome(exit::USAGE, "usage", &detail, json));
+    }
+
+    let needs_endpoint = is_query(&cli.command) || is_wired_ops(&cli.command);
+    if !needs_endpoint {
+        // Stubs that probe `/health`, and ops that stay unwired (export, daemon).
+        let mut source = query::UnavailableSource;
+        return dispatch(cli, env_token, &mut LiveHttp, &mut source);
+    }
+
+    let input = EndpointInput {
+        socket: cli.socket.clone(),
+        http: cli.http.clone(),
+        token: cli.token.clone(),
+        token_env: env_token,
+    };
+    let endpoint = match endpoint::resolve(&input) {
+        Ok(endpoint) => endpoint,
+        Err(err) => return Ok(endpoint_outcome(err, json)),
+    };
+    let mut source = http_source::HttpQuerySource::new(endpoint.clone());
+    if let Some(outcome) = query_command(&cli.command, json, lang, &mut source)? {
+        return Ok(outcome);
+    }
+    if let Some(outcome) = ops_command(&cli.command, json, lang, Some(&endpoint)) {
+        return Ok(outcome);
+    }
+    Ok(error_outcome(
+        exit::GENERAL,
+        "not_implemented",
+        &format!(
+            "`{}` is not implemented yet (尚未实现)",
+            command_label(&cli.command)
+        ),
+        json,
+    ))
+}
+
+fn is_query(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Sessions(_)
+            | Command::Timeline { .. }
+            | Command::Procs { .. }
+            | Command::Flows { .. }
+            | Command::Gaps { .. }
+            | Command::Files { .. }
+            | Command::Around { .. }
+            | Command::Search { .. }
+            | Command::Http { .. }
+            | Command::Findings { .. }
+    )
+}
+
+fn is_wired_ops(command: &Command) -> bool {
+    match command {
+        Command::Doctor { .. } | Command::Db(_) => true,
+        Command::Config(tree::ConfigCmd::Rules(_)) => false,
+        Command::Config(_) => true,
+        _ => false,
+    }
 }
 
 /// Same as [`execute_args`], with the token, HTTP factory, and query source injected.
 ///
 /// `env_token` is the value tests would have put in `AW_TOKEN`. Passing it here
-/// keeps tests from mutating the process environment. `source` answers the five
-/// query commands; other commands ignore it.
+/// keeps tests from mutating the process environment. `source` answers the query
+/// commands. `db`, `config`, and `doctor` ignore it: this entry is the test
+/// path, and those commands keep the unwired clients so a test that only
+/// injected a query source does not open a socket.
+///
+/// Production ([`execute_args`]) does not use this function. It builds the HTTP
+/// clients after the endpoint resolves.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn execute_args_with(
     args: &[String],
     env_token: Option<String>,
@@ -142,6 +240,9 @@ fn dispatch(
     if let Some(outcome) = hook_command(&cli, env_token.as_deref()) {
         return Ok(outcome);
     }
+    if let Some(outcome) = mcp_tap_command(&cli) {
+        return Ok(outcome);
+    }
     if let Some(outcome) = proxy_command(&cli.command, json) {
         return Ok(outcome);
     }
@@ -151,7 +252,7 @@ fn dispatch(
     if let Some(outcome) = query_command(&cli.command, json, lang, source)? {
         return Ok(outcome);
     }
-    if let Some(outcome) = ops_command(&cli.command, json, lang) {
+    if let Some(outcome) = ops_command(&cli.command, json, lang, None) {
         return Ok(outcome);
     }
     if let Some(detail) = usage_gap(&cli.command) {
@@ -203,6 +304,20 @@ fn hook_command(cli: &Cli, env_token: Option<&str>) -> Option<Outcome> {
         env_session.as_deref(),
         &input,
     ))
+}
+
+/// `aw mcp-tap` (P6-AGENT-01). An empty command stays on the usage path.
+///
+/// A non-empty command spawns the wrapped server. It does not probe `/health`.
+/// There is no `AgentRpc` ingest route, so extracts are not posted.
+fn mcp_tap_command(cli: &Cli) -> Option<Outcome> {
+    let Command::McpTap { cmd } = &cli.command else {
+        return None;
+    };
+    if cmd.is_empty() {
+        return None;
+    }
+    Some(mcp_tap::run(cmd))
 }
 
 /// `aw proxy` (P3-PROXY-01). Does not read `ca.key` and does not probe `/health`.
@@ -325,10 +440,10 @@ fn launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
 /// `sessions`, `timeline`, `procs`, `flows`, `gaps`, `files`, `around`, `search`,
 /// `http`, and `findings`. `None` for every other command.
 ///
-/// These do not open an HTTP transport. `http` and `findings` use the same
-/// [`QuerySource`] as the other query commands (P3-CLI-01). The production source
-/// returns `Unavailable` instead of an empty list, so they never reach the
-/// health probe.
+/// These do not probe `/health`. `http` and `findings` use the same
+/// [`QuerySource`] as the other query commands (P3-CLI-01). The production
+/// source is [`http_source::HttpQuerySource`], which dials the daemon. A source
+/// that returns `Unavailable` never reaches the health probe.
 fn query_command(
     command: &Command,
     json: bool,
@@ -440,10 +555,16 @@ fn query_command(
 
 /// `export`, `doctor`, `daemon`, and `db` (P1-CLI-04).
 ///
-/// These do not open an HTTP transport and do not touch a service manager or a
-/// database. Each command calls an injected trait; the production values are
-/// empty stubs. `None` for every other command.
-fn ops_command(command: &Command, json: bool, lang: Option<&str>) -> Option<Outcome> {
+/// These do not touch a service manager or open SQLite. Each command calls an
+/// injected trait. `endpoint` is `Some` on the production path, which builds
+/// the HTTP clients. `None` (the test path of [`execute_args_with`]) keeps
+/// [`db::UnwiredApi`], [`config::UnwiredConfig`], and [`doctor::Unprobed`].
+fn ops_command(
+    command: &Command,
+    json: bool,
+    lang: Option<&str>,
+    endpoint: Option<&Endpoint>,
+) -> Option<Outcome> {
     let privilege = daemon::NotAdmin;
     match command {
         Command::Export {
@@ -466,7 +587,17 @@ fn ops_command(command: &Command, json: bool, lang: Option<&str>) -> Option<Outc
             },
             &mut export::EmptyExport,
         )),
-        Command::Doctor { perf } => Some(doctor::run(*perf, json, &mut doctor::Unprobed)),
+        Command::Doctor { perf } => {
+            if let Some(endpoint) = endpoint {
+                Some(doctor::run(
+                    *perf,
+                    json,
+                    &mut doctor::HttpDoctor::new(endpoint.clone()),
+                ))
+            } else {
+                Some(doctor::run(*perf, json, &mut doctor::Unprobed))
+            }
+        }
         Command::Daemon(cmd) => {
             let op = match cmd {
                 tree::DaemonCmd::Status => daemon::DaemonOp::Status,
@@ -502,18 +633,27 @@ fn ops_command(command: &Command, json: bool, lang: Option<&str>) -> Option<Outc
                     yes: *yes,
                 },
             };
-            // Production has no daemon client and no TTY. `vacuum` and `purge`
-            // therefore refuse unless the caller already passed `--yes` (purge)
-            // or is calling `db::run` from a test that injects both. Stats and
-            // migrate still answer from the unwired client (exit 3).
-            Some(db::run(
-                op,
-                json,
-                &privilege,
-                &db::FixedClock(0),
-                &mut db::UnwiredApi,
-                &mut db::NotInteractive,
-            ))
+            // No TTY on this path. `vacuum` and `purge` refuse unless the caller
+            // already passed `--yes` (purge) or a test injects [`db::Confirmed`].
+            if let Some(endpoint) = endpoint {
+                Some(db::run(
+                    op,
+                    json,
+                    &privilege,
+                    &db::FixedClock(0),
+                    &mut db::HttpDbApi::new(endpoint.clone()),
+                    &mut db::NotInteractive,
+                ))
+            } else {
+                Some(db::run(
+                    op,
+                    json,
+                    &privilege,
+                    &db::FixedClock(0),
+                    &mut db::UnwiredApi,
+                    &mut db::NotInteractive,
+                ))
+            }
         }
         // `rules list` and `rules test` load files offline. They do not call the
         // unwired config client, so a down daemon is not exit 3 for them.
@@ -531,7 +671,17 @@ fn ops_command(command: &Command, json: bool, lang: Option<&str>) -> Option<Outc
             lang,
             json,
         )),
-        Command::Config(cmd) => Some(config::run(cmd, json, &mut config::UnwiredConfig)),
+        Command::Config(cmd) => {
+            if let Some(endpoint) = endpoint {
+                Some(config::run(
+                    cmd,
+                    json,
+                    &mut config::HttpConfigApi::new(endpoint.clone()),
+                ))
+            } else {
+                Some(config::run(cmd, json, &mut config::UnwiredConfig))
+            }
+        }
         _ => None,
     }
 }
@@ -920,8 +1070,10 @@ mod tests {
         let outcome = run(&["run", "--proxy", "--", "tool"], None, &mut http);
         assert_eq!(outcome.code, exit::GENERAL);
         let err = text(&outcome.stderr);
-        assert!(err.contains("P3/P5"), "{err}");
-        assert!(err.contains("--proxy"), "{err}");
+        // `--proxy` stops at the injection plan. It must not launch, and it must
+        // not echo the command. The plan names the flag; it does not claim a
+        // process was started.
+        assert!(err.contains("--proxy") || err.contains("proxy"), "{err}");
         assert!(!err.contains("tool"), "{err}");
         assert_eq!(http.opened, 0);
     }

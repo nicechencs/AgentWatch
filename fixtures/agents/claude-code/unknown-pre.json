@@ -1,0 +1,10 @@
+{
+  "hook_event_name": "PreToolUse",
+  "session_id": "sess-synthetic-1",
+  "tool_name": "NotebookEdit",
+  "tool_use_id": "tu-unknown-1",
+  "tool_input": {
+    "notebook_path": "notes.ipynb",
+    "new_source": "cell-source-must-not-be-stored"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "sess-synthetic-1",
+  "tool_name": "Read",
+  "tool_use_id": "tu-read-1",
+  "tool_input": {
+    "file_path": "src/lib.rs",
+    "content": "file-body-must-not-be-stored"
+  },
+  "tool_response": {
+    "file_text": "file-body-must-not-be-stored"
+  }
+}

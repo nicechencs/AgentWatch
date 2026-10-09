@@ -1,0 +1,14 @@
+{
+  "hook_event_name": "PreToolUse",
+  "session_id": "sess-synthetic-1",
+  "tool_name": "Bash",
+  "tool_use_id": "tu-bash-1",
+  "cwd": "/work/placeholder",
+  "tool_input": {
+    "command": "echo ok",
+    "content": "do-not-store-body"
+  },
+  "tool_response": {
+    "output": "do-not-store-output"
+  }
+}

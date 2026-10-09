@@ -2,9 +2,16 @@
 # SPIKE-07（2026-10-07 文档调研）没有录到可用于识别的 argv；下面的路径只复述
 # process-tracking §7 的草案，不把它写成已证实的进程形态。
 # 渠道名来自同一篇文档调研（hooks、otel），不是本机实测。
+# P5-AGENT-03 的注入首选是本次启动的 `--settings <临时文件>`（【待验证】，
+# 未对真实 claude 二进制确认）。做不到时只给出手工片段，不写 ~/.claude/。
+# P5-AGENT-04 在用户未设置 OTEL_EXPORTER_OTLP_ENDPOINT 时才注入端点；
+# 变量名同样来自文档调研，【待验证】。
 
 id = "claude-code"
 display = "Claude Code"
+
+# 放在 [children] 之前。写在该表后面且不换表头时，TOML 会把数组收进 children。
+self_report = ["hooks", "otel"]
 
 [match]
 # 只认产品命令名。不把 node / python 放进 exe_names。
@@ -23,5 +30,3 @@ role_regex = [
     { role = "mcp_server", regex = '(?i)(^|[\\/])npx(@[^\\/]+)?$' },
     { role = "mcp_server", regex = '(?i)@modelcontextprotocol[\\/]' },
 ]
-
-self_report = ["hooks", "otel"]

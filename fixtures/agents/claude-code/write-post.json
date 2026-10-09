@@ -1,0 +1,10 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "sess-synthetic-1",
+  "tool_name": "Write",
+  "tool_use_id": "tu-write-1",
+  "tool_input": {
+    "file_path": "notes.txt",
+    "content": "whole-file-must-not-be-stored"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "hook_event_name": "PreToolUse",
+  "session_id": "sess-synthetic-1",
+  "tool_name": "Edit",
+  "tool_use_id": "tu-edit-1",
+  "tool_input": {
+    "path": "README.md",
+    "old_string": "old-text-must-not-be-stored",
+    "new_string": "new-text-must-not-be-stored"
+  }
+}

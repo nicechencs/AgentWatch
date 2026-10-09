@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agents;
 mod channel;
 mod identify;
 pub mod mcp_tap;
@@ -21,11 +22,11 @@ pub use channel::{
     bound_tool_call, install_builtin_parsers, parse_hook, register_hook, ChannelError, HookParser,
     HookRegistry, SelfReportSource, SessionHandle, MAX_CALL_BYTES,
 };
+pub use identify::{identify, identify_with, AgentMatch, Inference, MatchHit, ProcInfo};
 pub use mcp_tap::{
     extract, push_frames, ArgType, ExtractGap, FrameError, FrameOutcome, RpcExtract, Splitter,
     DIR_C2S, DIR_S2C, MAX_FRAME_BYTES, MAX_KEY_SCALARS,
 };
-pub use identify::{identify, identify_with, AgentMatch, Inference, MatchHit, ProcInfo};
 pub use profile::{
     load_profiles, AgentProfile, ChildRole, ChildrenRules, MatchRules, ProfileError, ProfileSet,
 };

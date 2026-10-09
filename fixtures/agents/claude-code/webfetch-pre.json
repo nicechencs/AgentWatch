@@ -1,0 +1,10 @@
+{
+  "hook_event_name": "PreToolUse",
+  "session_id": "sess-synthetic-1",
+  "tool_name": "WebFetch",
+  "tool_use_id": "tu-web-1",
+  "tool_input": {
+    "url": "https://example.test/docs",
+    "prompt": "prompt-must-not-be-stored"
+  }
+}

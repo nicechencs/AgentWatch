@@ -1,0 +1,24 @@
+{
+  "resourceMetrics": [
+    {
+      "scopeMetrics": [
+        {
+          "metrics": [
+            {
+              "name": "claude_code.input_tokens",
+              "sum": { "dataPoints": [{ "asInt": "12" }] }
+            },
+            {
+              "name": "claude_code.output_tokens",
+              "sum": { "dataPoints": [{ "asInt": "3" }] }
+            },
+            {
+              "name": "claude_code.cost",
+              "gauge": { "dataPoints": [{ "asInt": "1" }] }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

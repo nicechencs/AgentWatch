@@ -1,0 +1,35 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "session.id",
+            "value": { "stringValue": "sess-synthetic-otel" }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "eventName": "claude_code.tool_result",
+              "attributes": [
+                { "key": "tool_name", "value": { "stringValue": "Bash" } },
+                { "key": "tool_use_id", "value": { "stringValue": "tu-otel-bash" } },
+                { "key": "prompt", "value": { "stringValue": "PROMPT_MUST_BE_DROPPED" } },
+                { "key": "user_prompt", "value": { "stringValue": "USER_PROMPT_MUST_BE_DROPPED" } },
+                {
+                  "key": "tool_parameters",
+                  "value": {
+                    "stringValue": "{\"command\":\"echo ok\",\"content\":\"body-must-be-dropped\"}"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

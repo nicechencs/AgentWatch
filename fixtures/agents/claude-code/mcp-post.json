@@ -1,0 +1,13 @@
+{
+  "hook_event_name": "PostToolUse",
+  "session_id": "sess-synthetic-1",
+  "tool_name": "search",
+  "tool_use_id": "tu-mcp-2",
+  "mcp_server": "docs",
+  "tool_input": {
+    "query": "argument-must-not-be-stored"
+  },
+  "tool_response": {
+    "text": "model-output-must-not-be-stored"
+  }
+}

@@ -1,6 +1,8 @@
 # ---- Rust ----
 /target/
 **/target/
+# 预览验证时用的独立编译目录（cargo --target-dir target-preview）
+/target-preview/
 **/*.rs.bk
 *.pdb
 
@@ -24,6 +26,9 @@ xcuserdata/
 .build/
 
 # ---- 本地数据、导出与录制（可能含敏感信息）----
+# 本机预览：配置含本机绝对路径，目录里还有锁文件和日志。
+# scripts/start-ui.ps1 在缺失时会自行生成。
+/.aw-preview/
 *.db
 *.db-wal
 *.db-shm

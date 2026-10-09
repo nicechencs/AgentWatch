@@ -517,6 +517,8 @@ fn foreground_api(config: &DaemonConfig, data_dir: &Path) -> ApiState {
     state.sessions.clear();
     state.query = StoreQuery::open_path(data_dir.join("agentwatch.db"));
     state.config_json = config_snapshot(config);
+    // Off unless the config asks for it. The flag only changes `GET /`.
+    state.preview_ui = config.debug.preview_ui;
     state
 }
 
@@ -543,7 +545,10 @@ fn config_snapshot(config: &DaemonConfig) -> serde_json::Value {
             },
         },
         "correlation": { "max_hash_file_size": config.correlation.max_hash_file_size },
-        "debug": { "keep_raw_events": config.debug.keep_raw_events },
+        "debug": {
+            "keep_raw_events": config.debug.keep_raw_events,
+            "preview_ui": config.debug.preview_ui,
+        },
     })
 }
 

@@ -203,6 +203,15 @@ pub struct ApiConfig {}
 pub struct DebugConfig {
     /// `debug.keep_raw_events`, default false.
     pub keep_raw_events: bool,
+    /// `debug.preview_ui`, default false.
+    ///
+    /// Local preview only. When true, `GET /` answers a redirect to
+    /// `/#ticket=<one-time ticket>` so a browser opened by hand reaches the UI
+    /// without the `aw ui` launcher (that command is not wired yet). The ticket
+    /// is the same one-time, 60-second ticket the socket path issues, and it is
+    /// redeemed by the page, not logged. Leave this off outside a local preview:
+    /// anyone who can open the loopback port gets a ticket.
+    pub preview_ui: bool,
 }
 
 impl Default for DaemonConfig {
@@ -233,6 +242,7 @@ impl Default for DaemonConfig {
             api: ApiConfig {},
             debug: DebugConfig {
                 keep_raw_events: false,
+                preview_ui: false,
             },
         }
     }
@@ -426,7 +436,8 @@ pub fn config_schema_json() -> Value {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "keep_raw_events": { "type": "boolean", "default": false }
+                    "keep_raw_events": { "type": "boolean", "default": false },
+                    "preview_ui": { "type": "boolean", "default": false, "description": "Local preview only. GET / redirects to /#ticket= so a browser reaches the UI without the aw ui launcher. Off by default." }
                 }
             }
         }
@@ -643,18 +654,25 @@ fn parse_debug(
     warnings: &mut Vec<ConfigWarning>,
 ) -> Result<DebugConfig, ConfigError> {
     let mut keep_raw_events = false;
+    let mut preview_ui = false;
     let table = expect_table(value, prefix)?;
     for (key, child) in table {
         match key.as_str() {
             "keep_raw_events" => {
                 keep_raw_events = expect_bool(child, &dot(prefix, "keep_raw_events"))?;
             }
+            "preview_ui" => {
+                preview_ui = expect_bool(child, &dot(prefix, "preview_ui"))?;
+            }
             other => warnings.push(ConfigWarning {
                 key: dot(prefix, other),
             }),
         }
     }
-    Ok(DebugConfig { keep_raw_events })
+    Ok(DebugConfig {
+        keep_raw_events,
+        preview_ui,
+    })
 }
 
 fn warn_unknown_children(

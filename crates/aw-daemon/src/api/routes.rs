@@ -180,6 +180,10 @@ pub struct ApiState {
     pub live: LiveHub,
     /// `AW_UI_DEV_URL`, captured at construction. Empty means embedded assets.
     pub ui_dev_url: Option<String>,
+    /// `debug.preview_ui`. When true, `GET /` redirects to `/#ticket=` so a
+    /// browser opened by hand reaches the UI. Default false: a normal daemon
+    /// never hands out a ticket over HTTP.
+    pub preview_ui: bool,
 }
 
 impl Default for ApiState {
@@ -196,6 +200,7 @@ impl Default for ApiState {
                 crate::assets::AssetMode::DevProxy { origin } => Some(origin),
                 crate::assets::AssetMode::Embedded => None,
             },
+            preview_ui: false,
         }
     }
 }
@@ -692,6 +697,12 @@ pub fn dispatch(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     }
 
     if !req.path.starts_with("/api/") && req.method.eq_ignore_ascii_case("GET") {
+        // Only the document root, and only when the preview switch is on. Every
+        // other page path still falls through to the embedded assets, so a deep
+        // link is not rewritten and the ticket is not attached to asset URLs.
+        if state.preview_ui && (req.path == "/" || req.path.is_empty()) {
+            return preview_ticket_redirect(state, req);
+        }
         return static_asset(state, req);
     }
 
@@ -1427,6 +1438,39 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
 fn session_name_from_body(body: &[u8]) -> String {
     json_string_field_bytes(body, "name").unwrap_or_default()
 }
+
+/// `GET /` while `debug.preview_ui` is on.
+///
+/// Issues one ticket for a fixed local-preview identity and redirects to
+/// `/#ticket=...`. The fragment is not sent back to the server, and the page
+/// strips it after redeeming. A non-loopback Host is refused like every other
+/// ticket path. The ticket secret is the redirect target, never a log line.
+fn preview_ticket_redirect(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
+    if req_host_bad(&req.headers.get("host").cloned(), req.listen_port) {
+        return misdirected();
+    }
+    let (_ticket, secret) = state
+        .tickets
+        .issue_ui_ticket(PREVIEW_UI_USER, false, clock(state));
+    let mut headers = BTreeMap::new();
+    headers.insert("location".to_owned(), format!("/#ticket={secret}"));
+    headers.insert(
+        "content-type".to_owned(),
+        "text/plain; charset=utf-8".to_owned(),
+    );
+    // `no-store` so a shared browser cache cannot replay the ticket.
+    headers.insert("cache-control".to_owned(), "no-store".to_owned());
+    ApiResponse {
+        status: 302,
+        headers,
+        body: b"preview ticket issued".to_vec(),
+    }
+}
+
+/// Identity the preview redirect binds its ticket to. Not a real account: the
+/// preview switch is a local convenience, and this name only scopes the
+/// resulting token. It is not read from the request.
+const PREVIEW_UI_USER: &str = "local-preview";
 
 fn redeem_token(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     if req_host_bad(&req.headers.get("host").cloned(), req.listen_port) {

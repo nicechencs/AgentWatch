@@ -465,9 +465,11 @@ pub fn run_foreground(
 
     let stop = StopFlag::new();
     let batcher = Batcher::spawn(Arc::clone(&stop));
-    // Per-session OTLP receivers bind 127.0.0.1:0 when a session asks. Holding
-    // the registry here is what keeps that API in the binary. No session is
-    // open at startup, so nothing listens yet and nothing is forwarded.
+    // The registry binds 127.0.0.1:0 only, and only from `OtlpRegistry::open`.
+    // Nothing here calls `open`: the foreground runtime has no session yet, and
+    // the session orchestrator does not carry an agent id to bind one to.
+    // Holding the empty registry keeps the type in the binary. Drop closes
+    // nothing because nothing was opened, and nothing is forwarded.
     let otlp = OtlpRegistry::new();
 
     // Loopback only. `HttpServer::bind` refuses anything else. A port that is

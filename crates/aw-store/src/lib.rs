@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+mod agent_events;
 mod error;
 mod export;
 mod file_access;
@@ -25,6 +26,10 @@ pub use retention::{
     RetentionConfig, Stats, TableCount, WriteMode,
 };
 
+pub use agent_events::{
+    insert_agent_event, insert_self_report_gap, session_id_by_public, store_agent_event,
+    AgentEventInsert,
+};
 pub use error::StoreError;
 pub use export::{
     redact_host_field, redact_host_text, redact_user_paths, write_csv_zip, write_jsonl,
@@ -37,8 +42,8 @@ pub use fts::{read_mode as read_fts_mode, set_mode as set_fts_mode, FtsMode, Fts
 pub use http::{insert_http, HttpRow};
 pub use migrate::FILE_SCHEMA_VERSION;
 pub use migrate::{
-    apply_http_schema, apply_proxy_schema, OpenStatus, Store, HTTP_SCHEMA_VERSION,
-    PROXY_SCHEMA_VERSION, SCHEMA_VERSION,
+    apply_agent_schema, apply_http_schema, apply_proxy_schema, OpenStatus, Store,
+    AGENT_SCHEMA_VERSION, HTTP_SCHEMA_VERSION, PROXY_SCHEMA_VERSION, SCHEMA_VERSION,
 };
 pub use query::{
     around, around_sql, compile_predicate, compile_store_expr, delete_session, dns_events,

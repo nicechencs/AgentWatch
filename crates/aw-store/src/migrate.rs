@@ -106,6 +106,18 @@ pub const HTTP_SCHEMA_VERSION: u32 = 7;
 /// records a proxy URL reason stays at 7. [`apply_proxy_schema`] advances this.
 pub const PROXY_SCHEMA_VERSION: u32 = 8;
 
+/// `agent_events`: one bounded E3 self-report. [`apply_agent_schema`] runs it
+/// only when the table is missing. A database that never stores a self-report
+/// stays at whatever version it already had.
+pub const MIGRATION_0009: &str = include_str!("../migrations/0009_agent_events.sql");
+
+/// Version after [`MIGRATION_0009`].
+///
+/// Not part of [`SCHEMA_VERSION`], [`FILE_SCHEMA_VERSION`], or
+/// [`PROXY_SCHEMA_VERSION`]. [`Store::open`] does not apply this script.
+/// [`apply_agent_schema`] does, and only when `agent_events` is absent.
+pub const AGENT_SCHEMA_VERSION: u32 = 9;
+
 /// Apply [`http_schema_scripts`] when `http` is not there yet.
 ///
 /// `file_access` must already exist: 0007's view reads it. A database that has
@@ -215,6 +227,50 @@ pub fn apply_proxy_schema(store: &mut Store) -> Result<(), StoreError> {
         Ok(()) => tx
             .commit()
             .map_err(|err| StoreError::sqlite("commit_proxy_schema", err)),
+        Err(err) => {
+            drop(tx);
+            Err(err)
+        }
+    }
+}
+
+/// Create `agent_events` when it is not there yet.
+///
+/// The table does not depend on `http` or `file_access`. A database that
+/// already has it is left alone, including its `schema_version`. `schema_version`
+/// moves to [`AGENT_SCHEMA_VERSION`] only when this call creates the table.
+///
+/// # Errors
+///
+/// [`StoreError::ReadOnly`] when the store was opened read-only.
+/// [`StoreError::Sqlite`] when the script or the version row fails. The
+/// transaction is rolled back.
+pub fn apply_agent_schema(store: &mut Store) -> Result<(), StoreError> {
+    if store.is_read_only() {
+        return Err(StoreError::ReadOnly);
+    }
+    let conn = store.connection();
+    if table_present(conn, "agent_events", "probe_agent_events")? {
+        return Ok(());
+    }
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|err| StoreError::sqlite("begin_agent_schema", err))?;
+    let applied = (|| {
+        tx.execute_batch(MIGRATION_0009)
+            .map_err(|err| StoreError::sqlite("migrate_agent_events", err))?;
+        tx.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![AGENT_SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|err| StoreError::sqlite("migrate_agent_schema_version", err))?;
+        Ok::<(), StoreError>(())
+    })();
+    match applied {
+        Ok(()) => tx
+            .commit()
+            .map_err(|err| StoreError::sqlite("commit_agent_schema", err)),
         Err(err) => {
             drop(tx);
             Err(err)

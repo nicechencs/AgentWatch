@@ -1,9 +1,9 @@
 //! E3 ingress: hook reports and a per-session loopback OTLP/HTTP receiver (P5-AGENT-02).
 //!
-//! `agent_events` has no migration yet. This module defines the row and the
-//! write trait, then keeps accepted calls in memory and returns
-//! [`StoreAgentEvent::StorageNotReady`]. It does not open SQLite and does not
-//! pretend a row was inserted.
+//! The row and the in-memory buffer live here. SQLite writes go through
+//! `aw-store` (`agent_events`, migration 0009) from the hook route. This module
+//! does not open a database. [`StoreAgentEvent::StorageNotReady`] is what the
+//! memory buffer returns; the route must not report that as a stored row.
 //!
 //! The OTLP listener is `std::net::TcpListener` plus a small HTTP/1.1 parser,
 //! the same style as [`super::http`]. It binds `127.0.0.1:0` only, accepts
@@ -160,7 +160,7 @@ pub trait AgentEventStore: Send {
 
 /// In-memory stand-in. Rows stay in the process. Nothing is written to SQLite.
 #[derive(Debug, Default)]
-pub struct MemoryAgentEvents {
+pub(crate) struct MemoryAgentEvents {
     rows: Vec<AgentEventRow>,
     gaps: Vec<Gap>,
 }
@@ -168,20 +168,20 @@ pub struct MemoryAgentEvents {
 impl MemoryAgentEvents {
     /// Empty buffer.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Rows accepted since construction. Tests and the hook route read this.
     /// Not a database query.
     #[must_use]
-    pub fn rows(&self) -> &[AgentEventRow] {
+    pub(crate) fn rows(&self) -> &[AgentEventRow] {
         &self.rows
     }
 
     /// Gaps recorded for dropped self-reports.
     #[must_use]
-    pub fn gaps(&self) -> &[Gap] {
+    pub(crate) fn gaps(&self) -> &[Gap] {
         &self.gaps
     }
 }
@@ -228,7 +228,7 @@ fn mono_now() -> u64 {
 /// becomes a `self_report_dropped` gap. The returned value is what the store
 /// said; today that is always [`StoreAgentEvent::StorageNotReady`] when at
 /// least one call was accepted, or `None` when nothing was accepted.
-pub fn ingest_hook(
+pub(crate) fn ingest_hook(
     store: &mut dyn AgentEventStore,
     agent: &str,
     session_id: Option<&str>,

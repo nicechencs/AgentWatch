@@ -310,6 +310,61 @@ pub trait SessionQuery {
         user_id: &str,
         admin: bool,
     ) -> Result<serde_json::Value, QueryBackendError>;
+
+    /// `POST /api/v1/agent/hook`. Writes one bounded self-report, or one gap when
+    /// the hook says the report was dropped. Does not store a prompt or a body.
+    fn ingest_self_report(&self, report: &HookReport) -> Result<HookIngest, QueryBackendError>;
+}
+
+/// One hook post, already split by the route. Fields are the whitelist only.
+///
+/// Not `Debug`: `command`, `path`, `url`, and `query` have the same shape as
+/// argv and request targets.
+#[derive(Clone)]
+pub struct HookReport {
+    /// Public session id, or unknown. An unknown id is stored as NULL, not 0.
+    pub session: Option<String>,
+    /// Agent id from the hook argument.
+    pub agent: String,
+    /// `agent.<id>/hook`.
+    pub source: String,
+    /// Tool name, or unknown.
+    pub tool: Option<String>,
+    /// `pre` / `post` / `unknown`.
+    pub phase: Option<String>,
+    /// Adapter call id, or unknown.
+    pub call_id: Option<String>,
+    /// Structured command, or unknown.
+    pub command: Option<String>,
+    /// Structured path, or unknown.
+    pub path: Option<String>,
+    /// Structured URL, already redacted, or unknown.
+    pub url: Option<String>,
+    /// Structured query, or unknown.
+    pub query: Option<String>,
+    /// Bounded summary JSON, or unknown. Not logged.
+    pub summary_json: Option<String>,
+    /// `E3` for a kept report, `NA` for a drop.
+    pub evidence: String,
+    /// Field evidence JSON, or none.
+    pub field_evidence: Option<String>,
+    /// NA reason, or none.
+    pub na_reason: Option<String>,
+    /// `true` when the CLI abandoned the real report. No tool-call row is written.
+    pub dropped: bool,
+    /// Why it was dropped: `timeout`, `send_failed`. Not a payload.
+    pub drop_reason: Option<String>,
+}
+
+/// What the store did with one hook post.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookIngest {
+    /// The row is in `agent_events`.
+    Stored,
+    /// The database is not configured. The row was not written.
+    NoDatabase,
+    /// `dropped: true` became a `self_report_dropped` gap. No tool-call row.
+    Gap,
 }
 
 /// Default backend. Opens a short-lived [`Store`] per call so the writer is
@@ -985,10 +1040,65 @@ impl SessionQuery for StoreQuery {
         // soon as `file_access` exists, so a database already at version 5 would
         // never reach `http` and `findings`.
         aw_store::apply_http_schema(&mut store).map_err(map_store)?;
+        // 0008 and 0009 are optional past `http`: a database that never recorded a
+        // proxy URL or a self-report stays where it was. `db_migrate` is the
+        // operator asking for every script, so both run here.
+        aw_store::apply_proxy_schema(&mut store).map_err(map_store)?;
+        aw_store::apply_agent_schema(&mut store).map_err(map_store)?;
         Ok(serde_json::json!({
             "file_schema_version": aw_store::FILE_SCHEMA_VERSION,
             "http_schema_version": aw_store::HTTP_SCHEMA_VERSION,
+            "proxy_schema_version": aw_store::PROXY_SCHEMA_VERSION,
+            "agent_schema_version": aw_store::AGENT_SCHEMA_VERSION,
         }))
+    }
+
+    fn ingest_self_report(&self, report: &HookReport) -> Result<HookIngest, QueryBackendError> {
+        if self.db_path.is_none() {
+            return Ok(HookIngest::NoDatabase);
+        }
+        let mut store = self.open_mut()?;
+        let now = unix_now_ns();
+        // No user id: a hook is not an HTTP caller. A miss stays NULL.
+        let session_id = match report.session.as_deref().filter(|sid| !sid.is_empty()) {
+            Some(sid) => aw_store::session_id_by_public(store.connection(), sid).map_err(map_store)?,
+            None => None,
+        };
+        if report.dropped {
+            // The hook timed out or could not deliver the report. One gap, no
+            // tool-call row: a dropped report is not a successful call.
+            let detail = report
+                .drop_reason
+                .as_deref()
+                .filter(|text| !text.is_empty())
+                .unwrap_or("self_report_dropped");
+            aw_store::insert_self_report_gap(store.connection(), session_id, now, detail)
+                .map_err(map_store)?;
+            return Ok(HookIngest::Gap);
+        }
+        let row = aw_store::AgentEventInsert {
+            session_id,
+            ts_ns: now,
+            agent: report.agent.clone(),
+            tool: report.tool.clone(),
+            phase: report.phase.clone(),
+            call_id: report.call_id.clone(),
+            command: report.command.clone(),
+            path: report.path.clone(),
+            url: report.url.clone(),
+            query: report.query.clone(),
+            summary_json: report.summary_json.clone(),
+            evidence: report.evidence.clone(),
+            source: report.source.clone(),
+            field_evidence: report.field_evidence.clone(),
+            na_reason: if session_id.is_none() && report.session.is_some() {
+                Some("unknown_session".to_owned())
+            } else {
+                report.na_reason.clone()
+            },
+        };
+        aw_store::store_agent_event(&mut store, &row).map_err(map_store)?;
+        Ok(HookIngest::Stored)
     }
 }
 

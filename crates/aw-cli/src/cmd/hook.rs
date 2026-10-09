@@ -140,14 +140,27 @@ pub(crate) fn run(input: HookInput<'_>, transport: &mut dyn HookTransport) -> Ou
         return silent_ok();
     }
     let session = resolve_session(input.session_env, input.session_flag);
-    let dropped = Instant::now() >= deadline;
-    let body = hook_message(input.agent, session.as_deref(), input.payload, dropped);
-    if !dropped {
-        // Errors and a `false` (abandoned at the deadline) are the same outcome:
-        // the agent must not see them. The daemon records the gap when the body
-        // arrives with `dropped: true`, or when it never arrives and a later
-        // sweep notices the missing post. This process does not wait past the budget.
-        let _ = transport.send(input.endpoint, &body, deadline);
+    if Instant::now() >= deadline {
+        // No time left to tell the daemon either. Still exit 0.
+        return silent_ok();
+    }
+    let body = hook_message(input.agent, session.as_deref(), input.payload, false);
+    // A `false` (abandoned at the deadline) or any error means the report was
+    // not delivered. Say so with one `dropped: true` post, using only the time
+    // still inside the budget. If that also fails, stop. Nothing is printed.
+    let delivered = transport.send(input.endpoint, &body, deadline);
+    if !matches!(delivered, Ok(true)) && Instant::now() < deadline {
+        // `Ok(false)` is the deadline. Anything else is a connect or write
+        // failure, including a Unix socket that `File::open` cannot write.
+        // The notice names the agent and the session only. The payload that
+        // failed to send is not attached a second time.
+        let reason = if matches!(delivered, Ok(false)) {
+            "timeout"
+        } else {
+            "send_failed"
+        };
+        let notice = drop_notice(input.agent, session.as_deref(), reason);
+        let _ = transport.send(input.endpoint, &notice, deadline);
     }
     silent_ok()
 }
@@ -167,6 +180,17 @@ fn parse_hook_quiet(agent: &str, payload: &[u8]) -> Vec<aw_core::AgentToolCall> 
         return Vec::new();
     };
     parse_hook(agent, &value)
+}
+
+/// A drop the daemon can record without seeing the payload.
+fn drop_notice(agent: &str, session: Option<&str>, reason: &str) -> Vec<u8> {
+    let value = json!({
+        "agent": agent,
+        "session": session,
+        "dropped": true,
+        "reason": reason,
+    });
+    serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec())
 }
 
 fn hook_message(agent: &str, session: Option<&str>, payload: &[u8], dropped: bool) -> Vec<u8> {

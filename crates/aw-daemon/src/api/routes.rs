@@ -699,6 +699,13 @@ pub fn dispatch(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
         return redeem_token(state, req);
     }
 
+    // A hook is not a UI caller. It has no ticket, and a 401 would throw away the
+    // only signal that a self-report was dropped. The listener is loopback-only;
+    // this route still refuses a non-loopback Host.
+    if req.path == "/api/v1/agent/hook" && req.method.eq_ignore_ascii_case("POST") {
+        return ingest_agent_hook(state, req);
+    }
+
     // Socket/pipe ticket issuance is not an HTTP-bearer flow. Over this stub,
     // a presented bearer (or an explicit test caller header is not invented):
     // HTTP callers redeem tokens; issuing a ticket requires an already-known
@@ -709,6 +716,200 @@ pub fn dispatch(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     };
 
     route_authed(state, req, &caller)
+}
+
+/// `POST /api/v1/agent/hook`. Loopback only. No bearer: the hook process has no ticket.
+///
+/// `dropped: true` records a `self_report_dropped` gap and does not insert a
+/// tool call. Any other body is parsed by [`super::agent::ingest_hook`] and,
+/// when the database is configured, written to `agent_events`. No database is
+/// `StorageNotReady`, not a forged success.
+fn ingest_agent_hook(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
+    let host = req.headers.get("host").cloned();
+    if req_host_bad(&host, req.listen_port) {
+        return misdirected();
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&req.body) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_response(400, "not_json", "hook body is not JSON");
+        }
+    };
+    let dropped = value.get("dropped").and_then(serde_json::Value::as_bool) == Some(true);
+    let agent = value
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let session = value
+        .get("session")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned);
+    let reason = value
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned);
+
+    if dropped {
+        let report = super::query::HookReport {
+            session,
+            agent: agent.to_owned(),
+            source: String::new(),
+            tool: None,
+            phase: None,
+            call_id: None,
+            command: None,
+            path: None,
+            url: None,
+            query: None,
+            summary_json: None,
+            evidence: "NA".to_owned(),
+            field_evidence: None,
+            na_reason: Some("self_report_dropped".to_owned()),
+            dropped: true,
+            drop_reason: reason.or_else(|| Some("self_report_dropped".to_owned())),
+        };
+        return hook_result(state, &report);
+    }
+
+    let payload = value.get("payload").cloned().unwrap_or_else(|| value.clone());
+    let mut memory = super::agent::MemoryAgentEvents::new();
+    let outcomes = super::agent::ingest_hook(&mut memory, agent, session.as_deref(), &payload);
+    if outcomes.is_empty() && !memory.gaps().is_empty() {
+        // The parser rejected the call (oversize or not JSON-shaped). That is a
+        // drop, recorded as a gap, not as an empty success.
+        let report = super::query::HookReport {
+            session,
+            agent: agent.to_owned(),
+            source: String::new(),
+            tool: None,
+            phase: None,
+            call_id: None,
+            command: None,
+            path: None,
+            url: None,
+            query: None,
+            summary_json: None,
+            evidence: "NA".to_owned(),
+            field_evidence: None,
+            na_reason: Some("self_report_dropped".to_owned()),
+            dropped: true,
+            drop_reason: Some("oversize".to_owned()),
+        };
+        return hook_result(state, &report);
+    }
+    if outcomes.is_empty() {
+        // Unknown agent, or a payload with no calls. Not an error, and not a row.
+        return ApiResponse::json(200, &json!({ "accepted": 0 }));
+    }
+
+    let mut accepted = 0_u64;
+    let mut not_ready = false;
+    for row in memory.rows() {
+        let fields = summary_fields(&row.summary_json);
+        let report = super::query::HookReport {
+            session: session.clone(),
+            agent: row.agent.clone(),
+            source: row.source.clone(),
+            tool: none_if_empty(fields.tool.or_else(|| none_if_empty_owned(row.tool.clone()))),
+            phase: Some(phase_label(row.phase).to_owned()),
+            call_id: row.call_id.clone(),
+            command: fields.command,
+            path: fields.path,
+            url: fields.url,
+            query: fields.query,
+            summary_json: Some(row.summary_json.clone()),
+            evidence: "E3".to_owned(),
+            field_evidence: None,
+            na_reason: None,
+            dropped: false,
+            drop_reason: None,
+        };
+        match state.query.ingest_self_report(&report) {
+            Ok(super::query::HookIngest::Stored) => accepted = accepted.saturating_add(1),
+            Ok(super::query::HookIngest::NoDatabase) => not_ready = true,
+            Ok(super::query::HookIngest::Gap) => {}
+            Err(_) => {
+                return error_response(500, "store", "self-report was not written");
+            }
+        }
+    }
+    if not_ready {
+        // The migration exists, but this process has no database configured.
+        // Say so. Do not claim the row was stored.
+        return ApiResponse::json(
+            200,
+            &json!({ "accepted": accepted, "storage": "not_ready" }),
+        );
+    }
+    ApiResponse::json(200, &json!({ "accepted": accepted }))
+}
+
+fn hook_result(state: &mut ApiState, report: &super::query::HookReport) -> ApiResponse {
+    match state.query.ingest_self_report(report) {
+        Ok(super::query::HookIngest::Gap) => ApiResponse::json(200, &json!({ "gap": "self_report_dropped" })),
+        Ok(super::query::HookIngest::NoDatabase) => {
+            ApiResponse::json(200, &json!({ "gap": "self_report_dropped", "storage": "not_ready" }))
+        }
+        Ok(super::query::HookIngest::Stored) => {
+            ApiResponse::json(200, &json!({ "gap": "self_report_dropped" }))
+        }
+        Err(_) => error_response(500, "store", "self-report gap was not written"),
+    }
+}
+
+/// The five summary keys a self-report may keep. Missing keys stay `None`.
+struct SummaryFields {
+    command: Option<String>,
+    path: Option<String>,
+    url: Option<String>,
+    query: Option<String>,
+    tool: Option<String>,
+}
+
+/// Whitelist keys only. Anything else in the summary JSON is ignored.
+fn summary_fields(summary_json: &str) -> SummaryFields {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(summary_json) else {
+        return SummaryFields {
+            command: None,
+            path: None,
+            url: None,
+            query: None,
+            tool: None,
+        };
+    };
+    SummaryFields {
+        command: summary_string(&value, "command"),
+        path: summary_string(&value, "path"),
+        url: summary_string(&value, "url"),
+        query: summary_string(&value, "query"),
+        tool: summary_string(&value, "tool"),
+    }
+}
+
+fn summary_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+fn none_if_empty(value: Option<String>) -> Option<String> {
+    value.filter(|text| !text.is_empty())
+}
+
+fn none_if_empty_owned(value: String) -> Option<String> {
+    none_if_empty(Some(value))
+}
+
+fn phase_label(phase: aw_core::ToolPhase) -> &'static str {
+    match phase {
+        aw_core::ToolPhase::Pre => "pre",
+        aw_core::ToolPhase::Post => "post",
+        aw_core::ToolPhase::Unknown => "unknown",
+    }
 }
 
 fn health(state: &ApiState) -> ApiResponse {

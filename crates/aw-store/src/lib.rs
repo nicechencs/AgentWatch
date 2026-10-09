@@ -11,6 +11,7 @@
 
 mod agent_events;
 mod error;
+mod inter_agent;
 mod export;
 mod file_access;
 mod findings;
@@ -30,6 +31,12 @@ pub use agent_events::{
     insert_agent_event, insert_self_report_gap, session_id_by_public, store_agent_event,
     AgentEventInsert,
 };
+pub use inter_agent::{
+    insert_agent_instance, insert_agent_link, insert_agent_rpc, insert_ipc_channel,
+    insert_watch_group, store_agent_instance, store_agent_link, store_agent_rpc,
+    store_ipc_channel, store_watch_group, AgentInstanceInsert, AgentLinkInsert, AgentRpcInsert,
+    IpcChannelInsert, WatchGroupInsert,
+};
 pub use error::StoreError;
 pub use export::{
     redact_host_field, redact_host_text, redact_user_paths, write_csv_zip, write_jsonl,
@@ -42,8 +49,9 @@ pub use fts::{read_mode as read_fts_mode, set_mode as set_fts_mode, FtsMode, Fts
 pub use http::{insert_http, HttpRow};
 pub use migrate::FILE_SCHEMA_VERSION;
 pub use migrate::{
-    apply_agent_schema, apply_http_schema, apply_proxy_schema, OpenStatus, Store,
-    AGENT_SCHEMA_VERSION, HTTP_SCHEMA_VERSION, PROXY_SCHEMA_VERSION, SCHEMA_VERSION,
+    apply_agent_schema, apply_http_schema, apply_inter_agent_schema, apply_proxy_schema,
+    OpenStatus, Store, AGENT_SCHEMA_VERSION, HTTP_SCHEMA_VERSION, INTER_AGENT_SCHEMA_VERSION,
+    PROXY_SCHEMA_VERSION, SCHEMA_VERSION,
 };
 pub use query::{
     around, around_sql, compile_predicate, compile_store_expr, delete_session, dns_events,

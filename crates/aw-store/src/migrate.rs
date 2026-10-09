@@ -118,6 +118,16 @@ pub const MIGRATION_0009: &str = include_str!("../migrations/0009_agent_events.s
 /// [`apply_agent_schema`] does, and only when `agent_events` is absent.
 pub const AGENT_SCHEMA_VERSION: u32 = 9;
 
+/// Inter-agent tables and `sessions.group_id` (P6-STORE-01).
+///
+/// [`apply_inter_agent_schema`] runs it only when `watch_groups` is missing.
+/// A database that never stores an inter-agent row stays at whatever version
+/// it already had. [`Store::open`] does not apply this script.
+pub const MIGRATION_0010: &str = include_str!("../migrations/0010_inter_agent.sql");
+
+/// Version after [`MIGRATION_0010`].
+pub const INTER_AGENT_SCHEMA_VERSION: u32 = 10;
+
 /// Apply [`http_schema_scripts`] when `http` is not there yet.
 ///
 /// `file_access` must already exist: 0007's view reads it. A database that has
@@ -271,6 +281,51 @@ pub fn apply_agent_schema(store: &mut Store) -> Result<(), StoreError> {
         Ok(()) => tx
             .commit()
             .map_err(|err| StoreError::sqlite("commit_agent_schema", err)),
+        Err(err) => {
+            drop(tx);
+            Err(err)
+        }
+    }
+}
+
+/// Create the inter-agent tables and `sessions.group_id` when they are absent.
+///
+/// The script does not depend on `http`, `file_access`, or `agent_events`.
+/// A database that already has `watch_groups` is left alone, including its
+/// `schema_version`. `schema_version` moves to [`INTER_AGENT_SCHEMA_VERSION`]
+/// only when this call creates the tables.
+///
+/// # Errors
+///
+/// [`StoreError::ReadOnly`] when the store was opened read-only.
+/// [`StoreError::Sqlite`] when the script or the version row fails. The
+/// transaction is rolled back.
+pub fn apply_inter_agent_schema(store: &mut Store) -> Result<(), StoreError> {
+    if store.is_read_only() {
+        return Err(StoreError::ReadOnly);
+    }
+    let conn = store.connection();
+    if table_present(conn, "watch_groups", "probe_watch_groups")? {
+        return Ok(());
+    }
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|err| StoreError::sqlite("begin_inter_agent_schema", err))?;
+    let applied = (|| {
+        tx.execute_batch(MIGRATION_0010)
+            .map_err(|err| StoreError::sqlite("migrate_inter_agent", err))?;
+        tx.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![INTER_AGENT_SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|err| StoreError::sqlite("migrate_inter_agent_schema_version", err))?;
+        Ok::<(), StoreError>(())
+    })();
+    match applied {
+        Ok(()) => tx
+            .commit()
+            .map_err(|err| StoreError::sqlite("commit_inter_agent_schema", err)),
         Err(err) => {
             drop(tx);
             Err(err)

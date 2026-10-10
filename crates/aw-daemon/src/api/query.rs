@@ -1487,6 +1487,9 @@ fn search_hit_json(hit: &aw_store::SearchHit) -> serde_json::Value {
         "src_id": hit.src_id,
         "session_id": hit.session_id,
         "public_id": hit.public_id,
+        "text": hit.text,
+        "ts_ns": hit.ts_ns,
+        "evidence": hit.evidence,
     })
 }
 

@@ -1,0 +1,19 @@
+[package]
+name = "aw-channel"
+# Explicit fields, not `workspace = true`: app/src-tauri (its own workspace)
+# depends on this crate by path, and keeping the manifest self-contained means
+# that build never needs the root workspace table.
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Internal-channel client shared by aw and the desktop app: socket/pipe path order, dial with error classes, one HTTP/1.1 exchange. std only."
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

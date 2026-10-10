@@ -82,7 +82,7 @@ export function SearchPage() {
               <button type="button" onClick={() => void navigate({ to: "/s/$sid", params: { sid: group.session_id }, search: {} })} className="hover:underline">
                 {group.session_name ?? group.session_id}
               </button>
-              <span className="font-mono text-[11px] text-ink-faint">{group.session_id}</span>
+              {group.session_name ? <span className="font-mono text-[11px] text-ink-faint">{group.session_id}</span> : null}
               <span className="text-xs text-ink-soft">{t("search.hits", { count: group.count })}</span>
               {group.count > group.hits.length ? <span className="text-[11px] text-ink-faint">{t("search.more", { count: group.hits.length })}</span> : null}
             </h2>

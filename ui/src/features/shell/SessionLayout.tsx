@@ -10,6 +10,7 @@ import { RelTime } from "@/components/RelTime";
 import { ErrorNote, Loading } from "@/components/QueryState";
 import { composedFilter, useSessionQuery } from "@/lib/session-query";
 import { useExport } from "@/lib/use-export";
+import { sessionTitle } from "@/lib/session-title";
 import { useI18n } from "@/lib/i18n";
 
 const TABS = [
@@ -82,7 +83,7 @@ export function SessionLayout() {
         </Link>
         <span className="text-ink-faint">▸</span>
         <span className="font-mono text-xs">{data.public_id}</span>
-        <span className="truncate text-sm">{data.name ?? data.argv?.[0] ?? ""}</span>
+        <span className="truncate text-sm">{sessionTitle(data)}</span>
         <span className={`text-xs ${active ? "text-accent" : "text-ink-faint"}`}>
           {active ? `● ${t("session.recording")}` : `○ ${t("session.stopped")}`}
         </span>

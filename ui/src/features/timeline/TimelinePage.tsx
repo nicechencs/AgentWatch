@@ -251,7 +251,7 @@ function TimelineRow({
       onClick={onSelect}
       className={`flex w-full items-baseline gap-3 px-3 py-1 text-left text-xs ${active ? "bg-paper-sunken" : "hover:bg-paper-sunken/60"}`}
     >
-      <TimelineTime ns={item.ts_ns} sessionStart={sessionStart} />
+      <TimelineTime ns={item.ts_ns} sessionStart={sessionStart} preExisting={item.kind === "proc" && item.pre_existing === true} />
       <EvidenceBadge level={item.evidence} source={item.source} naReason={item.na_reason} />
       <span aria-hidden="true">{GLYPH[item.kind]}</span>
       <span className="w-10 shrink-0 text-ink-faint">{kindLabel(t, item.kind)}</span>

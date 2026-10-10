@@ -1,12 +1,12 @@
 import { EvidenceBadge } from "@/components/EvidenceBadge";
-import { kindLabel, type Coverage } from "@/lib/capabilities";
+import { kindInSentence, type Coverage } from "@/lib/capabilities";
 import { useI18n } from "@/lib/i18n";
 
 /** Short cell text for a value this session's collectors do not observe. */
 export function NotCollected({ kind }: { kind: string }) {
   const { t } = useI18n();
   return (
-    <span className="text-ink-faint" title={t("coverage.notCollectedTip", { kind: kindLabel(t, kind) })}>
+    <span className="text-ink-faint" title={t("coverage.notCollectedTip", { kind: kindInSentence(t, kind) })}>
       {t("coverage.notCollectedShort")}
     </span>
   );
@@ -20,7 +20,7 @@ export function NotCollected({ kind }: { kind: string }) {
 export function CoverageNote({ kind, coverage }: { kind: string; coverage: Coverage }) {
   const { t } = useI18n();
   if (coverage === "collected") return null;
-  const label = kindLabel(t, kind);
+  const label = kindInSentence(t, kind);
   return (
     <p className="flex items-center gap-1 px-4 py-6 text-sm text-ink-soft" data-coverage={coverage}>
       <EvidenceBadge level="NA" naReason={coverage === "not_collected" ? "collector_unavailable" : null} />

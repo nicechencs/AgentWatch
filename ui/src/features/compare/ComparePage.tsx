@@ -14,6 +14,7 @@ import type { Session } from "@/api/types";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { EmptyNote, ErrorNote, Loading } from "@/components/QueryState";
 import { useI18n } from "@/lib/i18n";
+import { sessionTitle } from "@/lib/session-title";
 import { loadSide, type CompareSide } from "./api";
 
 const DIMENSIONS = ["files", "commands", "domains", "findings"] as const;
@@ -120,7 +121,7 @@ function SessionSelect({
         <option value="">{t("compare.none")}</option>
         {items.map((session) => (
           <option key={session.public_id} value={session.public_id}>
-            {session.name ?? session.argv?.[0] ?? session.public_id}
+            {sessionTitle(session)}
           </option>
         ))}
       </select>

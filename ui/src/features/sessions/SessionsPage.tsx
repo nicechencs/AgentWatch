@@ -13,6 +13,7 @@ import { formatDuration } from "@/lib/format";
 import { NotCollected } from "@/components/NotCollected";
 import { coverage } from "@/lib/capabilities";
 import { diskUnavailableText, diskUsed } from "@/lib/disk";
+import { sessionTitle } from "@/lib/session-title";
 import { useI18n } from "@/lib/i18n";
 import { useExport } from "@/lib/use-export";
 
@@ -155,7 +156,7 @@ export function SessionsPage() {
       <ConfirmDialog
         open={pendingDelete !== null}
         title={t("sessions.delete")}
-        body={t("sessions.deleteConfirm", { name: pendingDelete?.name ?? pendingDelete?.public_id ?? "" })}
+        body={t("sessions.deleteConfirm", { name: pendingDelete ? sessionTitle(pendingDelete) : "" })}
         confirmLabel={t("sessions.delete")}
         onCancel={() => setPendingDelete(null)}
         onConfirm={() => {
@@ -229,7 +230,7 @@ function SessionRow({
           />
         ) : (
           <button type="button" onClick={onOpen} className="text-left">
-            <span className="block">{session.name ?? session.argv?.[0] ?? session.public_id}</span>
+            <span className="block">{sessionTitle(session)}</span>
             <span className="font-mono text-[11px] text-ink-faint">{session.public_id}</span>
           </button>
         )}

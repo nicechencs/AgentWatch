@@ -10,7 +10,7 @@ import { Count } from "@/components/Count";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { NotCollected } from "@/components/NotCollected";
 import { ErrorNote, Loading } from "@/components/QueryState";
-import { capabilitiesUnknown, coverage, kindLabel, uncollectedKinds } from "@/lib/capabilities";
+import { capabilitiesUnknown, coverage, kindInSentence, kindLabel, uncollectedKinds } from "@/lib/capabilities";
 import { useI18n } from "@/lib/i18n";
 import { usePrefs } from "@/lib/prefs";
 import { useSessionQuery } from "@/lib/session-query";
@@ -119,7 +119,7 @@ function Overview({ summary, filter }: { summary: SessionSummary; filter: string
           t("overview.noGaps")
         )}
         {missing.length > 0 ? (
-          <span> · {t("overview.notCollected", { kinds: missing.map((kind) => kindLabel(t, kind)).join("、") })}</span>
+          <span> · {t("overview.notCollected", { kinds: missing.map((kind) => kindInSentence(t, kind)).join(t("common.listSep")) })}</span>
         ) : null}
         {unknownCaps ? <span> · {t("overview.coverageUnknown")}</span> : null}
         {summary.direct_count > 0 ? <span> · {t("overview.direct", { count: summary.direct_count })}</span> : null}

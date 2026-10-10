@@ -36,8 +36,26 @@ type T = (key: string, vars?: Record<string, string | number>) => string;
  * those become a plain sentence. Anything else keeps the daemon's message, and
  * an empty one says which status came back instead of printing nothing.
  */
+/**
+ * Daemon error codes that have their own sentence. Checked before the status:
+ * `launch_needs_cli` is a 403 but says more than 「没有权限」.
+ */
+const CODE_TEXT: Record<string, string> = {
+  program_not_found: "error.programNotFound",
+  program_not_permitted: "error.programNotPermitted",
+  spawn_failed: "error.spawnFailed",
+  launch_needs_cli: "error.launchNeedsCli",
+  collector_unavailable: "error.collectorUnavailable",
+  no_such_process: "error.noSuchProcess",
+  no_database: "error.noDatabase",
+  store_unavailable: "error.noDatabase",
+  session_ended: "error.sessionEnded",
+};
+
 export function describeError(error: unknown, t: T): string {
   if (error instanceof ApiError) {
+    const coded = CODE_TEXT[error.code];
+    if (coded) return t(coded);
     if (error.status === 401 || error.code === "unauthorized") return t("error.unauthorized");
     if (error.status === 403 || error.code === "forbidden") return t("error.forbidden");
     if (error.status === 501 || error.code === "not_implemented") return t("error.notImplemented");

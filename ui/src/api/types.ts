@@ -186,6 +186,8 @@ export interface TimelineItem {
   /** Collapse group produced by the "merge" density mode. */
   collapsed?: { count: number; dir: string } | null;
   gap?: Gap | null;
+  /** `proc` rows: running before the session began (daemon decides; attach baselines only). */
+  pre_existing?: boolean;
 }
 
 export interface HistogramBucket {
@@ -337,7 +339,17 @@ export interface DoctorReport {
   os_version: string | null;
   mode: string | null;
   capabilities: DoctorCapability[];
-  collectors: { name: string; status: string; note: string | null }[];
+  /** Runtime state from the service, not the config: `running` / `stopped` / `not_built` / `unknown`. */
+  collectors: {
+    name: string;
+    status: string;
+    note?: string | null;
+    running?: boolean | null;
+    daemon_sample?: boolean;
+    watched_roots?: number;
+    last_sample_ns?: number | null;
+    capabilities?: { kind: string; evidence: string | null; na_reason?: string | null }[];
+  }[];
   /** False when the daemon did not probe collectors (capabilities is then empty). */
   probed: boolean;
   reason: string | null;

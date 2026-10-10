@@ -2,11 +2,12 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { api } from "@/api/client";
 import { isApiError } from "@/api/errors";
-import type { ConfigView, RedactionRule } from "@/api/types";
+import type { ConfigView, DoctorReport, RedactionRule } from "@/api/types";
 import { Bytes } from "@/components/Bytes";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ErrorNote, Loading } from "@/components/QueryState";
 import { useAuth } from "@/lib/auth";
+import { kindLabel } from "@/lib/capabilities";
 import { diskUnavailableText, diskUsed } from "@/lib/disk";
 import { useI18n } from "@/lib/i18n";
 import { redactPreview } from "@/lib/redact-preview";
@@ -32,7 +33,7 @@ export function SettingsPage() {
       <Storage config={config.data} used={diskUsed(stats.data)} usedNa={diskUnavailableText(stats.data, t)} admin={admin} />
       <Privacy config={config.data} admin={admin} />
       <ProxySection config={config.data} admin={admin} />
-      <Collectors config={config.data} />
+      <Collectors />
       <Rules config={config.data} />
       <Appearance />
     </main>
@@ -203,22 +204,63 @@ function Privacy({ config, admin }: { config: ConfigView; admin: boolean }) {
   );
 }
 
-function Collectors({ config }: { config: ConfigView }) {
+/**
+ * What the collectors are doing now, from the service's runtime state
+ * (`GET /doctor` → `collectors`). Not the config: its per-platform switch
+ * table (`linux: tls_uprobe=off …`) read as 「linux 未启用」 while process
+ * sampling was running.
+ */
+export function Collectors() {
   const { t } = useI18n();
+  const doctor = useQuery({ queryKey: ["doctor"], queryFn: () => api.doctor(), refetchInterval: 10_000 });
   return (
     <Section title={t("settings.collectors")}>
-      {config.collectors.length === 0 ? <p className="text-ink-faint" data-empty="collectors">{t("settings.collectorsNotListed")}</p> : null}
+      {doctor.isLoading ? <p className="text-ink-faint">{t("common.loading")}</p> : null}
+      {doctor.isError ? <ErrorNote error={doctor.error} onRetry={() => void doctor.refetch()} /> : null}
+      {doctor.data && doctor.data.collectors.length === 0 ? (
+        <p className="text-ink-faint" data-empty="collectors">{t("settings.collectorsNotListed")}</p>
+      ) : null}
       <ul>
-        {config.collectors.map((collector) => (
-          <li key={collector.name} className="flex items-baseline gap-2 border-b border-line/60 py-1">
-            <span className="font-mono">{collector.name}</span>
-            <span className={collector.enabled ? "" : "text-ink-faint"}>{collector.enabled ? t("settings.collectorEnabled") : t("settings.collectorDisabled")}</span>
-            {collector.note ? <span className="text-ink-faint">{collector.note}</span> : null}
+        {(doctor.data?.collectors ?? []).map((collector) => (
+          <li key={collector.name} className="flex flex-wrap items-baseline gap-2 border-b border-line/60 py-1" data-collector={collector.name} data-status={collector.status}>
+            <span>{collectorName(t, collector.name)}</span>
+            <span className={collector.status === "running" ? "" : "text-ink-faint"}>{collectorStatus(t, collector)}</span>
+            {collector.capabilities && collector.capabilities.length > 0 ? (
+              <span className="text-ink-faint">
+                {collector.capabilities
+                  .map((cap) => `${kindLabel(t, cap.kind)} ${cap.evidence && cap.evidence !== "NA" ? t("settings.capYes") : t("settings.capNo")}`)
+                  .join(t("common.listSep"))}
+              </span>
+            ) : null}
           </li>
         ))}
       </ul>
     </Section>
   );
+}
+
+function collectorName(t: (key: string) => string, name: string): string {
+  const key = `settings.collectorName.${name}`;
+  const text = t(key);
+  return text === key ? name : text;
+}
+
+function collectorStatus(
+  t: (key: string, vars?: Record<string, string | number>) => string,
+  collector: DoctorReport["collectors"][number],
+): string {
+  switch (collector.status) {
+    case "running":
+      if (collector.daemon_sample && collector.watched_roots) return t("settings.collectorRunningBoth", { count: collector.watched_roots });
+      if (collector.watched_roots) return t("settings.collectorRunningSessions", { count: collector.watched_roots });
+      return t("settings.collectorRunning");
+    case "stopped":
+      return t("settings.collectorStopped");
+    case "not_built":
+      return t("settings.collectorNotBuilt");
+    default:
+      return t("settings.collectorUnknown");
+  }
 }
 
 function Rules({ config }: { config: ConfigView }) {

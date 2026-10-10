@@ -15,7 +15,7 @@ export function NewSessionPage() {
   const navigate = useNavigate();
   const client = useQueryClient();
   const doctor = useQuery({ queryKey: ["doctor"], queryFn: () => api.doctor() });
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<unknown>(null);
   const [pending, setPending] = useState(false);
 
   const start = async (body: Parameters<typeof api.createSession>[0]) => {
@@ -28,7 +28,9 @@ export function NewSessionPage() {
       await client.invalidateQueries({ queryKey: ["sessions"] });
       await navigate({ to: "/s/$sid", params: { sid: session.public_id }, search: {} });
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : t("common.error"));
+      // ErrorNote words daemon codes (`program_not_found`, …) in plain text
+      // instead of printing the daemon's English message.
+      setError(caught ?? new Error(t("common.error")));
     } finally {
       setPending(false);
     }
@@ -41,7 +43,7 @@ export function NewSessionPage() {
         <LaunchForm pending={pending} onStart={start} />
         <AttachForm pending={pending} onStart={start} />
       </div>
-      {error ? <ErrorNote message={error} /> : null}
+      {error ? <ErrorNote error={error} /> : null}
       <section className="mt-4">
         <h2 className="text-sm font-medium">{t("new.capabilities")}</h2>
         {doctor.isError ? <ErrorNote error={doctor.error} onRetry={() => void doctor.refetch()} /> : null}

@@ -224,6 +224,7 @@ export function toTimelineItem(raw: unknown): TimelineItem {
     source: strOrNull(r.source),
     proc_uid: strOrNull(r.proc_uid),
     proc: isObj(r.proc) ? (r.proc as unknown as TimelineItem["proc"]) : null,
+    pre_existing: r.pre_existing === true,
   } as TimelineItem;
 }
 

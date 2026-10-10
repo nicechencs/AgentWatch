@@ -10,6 +10,16 @@ export function kindLabel(t: T, kind: string): string {
 }
 
 /**
+ * The category as a word inside a sentence: lowercase in English
+ * ("does not collect files"), where `kindLabel` is a title ("File").
+ */
+export function kindInSentence(t: T, kind: string): string {
+  const key = `coverage.kinds.${kind}`;
+  const text = t(key);
+  return text === key ? kindLabel(t, kind) : text;
+}
+
+/**
  * Whether a session's collectors observe `kind`.
  *
  * - `collected`: some collector lists it with evidence other than NA.

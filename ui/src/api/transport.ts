@@ -11,26 +11,21 @@
  * Both paths return a standard `Response`, so `client.ts` handles status and
  * JSON the same way.
  *
- * Commands the page calls in the app (interface in app/README.md):
- * - `aw_request {method, target, body?}` → `{status, body}`: JSON/text.
- * - `aw_request_bytes {method, target, body?}` → `{status, headers, body_base64}`:
- *   binary-safe, used for exports (the CSV export is a zip).
- * A rejected command's error text starts with `daemon_unreachable:` (nothing
- * is listening), `daemon_forbidden:` (the socket/pipe refused this OS user),
- * or anything else (the channel itself failed).
+ * Commands the page calls in the app (app/README.md "Page ↔ shell interface"):
+ * - `aw_request {method, target, body?}` → `{status, headers, body, body_base64}`.
+ *   `body` for JSON, `body_base64` for exact bytes (the CSV export is a zip).
+ * - `aw_stream_open {target, onEvent: Channel}` → id, `aw_stream_close {id}`: `/live`.
+ * A rejected command gives `{code, message}`. Only `daemon_unreachable` means
+ * the service is not running; `daemon_forbidden` is a permission problem.
  */
 
 type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
 
 interface ChannelReply {
   status: number;
-  body: string;
-}
-
-interface BytesReply {
-  status: number;
   headers?: Record<string, string>;
-  body_base64: string;
+  body: string;
+  body_base64?: string;
 }
 
 function tauriInvoke(): Invoke | null {
@@ -69,7 +64,7 @@ export async function send(url: string, init: RequestInit & { method: string }):
     const nullBody = reply.status === 204 || reply.status === 304;
     return new Response(nullBody ? null : reply.body, {
       status: reply.status,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(reply.headers ?? {}) },
     });
   } catch (err) {
     return channelFailure(err);
@@ -81,13 +76,29 @@ export async function send(url: string, init: RequestInit & { method: string }):
  * only case the page calls "service not running"; a refused socket is
  * `daemon_forbidden` (403); anything else is `channel_error` (502).
  */
-export function channelFailure(err: unknown): Response {
+/** `{code, message}` from a rejected command (older shells sent `"code: text"`). */
+export function channelError(err: unknown): { code: string; message: string } {
+  if (typeof err === "object" && err !== null && "code" in err) {
+    const e = err as { code?: unknown; message?: unknown };
+    return { code: String(e.code), message: typeof e.message === "string" ? e.message : String(e.code) };
+  }
   const message = err instanceof Error ? err.message : String(err);
-  const [code, status]: [string, number] = message.startsWith("daemon_unreachable")
-    ? ["daemon_unreachable", 503]
-    : message.startsWith("daemon_forbidden")
-      ? ["daemon_forbidden", 403]
-      : ["channel_error", 502];
+  const prefix = /^([a-z_]+):/u.exec(message)?.[1];
+  return { code: prefix ?? "channel_broken", message };
+}
+
+/** HTTP-like status for a channel error code, so callers branch the same way. */
+const CHANNEL_STATUS: Record<string, number> = {
+  daemon_unreachable: 503,
+  daemon_forbidden: 403,
+  daemon_busy: 503,
+  daemon_timeout: 504,
+  refused: 400,
+};
+
+export function channelFailure(err: unknown): Response {
+  const { code, message } = channelError(err);
+  const status = CHANNEL_STATUS[code] ?? 502;
   return new Response(JSON.stringify({ error: { code, message } }), {
     status,
     headers: { "content-type": "application/json" },
@@ -103,17 +114,17 @@ function decodeBase64(text: string): Uint8Array {
 
 /**
  * Like {@link send}, but the body is never decoded as text, so a zip survives.
- * In a browser this is the same `fetch`; in the app it uses `aw_request_bytes`.
+ * In a browser this is the same `fetch`; in the app it reads `body_base64`.
  */
 export async function sendBytes(url: string, init: RequestInit & { method: string }): Promise<Response> {
   const invoke = tauriInvoke();
   if (!invoke) return fetch(url, init);
   try {
-    const reply = (await invoke("aw_request_bytes", {
+    const reply = (await invoke("aw_request", {
       method: init.method,
       target: url,
       body: bodyText(init.body),
-    })) as BytesReply;
+    })) as ChannelReply;
     const bytes = decodeBase64(reply.body_base64 ?? "");
     return new Response(bytes.byteLength ? (bytes as unknown as BodyInit) : null, {
       status: reply.status,
@@ -122,4 +133,25 @@ export async function sendBytes(url: string, init: RequestInit & { method: strin
   } catch (err) {
     return channelFailure(err);
   }
+}
+
+/** One message of `aw_stream_open`'s channel. */
+export type StreamEvent =
+  | { kind: "event"; id: string | null; event: string; data: string }
+  | { kind: "error"; code: string; message: string; status: number | null };
+
+/**
+ * App only: open the shell's `/live` stream. Returns a close function. In a
+ * browser this returns null and the caller polls through {@link send}.
+ */
+export async function openStream(target: string, onEvent: (event: StreamEvent) => void): Promise<(() => void) | null> {
+  const invoke = tauriInvoke();
+  if (!invoke) return null;
+  const { Channel } = await import("@tauri-apps/api/core");
+  const channel = new Channel<StreamEvent>();
+  channel.onmessage = onEvent;
+  const id = (await invoke("aw_stream_open", { target, onEvent: channel })) as number;
+  return () => {
+    void invoke("aw_stream_close", { id }).catch(() => undefined);
+  };
 }

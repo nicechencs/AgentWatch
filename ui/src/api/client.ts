@@ -5,7 +5,7 @@
  * a later browser start does not inherit the token.
  */
 import { ApiError } from "./errors";
-import { send as transportSend, sendBytes as transportSendBytes } from "./transport";
+import { openStream, send as transportSend, sendBytes as transportSendBytes } from "./transport";
 import type {
   ApiErrorBody,
   ConfigView,
@@ -604,23 +604,45 @@ export function parseSse(text: string): SseEvent[] {
 }
 
 /**
- * Follow `/sessions/{sid}/live`. The daemon answers each request with the
- * records after `cursor` and closes, so this polls through the same request
- * path as every other call: the bearer header in a browser, the internal
- * channel in the desktop app. `EventSource` could do neither (no header, no
- * channel), got 401, and the page unticked "跟随最新" on the first error.
- * Returns a stop function.
+ * Follow `/sessions/{sid}/live` through the unified request layer.
+ *
+ * - Browser: the daemon answers each request with the records after `cursor`
+ *   and closes, so this polls through the same path as every other call (the
+ *   bearer header). `EventSource` could not send that header, got 401, and the
+ *   page unticked "跟随最新" on the first error.
+ * - Desktop app: the shell's `aw_stream_open` channel stream over the internal
+ *   channel (app/README.md); the shell polls and pushes each SSE event.
+ *
+ * Errors go to `onError` (the page shows them next to the checkbox) and
+ * following continues; `onOk` clears them. Returns a stop function.
  */
 export function subscribeLive(sid: string, filter: string, handlers: LiveHandlers, intervalMs = 1000): () => void {
   let closed = false;
   let cursor = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let closeStream: (() => void) | null = null;
+  const onFrame = (event: string, data: string) => {
+    if (event === "record") {
+      try {
+        handlers.onRecord(toTimelineItem(JSON.parse(data)));
+      } catch {
+        // A record that is not JSON is skipped, not shown as an empty row.
+      }
+    } else if (event === "lagged") {
+      try {
+        const parsed = JSON.parse(data) as { dropped?: unknown };
+        handlers.onLagged(typeof parsed.dropped === "number" ? parsed.dropped : null);
+      } catch {
+        handlers.onLagged(null);
+      }
+    }
+  };
   const tick = async () => {
     try {
       const headers = new Headers({ accept: "text/event-stream" });
       if (token) headers.set("authorization", `Bearer ${token}`);
       const response = await transportSend(
-        `${API}/sessions/${sid}/live${qs({ filter: filter || undefined, cursor: cursor || undefined })}`,
+        `${API}/sessions/${encodeURIComponent(sid)}/live${qs({ filter: filter || undefined, cursor: cursor || undefined })}`,
         { method: "GET", headers },
       );
       const text = await response.text();
@@ -636,16 +658,7 @@ export function subscribeLive(sid: string, filter: string, handlers: LiveHandler
       if (closed) return;
       for (const event of parseSse(text)) {
         if (event.id !== null && event.id > cursor) cursor = event.id;
-        if (event.event === "record") {
-          try {
-            handlers.onRecord(toTimelineItem(JSON.parse(event.data)));
-          } catch {
-            // A record that is not JSON is skipped, not shown as an empty row.
-          }
-        } else if (event.event === "lagged") {
-          const data = JSON.parse(event.data) as { dropped?: unknown };
-          handlers.onLagged(typeof data.dropped === "number" ? data.dropped : null);
-        }
+        onFrame(event.event, event.data);
       }
       handlers.onOk?.();
     } catch (caught) {
@@ -654,9 +667,40 @@ export function subscribeLive(sid: string, filter: string, handlers: LiveHandler
       if (!closed) timer = setTimeout(() => void tick(), intervalMs);
     }
   };
-  void tick();
+  const target = `${API}/sessions/${encodeURIComponent(sid)}/live${qs({ filter: filter || undefined })}`;
+  openStream(target, (message) => {
+    if (closed) return;
+    if (message.kind === "event") {
+      onFrame(message.event, message.data);
+      handlers.onOk?.();
+    } else {
+      handlers.onError(
+        new ApiError(message.status ?? 0, { error: { code: message.code, message: message.message } }, message.message),
+      );
+    }
+  }).then(
+    (close) => {
+      if (close === null) {
+        // Not in the app: poll.
+        if (!closed) void tick();
+      } else if (closed) {
+        close();
+      } else {
+        closeStream = close;
+      }
+    },
+    (caught: unknown) => {
+      // aw_stream_open itself was refused ({code, message}).
+      if (closed) return;
+      const err = caught as { code?: string; message?: string } | null;
+      handlers.onError(
+        new ApiError(0, { error: { code: err?.code ?? "channel_broken", message: err?.message ?? String(caught) } }, ""),
+      );
+    },
+  );
   return () => {
     closed = true;
     if (timer) clearTimeout(timer);
+    closeStream?.();
   };
 }

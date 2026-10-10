@@ -77,7 +77,7 @@ describe("desktop app entry", () => {
   });
 
   it("a stopped daemon is 'service not running', with retry", async () => {
-    const invoke = vi.fn().mockRejectedValue("daemon_unreachable: connect failed");
+    const invoke = vi.fn().mockRejectedValue({ code: "daemon_unreachable", message: "connect failed" });
     (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = { invoke };
     render(
       <I18nProvider lang="en">
@@ -108,10 +108,17 @@ describe("desktop app entry", () => {
   };
 
   it("a refused channel is a permission message, not 'not running'", async () => {
-    const invoke = vi.fn().mockRejectedValue("daemon_forbidden: permission denied");
+    const invoke = vi.fn().mockRejectedValue({ code: "daemon_forbidden", message: "permission denied" });
     renderDesktop(invoke);
     await waitFor(() => expect(screen.getByText("forbidden")).toBeInTheDocument());
     expect(screen.getByText("Not allowed to connect to the AgentWatch service")).toBeInTheDocument();
+    expect(screen.queryByText("The AgentWatch service is not running")).toBeNull();
+  });
+
+  it("busy / timeout / broken channel are errors, not 'not running'", async () => {
+    const invoke = vi.fn().mockRejectedValue({ code: "daemon_busy", message: "every pipe instance is busy" });
+    renderDesktop(invoke);
+    await waitFor(() => expect(screen.getByText("failed")).toBeInTheDocument());
     expect(screen.queryByText("The AgentWatch service is not running")).toBeNull();
   });
 

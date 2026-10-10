@@ -111,10 +111,13 @@ describe("export and live go through the request layer", () => {
   });
 
   it("desktop: export uses the binary-safe channel command", async () => {
-    const invoke = vi.fn().mockResolvedValue({ status: 200, headers: {}, body_base64: btoa("PK\u0003\u0004\u00ff") });
+    // `body` is what a text decode would give; only `body_base64` is exact.
+    const invoke = vi
+      .fn()
+      .mockResolvedValue({ status: 200, headers: {}, body: "PK\u0003\u0004\ufffd", body_base64: btoa("PK\u0003\u0004\u00ff") });
     (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = { invoke };
     const file = await fetchExport("s1", "csv");
-    expect(invoke).toHaveBeenCalledWith("aw_request_bytes", expect.objectContaining({ target: "/api/v1/sessions/s1/export?format=csv" }));
+    expect(invoke).toHaveBeenCalledWith("aw_request", expect.objectContaining({ target: "/api/v1/sessions/s1/export?format=csv" }));
     expect(Array.from(new Uint8Array(await file.blob.arrayBuffer()))).toEqual([0x50, 0x4b, 3, 4, 0xff]);
     expect(file.name).toBe("s1.zip");
   });
@@ -147,5 +150,30 @@ describe("export and live go through the request layer", () => {
     vi.useRealTimers();
     expect(new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers).get("authorization")).toBe("Bearer k-live");
     expect(String(fetchMock.mock.calls[1][0])).toContain("cursor=3");
+  });
+
+  it("desktop: live uses aw_stream_open with a channel and closes it", async () => {
+    let deliver: ((raw: unknown) => void) | null = null;
+    const invoke = vi.fn().mockImplementation((cmd: string) => Promise.resolve(cmd === "aw_stream_open" ? 9 : null));
+    (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+      invoke,
+      transformCallback: (cb: (raw: unknown) => void) => {
+        deliver = cb;
+        return 1;
+      },
+      unregisterCallback: () => {},
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const records: unknown[] = [];
+    const errors: number[] = [];
+    const close = subscribeLive("s1", "", { onRecord: (r) => records.push(r), onLagged: () => {}, onError: () => errors.push(1) });
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith("aw_stream_open", expect.objectContaining({ target: "/api/v1/sessions/s1/live" })));
+    deliver!({ index: 0, message: { kind: "event", id: "4", event: "record", data: '{"cat":"net"}' } });
+    deliver!({ index: 1, message: { kind: "error", code: "daemon_unreachable", message: "x", status: null } });
+    expect(records).toEqual([{ cat: "net" }]);
+    expect(errors).toEqual([1]);
+    close();
+    expect(invoke).toHaveBeenCalledWith("aw_stream_close", { id: 9 });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

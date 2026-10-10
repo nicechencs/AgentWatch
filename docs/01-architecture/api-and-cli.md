@@ -13,16 +13,20 @@
 | HTTP `127.0.0.1:<port>`（默认 7456，`api.http_port` 可配置，`0` 关闭） | 全平台 | Web UI | Bearer token（见下）；校验 `Host` 头必须为 `127.0.0.1:<port>` 或 `localhost:<port>`，防 DNS rebinding；不开 CORS |
 
 内部通道的实现状态（2026-10-10）：
-- Linux / macOS：`agentwatchd` 前台运行时监听 Unix socket（`crates/aw-daemon/src/api/ipc.rs`），权限 0660；报文与 HTTP 相同（HTTP/1.1 请求和响应），不带 `Authorization`，也不做 `Host` 校验。只提供 `/health` 和 `/api/v1/*`，不提供页面资源。socket 与 HTTP 共用同一份状态，所以在 socket 上签的 ticket 可以在 HTTP 上兑换。
-- Linux 用 `SO_PEERCRED` 取对端 uid，uid 0 为管理员。macOS 暂未取到 `LOCAL_PEERCRED`，对端记为 `unverified-peer`、非管理员，只靠 socket 权限把关。属组 `agentwatch` 尚未设置。
-- Windows：`agentwatchd` 在 `\\.\pipe\agentwatch-api` 上监听（tokio 命名管道），报文同上。管道沿用系统默认 DACL，只有 LocalSystem、Administrators 和 daemon 自己的账户能以读写方式打开，所以连上的客户端记为管理员 `pipe-admin`。`AgentWatch Users` 组的 DACL 和按 `GetNamedPipeClientProcessId` 取客户端 SID 尚未实现：普通 Windows 用户暂时打不开管道。只做了交叉编译检查，没有在 Windows 上实跑。
-- `AW_SOCKET` 环境变量同时覆盖 daemon 的监听路径和 `aw` 的默认连接路径，用于测试和非 root 开发运行。`aw daemon start` 在通道无响应时拉起 `agentwatchd --foreground`（`AW_DAEMON_CONFIG` 作为 `--config` 传入）并等待 `/health`，不注册系统服务。
+- Linux / macOS：`agentwatchd` 前台运行时监听 Unix socket（`crates/aw-daemon/src/api/ipc.rs`）；报文与 HTTP 相同（HTTP/1.1 请求和响应），不带 `Authorization`，也不做 `Host` 校验。只提供 `/health` 和 `/api/v1/*`，不提供页面资源。socket 与 HTTP 共用同一份状态，所以在 socket 上签的 ticket 可以在 HTTP 上兑换。
+- 路径顺序由 `crates/aw-channel` 统一，daemon、`aw`、桌面 App 一致：先系统路径（Linux `/run/agentwatch/api.sock`，macOS `/var/run/agentwatch/api.sock`），再按用户路径（Linux `$XDG_RUNTIME_DIR/agentwatch/api.sock`，无则 `$HOME/.local/state/agentwatch/api.sock`；macOS `$HOME/Library/Application Support/AgentWatch/api.sock`）。daemon 建不了系统路径（非 root 运行）时自动改绑按用户路径；客户端取第一个存在的。`AW_SOCKET` 覆盖全部。
+- 权限：存在 `agentwatch` 组时 socket 为 `root:agentwatch 0660`；没有该组时为 `0666`，任何本机账户都能连，但每个请求都按对端 uid 判身份（普通用户只看自己的会话）。所以 root 跑的 daemon 普通用户的桌面 App 也连得上。
+- 对端身份：Linux 用 `SO_PEERCRED`，macOS 用 `getpeereid`（即 `LOCAL_PEERCRED` 的 uid）；uid 0 为管理员；读不到 uid 记为 `unverified-peer`、非管理员。
+- Windows：`agentwatchd` 在 `\\.\pipe\agentwatch-api` 上监听（tokio 命名管道），报文同上。管道带显式 DACL（`crates/aw-collector-windows/src/pipe.rs`）：SYSTEM、Administrators、管道属主完全控制；`AgentWatch Users` 组（不存在时退到交互用户 `IU`）可读写但不能新建管道实例。客户端身份按 `GetNamedPipeClientProcessId` → 进程令牌取 SID；令牌已提权或为 LocalSystem 才是管理员。取不到身份的连接直接 403。
+- 只走内部通道的 daemon 控制：`POST /api/v1/daemon/stop`（`aw daemon stop` / `restart`）和 `GET /api/v1/daemon/logs?tail=N|offset=B`（`aw daemon logs [-n N] [-f]`），只允许管理员或 daemon 自己的账户。`POST /api/v1/auth/ui-ticket` 的回复在内部通道上多带 `http_port`：HTTP 监听实际绑定的端口，`0` 表示 HTTP 关闭。
+- 客户端错误分类（`aw_channel::DialError`）：只有"不存在 / 连接被拒"算服务没运行（`daemon_unreachable`，`aw` 退出码 3）；权限不足单独报（`daemon_forbidden`，退出码 4）；管道实例全忙短暂重试 2 秒（`daemon_busy`）；超时 `daemon_timeout`。
+- `aw daemon start` 在通道无响应时拉起 `agentwatchd --foreground`（`AW_DAEMON_CONFIG` 作为 `--config` 传入）并等待 `/health`；子进程提前退出会直接报出；等不到就把拉起的进程停掉再报错，不留孤儿进程。不注册系统服务。
 
 CLI 和 UI 请求到达后走同一套 axum 路由。传输层不同，但请求体和响应体完全一致。
 
 **会话令牌（UI）**
 1. `aw ui` 经由 socket 或管道向 daemon 申请一个一次性 `ui_ticket`，60 秒有效。ticket 与 token 都是操作系统 CSPRNG 生成的 256 位随机数（十六进制），签发、兑换、校验用同一个时钟，过期即拒；过期未兑的 ticket 在下次签发时清掉。
-2. 用 `http://127.0.0.1:7456/#ticket=<t>` 打开浏览器。
+2. 用 `http://127.0.0.1:<port>/#ticket=<t>` 打开浏览器。`<port>` 取 daemon 随 ticket 返回的 `http_port`（HTTP 实际绑定的端口，跟随 `api.http_port`）；`--port` 可强制指定；`http_port` 为 `0`（HTTP 关闭）时 `aw ui` 直接说明 HTTP 已关闭、请用桌面 App，不打开链接。
 3. 前端用 ticket 换取 `ui_token`（12 小时）。token 存在内存，并镜像到本标签页的 sessionStorage，同一标签页刷新仍保持登录，不需要再用一次 ticket；不写 localStorage，新标签页或重开浏览器不会继承。之后的请求都带 `Authorization: Bearer <ui_token>`。
    - 本机预览（`debug.preview_ui = true`）：`GET /` 签一张票并 302 到 `/index.html#ticket=<t>`。片段不会发回服务端，所以落点必须是不会再触发签票的路径，否则会无限跳转；前端换票后把地址改回 `/`。
    - `Content-Security-Policy`（含 `frame-ancestors 'none'`）只由 daemon 在响应头下发，`index.html` 不带 CSP meta：浏览器会忽略 meta 里的 `frame-ancestors` 并在控制台报错。

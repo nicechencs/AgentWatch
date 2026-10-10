@@ -123,6 +123,14 @@ impl Watches {
                 .iter()
                 .any(|r| r.sampler.target().db_id == db_id)
             {
+                let root_pid = running.sampler.target().root_pid;
+                // Only the status the daemon reaped. An attached root (no child)
+                // and a status with no code stay unknown; they are not written
+                // as 0. The poll sampler cannot see a non-child's status, so
+                // children are left NULL here too.
+                if let Some(code) = code {
+                    record_root_exit(&self.db_path, db_id, root_pid, code);
+                }
                 self.end(db_id, "exited", code);
             }
         }
@@ -207,6 +215,31 @@ impl Watches {
             rusqlite::params![now_ns(), reason, exit_code, db_id],
         );
     }
+}
+
+/// Write `code` onto the root's `processes` row, and its `exit_ns` when that
+/// is still NULL.
+///
+/// The row is the one for `root_pid` in session `db_id`. The poll sampler
+/// records the process but not its status (a non-child's status is not
+/// readable), so this is the only place a daemon-spawned root's code is stored.
+/// A code already stored is kept: the first observation wins, and `0` is never
+/// written in place of an unknown one. Other rows of the session, including
+/// children, are not touched. A missing row or a database that cannot be
+/// opened leaves the table as it was; the session end is recorded separately.
+pub(crate) fn record_root_exit(db_path: &std::path::Path, db_id: i64, root_pid: u32, code: i32) {
+    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+        return;
+    };
+    let pid = i64::from(root_pid);
+    let code = i64::from(code);
+    let _ = conn.execute(
+        "UPDATE processes SET \
+            exit_code = COALESCE(exit_code, ?1), \
+            exit_ns = COALESCE(exit_ns, ?2) \
+         WHERE session_id = ?3 AND pid = ?4 AND exit_code IS NULL",
+        rusqlite::params![code, now_ns(), db_id, pid],
+    );
 }
 
 /// Unix nanoseconds.

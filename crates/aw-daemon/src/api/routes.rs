@@ -1597,6 +1597,7 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
                 "agent": summary.agent,
                 "started_ns": summary.started_ns,
                 "ended_ns": summary.ended_ns,
+                "exit_code": summary.exit_code,
                 "mode": summary.mode,
                 "collectors": stored_collectors_json(&summary.collectors),
                 "argv": super::query::argv_value(summary.argv.as_deref()),
@@ -3162,6 +3163,21 @@ mod tests {
         assert_eq!(body["id"], sid);
         assert_eq!(body["exit_code"], 7);
         assert_eq!(session_end(&db, &sid).and_then(|row| row.3), Some(7));
+        let root_code: Option<i64> = rusqlite::Connection::open(&db)
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT p.exit_code FROM processes p JOIN sessions s ON s.id = p.session_id \
+                     WHERE s.public_id = ?1 AND p.pid = ?2",
+                    rusqlite::params![sid, pid],
+                    |r| r.get(0),
+                )
+            })
+            .expect("root row");
+        assert_eq!(
+            root_code,
+            Some(7),
+            "the root process row carries the exit code"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3368,6 +3384,67 @@ mod tests {
             Some("exited")
         );
         assert_eq!(end.and_then(|r| r.3), Some(7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Under a root daemon a normal user can neither see nor stop root's
+    /// session: not by public id, not by numeric id, and not after root
+    /// opened it first (the id cache is not a way around the owner check).
+    #[test]
+    fn another_accounts_session_is_invisible_and_unstoppable() {
+        let (dir, db) = seeded_db(
+            "owner",
+            "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, ended_ns, platform, collectors, pinned) VALUES \
+               (2, 's-rootsess', 'attach', '0', 1, NULL, 'linux', '[]', 0), \
+               (3, 's-usersess', 'attach', '1000', 2, NULL, 'linux', '[]', 0);",
+        );
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let root = token_for(&mut state, "0", true);
+        let user = token_for(&mut state, "1000", false);
+        let mut call = |token: &str, method: &str, path: &str| {
+            let response = dispatch(
+                &mut state,
+                &req(method, path, Some("127.0.0.1:7456"), Some(token), b""),
+            );
+            (response.status, json_body(&response))
+        };
+        // Root opens its session first, so its id is remembered.
+        assert_eq!(call(&root, "GET", "/api/v1/sessions/s-rootsess").0, 200);
+        for path in ["/api/v1/sessions/s-rootsess", "/api/v1/sessions/2"] {
+            assert_eq!(call(&user, "GET", path).0, 404, "{path}");
+            assert_eq!(
+                call(&user, "GET", &format!("{path}/processes")).0,
+                404,
+                "{path}"
+            );
+            assert_eq!(
+                call(&user, "GET", &format!("{path}/timeline")).0,
+                404,
+                "{path}"
+            );
+            assert_eq!(
+                call(&user, "POST", &format!("{path}/stop")).0,
+                404,
+                "{path}"
+            );
+        }
+        let (status, body) = call(&user, "GET", "/api/v1/sessions");
+        assert_eq!(status, 200);
+        let ids: Vec<&str> = body["sessions"]
+            .as_array()
+            .map(|rows| rows.iter().filter_map(|r| r["id"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(ids, vec!["s-usersess"], "{body}");
+        let ended: Option<i64> = rusqlite::Connection::open(&db)
+            .and_then(|c| {
+                c.query_row("SELECT ended_ns FROM sessions WHERE id = 2", [], |r| {
+                    r.get(0)
+                })
+            })
+            .unwrap_or(Some(-1));
+        assert_eq!(ended, None, "root's session was not stopped");
+        assert_eq!(call(&user, "GET", "/api/v1/sessions/s-usersess").0, 200);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

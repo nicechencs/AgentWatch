@@ -18,6 +18,7 @@
 //! [`aw_store::session_by_public_id`] when a later request names an id this
 //! process has not seen. An unknown public id is "not found", not a guessed id.
 
+use rusqlite::OptionalExtension;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -440,8 +441,19 @@ impl StoreQuery {
         user_id: &str,
         sid: &str,
     ) -> Result<Option<i64>, QueryBackendError> {
+        // A remembered or numeric id is only a shortcut for the lookup; the
+        // row must still belong to the caller (peer identity). Without this
+        // check a numeric id, or a public id another account resolved first,
+        // opened that account's session.
         if let Some(id) = self.remembered(sid) {
-            return Ok(Some(id));
+            let owner: Option<String> = store
+                .connection()
+                .query_row("SELECT user_id FROM sessions WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .map_err(|err| QueryBackendError::Store(format!("session owner: {err}")))?;
+            return Ok((owner.as_deref() == Some(user_id)).then_some(id));
         }
         let found = session_by_public_id(store.connection(), user_id, sid).map_err(map_query)?;
         if let Some(id) = found {
@@ -1373,6 +1385,7 @@ fn node_json(node: &aw_store::ProcessNode) -> serde_json::Value {
         "depth": node.depth,
         "start_ns": node.start_ns,
         "exit_ns": node.exit_ns,
+        "exit_code": node.exit_code,
         "evidence": node.evidence,
         "exe_name": node.exe_name,
         "proc": { "pid": node.pid, "exe_name": node.exe_name },

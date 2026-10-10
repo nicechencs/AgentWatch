@@ -492,6 +492,13 @@ pub(super) fn record_exit(
             rusqlite::params![exit_code, db_id],
         )
         .map_err(|_| error_response(500, "store", "cannot update the session"))?;
+        // The launched root (depth 0) carries the same status; children stay
+        // NULL (not observed), never 0.
+        let _ = conn.execute(
+            "UPDATE processes SET exit_code = ?1 \
+             WHERE session_id = ?2 AND depth = 0 AND exit_code IS NULL",
+            rusqlite::params![exit_code, db_id],
+        );
         let stored: i32 = conn
             .query_row(
                 "SELECT exit_code FROM sessions WHERE id = ?1",

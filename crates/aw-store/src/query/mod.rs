@@ -196,6 +196,8 @@ pub struct SessionSummary {
     pub started_ns: i64,
     /// End, or still running.
     pub ended_ns: Option<i64>,
+    /// Session exit status, or unknown. `None` is not `0`.
+    pub exit_code: Option<i64>,
     /// Process rows.
     pub process_count: i64,
     /// Flow rows.
@@ -233,6 +235,9 @@ pub struct ProcessNode {
     pub start_ns: i64,
     /// Exit, or still running.
     pub exit_ns: Option<i64>,
+    /// Exit status, or unknown. `None` is not `0`: the poll sampler does not
+    /// observe a non-child's status, so an unobserved code stays NULL.
+    pub exit_code: Option<i64>,
     /// Evidence label.
     pub evidence: String,
     /// Latest image basename, or unknown.
@@ -441,7 +446,7 @@ pub fn session_summary(
     let head = conn
         .query_row(
             "SELECT s.id, s.public_id, s.name, s.agent, s.started_ns, s.ended_ns, \
-                    s.mode, s.collectors, s.argv \
+                    s.exit_code, s.mode, s.collectors, s.argv \
              FROM sessions s WHERE s.id = ? AND s.user_id = ?",
             rusqlite::params![session_id, user_id],
             |row| {
@@ -452,15 +457,17 @@ pub fn session_summary(
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<i64>>(6)?,
                     row.get::<_, String>(7)?,
-                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             },
         )
         .optional()
         .map_err(|err| QueryError::sqlite("session_summary", err))?;
-    let Some((id, public_id, name, agent, started_ns, ended_ns, mode, collectors, argv)) = head
+    let Some((id, public_id, name, agent, started_ns, ended_ns, exit_code, mode, collectors, argv)) =
+        head
     else {
         return Ok(None);
     };
@@ -473,6 +480,7 @@ pub fn session_summary(
         agent,
         started_ns,
         ended_ns,
+        exit_code,
         process_count: counts.process_count,
         flow_count: counts.flow_count,
         dns_count: counts.dns_count,
@@ -501,7 +509,8 @@ pub fn process_tree(
     }
     let mut stmt = conn
         .prepare(
-            "SELECT p.proc_uid, p.pid, p.parent_uid, p.depth, p.start_ns, p.exit_ns, p.evidence, \
+            "SELECT p.proc_uid, p.pid, p.parent_uid, p.depth, p.start_ns, p.exit_ns, p.exit_code, \
+                    p.evidence, \
                     (SELECT CASE \
                         WHEN exe IS NULL THEN NULL \
                         ELSE replace(exe, rtrim(exe, replace(replace(exe, char(92), char(47)), char(47), '')), '') \
@@ -523,8 +532,9 @@ pub fn process_tree(
                 depth: row.get(3)?,
                 start_ns: row.get(4)?,
                 exit_ns: row.get(5)?,
-                evidence: row.get(6)?,
-                exe_name: row.get(7)?,
+                exit_code: row.get(6)?,
+                evidence: row.get(7)?,
+                exe_name: row.get(8)?,
             })
         })
         .map_err(|err| QueryError::sqlite("process_tree", err))?;
@@ -2135,6 +2145,7 @@ struct FlatProc {
     depth: i64,
     start_ns: i64,
     exit_ns: Option<i64>,
+    exit_code: Option<i64>,
     evidence: String,
     exe_name: Option<String>,
 }
@@ -2151,6 +2162,7 @@ fn build_tree(flat: Vec<FlatProc>) -> Vec<ProcessNode> {
             depth: row.depth,
             start_ns: row.start_ns,
             exit_ns: row.exit_ns,
+            exit_code: row.exit_code,
             evidence: row.evidence,
             exe_name: row.exe_name,
             children: Vec::new(),
@@ -2450,6 +2462,11 @@ mod tests {
         let conn = conn();
         session(&conn, 1, "user-a", 1);
         proc_row(&conn, 1, 1, 10, None, 1);
+        conn.execute(
+            "UPDATE processes SET exit_code = 7 WHERE session_id = 1 AND proc_uid = 1",
+            [],
+        )
+        .unwrap();
         proc_row(&conn, 1, 2, 11, Some(1), 2);
         image(&conn, 1, 2, 2, Some("/usr/bin/node"));
         flow(
@@ -2473,8 +2490,12 @@ mod tests {
         let tree = process_tree(&conn, "user-a", 1).unwrap().unwrap();
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].proc_uid, 1);
+        // The root's status was recorded. The child's was not, and that stays
+        // NULL rather than 0: the poll sampler cannot see a non-child's status.
+        assert_eq!(tree[0].exit_code, Some(7));
         assert_eq!(tree[0].children.len(), 1);
         assert_eq!(tree[0].children[0].exe_name.as_deref(), Some("node"));
+        assert_eq!(tree[0].children[0].exit_code, None);
         let grouped = flows(
             &conn,
             "user-a",

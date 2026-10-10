@@ -8,8 +8,9 @@
 //! call Win32.
 //!
 //! `unsafe_code` is `deny` here, not `forbid`. A `forbid` cannot be relaxed in
-//! a child module. Two modules opt in with `allow`: `etw::ffi` (`ControlTraceW`,
-//! which ferrisetw does not expose) and `peb` (`NtQueryInformationProcess` and
+//! a child module. Three modules opt in with `allow`: `etw::ffi` (`ControlTraceW`,
+//! which ferrisetw does not expose), `pipe` (named-pipe DACL and client token),
+//! and `peb` (`NtQueryInformationProcess` and
 //! `ReadProcessMemory`). Every `unsafe` block in both carries a `SAFETY`
 //! comment. The workspace lint stays `forbid`; this crate overrides it for itself.
 
@@ -24,6 +25,9 @@ pub mod etw;
 pub mod file_map;
 #[cfg(target_os = "windows")]
 pub mod peb;
+/// Internal-channel pipe DACL and caller identity. `sddl_for` is pure;
+/// the Win32 calls are Windows-only.
+pub mod pipe;
 pub mod privilege;
 pub mod scope;
 /// Pktmon SNI skeleton (P3-WIN-01). Pure classification plus a capture handle

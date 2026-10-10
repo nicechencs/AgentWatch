@@ -1,17 +1,21 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { api, getToken, setToken } from "@/api/client";
+import { isDesktop } from "@/api/transport";
 import { isApiError } from "@/api/errors";
 import type { Me } from "@/api/types";
 
-type AuthStatus = "checking" | "anonymous" | "signed-in";
+/** `unreachable`: desktop app only, the daemon did not answer on the internal channel. */
+type AuthStatus = "checking" | "anonymous" | "signed-in" | "unreachable";
 
 interface AuthValue {
   status: AuthStatus;
   me: Me | null;
   error: string | null;
+  /** Check again (desktop: after the service was started). */
+  retry: () => void;
 }
 
-const AuthContext = createContext<AuthValue>({ status: "checking", me: null, error: null });
+const AuthContext = createContext<AuthValue>({ status: "checking", me: null, error: null, retry: () => {} });
 
 export function useAuth(): AuthValue {
   return useContext(AuthContext);
@@ -94,8 +98,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const [attempt, setAttempt] = useState(0);
+  const retry = useCallback(() => {
+    setStatus("checking");
+    setAttempt((n) => n + 1);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
+    if (isDesktop()) {
+      // The desktop window talks to the daemon over the internal channel; the
+      // daemon names the OS user. No ticket, no token, no sign-in screen.
+      loadMe()
+        .then(() => {
+          if (!cancelled) setStatus("signed-in");
+        })
+        .catch((caught: unknown) => {
+          if (cancelled) return;
+          setError(caught instanceof Error ? caught.message : "daemon_unreachable");
+          setStatus("unreachable");
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
     const ticket = startupTicket ?? takeTicketFromLocation();
     startupTicket = null;
     const ready: Promise<unknown> | null = ticket ? exchangeOnce(ticket) : pending;
@@ -132,8 +158,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [loadMe]);
+  }, [loadMe, attempt]);
 
-  const value = useMemo(() => ({ status, me, error }), [status, me, error]);
+  const value = useMemo(() => ({ status, me, error, retry }), [status, me, error, retry]);
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

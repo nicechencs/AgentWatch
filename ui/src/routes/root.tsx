@@ -9,6 +9,7 @@ export const Route = createRootRoute({
 function Root() {
   const { status } = useAuth();
   const path = useRouterState({ select: (state) => state.location.pathname });
-  if (status !== "signed-in" && path !== "/settings") return <SignIn />;
+  // In the desktop app nothing works without the daemon, settings included.
+  if (status === "unreachable" || (status !== "signed-in" && path !== "/settings")) return <SignIn />;
   return <Outlet />;
 }

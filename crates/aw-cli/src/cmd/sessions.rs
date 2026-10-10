@@ -201,8 +201,131 @@ pub(crate) fn write_ok(
 pub(crate) fn query_outcome(err: QueryError, json: bool) -> Outcome {
     let (code, machine) = match &err {
         QueryError::NotFound { .. } => (exit::GENERAL, "not_found"),
+        QueryError::NoSessions => (exit::GENERAL, "no_sessions"),
         QueryError::BadArgument { .. } => (exit::USAGE, "usage"),
         QueryError::Unavailable { .. } => (exit::GENERAL, "not_connected"),
     };
     super::error_outcome(code, machine, &err.to_string(), json)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::run;
+    use crate::client::{ApiReply, ApiRequest, ClientError, Transport};
+    use crate::cmd::http_source::HttpQuerySource;
+    use crate::cmd::tree::SessionsCmd;
+    use crate::endpoint::{Endpoint, HttpBase};
+    use crate::exit;
+
+    struct Script {
+        paths: Rc<RefCell<Vec<String>>>,
+        /// Status and body, one per exchange, in order.
+        replies: RefCell<Vec<(u16, &'static str)>>,
+    }
+
+    impl Transport for Script {
+        fn exchange(&mut self, request: &ApiRequest) -> Result<ApiReply, ClientError> {
+            self.paths.borrow_mut().push(request.path.clone());
+            let (status, body) = self
+                .replies
+                .borrow_mut()
+                .pop()
+                .unwrap_or((500, r#"{"error":{"code":"empty","message":"no script"}}"#));
+            Ok(ApiReply {
+                status,
+                body: body.as_bytes().to_vec(),
+            })
+        }
+    }
+
+    fn endpoint() -> Endpoint {
+        Endpoint::Http {
+            base: HttpBase {
+                host: "127.0.0.1".to_owned(),
+                port: 9,
+            },
+            token: "test-token".to_owned(),
+        }
+    }
+
+    const SESSION_DOC: &str = r#"{
+        "id":"s-mine","name":"demo","mode":"launch","agent":null,
+        "started_ns":10,"ended_ns":null,"pinned":false,
+        "stats":{"process_count":0,"flow_count":0,"dns_count":0,"gap_count":0}
+    }"#;
+
+    /// `@last` goes to the daemon as `@last`. The printed id is the one the
+    /// daemon resolved, not the token.
+    #[test]
+    fn show_sends_at_last_to_the_daemon() {
+        let paths = Rc::new(RefCell::new(Vec::new()));
+        let script = Script {
+            paths: Rc::clone(&paths),
+            replies: RefCell::new(vec![(200, SESSION_DOC)]),
+        };
+        let mut source = HttpQuerySource::with_transport(endpoint(), script);
+        let outcome = run(
+            &SessionsCmd::Show {
+                session: "@last".to_owned(),
+            },
+            true,
+            &mut source,
+        )
+        .expect("show");
+        assert_eq!(
+            outcome.code,
+            exit::OK,
+            "{}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+        assert_eq!(
+            paths.borrow().clone(),
+            vec!["/api/v1/sessions/@last".to_owned()]
+        );
+        let text = String::from_utf8(outcome.stdout).expect("utf8");
+        assert!(text.contains("\"s-mine\""), "{text}");
+        assert!(!text.contains("@last"), "{text}");
+    }
+
+    /// A name the daemon does not list is sent on unchanged, and the 404 names
+    /// what was typed — once, not twice.
+    #[test]
+    fn unknown_name_is_one_sentence() {
+        let paths = Rc::new(RefCell::new(Vec::new()));
+        let script = Script {
+            paths: Rc::clone(&paths),
+            replies: RefCell::new(vec![
+                (
+                    404,
+                    r#"{"error":{"code":"not_found","message":"session not found"}}"#,
+                ),
+                (200, r#"{"sessions":[]}"#),
+            ]),
+        };
+        let mut source = HttpQuerySource::with_transport(endpoint(), script);
+        let outcome = run(
+            &SessionsCmd::Show {
+                session: "no-such-name".to_owned(),
+            },
+            false,
+            &mut source,
+        )
+        .expect("show");
+        assert_eq!(outcome.code, exit::GENERAL);
+        assert_eq!(
+            paths.borrow().clone(),
+            vec![
+                "/api/v1/sessions".to_owned(),
+                "/api/v1/sessions/no-such-name".to_owned(),
+            ]
+        );
+        assert_eq!(
+            String::from_utf8(outcome.stderr).expect("utf8"),
+            "aw: 找不到会话 `no-such-name`\n"
+        );
+    }
 }

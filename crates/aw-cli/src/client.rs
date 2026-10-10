@@ -159,10 +159,10 @@ impl fmt::Display for ClientError {
             ),
             Self::Transport { detail } => write!(f, "向后台发请求失败：{detail}"),
             Self::Status {
-                status, message, ..
-            } => {
-                write!(f, "后台返回 HTTP {status}：{message}")
-            }
+                status,
+                code,
+                message,
+            } => crate::daemon_errors::write_status(f, *status, code.as_deref(), message),
         }
     }
 }
@@ -185,7 +185,9 @@ impl ClientError {
 /// Client bound to one endpoint and one transport.
 pub struct Client<T: Transport> {
     endpoint: Endpoint,
-    transport: T,
+    /// The transport. Public so a caller that lends one can take it back
+    /// after [`Self::call`].
+    pub transport: T,
 }
 
 impl<T: Transport> Client<T> {
@@ -558,7 +560,7 @@ mod tests {
             .expect_err("401");
         assert_eq!(err.exit_code(), exit::PERMISSION);
         let text = err.to_string();
-        assert!(text.contains("401"), "{text}");
+        assert!(text.contains("没有通过后台的身份验证"), "{text}");
         assert!(text.contains("bearer token required"), "{text}");
         assert!(!text.contains("unit-test-token"), "{text}");
         assert!(!text.contains("ABCD") || text.contains("len="), "{text}");

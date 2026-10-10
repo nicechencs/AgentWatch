@@ -37,6 +37,8 @@ use aw_core::NaReason;
 pub(crate) enum QueryError {
     /// The session id or name is not in this source.
     NotFound { session: String },
+    /// `@last` for a caller who has no sessions.
+    NoSessions,
     /// `--group-by` / `--sort` / a time bound the command refused.
     BadArgument { detail: String },
     /// No live query API is wired. The message says so; it is not a fake empty list.
@@ -47,6 +49,7 @@ impl std::fmt::Display for QueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound { session } => write!(f, "找不到会话 `{session}`"),
+            Self::NoSessions => write!(f, "还没有你的会话，@last 无处可指"),
             Self::BadArgument { detail } => write!(f, "{detail}"),
             Self::Unavailable { detail } => write!(f, "{detail}"),
         }

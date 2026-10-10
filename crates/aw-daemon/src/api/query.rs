@@ -25,11 +25,11 @@ use std::sync::Mutex;
 
 use aw_store::{
     around, delete_session, dns_events, files, flow_buckets, flows, gaps, list_sessions,
-    patch_session, process_detail, process_tree, search, session_by_public_id, session_summary,
-    stop_session, timeline, timeline_histogram, traffic, CompileCtx, Cursor, FileGroupBy,
-    FileQuery, FlowQuery, FtsMode, ProcessNode, PurgeScope, QueryError, Retention, RetentionConfig,
-    SessionFilter, SessionListItem, SessionSummary, Store, StoreError, StoreExpr, TimelinePage,
-    TimelineQuery,
+    newest_session_for_user, patch_session, process_detail, process_tree, public_id_by_session_id,
+    search, session_by_public_id, session_summary, stop_session, timeline, timeline_histogram,
+    traffic, CompileCtx, Cursor, FileGroupBy, FileQuery, FlowQuery, FtsMode, ProcessNode,
+    PurgeScope, QueryError, Retention, RetentionConfig, SessionFilter, SessionListItem,
+    SessionSummary, Store, StoreError, StoreExpr, TimelinePage, TimelineQuery,
 };
 
 // Every method calls a function `aw-store` exports. A filter string is parsed
@@ -65,6 +65,9 @@ pub enum QueryBackendError {
     },
     /// The session is not visible to this user. Routes map this to 404.
     NotFound,
+    /// `@last` for a caller who has no sessions of their own. Routes map this
+    /// to 404 `no_sessions`, distinct from a public id that does not exist.
+    NoSessions,
     /// The backing function is not exported by this build of `aw-store`.
     Unimplemented {
         /// Short name, for the 501 body. Not a SQL statement.
@@ -85,6 +88,7 @@ impl std::fmt::Display for QueryBackendError {
                 write!(f, "bad {name}: expected {expected}")
             }
             Self::NotFound => write!(f, "session not found"),
+            Self::NoSessions => write!(f, "this account has no sessions"),
             Self::Unimplemented { what } => write!(f, "{what} is not available"),
             Self::Store(msg) => write!(f, "{msg}"),
         }
@@ -192,8 +196,9 @@ pub trait SessionQuery {
     /// `DELETE /sessions/{sid}`.
     fn delete_session(&self, user_id: &str, sid: &str) -> Result<Option<()>, QueryBackendError>;
 
-    /// `POST /sessions/{sid}/stop`.
-    fn stop_session(&self, user_id: &str, sid: &str) -> Result<Option<()>, QueryBackendError>;
+    /// `POST /sessions/{sid}/stop`. `Some` carries the public id that was
+    /// stopped, which is not `sid` when `sid` was `@last`.
+    fn stop_session(&self, user_id: &str, sid: &str) -> Result<Option<String>, QueryBackendError>;
 
     /// `GET /sessions/{sid}/timeline`.
     fn timeline(
@@ -435,12 +440,23 @@ impl StoreQuery {
     /// Integer id for `sid`. A public id that is not in [`IdMap`] is looked up
     /// and remembered. `Ok(None)` when the store has no such session for this
     /// user — that is "not found", not a guessed id.
+    ///
+    /// `sid` of `@last` is the newest session this `user_id` owns (greatest
+    /// `started_ns`), never the newest session in the database and never a
+    /// remembered id. A caller with no sessions of their own is
+    /// [`QueryBackendError::NoSessions`], not a lookup of another user's row.
     fn resolve_id(
         &self,
         store: &Store,
         user_id: &str,
         sid: &str,
     ) -> Result<Option<i64>, QueryBackendError> {
+        if sid == "@last" {
+            return match newest_session_for_user(store.connection(), user_id).map_err(map_query)? {
+                Some((id, _)) => Ok(Some(id)),
+                None => Err(QueryBackendError::NoSessions),
+            };
+        }
         // A remembered or numeric id is only a shortcut for the lookup; the
         // row must still belong to the caller (peer identity). Without this
         // check a numeric id, or a public id another account resolved first,
@@ -553,16 +569,24 @@ impl SessionQuery for StoreQuery {
         delete_session(store.connection(), user_id, id).map_err(map_query)
     }
 
-    fn stop_session(&self, user_id: &str, sid: &str) -> Result<Option<()>, QueryBackendError> {
+    fn stop_session(&self, user_id: &str, sid: &str) -> Result<Option<String>, QueryBackendError> {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
         let Some(id) = self.resolve_id(&store, user_id, sid)? else {
             return Ok(None);
         };
+        // The public id of the row that was stopped. For `@last` this is the
+        // resolved session, not the token the caller typed.
+        let public_id = public_id_by_session_id(store.connection(), user_id, id)
+            .map_err(map_query)?
+            .unwrap_or_else(|| sid.to_owned());
         // Wall clock of the user action, not an observation time.
         let ended_ns = unix_now_ns();
-        stop_session(store.connection(), user_id, id, ended_ns).map_err(map_query)
+        match stop_session(store.connection(), user_id, id, ended_ns).map_err(map_query)? {
+            Some(()) => Ok(Some(public_id)),
+            None => Ok(None),
+        }
     }
 
     fn timeline(

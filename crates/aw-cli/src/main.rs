@@ -8,6 +8,7 @@
 
 mod client;
 mod cmd;
+mod daemon_errors;
 mod endpoint;
 mod exit;
 mod launch;

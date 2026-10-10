@@ -12,10 +12,12 @@
 //! `ts_ns,id`, not an `after` bound, and this client reads one HTTP response then
 //! closes the socket, so it cannot consume `GET /sessions/{sid}/live` (SSE).
 
+use std::cell::RefCell;
+
 use aw_core::{Evidence, NaReason};
 use serde_json::Value;
 
-use crate::client::{ApiRequest, Client, ClientError, LoopbackHttp};
+use crate::client::{ApiRequest, Client, ClientError, LoopbackHttp, Transport};
 use crate::endpoint::Endpoint;
 
 use super::query::{
@@ -25,29 +27,79 @@ use super::query::{
     SessionShow, TimelineBounds, TimelineItem, TimelinePage,
 };
 
-/// One resolved daemon endpoint. The token lives inside [`Endpoint`] and is not logged.
-pub(crate) struct HttpQuerySource {
-    endpoint: Endpoint,
+/// Lends a [`Transport`] to [`Client`], which takes one by value.
+struct Passthrough<'a, T>(&'a mut T);
+
+impl<T: Transport> Transport for Passthrough<'_, T> {
+    fn exchange(&mut self, request: &ApiRequest) -> Result<crate::client::ApiReply, ClientError> {
+        self.0.exchange(request)
+    }
 }
 
-impl HttpQuerySource {
+/// One resolved daemon endpoint. The token lives inside [`Endpoint`] and is not logged.
+pub(crate) struct HttpQuerySource<T: Transport = LoopbackHttp> {
+    endpoint: Endpoint,
+    /// `None` dials per call. Tests pass a scripted transport. Interior
+    /// mutability because [`QuerySource`] hands out `&self`.
+    transport: Option<RefCell<T>>,
+}
+
+impl HttpQuerySource<LoopbackHttp> {
     /// Bind to `endpoint`. Does not connect.
     #[must_use]
     pub(crate) fn new(endpoint: Endpoint) -> Self {
-        Self { endpoint }
+        Self {
+            endpoint,
+            transport: None,
+        }
+    }
+}
+
+impl<T: Transport> HttpQuerySource<T> {
+    /// Bind to `endpoint` and answer every call with `transport`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_transport(endpoint: Endpoint, transport: T) -> Self {
+        Self {
+            endpoint,
+            transport: Some(RefCell::new(transport)),
+        }
     }
 
     fn call(&self, request: &ApiRequest) -> Result<Value, QueryError> {
-        let transport = LoopbackHttp::new(&self.endpoint).map_err(client_to_query)?;
-        let mut client = Client::new(self.endpoint.clone(), transport);
-        let reply = client.call(request).map_err(client_to_query)?;
+        self.call_session(request, None)
+    }
+
+    /// `session` is what the user typed. A 404 names it, instead of the
+    /// daemon's English message.
+    fn call_session(
+        &self,
+        request: &ApiRequest,
+        session: Option<&str>,
+    ) -> Result<Value, QueryError> {
+        let reply = match self.transport.as_ref() {
+            Some(transport) => {
+                let mut transport = transport.borrow_mut();
+                let mut client = Client::new(self.endpoint.clone(), Passthrough(&mut *transport));
+                client
+                    .call(request)
+                    .map_err(|err| client_to_query_for(&err, session))?
+            }
+            None => {
+                let transport = LoopbackHttp::new(&self.endpoint).map_err(client_to_query)?;
+                let mut client = Client::new(self.endpoint.clone(), transport);
+                client
+                    .call(request)
+                    .map_err(|err| client_to_query_for(&err, session))?
+            }
+        };
         reply.json().ok_or_else(|| QueryError::Unavailable {
             detail: "后台返回的响应体不是 JSON".to_owned(),
         })
     }
 }
 
-impl QuerySource for HttpQuerySource {
+impl<T: Transport> QuerySource for HttpQuerySource<T> {
     fn list_sessions(&self, query: &SessionQuery) -> Result<Vec<SessionItem>, QueryError> {
         let mut pairs: Vec<(String, String)> = Vec::new();
         if let Some(agent) = query.agent.as_deref() {
@@ -69,8 +121,17 @@ impl QuerySource for HttpQuerySource {
     }
 
     fn show_session(&self, key: &str) -> Result<SessionShow, QueryError> {
-        let path = format!("/api/v1/sessions/{}", encode_path_segment(key));
-        let body = self.call(&ApiRequest::get(&path))?;
+        // `@last` is resolved by the daemon against this caller's sessions, so
+        // it is sent as-is. A name is resolved here, but only among the
+        // sessions the daemon already filtered to this caller.
+        let (resolved, fetched) = self.resolve_session_key(key)?;
+        let body = match fetched {
+            Some(body) => body,
+            None => {
+                let path = format!("/api/v1/sessions/{}", encode_path_segment(&resolved));
+                self.call_session(&ApiRequest::get(&path), Some(key))?
+            }
+        };
         let item = session_item(&body)?;
         let stats = body.get("stats").cloned().unwrap_or(Value::Null);
         Ok(SessionShow {
@@ -268,7 +329,45 @@ impl QuerySource for HttpQuerySource {
     }
 }
 
-impl HttpQuerySource {
+impl<T: Transport> HttpQuerySource<T> {
+    /// `@last` and `s-` ids pass through (`None`: the caller still fetches).
+    /// Anything else is a name, resolved among the caller's own sessions. One
+    /// match returns that row's document, so the caller does not fetch again.
+    /// No match returns the key unchanged and the daemon answers 404.
+    fn resolve_session_key(&self, key: &str) -> Result<(String, Option<Value>), QueryError> {
+        if key == "@last" || key.starts_with("s-") {
+            return Ok((key.to_owned(), None));
+        }
+        let body = self.call(&get_pairs(
+            "/api/v1/sessions",
+            &[("limit".to_owned(), "500".to_owned())],
+        ))?;
+        let rows = array_field(&body, "sessions")?;
+        let matches: Vec<&Value> = rows
+            .iter()
+            .filter(|row| row.get("name").and_then(Value::as_str) == Some(key))
+            .collect();
+        match matches.as_slice() {
+            [] => Ok((key.to_owned(), None)),
+            [one] => {
+                let id = one
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| QueryError::Unavailable {
+                        detail: "响应缺少字段 `id`".to_owned(),
+                    })?;
+                Ok((id.to_owned(), Some((*one).clone())))
+            }
+            many => Err(QueryError::BadArgument {
+                detail: format!(
+                    "有 {} 个会话名为 `{key}`；请传入 `aw sessions list` 中的公开 ID",
+                    many.len()
+                ),
+            }),
+        }
+    }
+
     fn patch(&self, key: &str, body: &Value) -> Result<Value, QueryError> {
         let path = format!("/api/v1/sessions/{}", encode_path_segment(key));
         self.call(&ApiRequest::json_method_public("PATCH", &path, body))
@@ -301,13 +400,20 @@ fn ns_to_window(ns: i64) -> String {
 }
 
 fn client_to_query(err: ClientError) -> QueryError {
+    client_to_query_for(&err, None)
+}
+
+/// [`client_to_query`], but a 404 names `key` — what the user typed — instead
+/// of the daemon's English message.
+fn client_to_query_for(err: &ClientError, key: Option<&str>) -> QueryError {
     match err {
         ClientError::Status {
             status: 404,
-            message,
+            code: Some(code),
             ..
-        } => QueryError::NotFound {
-            session: clip(&message),
+        } if code == "no_sessions" => QueryError::NoSessions,
+        ClientError::Status { status: 404, .. } => QueryError::NotFound {
+            session: key.unwrap_or("").to_owned(),
         },
         ClientError::Status {
             status: 400 | 422, ..

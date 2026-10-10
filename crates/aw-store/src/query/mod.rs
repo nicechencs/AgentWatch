@@ -1073,6 +1073,43 @@ pub fn search(
     Ok(hits)
 }
 
+/// The caller's newest session: the greatest `started_ns`, then the greatest
+/// `id` when two start together.
+///
+/// Only rows with this `user_id` are considered. Another user's session is
+/// never returned, however recently it started. `None` when this user has no
+/// sessions at all.
+pub fn newest_session_for_user(
+    conn: &Connection,
+    user_id: &str,
+) -> Result<Option<(i64, String)>, QueryError> {
+    conn.query_row(
+        "SELECT id, public_id FROM sessions WHERE user_id = ? \
+         ORDER BY started_ns DESC, id DESC LIMIT 1",
+        rusqlite::params![user_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(|err| QueryError::sqlite("newest_session_for_user", err))
+}
+
+/// `sessions.public_id` for an integer id owned by `user_id`.
+///
+/// `None` when the row is absent or belongs to someone else.
+pub fn public_id_by_session_id(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+) -> Result<Option<String>, QueryError> {
+    conn.query_row(
+        "SELECT public_id FROM sessions WHERE id = ? AND user_id = ?",
+        rusqlite::params![session_id, user_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|err| QueryError::sqlite("public_id_by_session_id", err))
+}
+
 /// Integer `sessions.id` for `public_id`, when that session belongs to `user_id`.
 ///
 /// `None` when no session with that public id is owned by this user. Another
@@ -2785,5 +2822,24 @@ mod tests {
         assert_eq!(items[0].argv.as_deref(), Some(r#"["sleep","90"]"#));
         let summary = session_summary(&conn, "u", 1).unwrap().unwrap();
         assert_eq!(summary.argv.as_deref(), Some(r#"["sleep","90"]"#));
+    }
+
+    #[test]
+    fn newest_session_is_the_users_own_latest_start() {
+        let conn = conn();
+        // Root's session starts last, and a lower id for the same user starts
+        // later than a higher one. Neither may win for user "1000".
+        session(&conn, 1, "0", 300);
+        session(&conn, 3, "1000", 100);
+        session(&conn, 2, "1000", 200);
+        let (id, public_id) = newest_session_for_user(&conn, "1000").unwrap().unwrap();
+        assert_eq!((id, public_id.as_str()), (2, "s2"));
+        let (root_id, _) = newest_session_for_user(&conn, "0").unwrap().unwrap();
+        assert_eq!(root_id, 1);
+        // Same start: the greater id is the newer row.
+        session(&conn, 4, "1000", 200);
+        let (id, _) = newest_session_for_user(&conn, "1000").unwrap().unwrap();
+        assert_eq!(id, 4);
+        assert!(newest_session_for_user(&conn, "1001").unwrap().is_none());
     }
 }

@@ -1413,7 +1413,10 @@ fn session_sub(
     body: &[u8],
     query: &str,
 ) -> ApiResponse {
-    let (sid, tail) = split_sid(rest);
+    // `@last` may arrive percent-encoded (`%40last`). Every session route
+    // resolves it the same way, so decode the id before anything matches on it.
+    let rest = percent_decode(rest);
+    let (sid, tail) = split_sid(&rest);
     let memory = state.sessions.iter().find(|row| row.id == sid).cloned();
     if let Some(session) = &memory {
         if !caller.admin && session.user_id != caller.user_id {
@@ -1792,6 +1795,9 @@ fn from_backend(err: QueryBackendError) -> ApiResponse {
             error_response(400, "bad_argument", &format!("{name}: expected {expected}"))
         }
         QueryBackendError::NotFound => error_response(404, "not_found", "session not found"),
+        QueryBackendError::NoSessions => {
+            error_response(404, "no_sessions", "this account has no sessions")
+        }
         QueryBackendError::Unimplemented { what } => not_implemented(what),
         QueryBackendError::Store(message) => error_response(500, "store", &message),
     }
@@ -1990,25 +1996,25 @@ fn session_query_route(
         ("GET", "live") => live_snapshot(state, sid, caller, &parsed),
         ("POST", "stop") => match state.query.stop_session(user, sid) {
             Ok(None) => stop_memory(state, sid, caller),
-            Ok(Some(())) => {
+            Ok(Some(public_id)) => {
                 // A `/sessions/run` the CLI never adopted (it could not start the
                 // program) has no process to record. Stopping it discards the
                 // empty row instead of leaving a session that never ran.
-                let unadopted = state.pending_launches.contains_key(sid);
-                super::watch_routes::stopped(state, sid);
+                let unadopted = state.pending_launches.contains_key(&public_id);
+                super::watch_routes::stopped(state, &public_id);
                 if unadopted {
-                    match state.query.delete_session(user, sid) {
+                    match state.query.delete_session(user, &public_id) {
                         Ok(Some(())) => {
                             return Some(ApiResponse::json(
                                 200,
-                                &json!({ "stopped": sid, "discarded": true }),
+                                &json!({ "stopped": sid, "id": public_id, "discarded": true }),
                             ));
                         }
                         Ok(None) => {}
                         Err(err) => return Some(from_backend(err)),
                     }
                 }
-                ApiResponse::json(200, &json!({ "stopped": sid }))
+                ApiResponse::json(200, &json!({ "stopped": sid, "id": public_id }))
             }
             Err(err) => from_backend(err),
         },
@@ -2757,6 +2763,80 @@ mod tests {
             ),
         );
         (response.status, json_body(&response))
+    }
+
+    const LAST_SESSIONS_SQL: &str = "
+        INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors)
+        VALUES
+            (1, 's-root-old', 'launch', '0', 100, 'linux', '[]'),
+            (2, 's-user-old', 'launch', '1000', 200, 'linux', '[]'),
+            (3, 's-user-new', 'launch', '1000', 300, 'linux', '[]'),
+            (4, 's-root-new', 'launch', '0', 400, 'linux', '[]');
+    ";
+
+    fn get_as(state: &mut ApiState, user: &str, path: &str) -> (u16, serde_json::Value) {
+        let token = token_for(state, user, false);
+        let response = dispatch(
+            state,
+            &req("GET", path, Some("127.0.0.1:7456"), Some(&token), b""),
+        );
+        (response.status, json_body(&response))
+    }
+
+    /// `@last` is the newest session of the caller, never the daemon-wide
+    /// newest and never another user's — including when the caller is root and
+    /// root's own session is the newest row in the database.
+    #[test]
+    fn at_last_follows_the_caller_not_the_newest_row() {
+        let (dir, db) = seeded_db("at-last", LAST_SESSIONS_SQL);
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+
+        // Root's newest row starts after everyone else's. Caller 1000 still
+        // resolves to their own newest session.
+        let (status, body) = get_as(&mut state, "1000", "/api/v1/sessions/@last");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["id"], "s-user-new");
+
+        let token = token_for(&mut state, "1000", false);
+        let (status, body) = post(&mut state, &token, "/api/v1/sessions/@last/stop", "{}");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["stopped"], "@last");
+        assert_eq!(
+            session_end(&db, "s-user-new").and_then(|row| row.2),
+            Some("stopped".to_owned())
+        );
+        // The newer root session was not the one stopped.
+        assert_eq!(session_end(&db, "s-root-new").and_then(|row| row.1), None);
+
+        // Root, even as an administrator, gets root's newest — not user 1000's.
+        let token = token_for(&mut state, "0", true);
+        let response = dispatch(
+            &mut state,
+            &req(
+                "GET",
+                "/api/v1/sessions/@last",
+                Some("127.0.0.1:7456"),
+                Some(&token),
+                b"",
+            ),
+        );
+        let body = json_body(&response);
+        assert_eq!(response.status, 200, "{body}");
+        assert_eq!(body["id"], "s-root-new");
+
+        // Percent-encoded `@` takes the same path.
+        let (status, body) = get_as(&mut state, "0", "/api/v1/sessions/%40last");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["id"], "s-root-new");
+
+        // A caller with nothing of their own is a distinct 404, not someone
+        // else's session.
+        let (status, body) = get_as(&mut state, "1001", "/api/v1/sessions/@last");
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(body["error"]["code"], "no_sessions");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// None of these may answer 501 any more (the bug this card fixes).

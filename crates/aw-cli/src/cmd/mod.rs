@@ -61,6 +61,22 @@ pub(crate) trait HttpFactory {
     fn open(&mut self, endpoint: &Endpoint) -> Result<Box<dyn Transport>, ClientError>;
 }
 
+/// Build the session-control client for one endpoint. Tests substitute a stub
+/// so `aw stop` can be exercised without a daemon.
+pub(crate) trait ControlFactory {
+    /// Session control bound to `endpoint`.
+    fn open(&mut self, endpoint: &Endpoint) -> Box<dyn attach::DaemonSessions>;
+}
+
+/// Production control. Dials inside each call, not here.
+struct LiveControl;
+
+impl ControlFactory for LiveControl {
+    fn open(&mut self, endpoint: &Endpoint) -> Box<dyn attach::DaemonSessions> {
+        Box::new(attach::HttpDaemonSessions::new(endpoint.clone()))
+    }
+}
+
 /// Production factory. Dials inside [`LoopbackHttp::exchange`], not here.
 struct LiveHttp;
 
@@ -132,7 +148,7 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
     if !needs_endpoint {
         // Stubs that probe `/health`, and ops that stay unwired (export, daemon).
         let mut source = query::UnavailableSource;
-        return dispatch(cli, env_token, &mut LiveHttp, &mut source);
+        return dispatch(cli, env_token, &mut LiveHttp, &mut source, &mut LiveControl);
     }
 
     let input = EndpointInput {
@@ -146,7 +162,7 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
         Err(err) => return Ok(endpoint_outcome(err, json)),
     };
     let mut source = http_source::HttpQuerySource::new(endpoint.clone());
-    if let Some(outcome) = session_command(&cli, &endpoint, json) {
+    if let Some(outcome) = session_command(&cli, &endpoint, json, &mut LiveControl) {
         return Ok(outcome);
     }
     if let Some(outcome) = query_command(&cli.command, json, lang, &mut source)? {
@@ -408,7 +424,12 @@ fn attach_parts<'a>(command: &'a Command, json: bool) -> Option<attach::AttachAr
 
 /// `aw run` (except `--no-daemon`), `aw attach`, and `aw stop` on the resolved
 /// production channel.
-fn session_command(cli: &Cli, endpoint: &Endpoint, json: bool) -> Option<Outcome> {
+fn session_command(
+    cli: &Cli,
+    endpoint: &Endpoint,
+    json: bool,
+    control: &mut dyn ControlFactory,
+) -> Option<Outcome> {
     match &cli.command {
         Command::Run {
             no_daemon: false, ..
@@ -417,25 +438,39 @@ fn session_command(cli: &Cli, endpoint: &Endpoint, json: bool) -> Option<Outcome
             Some(run::daemon_run(
                 &args,
                 deferred,
-                &mut attach::HttpDaemonSessions::new(endpoint.clone()),
+                &mut *control.open(endpoint),
                 &mut run::CommandSpawner,
                 &mut run::DaemonSummary::new(endpoint.clone()),
             ))
         }
         Command::Attach { .. } => {
             let args = attach_parts(&cli.command, json)?;
-            Some(attach::run(
-                &args,
-                &mut attach::HttpDaemonSessions::new(endpoint.clone()),
-            ))
+            Some(attach::run(&args, &mut *control.open(endpoint)))
         }
-        Command::Stop { session } => Some(stop::run(
-            session,
-            json,
-            &mut attach::HttpDaemonSessions::new(endpoint.clone()),
-        )),
+        Command::Stop { session } => Some(stop::run(session, json, &mut *control.open(endpoint))),
         _ => None,
     }
+}
+
+/// `aw stop` on the test path. The factory supplies the endpoint, so a test can
+/// record what was sent without this dispatcher resolving one of its own.
+fn injected_session_command(
+    cli: &Cli,
+    json: bool,
+    control: &mut dyn ControlFactory,
+) -> Option<Outcome> {
+    let Command::Stop { session } = &cli.command else {
+        return None;
+    };
+    use crate::endpoint::HttpBase;
+    let endpoint = Endpoint::Http {
+        base: HttpBase {
+            host: "127.0.0.1".to_owned(),
+            port: 9,
+        },
+        token: cli.token.clone().unwrap_or_default(),
+    };
+    Some(stop::run(session, json, &mut *control.open(&endpoint)))
 }
 
 /// Same as [`execute_args`], with the token, HTTP factory, and query source injected.
@@ -455,8 +490,22 @@ pub(crate) fn execute_args_with(
     http: &mut dyn HttpFactory,
     source: &mut dyn QuerySource,
 ) -> io::Result<Outcome> {
+    execute_args_with_control(args, env_token, http, source, &mut LiveControl)
+}
+
+/// [`execute_args_with`] with the session-control client injected too.
+///
+/// `aw stop` talks to the daemon through `control`, not through `source`. Tests
+/// that send `@last` pass a factory whose transport records the request.
+pub(crate) fn execute_args_with_control(
+    args: &[String],
+    env_token: Option<String>,
+    http: &mut dyn HttpFactory,
+    source: &mut dyn QuerySource,
+    control: &mut dyn ControlFactory,
+) -> io::Result<Outcome> {
     match Cli::try_parse_from(std::iter::once("aw".to_owned()).chain(args.iter().cloned())) {
-        Ok(cli) => dispatch(cli, env_token, http, source),
+        Ok(cli) => dispatch(cli, env_token, http, source, control),
         Err(err) => Ok(usage_outcome(err)),
     }
 }
@@ -486,6 +535,7 @@ fn dispatch(
     env_token: Option<String>,
     http: &mut dyn HttpFactory,
     source: &mut dyn QuerySource,
+    control: &mut dyn ControlFactory,
 ) -> io::Result<Outcome> {
     let json = cli.json;
     // `--lang` selects the wording table for `findings` and `config rules test`.
@@ -513,6 +563,9 @@ fn dispatch(
         return Ok(outcome);
     }
     if let Some(outcome) = query_command(&cli.command, json, lang, source)? {
+        return Ok(outcome);
+    }
+    if let Some(outcome) = injected_session_command(&cli, json, control) {
         return Ok(outcome);
     }
     if let Some(outcome) = ops_command(&cli.command, json, lang, None) {
@@ -1201,7 +1254,7 @@ mod tests {
         );
         assert_eq!(outcome.code, exit::PERMISSION);
         let err = text(&outcome.stderr);
-        assert!(err.contains("401"), "{err}");
+        assert!(err.contains("没有通过后台的身份验证"), "{err}");
         assert!(err.contains("len=19"), "{err}");
         assert!(err.contains("WXYZ"), "{err}");
         assert!(!err.contains(TOKEN), "{err}");

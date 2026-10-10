@@ -5,12 +5,13 @@
 //! launch sessions use [`DaemonSessions::begin_run`] followed by
 //! [`DaemonSessions::adopt`]. None of these operations signal a target process.
 
+use std::marker::PhantomData;
 use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
-use crate::client::{ApiRequest, Client, ClientError, LoopbackHttp};
+use crate::client::{ApiRequest, Client, ClientError, LoopbackHttp, Transport};
 use crate::endpoint::Endpoint;
 use crate::exit;
 
@@ -122,10 +123,10 @@ impl std::fmt::Display for ControlError {
             ),
             Self::Transport { detail } => write!(f, "向后台发请求失败：{detail}"),
             Self::Status {
-                status, message, ..
-            } => {
-                write!(f, "后台返回 HTTP {status}：{message}")
-            }
+                status,
+                code,
+                message,
+            } => crate::daemon_errors::write_status(f, *status, code.as_deref(), message),
             Self::BadReply { detail } => write!(f, "后台返回的会话数据不完整：{detail}"),
         }
     }
@@ -165,16 +166,21 @@ impl ControlError {
     }
 
     /// Stable machine-readable code for this failure.
+    ///
+    /// A daemon `error.code` is kept as-is (it is already a machine token, and
+    /// JSON output must not replace it with a status class). Statuses without
+    /// one fall back to the class.
     #[must_use]
-    pub(crate) fn machine_code(&self) -> &'static str {
+    pub(crate) fn machine_code(&self) -> &str {
         match self {
             Self::Unreachable { .. } => "unreachable",
-            Self::Forbidden { .. }
-            | Self::Status {
-                status: 401 | 403, ..
-            } => "forbidden",
-            Self::Status { status: 404, .. } => "not_found",
-            Self::Status { .. } => "status",
+            Self::Forbidden { .. } => "forbidden",
+            Self::Status { code, status, .. } => code.as_deref().unwrap_or(match *status {
+                401 => "unauthorized",
+                403 => "forbidden",
+                404 => "not_found",
+                _ => "status",
+            }),
             Self::Transport { .. } => "transport",
             Self::BadReply { .. } => "bad_reply",
         }
@@ -191,6 +197,16 @@ impl ControlError {
     #[must_use]
     pub(crate) fn not_found(&self) -> bool {
         matches!(self, Self::Status { status: 404, .. })
+    }
+
+    /// `@last` when the caller has no sessions. The daemon answers 404 with
+    /// `no_sessions`, which is not "that session is missing".
+    #[must_use]
+    pub(crate) fn no_sessions(&self) -> bool {
+        matches!(
+            self,
+            Self::Status { code: Some(code), .. } if code == "no_sessions"
+        )
     }
 }
 
@@ -213,50 +229,92 @@ pub(crate) trait DaemonSessions {
     fn attach(&mut self, request: &AttachRequest) -> Result<SessionHandle, ControlError>;
 
     /// Stop observation for a session. This never ends the target process.
-    /// Returns the public id that was stopped (`@last` and names resolved).
+    /// Returns the public id that was stopped. `@last` is resolved by the
+    /// daemon; a name is resolved among the caller's own sessions.
     fn stop_monitoring(&mut self, session: &str) -> Result<String, ControlError>;
 
     /// Set the session's pinned flag.
     fn pin(&mut self, session: &str) -> Result<(), ControlError>;
 }
 
-/// Production session control over one resolved daemon endpoint.
-pub(crate) struct HttpDaemonSessions {
-    endpoint: Endpoint,
+/// Lends a [`Transport`] to [`Client`], which takes one by value.
+#[cfg(test)]
+struct Passthrough<'a, T>(&'a mut T);
+
+#[cfg(test)]
+impl<T: Transport> Transport for Passthrough<'_, T> {
+    fn exchange(&mut self, request: &ApiRequest) -> Result<crate::client::ApiReply, ClientError> {
+        self.0.exchange(request)
+    }
 }
 
-impl HttpDaemonSessions {
+/// Where [`HttpDaemonSessions`] sends a request.
+enum SessionTransport<T: Transport> {
+    /// Dial a fresh [`LoopbackHttp`] for each call.
+    Live(PhantomData<T>),
+    /// A transport the caller owns. Tests use this to record requests.
+    #[cfg(test)]
+    Scripted(T),
+}
+
+/// Production session control over one resolved daemon endpoint.
+pub(crate) struct HttpDaemonSessions<T: Transport = LoopbackHttp> {
+    endpoint: Endpoint,
+    transport: SessionTransport<T>,
+}
+
+impl HttpDaemonSessions<LoopbackHttp> {
     /// Bind to an endpoint. This does not open a socket.
     #[must_use]
     pub(crate) fn new(endpoint: Endpoint) -> Self {
-        Self { endpoint }
+        Self {
+            endpoint,
+            transport: SessionTransport::Live(PhantomData),
+        }
+    }
+}
+
+impl<T: Transport> HttpDaemonSessions<T> {
+    /// Bind to an endpoint and answer every call with `transport`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_transport(endpoint: Endpoint, transport: T) -> Self {
+        Self {
+            endpoint,
+            transport: SessionTransport::Scripted(transport),
+        }
     }
 
-    fn call(&self, request: &ApiRequest) -> Result<Value, ControlError> {
-        let transport = LoopbackHttp::new(&self.endpoint).map_err(ControlError::from)?;
-        let mut client = Client::new(self.endpoint.clone(), transport);
-        let reply = client.call(request).map_err(ControlError::from)?;
+    fn call(&mut self, request: &ApiRequest) -> Result<Value, ControlError> {
+        let reply = match &mut self.transport {
+            #[cfg(test)]
+            SessionTransport::Scripted(transport) => {
+                let mut client = Client::new(self.endpoint.clone(), Passthrough(transport));
+                client.call(request).map_err(ControlError::from)?
+            }
+            SessionTransport::Live(_) => {
+                let transport = LoopbackHttp::new(&self.endpoint).map_err(ControlError::from)?;
+                let mut client = Client::new(self.endpoint.clone(), transport);
+                client.call(request).map_err(ControlError::from)?
+            }
+        };
         reply.json().ok_or_else(|| ControlError::BadReply {
             detail: "响应体不是 JSON".to_owned(),
         })
     }
 }
 
-impl HttpDaemonSessions {
-    /// The daemon's session routes take public ids only. `@last` is the
-    /// caller's newest session (the list is `started_ns DESC`); any other key
-    /// that is not an `s-` id is looked up by exact name among the caller's
-    /// sessions. Not found by name is passed through so the daemon answers 404.
-    fn resolve_session(&self, key: &str) -> Result<String, ControlError> {
-        if key.starts_with("s-") {
+impl<T: Transport> HttpDaemonSessions<T> {
+    /// The daemon's session routes take public ids and `@last`. `@last` is
+    /// resolved on the daemon, against the caller's own sessions, so it is
+    /// forwarded unchanged. Any other key that is not an `s-` id is looked up
+    /// by exact name among the sessions the daemon returned for this caller.
+    /// Not found by name is passed through so the daemon answers 404.
+    fn resolve_session(&mut self, key: &str) -> Result<String, ControlError> {
+        if key.starts_with("s-") || key == "@last" {
             return Ok(key.to_owned());
         }
-        let last = key == "@last";
-        let limit = if last { "1" } else { "500" };
-        let list = self.call(&ApiRequest::get_query(
-            "/api/v1/sessions",
-            format!("limit={limit}"),
-        ))?;
+        let list = self.call(&ApiRequest::get_query("/api/v1/sessions", "limit=500"))?;
         let rows = list
             .get("sessions")
             .and_then(Value::as_array)
@@ -264,13 +322,6 @@ impl HttpDaemonSessions {
                 detail: "缺少字段 `sessions`".to_owned(),
             })?;
         let ids = |row: &Value| row.get("id").and_then(Value::as_str).map(str::to_owned);
-        if last {
-            return rows.first().and_then(ids).ok_or(ControlError::Status {
-                status: 404,
-                code: Some("not_found".to_owned()),
-                message: "@last 没有可停止的会话".to_owned(),
-            });
-        }
         let matches: Vec<String> = rows
             .iter()
             .filter(|row| row.get("name").and_then(Value::as_str) == Some(key))
@@ -291,7 +342,7 @@ impl HttpDaemonSessions {
     }
 }
 
-impl DaemonSessions for HttpDaemonSessions {
+impl<T: Transport> DaemonSessions for HttpDaemonSessions<T> {
     fn begin_run(&mut self, request: &BeginRunRequest) -> Result<LaunchSession, ControlError> {
         let mut body = Map::new();
         body.insert("argv".to_owned(), json!(request.argv));
@@ -349,8 +400,14 @@ impl DaemonSessions for HttpDaemonSessions {
     fn stop_monitoring(&mut self, session: &str) -> Result<String, ControlError> {
         let public_id = self.resolve_session(session)?;
         let path = format!("/api/v1/sessions/{}/stop", encode_path_segment(&public_id));
-        let _ = self.call(&ApiRequest::post_json(&path, &json!({})))?;
-        Ok(public_id)
+        let reply = self.call(&ApiRequest::post_json(&path, &json!({})))?;
+        // `@last` is resolved by the daemon. The id it stopped is the one it
+        // names back; a reply that names nothing keeps what was sent.
+        Ok(reply
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map_or(public_id, str::to_owned))
     }
 
     fn pin(&mut self, session: &str) -> Result<(), ControlError> {
@@ -856,16 +913,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn stop_resolves_last_and_names_to_public_ids_before_posting() {
+    fn stop_sends_at_last_unchanged_and_resolves_names_first() {
         use super::{DaemonSessions, HttpDaemonSessions};
         let (endpoint, dir, server) = fake_daemon(
             "st",
             vec![
+                // `@last` is the daemon's to resolve. It names the session back.
+                r#"{"stopped":"@last","id":"s-new"}"#,
                 r#"{"sessions":[{"id":"s-new","name":null},{"id":"s-old","name":"x"}]}"#,
-                r#"{"stopped":"s-new"}"#,
-                r#"{"sessions":[{"id":"s-new","name":null},{"id":"s-old","name":"x"}]}"#,
-                r#"{"stopped":"s-old"}"#,
-                r#"{"stopped":"s-direct"}"#,
+                r#"{"stopped":"s-old","id":"s-old"}"#,
+                r#"{"stopped":"s-direct","id":"s-direct"}"#,
             ],
         );
         let mut control = HttpDaemonSessions::new(endpoint);
@@ -877,29 +934,24 @@ mod tests {
         );
         let seen = server.join().expect("join");
         assert!(
-            seen[0].starts_with("GET /api/v1/sessions?limit=1 "),
+            seen[0].starts_with("POST /api/v1/sessions/@last/stop "),
             "{}",
             seen[0]
         );
         assert!(
-            seen[1].starts_with("POST /api/v1/sessions/s-new/stop "),
+            seen[1].starts_with("GET /api/v1/sessions?limit=500 "),
             "{}",
             seen[1]
         );
         assert!(
-            seen[2].starts_with("GET /api/v1/sessions?limit=500 "),
+            seen[2].starts_with("POST /api/v1/sessions/s-old/stop "),
             "{}",
             seen[2]
         );
         assert!(
-            seen[3].starts_with("POST /api/v1/sessions/s-old/stop "),
+            seen[3].starts_with("POST /api/v1/sessions/s-direct/stop "),
             "{}",
             seen[3]
-        );
-        assert!(
-            seen[4].starts_with("POST /api/v1/sessions/s-direct/stop "),
-            "{}",
-            seen[4]
         );
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }

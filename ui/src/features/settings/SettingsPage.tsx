@@ -109,7 +109,7 @@ export function Storage({ config, used, usedNa, admin }: { config: ConfigView; u
   return (
     <Section title={t("settings.storage")}>
       <Locked admin={admin} />
-      <p>{t("settings.used")}：{used === null ? <span className="text-ink-faint">{usedNa}</span> : <Bytes value={used} />}</p>
+      <p>{t("settings.used")}{t("common.colon")}{used === null ? <span className="text-ink-faint">{usedNa}</span> : <Bytes value={used} />}</p>
       <label className="flex items-center gap-2">
         {t("settings.maxBytes")}
         <span className="font-mono"><Bytes value={config.retention.max_db_bytes} /></span>
@@ -209,7 +209,7 @@ function Privacy({ config, admin }: { config: ConfigView; admin: boolean }) {
         <input value={sample} onChange={(event) => setSample(event.target.value)} className="mt-1 w-full rounded border border-line bg-paper px-2 py-1" />
       </label>
       <p>
-        {t("settings.previewResult")}：<span className="font-mono">{preview.text}</span>
+        {t("settings.previewResult")}{t("common.colon")}<span className="font-mono">{preview.text}</span>
         {preview.invalid ? <span className="ml-2 text-amber-700 dark:text-amber-400">{t("settings.patternInvalid")}</span> : null}
       </p>
       <button

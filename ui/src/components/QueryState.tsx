@@ -12,7 +12,7 @@ export function ErrorNote({ message, error, onRetry }: { message?: string; error
   const text = error !== undefined && error !== null ? describeError(error, t) : message || t("error.unknown");
   return (
     <p className="px-4 py-6 text-sm text-ink-soft">
-      {t("common.error")}：{text}{" "}
+      {t("common.error")}{t("common.colon")}{text}{" "}
       {onRetry ? (
         <button type="button" className="underline" onClick={onRetry}>
           {t("common.retry")}

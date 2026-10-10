@@ -3,6 +3,7 @@ import { Link, useNavigate } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { api } from "@/api/client";
+import { refreshListWhileRecording } from "@/lib/live-session";
 import type { DbStats, Session } from "@/api/types";
 import { Bytes } from "@/components/Bytes";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -35,6 +36,9 @@ export function SessionsPage() {
   const sessions = useQuery({
     queryKey: ["sessions", q, agent, range, activeOnly],
     queryFn: () => api.sessions({ q, agent: agent || undefined, since, active: activeOnly || undefined, limit: 200 }),
+    // A program that exits on its own ends its session: the row must turn
+    // 「已停止」 without reopening the page.
+    refetchInterval: refreshListWhileRecording,
   });
   const stats = useQuery({ queryKey: ["db-stats"], queryFn: () => api.dbStats() });
 

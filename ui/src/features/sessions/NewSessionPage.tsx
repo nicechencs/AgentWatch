@@ -2,11 +2,11 @@ import { useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/api/client";
-import type { SystemProcess, SystemProcessTable } from "@/api/types";
+import type { DoctorCapability, SystemProcess, SystemProcessTable } from "@/api/types";
 import { describeError } from "@/api/errors";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { ErrorNote } from "@/components/QueryState";
-import { kindLabel } from "@/lib/capabilities";
+import { kindInSentence, kindLabel } from "@/lib/capabilities";
 import { useI18n } from "@/lib/i18n";
 
 const AGENTS = ["auto", "claude", "codex", "cursor", "other"];
@@ -58,25 +58,49 @@ export function NewSessionPage() {
             {doctor.data.privileged_note ? <span title={doctor.data.privileged_note}>ⓘ</span> : null}
           </p>
         ) : null}
-        {doctor.data && doctor.data.capabilities.length > 0 ? (
-          <ul className="mt-2 flex flex-wrap gap-2 text-xs">
-            {doctor.data.capabilities.map((capability) => (
-              <li key={capability.kind} className="flex items-center gap-1 rounded border border-line px-2 py-1">
-                <span>{kindLabel(t, capability.kind)}</span>
-                {capability.available && capability.evidence ? (
-                  <EvidenceBadge level={capability.evidence} />
-                ) : (
-                  <span className="text-ink-faint">
-                    {t("new.capMissing")}
-                    {capability.na_reason ? `：${t(`na.${capability.na_reason}`)}` : capability.note ? `：${capability.note}` : ""}
-                  </span>
-                )}
-              </li>
-            ))}
-          </ul>
-        ) : null}
+        {doctor.data && doctor.data.capabilities.length > 0 ? <CapabilityList capabilities={doctor.data.capabilities} /> : null}
       </section>
     </main>
+  );
+}
+
+/**
+ * Collected kinds as chips with their evidence; the rest in one plain
+ * sentence per reason, worded like the Settings page (「没采」). A kind whose
+ * collector does not run in this mode (`collector_unavailable`) says exactly
+ * that, not 「不可得：当前运行模式不支持采集此信息」. List separator and colon
+ * come from the locale, never a hard-coded full-width 「：」.
+ */
+export function CapabilityList({ capabilities }: { capabilities: DoctorCapability[] }) {
+  const { t } = useI18n();
+  const collected = capabilities.filter((c) => c.available && c.evidence);
+  const missing = new Map<string, string[]>();
+  for (const capability of capabilities) {
+    if (capability.available && capability.evidence) continue;
+    const reason =
+      !capability.na_reason || capability.na_reason === "collector_unavailable"
+        ? t("new.capReasonNotRunning")
+        : t(`na.${capability.na_reason}`);
+    missing.set(reason, [...(missing.get(reason) ?? []), kindInSentence(t, capability.kind)]);
+  }
+  return (
+    <div className="mt-2 text-xs" data-capability-list="">
+      {collected.length > 0 ? (
+        <ul className="flex flex-wrap gap-2">
+          {collected.map((capability) => (
+            <li key={capability.kind} className="flex items-center gap-1 rounded border border-line px-2 py-1">
+              <span>{kindLabel(t, capability.kind)}</span>
+              {capability.evidence ? <EvidenceBadge level={capability.evidence} /> : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {[...missing.entries()].map(([reason, kinds]) => (
+        <p key={reason} className="mt-1 text-ink-faint" data-not-collected="">
+          {t("new.capNotCollected", { kinds: kinds.join(t("common.listSep")), reason })}
+        </p>
+      ))}
+    </div>
   );
 }
 

@@ -200,12 +200,12 @@ function SideCard({ side, label }: { side: CompareSide; label: string }) {
       </p>
       <p>{session.name ?? session.argv?.[0] ?? t("common.unavailable")}</p>
       <p className="text-ink-faint">
-        {t("compare.platform")}：{session.platform}
+        {t("compare.platform")}{t("common.colon")}{session.platform}
         {session.os_version ? ` ${session.os_version}` : ""}
         {session.agent ? ` · ${session.agent}` : ""}
       </p>
       <p className="mt-1 text-ink-faint">
-        {t("compare.collectors")}：{kinds.length > 0 ? kinds.join(", ") : t("common.unavailable")}
+        {t("compare.collectors")}{t("common.colon")}{kinds.length > 0 ? kinds.join(", ") : t("common.unavailable")}
       </p>
     </section>
   );

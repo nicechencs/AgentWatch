@@ -19,6 +19,11 @@ export function refreshWhileRecording(query: Query<Session, Error>): number | fa
   return recording(query.state.data) ? RECORDING_REFRESH_MS : false;
 }
 
+/** The session list: re-read while any listed session is still recording. */
+export function refreshListWhileRecording(query: { state: { data?: { items: Session[] } } }): number | false {
+  return (query.state.data?.items ?? []).some((session) => recording(session)) ? RECORDING_REFRESH_MS : false;
+}
+
 export function sessionQueryOptions(sid: string) {
   return {
     queryKey: ["session", sid] as const,

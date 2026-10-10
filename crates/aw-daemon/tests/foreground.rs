@@ -9,21 +9,24 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agentwatchd"))
 }
 
+/// Short root: daemons here bind `<root>/api.sock` (and deeper), and Unix
+/// socket paths are capped (104 bytes on macOS, whose temp dir is long).
 fn scratch(label: &str) -> io::Result<PathBuf> {
-    let nanos = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos(),
-        Err(_) => 0,
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = if cfg!(unix) {
+        PathBuf::from(format!("/tmp/aw-{}-{seq}", std::process::id()))
+    } else {
+        std::env::temp_dir().join(format!("agentwatchd-{label}-{}-{seq}", std::process::id()))
     };
-    let dir = std::env::temp_dir().join(format!(
-        "agentwatchd-{label}-{}-{nanos}",
-        std::process::id()
-    ));
+    let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }

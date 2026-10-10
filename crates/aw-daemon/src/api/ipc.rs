@@ -704,10 +704,32 @@ mod tests {
     use super::super::routes::{dispatch, ApiState, HttpRequest};
     use super::{socket_path_from, Control, IpcServer, OPEN_SOCKET_MODE, SOCKET_MODE};
 
-    fn temp_socket(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("aw-ipc-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir.join("api.sock")
+    /// `<short dir>/api.sock`; the directory is removed when this drops.
+    struct TempSocket(PathBuf);
+
+    impl std::ops::Deref for TempSocket {
+        type Target = PathBuf;
+        fn deref(&self) -> &PathBuf {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempSocket {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempSocket {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    fn temp_socket(name: &str) -> TempSocket {
+        TempSocket(aw_channel::short_temp_dir(name).join("api.sock"))
     }
 
     fn exchange(path: &PathBuf, raw: &str) -> (u16, serde_json::Value) {

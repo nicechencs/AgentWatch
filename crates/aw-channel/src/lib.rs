@@ -255,6 +255,27 @@ impl std::fmt::Display for DialError {
 
 impl std::error::Error for DialError {}
 
+/// A fresh, short scratch directory for tests that bind sockets. Unix
+/// socket paths are limited (`SUN_LEN`: 104 bytes on macOS, 108 on Linux)
+/// and macOS temp dirs (`/var/folders/...`) are already long, so on Unix this
+/// is `/tmp/aw-<pid>-<seq>` (`tag` is ignored there; elsewhere it names the
+/// dir under the OS temp dir). Callers remove it. Not for production.
+#[doc(hidden)]
+#[must_use]
+pub fn short_temp_dir(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = if cfg!(unix) {
+        PathBuf::from(format!("/tmp/aw-{}-{seq}", std::process::id()))
+    } else {
+        std::env::temp_dir().join(format!("aw-{}-{seq}-{tag}", std::process::id()))
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// Classify an open/connect error. Pure.
 #[must_use]
 pub fn classify(err: &io::Error, path: &Path) -> DialError {
@@ -264,6 +285,12 @@ pub fn classify(err: &io::Error, path: &Path) -> DialError {
     }
     match err.kind() {
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => DialError::Unreachable(what),
+        // The path cannot be used as a socket address (longer than SUN_LEN,
+        // or a NUL byte): nothing can be listening there. Same as not found,
+        // so the next candidate is tried; the reason stays in the detail.
+        io::ErrorKind::InvalidInput => {
+            DialError::Unreachable(format!("{}: unusable socket path ({err})", path.display()))
+        }
         io::ErrorKind::PermissionDenied => DialError::Forbidden(what),
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => DialError::Timeout(what),
         _ => DialError::Broken(what),
@@ -568,7 +595,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resolve_prefers_an_existing_user_socket_over_a_missing_system_one() {
-        let dir = std::env::temp_dir().join(format!("aw-chan-{}", std::process::id()));
+        let dir = super::short_temp_dir("res");
         let sock = dir.join("agentwatch").join("api.sock");
         std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
         std::fs::write(&sock, b"").unwrap();
@@ -649,7 +676,7 @@ mod tests {
     #[test]
     fn exchange_over_a_socket_and_missing_is_unreachable() {
         use std::io::{Read, Write};
-        let dir = std::env::temp_dir().join(format!("aw-chan-x-{}", std::process::id()));
+        let dir = super::short_temp_dir("x");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("api.sock");
@@ -680,7 +707,7 @@ mod tests {
         if nix_like_is_root() {
             return; // root ignores the mode bits
         }
-        let dir = std::env::temp_dir().join(format!("aw-chan-p-{}", std::process::id()));
+        let dir = super::short_temp_dir("p");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("api.sock");
@@ -715,10 +742,7 @@ mod fallback_tests {
     use super::{dial_order, exchange_first, DialError, AW_SOCKET, AW_SYSTEM_SOCKET, TIMEOUT};
 
     fn dir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("aw-chan-fb-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        super::short_temp_dir(name)
     }
 
     fn serve_once(listener: UnixListener) -> std::thread::JoinHandle<()> {
@@ -778,7 +802,8 @@ mod fallback_tests {
         let err = exchange_first(&dial_order(&system, &env), b"", TIMEOUT).unwrap_err();
         assert_eq!(err.code(), "daemon_unreachable");
         assert!(err.detail().contains("system.sock"), "{err}");
-        assert!(err.detail().contains("agentwatch/api.sock"), "{err}");
+        let user = super::user_path(&env).unwrap();
+        assert!(err.detail().contains(&*user.to_string_lossy()), "{err}");
         assert_eq!(err.plain(), "AgentWatch 服务没有运行。");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -822,6 +847,41 @@ mod fallback_tests {
         let _user = UnixListener::bind(&order[1]).unwrap();
         let err = exchange_first(&order, b"", TIMEOUT).unwrap_err();
         assert_eq!(err.code(), "daemon_forbidden", "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// macOS SUN_LEN is 104, Linux 108: a longer path cannot be dialled.
+    /// It is "not running there", never `channel_broken`, and the next
+    /// candidate is still tried.
+    #[test]
+    fn too_long_path_is_unreachable_and_skipped() {
+        let d = dir("long");
+        let long = d.join("x".repeat(200)).join("api.sock");
+        let err = super::exchange(&long, b"", TIMEOUT).unwrap_err();
+        assert_eq!(err.code(), "daemon_unreachable", "{err}");
+        assert!(err.detail().contains("unusable socket path"), "{err}");
+        let pure = super::classify(
+            &std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path must be shorter than SUN_LEN",
+            ),
+            &long,
+        );
+        assert!(matches!(pure, DialError::Unreachable(_)), "{pure:?}");
+
+        let live = d.join("live.sock");
+        let server = serve_once(UnixListener::bind(&live).unwrap());
+        let (used, _) = exchange_first(
+            &[long.clone(), live.clone()],
+            b"GET / HTTP/1.1\r\n\r\n",
+            TIMEOUT,
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(used, live);
+        let only = exchange_first(&[long], b"", TIMEOUT).unwrap_err();
+        assert_eq!(only.code(), "daemon_unreachable");
+        assert!(only.detail().contains("unusable socket path"), "{only}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

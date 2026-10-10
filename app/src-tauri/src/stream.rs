@@ -229,7 +229,7 @@ mod tests {
         use std::io::{Read, Write};
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
-        let dir = std::env::temp_dir().join(format!("aw-desktop-live-{}", std::process::id()));
+        let dir = aw_channel::short_temp_dir("live");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("api.sock");
         let _ = std::fs::remove_file(&path);

@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn binary_body_survives_a_real_socket_and_missing_is_unreachable() {
         use std::io::{Read, Write};
-        let dir = std::env::temp_dir().join(format!("aw-desktop-{}", std::process::id()));
+        let dir = aw_channel::short_temp_dir("desktop");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("api.sock");
         let _ = std::fs::remove_file(&path);
@@ -275,12 +275,7 @@ mod tests {
     fn retry_falls_back_from_a_stale_system_socket_to_the_user_socket() {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixListener;
-        // Short base under /tmp: macOS's per-user path adds
-        // "Library/Application Support/AgentWatch/api.sock", and its temp dir
-        // is long enough to pass the 104-byte socket path limit.
-        let dir = std::path::PathBuf::from(format!("/tmp/awdr-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = aw_channel::short_temp_dir("retry");
         let system = dir.join("system.sock");
         drop(UnixListener::bind(&system).unwrap()); // stale socket file
         let (sys, run) = (system.display().to_string(), dir.display().to_string());

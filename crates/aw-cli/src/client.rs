@@ -588,7 +588,7 @@ mod tests {
     #[test]
     fn socket_endpoint_dials_and_sends_no_bearer() {
         use std::io::{Read, Write};
-        let dir = std::env::temp_dir().join(format!("aw-cli-sock-{}", std::process::id()));
+        let dir = aw_channel::short_temp_dir("cli");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("api.sock");
         let _ = std::fs::remove_file(&path);
@@ -622,7 +622,7 @@ mod tests {
             !seen.to_ascii_lowercase().contains("authorization"),
             "{seen}"
         );
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

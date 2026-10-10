@@ -441,7 +441,8 @@ export const api = {
   sessions: async (query: SessionListQuery = {}) =>
     toPage(await get<unknown>(`/sessions${qs({ ...query })}`), ["sessions"], toSession),
   session: async (sid: string) => toSession(await get<unknown>(`/sessions/${sid}`)),
-  createSession: (body: CreateSessionBody) => send<Session>("POST", "/sessions", body),
+  /** `201 {id, session_id, mode, root_pid}`; `id` is the public id the routes use. */
+  createSession: async (body: CreateSessionBody) => toSession(await send<unknown>("POST", "/sessions", body)),
   patchSession: (sid: string, body: { name?: string; pinned?: boolean }) =>
     send<Session>("PATCH", `/sessions/${sid}`, body),
   stopSession: (sid: string) => send<Session>("POST", `/sessions/${sid}/stop`),
@@ -508,7 +509,8 @@ export const api = {
   purgePreview: (body: { older_than?: string; all?: boolean }) =>
     send<{ would_purge: { public_id: string; session_id: number }[] }>("POST", "/db/purge", { ...body, dry_run: true }),
   /** Call only after the user confirmed: the daemon refuses a purge without `confirm`. */
-  purge: (body: { older_than?: string; all?: boolean }) => send<void>("POST", "/db/purge", { ...body, confirm: true }),
+  purge: (body: { older_than?: string; all?: boolean }) =>
+    send<{ purged: { public_id: string }[] }>("POST", "/db/purge", { ...body, confirm: true }),
 };
 
 export type ExportFormat = "jsonl" | "csv" | "md";

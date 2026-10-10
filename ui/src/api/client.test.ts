@@ -176,4 +176,29 @@ describe("export and live go through the request layer", () => {
     expect(invoke).toHaveBeenCalledWith("aw_stream_close", { id: 9 });
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it("purge: preview is a dry run and the delete carries confirm", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response('{"dry_run":true,"would_purge":[{"public_id":"a","session_id":2}]}', { status: 200 }))
+      .mockResolvedValueOnce(new Response('{"purged":[{"public_id":"a"}]}', { status: 200 }));
+    const { api } = await import("./client");
+    expect((await api.purgePreview({ older_than: "30d" })).would_purge).toHaveLength(1);
+    expect((await api.purge({ older_than: "30d" })).purged).toHaveLength(1);
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({ older_than: "30d", dry_run: true });
+    expect(JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body))).toEqual({ older_than: "30d", confirm: true });
+  });
+});
+
+describe("create session", () => {
+  it("maps the daemon's {id} to public_id so the page does not open /s/undefined", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response('{"id":"s-0123456789ab","session_id":2,"mode":"attach","root_pid":42}', { status: 201 }),
+    );
+    const { api } = await import("./client");
+    const session = await api.createSession({ mode: "attach", pid: 42 });
+    expect(session.public_id).toBe("s-0123456789ab");
+    expect(session.mode).toBe("attach");
+    vi.restoreAllMocks();
+  });
 });

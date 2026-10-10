@@ -281,6 +281,8 @@
   "settings.maxBytes": "Size limit",
   "settings.maxAge": "Retention days",
   "settings.used": "Currently used",
+  "settings.purgeCount": "{count} finished sessions older than {days} days will be deleted.",
+  "settings.purged": "Deleted {count} sessions.",
   "settings.purgeNow": "Clean up now",
   "settings.purgeConfirm": "Clean up finished sessions under the current retention policy? Pinned sessions are kept.",
   "settings.builtinReadonly": "Built-in rules are read-only",

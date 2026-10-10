@@ -281,6 +281,8 @@
   "settings.maxBytes": "体积上限",
   "settings.maxAge": "保留天数",
   "settings.used": "当前占用",
+  "settings.purgeCount": "将删除 {count} 个超过 {days} 天的已结束会话。",
+  "settings.purged": "已删除 {count} 个会话。",
   "settings.purgeNow": "立即清理",
   "settings.purgeConfirm": "按当前保留策略清理已结束的会话？固定的会话不会被删除。",
   "settings.builtinReadonly": "内置规则只读",

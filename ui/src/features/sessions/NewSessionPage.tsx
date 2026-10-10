@@ -1,5 +1,5 @@
 import { useNavigate } from "@tanstack/react-router";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "@/api/client";
 import type { SystemProcess } from "@/api/types";
@@ -13,6 +13,7 @@ const AGENTS = ["auto", "claude", "codex", "cursor", "other"];
 export function NewSessionPage() {
   const { t } = useI18n();
   const navigate = useNavigate();
+  const client = useQueryClient();
   const doctor = useQuery({ queryKey: ["doctor"], queryFn: () => api.doctor() });
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
@@ -22,6 +23,9 @@ export function NewSessionPage() {
     setError(null);
     try {
       const session = await api.createSession(body);
+      if (!session.public_id) throw new Error(t("common.error"));
+      // The list must show the new, real session next to the others.
+      await client.invalidateQueries({ queryKey: ["sessions"] });
       await navigate({ to: "/s/$sid", params: { sid: session.public_id }, search: {} });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : t("common.error"));

@@ -62,7 +62,7 @@ fn paths() -> Value {
         },
         "/sessions/run": op("post", "aw run: record a launch session {argv} and return {id, ticket, adopt_timeout_ms}. The caller starts the process itself, then posts /adopt.", true, "implemented"),
         "/sessions/{sid}/adopt": op("post", "{ticket, pid}: hand the caller's process to a /sessions/run session within 5 s. Wrong ticket 403, late 410 adopt_timeout.", true, "implemented"),
-        "/sessions/{sid}/attach": op("post", "{pid}: watch one more root in an open session the caller owns. Another user's process needs an administrator.", true, "implemented"),
+        "/sessions/{sid}/attach": op("post", "{pid}: watch one more root in an open session the caller owns. Another user's process needs an administrator. A daemon without a session database answers 503 store_unavailable.", true, "implemented"),
         "/sessions/{sid}": {
             "get": op_body("Session detail, mode, collectors [{name, mode, capabilities:[{kind, evidence, na_reason}]}] and stats (same counts as the list).", true, "implemented"),
             "patch": op_body("Rename or pin.", true, "implemented"),

@@ -147,6 +147,15 @@ impl ApiResponse {
 
 /// JSON body for an endpoint this card does not back with a store.
 #[must_use]
+/// Attach / adopt on a daemon without a database: recording needs the store.
+fn no_store_to_record() -> ApiResponse {
+    error_response(
+        503,
+        "store_unavailable",
+        "recording needs the session database; this daemon has none open",
+    )
+}
+
 pub fn not_implemented(op: &str) -> ApiResponse {
     ApiResponse::json(
         501,
@@ -1487,11 +1496,13 @@ fn session_sub(
     };
 
     if op == "attach" {
-        // No process table in this card. `process_owner` in the JSON body stands
-        // in for "this pid belongs to another user". A different owner is
-        // admin-only and returns 403. A missing owner is not treated as "ours";
-        // the attach itself stays unimplemented (501) because there is no process
-        // table to attach to.
+        // Only reached without a database: with one, `/sessions/{sid}/attach`
+        // is answered by `watch_routes::attach` before this point, and the
+        // foreground daemon always opens `agentwatch.db`. A recording here would
+        // have nowhere to be written, so after the owner check the answer is
+        // 503 `store_unavailable`, not 501. `process_owner` in the body stands in
+        // for "this pid belongs to another user": a different owner is
+        // admin-only (403).
         if let Some(process_owner) = json_string_field_bytes(body, "process_owner") {
             if process_owner != caller.user_id {
                 let input = AuthInput {
@@ -1505,11 +1516,14 @@ fn session_sub(
                     target_process_owner: Some(process_owner),
                 };
                 return match authorize(&input) {
-                    AuthDecision::Allow(_) => not_implemented("attach"),
+                    AuthDecision::Allow(_) => no_store_to_record(),
                     _ => forbidden(),
                 };
             }
         }
+    }
+    if op == "attach" || op == "run" {
+        return no_store_to_record();
     }
 
     not_implemented(op)
@@ -3321,6 +3335,27 @@ mod tests {
             ),
         );
         assert_eq!(response.status, 403);
+        // Own process, or an admin: still no 501. Without a database there is
+        // nowhere to record, and the daemon says so.
+        for body in [&br#"{"pid":1}"#[..], &br#"{"process_owner":"alice"}"#[..]] {
+            let own = dispatch(
+                &mut state,
+                &req("POST", &path, Some("127.0.0.1:7456"), Some(&alice), body),
+            );
+            assert_eq!(own.status, 503);
+            assert_eq!(json_body(&own)["error"]["code"], "store_unavailable");
+        }
+        let adopt = dispatch(
+            &mut state,
+            &req(
+                "POST",
+                &format!("/api/v1/sessions/{id}/adopt"),
+                Some("127.0.0.1:7456"),
+                Some(&alice),
+                br#"{"ticket":"x","pid":1}"#,
+            ),
+        );
+        assert_eq!(adopt.status, 503);
     }
 
     #[test]

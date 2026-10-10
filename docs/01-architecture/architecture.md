@@ -161,7 +161,9 @@ stdio 处理有两个候选方案：
 | `collectors.windows.sni` | `false` | Windows pktmon SNI 采集（可选） | [windows](../02-platforms/windows.md) |
 | `collectors.linux.tls_uprobe` | `false` | Linux TLS 明文 uprobe（可选，开启时 UI 显著提示） | [network-attribution](network-attribution.md) |
 | `collectors.linux.ipc_payload_peek` | `false` | Linux eBPF 读取 IPC 缓冲区做协议解析（可选，默认关闭；与 tls_uprobe 同级审批） | [inter-agent-communication §5](inter-agent-communication.md#5-协议层e2mcp-与常见-agent-协议) |
+| `api.http_port` | `7456` | 浏览器 UI 的本机 HTTP 端口，只绑 `127.0.0.1`；`0` 关闭 HTTP 监听 | [api-and-cli §1](api-and-cli.md) |
 | `debug.keep_raw_events` | `false` | 另写未聚合的 `raw_events` 表 | [pipeline](pipeline.md) |
+| `debug.preview_ui` | `false` | 仅本机预览：`GET /` 签票并 302 到 `/index.html#ticket=` | [api-and-cli §1](api-and-cli.md) |
 
 ### 7.2 环境变量
 

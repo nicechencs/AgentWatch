@@ -79,6 +79,15 @@ async function request<T>(method: string, path: string, init: RequestInit = {}):
   return body as T;
 }
 
+/**
+ * The one request path every feature uses (findings, network HTTP rows, proxy
+ * CA). Features must not call `fetch("/api/v1…")` themselves: a second copy of
+ * the token and error handling is what a transport change would miss.
+ */
+export function apiCall<T>(method: string, path: string, body?: unknown): Promise<T> {
+  return request<T>(method, path, body === undefined ? {} : { body: JSON.stringify(body) });
+}
+
 const get = <T>(path: string) => request<T>("GET", path);
 const send = <T>(method: string, path: string, body?: unknown) =>
   request<T>(method, path, body === undefined ? {} : { body: JSON.stringify(body) });

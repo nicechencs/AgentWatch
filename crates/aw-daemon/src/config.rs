@@ -97,7 +97,7 @@ pub struct DaemonConfig {
     pub limits: LimitsConfig,
     /// Correlation caps registered in §7.
     pub correlation: CorrelationConfig,
-    /// Local API. Empty in this card (P1-DAEMON-03 owns the listener).
+    /// Local API listeners: loopback HTTP port and the CLI / desktop IPC channel.
     pub api: ApiConfig,
     /// Debug switches registered in §7.
     pub debug: DebugConfig,
@@ -194,9 +194,24 @@ pub struct CorrelationConfig {
     pub max_hash_file_size: u64,
 }
 
-/// `[api]`. No registered keys yet.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ApiConfig {}
+/// Default loopback HTTP port (api-and-cli §1). `api.http_port` overrides it.
+pub const DEFAULT_HTTP_PORT: u16 = 7456;
+
+/// `[api]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiConfig {
+    /// `api.http_port`, default [`DEFAULT_HTTP_PORT`]. `0` turns the loopback
+    /// HTTP listener off. The address is always `127.0.0.1`.
+    pub http_port: u16,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            http_port: DEFAULT_HTTP_PORT,
+        }
+    }
+}
 
 /// `[debug]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,7 +254,7 @@ impl Default for DaemonConfig {
             correlation: CorrelationConfig {
                 max_hash_file_size: 10 * MIB,
             },
-            api: ApiConfig {},
+            api: ApiConfig::default(),
             debug: DebugConfig {
                 keep_raw_events: false,
                 preview_ui: false,
@@ -299,9 +314,7 @@ pub fn parse_toml(text: &str) -> Result<(DaemonConfig, Vec<ConfigWarning>), Conf
             "correlation" => {
                 config.correlation = parse_correlation(child, "correlation", &mut warnings)?;
             }
-            "api" => {
-                warn_unknown_children(child, "api", &mut warnings)?;
-            }
+            "api" => config.api = parse_api(child, "api", &mut warnings)?,
             "debug" => config.debug = parse_debug(child, "debug", &mut warnings)?,
             other => warnings.push(ConfigWarning {
                 key: other.to_owned(),
@@ -430,7 +443,9 @@ pub fn config_schema_json() -> Value {
             "api": {
                 "type": "object",
                 "additionalProperties": false,
-                "properties": {}
+                "properties": {
+                    "http_port": { "type": "integer", "minimum": 0, "maximum": 65535, "default": DEFAULT_HTTP_PORT, "description": "Loopback HTTP port for the browser UI. 0 turns the HTTP listener off." }
+                }
             },
             "debug": {
                 "type": "object",
@@ -648,6 +663,31 @@ fn parse_correlation(
     Ok(CorrelationConfig { max_hash_file_size })
 }
 
+fn parse_api(
+    value: &toml::Value,
+    prefix: &str,
+    warnings: &mut Vec<ConfigWarning>,
+) -> Result<ApiConfig, ConfigError> {
+    let mut out = ApiConfig::default();
+    let table = expect_table(value, prefix)?;
+    for (key, child) in table {
+        match key.as_str() {
+            "http_port" => {
+                let key = dot(prefix, "http_port");
+                let number = child
+                    .as_integer()
+                    .ok_or_else(|| invalid(&key, "expected an integer 0..=65535"))?;
+                out.http_port = u16::try_from(number)
+                    .map_err(|_| invalid(&key, "expected an integer 0..=65535"))?;
+            }
+            other => warnings.push(ConfigWarning {
+                key: dot(prefix, other),
+            }),
+        }
+    }
+    Ok(out)
+}
+
 fn parse_debug(
     value: &toml::Value,
     prefix: &str,
@@ -832,6 +872,20 @@ mod tests {
                 return Err(format!("schema missing {name}"));
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn api_http_port_is_configurable_and_zero_disables() -> Result<(), ConfigError> {
+        let (default, _) = parse_toml("")?;
+        assert_eq!(default.api.http_port, super::DEFAULT_HTTP_PORT);
+        let (custom, warnings) = parse_toml("[api]\nhttp_port = 18456\n")?;
+        assert!(warnings.is_empty());
+        assert_eq!(custom.api.http_port, 18456);
+        let (off, _) = parse_toml("[api]\nhttp_port = 0\n")?;
+        assert_eq!(off.api.http_port, 0);
+        assert!(parse_toml("[api]\nhttp_port = 70000\n").is_err());
+        assert!(parse_toml("[api]\nhttp_port = -1\n").is_err());
         Ok(())
     }
 }

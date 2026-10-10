@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use super::routes::{dispatch, ApiResponse, ApiState, HttpBind, HttpRequest};
 
-/// Default UI / API port. api-and-cli §1.
-pub const DEFAULT_HTTP_PORT: u16 = 7456;
+/// Default UI / API port. api-and-cli §1. `api.http_port` overrides it.
+pub const DEFAULT_HTTP_PORT: u16 = crate::config::DEFAULT_HTTP_PORT;
 
 /// How long one request may sit on the socket before the worker drops it.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);

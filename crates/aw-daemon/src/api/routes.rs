@@ -957,8 +957,11 @@ fn health(state: &ApiState) -> ApiResponse {
 fn authenticate(state: &mut ApiState, req: &HttpRequest) -> Result<Caller, ApiResponse> {
     let header = req.headers.get("authorization").map(String::as_str);
     let token = bearer_token(header);
+    // Same clock as issuance. `state.now` alone is 0 in production, which made
+    // every expiry check compare against 1970 and never fire.
+    let now = clock(state);
     let caller = match token {
-        Some(token) => state.tickets.caller_for_token(token, state.now).ok(),
+        Some(token) => state.tickets.caller_for_token(token, now).ok(),
         None => None,
     };
     // Host is checked even when the token is missing, but a foreign host wins
@@ -1499,7 +1502,8 @@ fn redeem_token(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     if ticket.is_empty() {
         return unauthorized();
     }
-    match state.tickets.redeem(&ticket, state.now) {
+    let now = clock(state);
+    match state.tickets.redeem(&ticket, now) {
         Ok(token) => ApiResponse::json(200, &json!({ "token": token, "ttl_s": 12 * 60 * 60 })),
         Err(_) => ApiResponse::json(
             401,
@@ -2244,6 +2248,45 @@ mod tests {
         };
         assert_eq!(redeem(&mut state), 200);
         assert_eq!(redeem(&mut state), 401);
+    }
+
+    #[test]
+    fn production_clock_enforces_ticket_and_token_expiry() {
+        // `now == 0` is the production state: the handler reads the wall clock.
+        let mut state = ApiState::new(0);
+        let wall = super::clock(&state);
+        // A ticket issued 61 s ago must be refused, not redeemed against 1970.
+        let (_ticket, stale) =
+            state
+                .tickets
+                .issue_ui_ticket("alice", false, wall - UI_TICKET_TTL - 1);
+        let body = format!(r#"{{"ticket":"{stale}"}}"#);
+        let late = dispatch(
+            &mut state,
+            &req(
+                "POST",
+                "/api/v1/auth/ui-token",
+                Some("127.0.0.1:7456"),
+                None,
+                body.as_bytes(),
+            ),
+        );
+        assert_eq!(late.status, 401);
+        // A token whose 12 h ran out is refused on a real request.
+        let (_ticket, old) = state.tickets.issue_ui_ticket("alice", false, 1_000);
+        let token = state.tickets.redeem(&old, 1_000).unwrap_or_default();
+        assert!(!token.is_empty());
+        let response = dispatch(
+            &mut state,
+            &req(
+                "GET",
+                "/api/v1/sessions",
+                Some("127.0.0.1:7456"),
+                Some(&token),
+                b"",
+            ),
+        );
+        assert_eq!(response.status, 401);
     }
 
     #[test]

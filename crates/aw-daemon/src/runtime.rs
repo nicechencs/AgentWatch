@@ -35,7 +35,7 @@ use tracing::{Event, Level, Subscriber};
 use tracing_core::span::{Attributes, Id, Record};
 use tracing_core::Metadata;
 
-use crate::api::{ApiState, HttpServer, OtlpRegistry, StoreQuery, DEFAULT_HTTP_PORT};
+use crate::api::{ApiState, HttpServer, OtlpRegistry, StoreQuery};
 use crate::config::{resolve_data_dir, ConfigWarning, DaemonConfig};
 use crate::paths::ensure_data_dir;
 use crate::sample::HostSampler;
@@ -320,7 +320,8 @@ impl Subscriber for FileSubscriber {
         let level = event.metadata().level();
         let target = event.metadata().target();
         let fields = visitor.finish();
-        let line = format!("{level} {target}{fields}");
+        let stamp = rfc3339_utc(SystemTime::now());
+        let line = format!("{stamp} {level} {target}{fields}");
         if let Ok(mut writer) = self.writer.lock() {
             let _ = writer.write_line(&line);
             let _ = writer.flush();
@@ -330,6 +331,41 @@ impl Subscriber for FileSubscriber {
     fn enter(&self, _span: &Id) {}
 
     fn exit(&self, _span: &Id) {}
+}
+
+/// `2026-10-10T10:01:02.345Z`. UTC with an explicit `Z`, so a reader in any
+/// zone can convert it; no timezone database is needed.
+fn rfc3339_utc(at: SystemTime) -> String {
+    let since = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = since.as_secs();
+    let millis = since.subsec_millis();
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rem = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Days since 1970-01-01 to (year, month, day). Howard Hinnant's algorithm.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (
+        year,
+        u32::try_from(month).unwrap_or(1),
+        u32::try_from(day).unwrap_or(1),
+    )
 }
 
 #[derive(Default)]
@@ -513,14 +549,21 @@ pub fn run_foreground(
 
     // Loopback only. `HttpServer::bind` refuses anything else. A port that is
     // already taken is a warning: the daemon keeps running without HTTP.
-    let mut http = match HttpServer::bind(DEFAULT_HTTP_PORT, foreground_api(config, &data_dir)) {
-        Ok(server) => {
-            tracing::info!(port = server.addr.port(), "http listener started");
-            Some(server)
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "http listener not started");
-            None
+    // `api.http_port` picks the port; 0 turns the listener off.
+    let http_port = config.api.http_port;
+    let mut http = if http_port == 0 {
+        tracing::info!("http listener disabled (api.http_port = 0)");
+        None
+    } else {
+        match HttpServer::bind(http_port, foreground_api(config, &data_dir)) {
+            Ok(server) => {
+                tracing::info!(port = server.addr.port(), "http listener started");
+                Some(server)
+            }
+            Err(err) => {
+                tracing::warn!(port = http_port, error = %err, "http listener not started");
+                None
+            }
         }
     };
 
@@ -659,9 +702,21 @@ pub fn signal_stop(data_dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        core_dump_guard_status, is_sensitive_field, InstanceLock, RollingFile, RuntimeError,
-        LOG_MAX_BYTES,
+        core_dump_guard_status, is_sensitive_field, rfc3339_utc, InstanceLock, RollingFile,
+        RuntimeError, LOG_MAX_BYTES,
     };
+
+    #[test]
+    fn log_timestamp_is_rfc3339_utc() {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_791_626_461_007);
+        assert_eq!(rfc3339_utc(at), "2026-10-10T10:01:01.007Z");
+        assert_eq!(
+            rfc3339_utc(std::time::UNIX_EPOCH),
+            "1970-01-01T00:00:00.000Z"
+        );
+        let leap = std::time::UNIX_EPOCH + std::time::Duration::from_secs(951_782_400);
+        assert_eq!(rfc3339_utc(leap), "2000-02-29T00:00:00.000Z");
+    }
 
     #[test]
     fn sensitive_names_cover_content_and_credentials() {

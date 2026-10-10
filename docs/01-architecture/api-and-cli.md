@@ -10,12 +10,12 @@
 |---|---|---|---|
 | Unix 域 socket `/run/agentwatch/api.sock`（Linux）、`/var/run/agentwatch/api.sock`（macOS） | Linux / macOS | CLI 主通道 | `SO_PEERCRED` / `LOCAL_PEERCRED` 拿到对端 uid；socket 权限 0660，属组 `agentwatch` |
 | 命名管道 `\\.\pipe\agentwatch-api` | Windows | CLI 主通道 | `GetNamedPipeClientProcessId` + 客户端 token 拿到 SID；管道 DACL 允许 Administrators + `AgentWatch Users` 组 |
-| HTTP `127.0.0.1:<port>`（默认 7456，可配置） | 全平台 | Web UI | Bearer token（见下）；校验 `Host` 头必须为 `127.0.0.1:<port>` 或 `localhost:<port>`，防 DNS rebinding；不开 CORS |
+| HTTP `127.0.0.1:<port>`（默认 7456，`api.http_port` 可配置，`0` 关闭） | 全平台 | Web UI | Bearer token（见下）；校验 `Host` 头必须为 `127.0.0.1:<port>` 或 `localhost:<port>`，防 DNS rebinding；不开 CORS |
 
 CLI 和 UI 请求到达后走同一套 axum 路由。传输层不同，但请求体和响应体完全一致。
 
 **会话令牌（UI）**
-1. `aw ui` 经由 socket 或管道向 daemon 申请一个一次性 `ui_ticket`，60 秒有效。
+1. `aw ui` 经由 socket 或管道向 daemon 申请一个一次性 `ui_ticket`，60 秒有效。ticket 与 token 都是操作系统 CSPRNG 生成的 256 位随机数（十六进制），签发、兑换、校验用同一个时钟，过期即拒；过期未兑的 ticket 在下次签发时清掉。
 2. 用 `http://127.0.0.1:7456/#ticket=<t>` 打开浏览器。
 3. 前端用 ticket 换取 `ui_token`（12 小时）。token 存在内存，并镜像到本标签页的 sessionStorage，同一标签页刷新仍保持登录，不需要再用一次 ticket；不写 localStorage，新标签页或重开浏览器不会继承。之后的请求都带 `Authorization: Bearer <ui_token>`。
    - 本机预览（`debug.preview_ui = true`）：`GET /` 签一张票并 302 到 `/index.html#ticket=<t>`。片段不会发回服务端，所以落点必须是不会再触发签票的路径，否则会无限跳转；前端换票后把地址改回 `/`。

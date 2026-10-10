@@ -1,11 +1,10 @@
 /**
- * Proxy CA routes (crates/aw-daemon/src/api/proxy.rs). Not in src/api/client.ts
- * because that file is outside P3-UI-02's file range. The body carries the
+ * Proxy CA routes (crates/aw-daemon/src/api/proxy.rs), sent through the shared
+ * `apiCall` in src/api/client.ts. The body carries the
  * fingerprint and times only; no key material.
  */
-import { getToken } from "@/api/client";
+import { apiCall } from "@/api/client";
 import { ApiError } from "@/api/errors";
-import type { ApiErrorBody } from "@/api/types";
 
 export interface CaInfo {
   fingerprint: string;
@@ -18,17 +17,7 @@ export interface CaInfo {
 
 export type TlsReject = "fail" | "tunnel";
 
-async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const headers = new Headers();
-  const token = getToken();
-  if (token) headers.set("authorization", `Bearer ${token}`);
-  if (body !== undefined) headers.set("content-type", "application/json");
-  const response = await fetch(`/api/v1${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
-  const text = await response.text();
-  const parsed = text ? (JSON.parse(text) as unknown) : null;
-  if (!response.ok) throw new ApiError(response.status, parsed as ApiErrorBody | null, response.statusText);
-  return parsed as T;
-}
+const call = apiCall;
 
 export const proxyApi = {
   caInfo: () => call<CaInfo | null>("GET", "/proxy/ca"),

@@ -1,14 +1,12 @@
 /**
  * HTTP rows for the network page (P3-UI-02).
  *
- * `GET /sessions/{sid}/http` is not in src/api/client.ts yet (that file is
- * outside this task's file range), so the call lives here and reuses the
- * in-memory token from the shared client. Field names follow
+ * `GET /sessions/{sid}/http`, sent through the shared `apiCall` in
+ * src/api/client.ts. Field names follow
  * crates/aw-daemon/src/api/http_events.rs.
  */
-import { getToken } from "@/api/client";
-import { ApiError } from "@/api/errors";
-import type { ApiErrorBody, EvidenceLevel, NetFlow, ProcSummary } from "@/api/types";
+import { apiCall } from "@/api/client";
+import type { EvidenceLevel, NetFlow, ProcSummary } from "@/api/types";
 
 export interface HttpRow {
   id: number;
@@ -47,14 +45,7 @@ export const HTTP_PAGE_LIMIT = 2000;
 export async function fetchHttp(sid: string, filter: string): Promise<HttpPage> {
   const params = new URLSearchParams({ limit: String(HTTP_PAGE_LIMIT) });
   if (filter) params.set("filter", filter);
-  const headers = new Headers();
-  const token = getToken();
-  if (token) headers.set("authorization", `Bearer ${token}`);
-  const response = await fetch(`/api/v1/sessions/${encodeURIComponent(sid)}/http?${params.toString()}`, { headers });
-  const text = await response.text();
-  const body = text ? (JSON.parse(text) as unknown) : null;
-  if (!response.ok) throw new ApiError(response.status, body as ApiErrorBody | null, response.statusText);
-  return body as HttpPage;
+  return apiCall<HttpPage>("GET", `/sessions/${encodeURIComponent(sid)}/http?${params.toString()}`);
 }
 
 /** Index rows by flow_id. Rows with no flow_id are counted, not dropped silently. */

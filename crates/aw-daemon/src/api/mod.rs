@@ -24,7 +24,7 @@ mod routes;
 pub(crate) use agent::OtlpRegistry;
 pub(crate) use findings::share;
 
-pub(crate) use http::{HttpServer, DEFAULT_HTTP_PORT};
+pub(crate) use http::HttpServer;
 pub(crate) use query::StoreQuery;
 pub(crate) use routes::ApiState;
 

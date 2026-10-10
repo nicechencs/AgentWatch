@@ -97,16 +97,22 @@ pub fn file_name(sid: &str, format: &str, disposition: Option<&str>) -> String {
     }
 }
 
-/// Folder the dialog opens in: the user's Downloads folder, else home.
-/// Without it the dialog opened in the app's launch directory (for example
-/// `/tmp/...` when started from a terminal there). A folder that does not
-/// exist is skipped.
+/// Folder the dialog opens in: the platform Downloads folder, then
+/// `~/Downloads`, then home. Without it the dialog opened in the app's launch
+/// directory (for example `/tmp/...` when started from a terminal there).
+/// Missing folders are skipped. `is_dir` is injected so this selection stays
+/// independent of the filesystem in tests.
 #[must_use]
-pub fn default_dir(downloads: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
-    [downloads, home]
-        .into_iter()
-        .flatten()
-        .find(|dir| dir.is_dir())
+pub fn default_dir(
+    downloads: Option<PathBuf>,
+    home: Option<PathBuf>,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let home_downloads = home.as_ref().map(|dir| dir.join("Downloads"));
+    downloads
+        .filter(|dir| is_dir(dir))
+        .or_else(|| home_downloads.filter(|dir| is_dir(dir)))
+        .or_else(|| home.filter(|dir| is_dir(dir)))
 }
 
 /// Dialog filter for `format`: (label, extensions without the dot).
@@ -248,25 +254,30 @@ pub fn finish(response: &aw_channel::Response, chosen: Option<PathBuf>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{daemon_error, default_dir, file_name, filter, finish, target, write, write_with};
+    use std::path::PathBuf;
 
     #[test]
     fn the_dialog_opens_in_downloads_then_home_never_the_launch_dir() {
-        let base = std::env::temp_dir().join(format!("aw-dir-test-{}", std::process::id()));
-        let downloads = base.join("Downloads");
-        let home = base.join("home");
-        let _ = std::fs::create_dir_all(&downloads);
-        let _ = std::fs::create_dir_all(&home);
+        let downloads = PathBuf::from("/configured/Downloads");
+        let home = PathBuf::from("/home/alice");
+        let home_downloads = home.join("Downloads");
         assert_eq!(
-            default_dir(Some(downloads.clone()), Some(home.clone())),
+            default_dir(Some(downloads.clone()), Some(home.clone()), |dir| {
+                dir == downloads || dir == home || dir == home_downloads
+            }),
             Some(downloads)
         );
-        assert_eq!(default_dir(None, Some(home.clone())), Some(home.clone()));
         assert_eq!(
-            default_dir(Some(base.join("missing")), Some(home.clone())),
+            default_dir(None, Some(home.clone()), |dir| {
+                dir == home || dir == home_downloads
+            }),
+            Some(home_downloads)
+        );
+        assert_eq!(
+            default_dir(None, Some(home.clone()), |dir| dir == home),
             Some(home)
         );
-        assert_eq!(default_dir(None, None), None);
-        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(default_dir(None, None, |_| false), None);
     }
 
     fn response(status: u16, body: &[u8]) -> aw_channel::Response {

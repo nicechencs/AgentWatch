@@ -476,7 +476,12 @@ impl<S: ScopeProvider, K: SessionSink> SessionOrchestrator<S, K> {
         self.ingest_snapshot(id, &attached.members, follow)?;
         let again = self.provider.rescan(id, root_pid)?;
         self.ingest_snapshot(id, &again, follow)?;
-        tracing::info!(session = id.0, pid = root_pid, mode = "attach", "session attached");
+        tracing::info!(
+            session = id.0,
+            pid = root_pid,
+            mode = "attach",
+            "session attached"
+        );
         Ok(self.live(id)?.record.clone())
     }
 

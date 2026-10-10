@@ -286,10 +286,7 @@ impl<C: Supervised> Supervisor<C> {
                     evidence = evidence_label(&choice.evidence),
                     "collector selected"
                 ),
-                None => tracing::warn!(
-                    class = class.as_str(),
-                    "no collector offered this class"
-                ),
+                None => tracing::warn!(class = class.as_str(), "no collector offered this class"),
             }
         }
     }

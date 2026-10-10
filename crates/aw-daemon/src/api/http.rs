@@ -207,14 +207,20 @@ pub(crate) fn log_route(path: &str) -> String {
         }
         let opaque = segment.chars().all(|ch| ch.is_ascii_digit())
             || segment.len() > 16
-            || segment.chars().any(|ch| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
+            || segment
+                .chars()
+                .any(|ch| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
         if opaque {
             out.push('*');
         } else {
             out.push_str(segment);
         }
     }
-    if out.is_empty() { "/".to_owned() } else { out }
+    if out.is_empty() {
+        "/".to_owned()
+    } else {
+        out
+    }
 }
 
 fn content_length(buf: &[u8]) -> Option<usize> {

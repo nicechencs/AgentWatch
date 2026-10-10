@@ -687,7 +687,15 @@ mod tests {
             assert!(is_sensitive_field(name), "{name} must be redacted");
         }
         // Names the lifecycle logs actually use must survive.
-        for name in ["session", "pid", "status", "reason", "collector", "detail", "route"] {
+        for name in [
+            "session",
+            "pid",
+            "status",
+            "reason",
+            "collector",
+            "detail",
+            "route",
+        ] {
             assert!(!is_sensitive_field(name), "{name} must stay visible");
         }
     }

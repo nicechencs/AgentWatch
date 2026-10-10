@@ -952,7 +952,8 @@ mod launch_tests {
 
     /// `cgroup.procs` refuses the pid (here: the session directory is gone):
     /// the already-running program is not killed; it finishes and its exit
-    /// code comes back, marked as not scoped.
+    /// code comes back, marked as not scoped. Linux only, like `move_and_wait`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn refused_cgroup_procs_keeps_the_running_program() {
         let child = std::process::Command::new("sh")

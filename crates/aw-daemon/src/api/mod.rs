@@ -21,6 +21,7 @@ mod openapi;
 mod proxy;
 mod query;
 mod routes;
+mod timeline_rows;
 
 pub(crate) use agent::OtlpRegistry;
 pub(crate) use findings::share;

@@ -1749,7 +1749,11 @@ fn session_query_route(
         ("GET", "summary") => map_summary(state.query.session_summary(user, sid)),
         ("GET", "timeline") => match state.query.timeline(user, sid, &parsed) {
             Ok(None) => not_found_session(),
-            Ok(Some(page)) => ApiResponse::json(200, &timeline_json(&page)),
+            Ok(Some(page)) => {
+                let mut body = timeline_json(&page);
+                add_row_details(state, &mut body);
+                ApiResponse::json(200, &body)
+            }
             Err(err) => from_backend(err),
         },
         ("GET", "timeline/histogram") => map_opt(state.query.histogram(user, sid, &parsed)),
@@ -1758,7 +1762,13 @@ fn session_query_route(
         ("GET", "traffic") => map_opt(state.query.traffic(user, sid, &parsed)),
         ("GET", "dns") => map_opt(state.query.dns(user, sid, &parsed)),
         ("GET", "gaps") => map_opt(state.query.gaps(user, sid)),
-        ("GET", "around") => map_opt(state.query.around(user, sid, &parsed)),
+        ("GET", "around") => match state.query.around(user, sid, &parsed) {
+            Ok(Some(mut body)) => {
+                add_row_details(state, &mut body);
+                ApiResponse::json(200, &body)
+            }
+            other => map_opt(other),
+        },
         ("GET", "files") => map_opt(state.query.files(user, sid, &parsed)),
         ("GET", "live") => live_snapshot(state, sid, caller, &parsed),
         ("POST", "stop") => match state.query.stop_session(user, sid) {
@@ -1906,6 +1916,52 @@ fn stop_memory(state: &mut ApiState, sid: &str, caller: &Caller) -> ApiResponse 
     }
     // The stub has no process. Stopping records the intent without deleting the row.
     ApiResponse::json(200, &json!({ "stopped": sid, "persisted": false }))
+}
+
+/// Fill `summary`, `fields` and `proc` on every row of a timeline-shaped body
+/// (`rows: [{session_id, cat, id, proc_uid}]`). Read-only connection: this
+/// never migrates or writes. Without a database the rows stay as they are.
+fn add_row_details(state: &ApiState, body: &mut serde_json::Value) {
+    let Some(path) = state.query.db_path.as_deref() else {
+        return;
+    };
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return;
+    };
+    let Some(rows) = body
+        .get_mut("rows")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for row in rows {
+        let Some(obj) = row.as_object_mut() else {
+            continue;
+        };
+        let session_id = obj.get("session_id").and_then(serde_json::Value::as_i64);
+        let cat = obj
+            .get("cat")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let id = obj.get("id").and_then(serde_json::Value::as_i64);
+        let (Some(session_id), Some(cat), Some(id)) = (session_id, cat, id) else {
+            continue;
+        };
+        let proc_uid = obj
+            .get("proc_uid")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            .map(|bits| i64::from_ne_bytes(bits.to_ne_bytes()));
+        let detail = super::timeline_rows::row_detail(&conn, session_id, &cat, id, proc_uid);
+        obj.insert("summary".to_owned(), json!(detail.summary));
+        obj.insert(
+            "fields".to_owned(),
+            serde_json::Value::Object(detail.fields),
+        );
+        obj.insert("proc".to_owned(), detail.proc);
+    }
 }
 
 fn timeline_json(page: &aw_store::TimelinePage) -> serde_json::Value {
@@ -2402,6 +2458,85 @@ mod tests {
             ),
         );
         assert_eq!(response.status, 401);
+    }
+
+    /// Migrated database at a fresh temp path, with `sql` run on it.
+    fn seeded_db(tag: &str, sql: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "aw-routes-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let db = dir.join("agentwatch.db");
+        let seeded = aw_store::Store::open(&db).map(|store| {
+            let result = store.connection().execute_batch(sql);
+            assert!(result.is_ok(), "{result:?}");
+        });
+        assert!(seeded.is_ok());
+        (dir, db)
+    }
+
+    #[test]
+    fn timeline_rows_carry_a_summary_from_their_source_table() {
+        let (dir, db) = seeded_db(
+            "timeline",
+            "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors) \
+               VALUES (1, 'sx', 'attach', 'alice', 1, 'linux', '[]'); \
+             INSERT INTO processes (session_id, proc_uid, pid, ppid, start_ns, how, evidence, source, exit_code) \
+               VALUES (1, 77, 4242, 1, 10, 'snapshot', 'S', 'poll/sysinfo', 3); \
+             INSERT INTO process_images (session_id, proc_uid, seq, ts_ns, exe, argv, evidence, source) \
+               VALUES (1, 77, 0, 10, '/usr/bin/curl', '[\"curl\",\"-s\",\"https://example.com\"]', 'S', 'poll/sysinfo'); \
+             INSERT INTO net_flows (id, session_id, proc_uid, proto, direction, local_ip, local_port, remote_ip, remote_port, domain, start_ns, bytes_up, bytes_down, evidence, source) \
+               VALUES (5, 1, 77, 'tcp', 'out', '10.0.0.2', 50000, '93.184.216.34', 443, 'example.com', 20, 120, 4096, 'S', 'poll/sysinfo'); \
+             INSERT INTO gaps (id, session_id, collector, kind, affects, from_ns, to_ns, count, detail) \
+               VALUES (9, 1, 'daemon/poll', 'unknown', '[\"store\"]', 30, 30, 2, 'store_failure');",
+        );
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+        let token = token_for(&mut state, "alice", false);
+        let mut request = req(
+            "GET",
+            "/api/v1/sessions/sx/timeline",
+            Some("127.0.0.1:7456"),
+            Some(&token),
+            b"",
+        );
+        request.query = "limit=50".to_owned();
+        let response = dispatch(&mut state, &request);
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let body = json_body(&response);
+        let rows = body["rows"].as_array().cloned().unwrap_or_default();
+        let by_cat = |cat: &str| {
+            rows.iter()
+                .find(|row| row["cat"] == cat)
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            by_cat("proc")["summary"],
+            "curl(4242) curl -s https://example.com exit 3"
+        );
+        assert_eq!(by_cat("proc")["proc"]["exe_name"], "curl");
+        assert_eq!(
+            by_cat("net")["summary"],
+            "tcp → example.com:443 ↑120 B ↓4096 B"
+        );
+        assert_eq!(by_cat("net")["proc"]["pid"], 4242);
+        assert_eq!(
+            by_cat("gap")["summary"],
+            "daemon/poll unknown store_failure ×2"
+        );
+        assert_eq!(by_cat("gap")["fields"]["count"], 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

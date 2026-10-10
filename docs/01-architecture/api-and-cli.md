@@ -164,7 +164,7 @@ $ aw run --proxy -- claude
 | POST | `/sessions/{sid}/stop` | 停止监控 |
 | DELETE | `/sessions/{sid}` | 删除 |
 | GET | `/sessions/{sid}/summary` | 概览页数据：Top 目录、Top 域名、按类别计数、按证据等级计数、缺口摘要 |
-| GET | `/sessions/{sid}/timeline` | 参数：`?filter&from&to&cats&cursor&limit` |
+| GET | `/sessions/{sid}/timeline` | 参数：`?filter&from&to&cats&cursor&limit`。每行在视图列（`session_id, ts_ns, cat, id, proc_uid, evidence`）之外带 `summary`（按 `cat` 从来源表的已存列拼一行，NULL 的列不出现，不推测）、`fields`（拼 summary 用到的列，原样）和 `proc: {pid, exe_name}`。来源行不存在时 `summary` 为空串。`/around` 同样。 |
 | GET | `/sessions/{sid}/timeline/histogram` | 参数：`?filter&from&to&buckets`。返回时间轴密度图数据 |
 | GET | `/sessions/{sid}/processes` | 参数：`?tree=1&filter` |
 | GET | `/sessions/{sid}/processes/{proc_uid}` | 进程详情：镜像链、统计、子进程 |

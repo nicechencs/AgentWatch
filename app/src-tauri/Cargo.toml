@@ -1,0 +1,30 @@
+[package]
+name = "aw-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "AgentWatch desktop app: Tauri window over the bundled ui/dist, talking to agentwatchd on the internal channel."
+
+# Not a member of the root workspace (ADR-0001): Tauri on Linux links
+# webkit2gtk, which the default `cargo test --workspace` runners do not have.
+# Build it from this directory; see app/README.md.
+[workspace]
+
+[build-dependencies]
+# tauri-build 2: MIT OR Apache-2.0.
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# tauri 2: MIT OR Apache-2.0. Default features only; no updater, no shell plugin.
+tauri = { version = "2", features = [] }
+# serde / serde_json: MIT OR Apache-2.0.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

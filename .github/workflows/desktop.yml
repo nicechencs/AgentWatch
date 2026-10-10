@@ -1,0 +1,63 @@
+# Desktop app (app/src-tauri, crate aw-desktop). Separate from ci.yml because
+# the crate is not in the root workspace (ADR-0001): Tauri on Linux links
+# webkit2gtk, which the root `cargo test --workspace` jobs do not install.
+# Builds the UI first, then fmt/clippy/test/build the app. No bundling, no
+# signing, no updater (P4). No secrets.
+name: desktop
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    name: desktop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux WebView libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: UI build (bundled into the app)
+        run: pnpm -C ui install --frozen-lockfile && pnpm -C ui build
+      - name: cargo fmt
+        working-directory: app/src-tauri
+        run: cargo fmt --check
+      - name: cargo clippy
+        working-directory: app/src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: cargo test
+        working-directory: app/src-tauri
+        run: cargo test --locked
+      - name: cargo build
+        working-directory: app/src-tauri
+        run: cargo build --locked

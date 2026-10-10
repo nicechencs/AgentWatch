@@ -8,9 +8,10 @@ import { describe, expect, it } from "vitest";
 const sources = import.meta.glob<string>("/src/**/*.{ts,tsx}", { query: "?raw", import: "default", eager: true });
 
 describe("single request path", () => {
-  it("only client.ts calls fetch", () => {
+  it("only client.ts (through transport.ts) calls fetch", () => {
+    const allowed = new Set(["/src/api/client.ts", "/src/api/transport.ts"]);
     const offenders = Object.entries(sources)
-      .filter(([path]) => path !== "/src/api/client.ts" && !/\.test\.tsx?$/.test(path))
+      .filter(([path]) => !allowed.has(path) && !/\.test\.tsx?$/.test(path))
       .filter(([, text]) => /\bfetch\(/.test(text))
       .map(([path]) => path);
     expect(Object.keys(sources).length).toBeGreaterThan(20);

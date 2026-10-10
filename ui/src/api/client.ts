@@ -5,6 +5,7 @@
  * a later browser start does not inherit the token.
  */
 import { ApiError } from "./errors";
+import { send as transportSend } from "./transport";
 import type {
   ApiErrorBody,
   ConfigView,
@@ -69,7 +70,7 @@ async function request<T>(method: string, path: string, init: RequestInit = {}):
   const headers = new Headers(init.headers);
   if (init.body && !headers.has("content-type")) headers.set("content-type", "application/json");
   if (token) headers.set("authorization", `Bearer ${token}`);
-  const response = await fetch(`${API}${path}`, { ...init, method, headers });
+  const response = await transportSend(`${API}${path}`, { ...init, method, headers });
   if (response.status === 204) return undefined as T;
   const text = await response.text();
   const body = text ? (JSON.parse(text) as unknown) : null;

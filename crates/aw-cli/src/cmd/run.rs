@@ -2385,10 +2385,14 @@ mod tests {
         let mut child = super::CommandSpawner.spawn(&spec).expect("held child");
         child.release().expect("release gate");
         assert_eq!(child.wait().expect("wait target"), 0);
-        assert_eq!(
-            listed_fds(&fds),
-            listed_fds(&baseline_path),
-            "the gated target must match a plain spawn; the gate pipe must not remain"
+        // The gate occupies fd 3 in the shell child (closing whatever the test
+        // harness may have inherited there), so the gated target can have
+        // fewer descriptors than a plain spawn, never one the plain spawn lacks.
+        let gated = listed_fds(&fds);
+        let plain = listed_fds(&baseline_path);
+        assert!(
+            gated.iter().all(|fd| plain.contains(fd)),
+            "the gate pipe must not remain in the target: gated {gated:?}, plain {plain:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
 

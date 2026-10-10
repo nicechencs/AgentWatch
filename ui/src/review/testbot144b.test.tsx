@@ -31,10 +31,10 @@ describe("Test-bot #144 capability wording and list refresh", () => {
     const view = render(
       <CapabilityList
         capabilities={[
-          { kind: "proc", evidence: "S", available: true },
-          { kind: "file", evidence: null, available: false, na_reason: "collector_unavailable" },
-          { kind: "net", evidence: null, available: false, na_reason: "collector_unavailable" },
-          { kind: "dns", evidence: null, available: false, na_reason: "collector_unavailable" },
+          { kind: "proc", evidence: "S", available: true, na_reason: null, note: null },
+          { kind: "file", evidence: null, available: false, na_reason: "collector_unavailable", note: null },
+          { kind: "net", evidence: null, available: false, na_reason: "collector_unavailable", note: null },
+          { kind: "dns", evidence: null, available: false, na_reason: "collector_unavailable", note: null },
         ]}
       />,
     );

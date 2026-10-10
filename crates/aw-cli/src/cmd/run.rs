@@ -1,7 +1,9 @@
 //! `aw run` (P1-CLI-02).
 //!
-//! Starts the target as the calling user through an injected [`Launcher`], then
-//! prints a session summary. On Windows the production launcher is
+//! `--no-daemon` starts the target as the calling user through an injected
+//! [`Launcher`], then prints a session summary. The default daemon path first
+//! records `/sessions/run`, starts the child as the caller, and hands it over
+//! through `/adopt`. On Windows the local production launcher is
 //! [`launch::production`]: Job assignment is unavailable, so no process is
 //! created. On macOS it spawns with `Command` and says suspension was not
 //! applied. On Linux [`launch::LocalCgroupHost`] places the child in a delegated
@@ -24,6 +26,7 @@
 //! the launcher. They are not written to stdout, stderr, or an error string.
 
 use std::io::{self, Write};
+use std::process::{Child, Command};
 
 use aw_proxy::{plan_injection, Injection, ProxyOnReject};
 
@@ -32,6 +35,7 @@ use serde_json::{json, Value};
 use crate::exit;
 use crate::launch::{self, LaunchDispatchError, Launched, RunSpec, UnixLauncher};
 
+use super::attach::{BeginRunRequest, ControlError, DaemonSessions};
 use super::Outcome;
 
 /// Flags `aw run` acts on. Built by dispatch from the parsed command.
@@ -156,6 +160,54 @@ impl SessionSummary for EmptySummary {
     }
 }
 
+/// Summary for a daemon-recorded session: `GET /api/v1/sessions/{id}` after
+/// the target exits. Counts are what the daemon has stored at that moment; a
+/// missing count stays unknown, never zero.
+pub(crate) struct DaemonSummary {
+    endpoint: crate::endpoint::Endpoint,
+}
+
+impl DaemonSummary {
+    /// Bind to the endpoint `aw run` used. Does not connect.
+    #[must_use]
+    pub(crate) fn new(endpoint: crate::endpoint::Endpoint) -> Self {
+        Self { endpoint }
+    }
+}
+
+/// Fixed sentence for a daemon-recorded run. Not a claim about the target.
+const DAEMON_LEVEL_NOTE: &str =
+    "证据 S（daemon 轮询采样）· 数字为目标退出时 daemon 已记录的部分，会话由 daemon 在根进程退出后结束";
+
+impl SessionSummary for DaemonSummary {
+    fn summarize(&mut self, session_hint: Option<&str>) -> Result<Option<Summary>, String> {
+        let Some(id) = session_hint else {
+            return Ok(None);
+        };
+        let path = format!("/api/v1/sessions/{}", super::query::encode_path_segment(id));
+        let transport =
+            crate::client::LoopbackHttp::new(&self.endpoint).map_err(|err| err.to_string())?;
+        let mut client = crate::client::Client::new(self.endpoint.clone(), transport);
+        let reply = client
+            .call(&crate::client::ApiRequest::get(&path))
+            .map_err(|err| err.to_string())?;
+        let body = reply
+            .json()
+            .ok_or_else(|| "daemon returned a non-JSON body".to_owned())?;
+        let stats = body.get("stats").cloned().unwrap_or(Value::Null);
+        let count = |key: &str| stats.get(key).and_then(Value::as_u64);
+        Ok(Some(Summary {
+            session_id: Some(id.to_owned()),
+            processes: count("process_count"),
+            bytes_up: count("bytes_up"),
+            bytes_down: count("bytes_down"),
+            top_domains: Vec::new(),
+            gaps: count("gap_count"),
+            level_note: DAEMON_LEVEL_NOTE.to_owned(),
+        }))
+    }
+}
+
 /// Starts a process and can forward one interrupt. Tests use a fake.
 #[allow(dead_code)]
 pub(crate) trait Launcher {
@@ -173,6 +225,74 @@ pub(crate) trait Launcher {
     ///
     /// The launcher could not forward.
     fn forward_interrupt(&mut self, pid: u32) -> Result<(), LaunchDispatchError>;
+}
+
+/// A caller-created child after a daemon launch session has been registered.
+pub(crate) trait SpawnedChild {
+    /// Process id supplied to `/adopt`.
+    fn pid(&self) -> u32;
+
+    /// Reap the child and return its target exit code. A signalled child is a
+    /// general CLI failure because it has no numeric exit code to forward.
+    fn wait(&mut self) -> Result<i32, String>;
+
+    /// Stop and reap a child that the daemon refused to adopt.
+    fn kill_and_reap(&mut self);
+}
+
+/// Spawn a child for the default daemon-backed `aw run` path.
+pub(crate) trait Spawner {
+    /// Spawn the target as this CLI's user, with inherited standard streams.
+    ///
+    /// # Errors
+    ///
+    /// A short OS error class with no argv or environment values.
+    fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, String>;
+}
+
+/// Production caller-side spawner. It never creates a cgroup: the daemon
+/// records the adopted root pid and performs its own scope handling.
+#[derive(Debug, Default)]
+pub(crate) struct CommandSpawner;
+
+struct ProcessChild(Child);
+
+impl SpawnedChild for ProcessChild {
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    fn wait(&mut self) -> Result<i32, String> {
+        self.0
+            .wait()
+            .map(|status| status.code().unwrap_or(exit::GENERAL))
+            .map_err(|error| format!("could not wait for program: {}", error.kind()))
+    }
+
+    fn kill_and_reap(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Spawner for CommandSpawner {
+    fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, String> {
+        let Some((program, args)) = spec.command.split_first() else {
+            return Err("program is empty".to_owned());
+        };
+        let mut command = Command::new(program);
+        command.args(args);
+        if let Some(cwd) = spec.cwd.as_deref() {
+            command.current_dir(cwd);
+        }
+        for (key, value) in &spec.env {
+            command.env(key, value);
+        }
+        command
+            .spawn()
+            .map(|child| Box::new(ProcessChild(child)) as Box<dyn SpawnedChild>)
+            .map_err(|error| format!("could not start program: {}", error.kind()))
+    }
 }
 
 /// Windows production launcher.
@@ -215,31 +335,9 @@ pub(crate) struct PlatformLauncher;
 #[cfg(target_os = "linux")]
 impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
-        let Some((program, args)) = spec.command.split_first() else {
-            return Err(LaunchDispatchError::NotImplemented {
-                detail: "launch command is empty".to_owned(),
-            });
-        };
-        let argv: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
-        let host = launch::LocalCgroupHost;
-        match host.launch(
-            std::ffi::OsStr::new(program),
-            &argv,
-            spec.cwd.as_deref(),
-            &spec.env,
-            session_token(),
-        ) {
-            Ok(done) => Ok(Launched {
-                // A signalled child has no exit code. That is not success.
-                code: done.code.unwrap_or(exit::GENERAL),
-                pid: done.pid,
-                note: Some(POST_SPAWN_MOVE_NOTE),
-                sampling: spec.no_daemon,
-            }),
-            Err(err) => Err(LaunchDispatchError::NotImplemented {
-                detail: err.to_string(),
-            }),
-        }
+        launch_linux(spec, &mut |program, argv, cwd, env| {
+            launch::LocalCgroupHost.launch(program, argv, cwd, env, session_token())
+        })
     }
 
     fn forward_interrupt(&mut self, _pid: u32) -> Result<(), LaunchDispatchError> {
@@ -250,6 +348,100 @@ impl Launcher for PlatformLauncher {
         })
     }
 }
+
+/// One cgroup-scoped launch attempt (production: [`launch::LocalCgroupHost`]).
+#[cfg(target_os = "linux")]
+type CgroupAttempt<'a> = dyn FnMut(
+        &std::ffi::OsStr,
+        &[std::ffi::OsString],
+        Option<&str>,
+        &[(String, String)],
+    ) -> Result<launch::LinuxLaunchResult, launch::LinuxLaunchError>
+    + 'a;
+
+/// Whether a failed cgroup attempt may fall back to process-tree tracking.
+///
+/// Only failures that happen before any child exists qualify: cgroup v1 /
+/// unknown hierarchy, and a parent that is not delegated or not writable
+/// (`CreateFailed`, e.g. "no delegated controllers"). A failure after the
+/// child started (procs write, wait) is not retried, so the program never
+/// runs twice; a spawn failure is the program's own problem.
+#[cfg(target_os = "linux")]
+pub(crate) fn cgroup_fallback_allowed(err: &launch::LinuxLaunchError) -> bool {
+    matches!(
+        err,
+        launch::LinuxLaunchError::CgroupV1NoLaunch | launch::LinuxLaunchError::CreateFailed { .. }
+    )
+}
+
+/// Linux `aw run --no-daemon`: try the cgroup scope, else track the process
+/// tree by pid (scope_pids) and say which capability is missing.
+#[cfg(target_os = "linux")]
+fn launch_linux(
+    spec: &RunSpec,
+    attempt: &mut CgroupAttempt<'_>,
+) -> Result<Launched, LaunchDispatchError> {
+    let Some((program, args)) = spec.command.split_first() else {
+        return Err(LaunchDispatchError::NotImplemented {
+            detail: "launch command is empty".to_owned(),
+        });
+    };
+    let argv: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    match attempt(
+        std::ffi::OsStr::new(program),
+        &argv,
+        spec.cwd.as_deref(),
+        &spec.env,
+    ) {
+        Ok(done) => Ok(Launched {
+            // A signalled child has no exit code. That is not success.
+            code: done.code.unwrap_or(exit::GENERAL),
+            pid: done.pid,
+            note: Some(POST_SPAWN_MOVE_NOTE),
+            sampling: spec.no_daemon,
+        }),
+        Err(err) if cgroup_fallback_allowed(&err) => {
+            let mut child = std::process::Command::new(program);
+            child.args(&argv);
+            if let Some(dir) = spec.cwd.as_deref() {
+                child.current_dir(dir);
+            }
+            for (key, value) in &spec.env {
+                child.env(key, value);
+            }
+            let mut spawned =
+                child
+                    .spawn()
+                    .map_err(|error| LaunchDispatchError::NotImplemented {
+                        detail: format!(
+                            "无法启动程序：{}（cgroup 不可用，按进程树跟踪也没能启动）",
+                            error.kind()
+                        ),
+                    })?;
+            let pid = spawned.id();
+            let status = spawned
+                .wait()
+                .map_err(|error| LaunchDispatchError::NotImplemented {
+                    detail: format!("等待程序结束失败：{}", error.kind()),
+                })?;
+            Ok(Launched {
+                code: status.code().unwrap_or(exit::GENERAL),
+                pid,
+                note: Some(PID_TREE_FALLBACK_NOTE),
+                sampling: spec.no_daemon,
+            })
+        }
+        Err(err) => Err(LaunchDispatchError::NotImplemented {
+            detail: err.to_string(),
+        }),
+    }
+}
+
+/// Fixed sentence when no delegated cgroup v2 was available. Names the
+/// missing capability; not a claim about the target.
+#[cfg(target_os = "linux")]
+pub(crate) const PID_TREE_FALLBACK_NOTE: &str =
+    "没采：cgroup 会话范围（本机没有可委派的 cgroup v2），已退化为按进程树跟踪（scope_pids）；脱离进程树的子进程可能漏记";
 
 /// Fixed sentence for the post-spawn cgroup move. Not a claim about the target.
 #[cfg(target_os = "linux")]
@@ -333,51 +525,10 @@ pub(crate) fn run(
     launcher: &mut dyn Launcher,
     summary: &mut dyn SessionSummary,
 ) -> Outcome {
-    let planned = match proxy_plan(args, deferred) {
-        Ok(planned) => planned,
-        Err(detail) => {
-            return super::error_outcome(exit::USAGE, "usage", &detail, args.json);
-        }
+    let (level, spec) = match prepare(args, deferred) {
+        Ok(prepared) => prepared,
+        Err(outcome) => return outcome,
     };
-    // A proxy plan stops here. Printing it and then launching would turn a
-    // successful plan into a launch, and this process has no listener. No
-    // process is created, which is also what the child-start gap requires.
-    if let Some(plan) = &planned {
-        let mut stderr = Vec::new();
-        if let Err(err) = write_proxy_plan(&mut stderr, plan) {
-            return super::error_outcome(exit::GENERAL, "proxy", &err.to_string(), args.json);
-        }
-        return Outcome {
-            code: exit::GENERAL,
-            stdout: Vec::new(),
-            stderr,
-        };
-    }
-    if let Some(detail) = deferred_reason(deferred) {
-        return super::error_outcome(exit::GENERAL, "not_available", &detail, args.json);
-    }
-    let level = match parse_summary(args.summary) {
-        Ok(level) => level,
-        Err(detail) => {
-            return super::error_outcome(exit::USAGE, "usage", &detail, args.json);
-        }
-    };
-    let env = match split_env(args.env) {
-        Ok(pairs) => pairs,
-        Err(detail) => {
-            return super::error_outcome(exit::USAGE, "usage", &detail, args.json);
-        }
-    };
-    let mut spec = match RunSpec::new(args.command.to_vec()) {
-        Ok(spec) => spec,
-        Err(err) => {
-            return super::error_outcome(exit::USAGE, "usage", &err.to_string(), args.json);
-        }
-    };
-    spec.cwd = args.cwd.map(str::to_owned);
-    spec.env = env;
-    spec.no_follow_children = args.no_follow_children;
-    spec.no_daemon = args.no_daemon;
 
     let launched = match launcher.launch(&spec) {
         Ok(launched) => launched,
@@ -403,7 +554,15 @@ pub(crate) fn run(
 
     let figures = summary.summarize(args.name);
     let mut stderr = Vec::new();
-    if let Err(err) = write_summary(&mut stderr, args, level, &launched, &figures) {
+    if let Err(err) = write_summary(
+        &mut stderr,
+        args,
+        level,
+        &launched,
+        &figures,
+        None,
+        PinState::Unknown,
+    ) {
         return super::error_outcome(exit::GENERAL, "summary", &err.to_string(), args.json);
     }
     Outcome {
@@ -411,6 +570,230 @@ pub(crate) fn run(
         stdout: Vec::new(),
         stderr,
     }
+}
+
+/// Validate and normalize run arguments before any daemon session request.
+///
+/// The returned [`RunSpec`] still contains environment values for the local
+/// spawner, but callers must not serialize it into the daemon request.
+pub(crate) fn preflight(args: &RunArgs<'_>, deferred: DeferredFlags) -> Result<(), Outcome> {
+    daemon_prepare(args, deferred).map(|_| ())
+}
+
+/// [`prepare`] plus the refusals that apply only when the daemon records the
+/// session: its poll sampler always follows children, so
+/// `--no-follow-children` would be silently ignored.
+fn daemon_prepare(
+    args: &RunArgs<'_>,
+    deferred: DeferredFlags,
+) -> Result<(SummaryLevel, RunSpec), Outcome> {
+    let prepared = prepare(args, deferred)?;
+    if args.no_follow_children {
+        return Err(super::error_outcome(
+            exit::GENERAL,
+            "not_available",
+            "--no-follow-children is not available when the daemon records the session (its poll sampler always follows children); drop the flag or use --no-daemon",
+            args.json,
+        ));
+    }
+    Ok(prepared)
+}
+
+fn prepare(
+    args: &RunArgs<'_>,
+    deferred: DeferredFlags,
+) -> Result<(SummaryLevel, RunSpec), Outcome> {
+    let planned = match proxy_plan(args, deferred) {
+        Ok(planned) => planned,
+        Err(detail) => {
+            return Err(super::error_outcome(
+                exit::USAGE,
+                "usage",
+                &detail,
+                args.json,
+            ));
+        }
+    };
+    // A proxy plan stops here. Printing it and then launching would turn a
+    // successful plan into a launch, and this process has no listener. No
+    // process is created, which is also what the child-start gap requires.
+    if let Some(plan) = &planned {
+        let mut stderr = Vec::new();
+        if let Err(err) = write_proxy_plan(&mut stderr, plan) {
+            return Err(super::error_outcome(
+                exit::GENERAL,
+                "proxy",
+                &err.to_string(),
+                args.json,
+            ));
+        }
+        return Err(Outcome {
+            code: exit::GENERAL,
+            stdout: Vec::new(),
+            stderr,
+        });
+    }
+    if let Some(detail) = deferred_reason(deferred) {
+        return Err(super::error_outcome(
+            exit::GENERAL,
+            "not_available",
+            &detail,
+            args.json,
+        ));
+    }
+    let level = match parse_summary(args.summary) {
+        Ok(level) => level,
+        Err(detail) => {
+            return Err(super::error_outcome(
+                exit::USAGE,
+                "usage",
+                &detail,
+                args.json,
+            ));
+        }
+    };
+    let env = match split_env(args.env) {
+        Ok(pairs) => pairs,
+        Err(detail) => {
+            return Err(super::error_outcome(
+                exit::USAGE,
+                "usage",
+                &detail,
+                args.json,
+            ));
+        }
+    };
+    let mut spec = match RunSpec::new(args.command.to_vec()) {
+        Ok(spec) => spec,
+        Err(err) => {
+            return Err(super::error_outcome(
+                exit::USAGE,
+                "usage",
+                &err.to_string(),
+                args.json,
+            ));
+        }
+    };
+    spec.cwd = args.cwd.map(str::to_owned);
+    spec.env = env;
+    spec.no_follow_children = args.no_follow_children;
+    spec.no_daemon = args.no_daemon;
+    Ok((level, spec))
+}
+
+/// Whether the pin result is known after a completed run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinState {
+    /// The local launcher has no daemon pin operation.
+    Unknown,
+    /// The daemon acknowledged the pin request.
+    Confirmed,
+    /// The daemon did not acknowledge the pin request.
+    Failed,
+}
+
+/// Run the default daemon-backed launch flow.
+///
+/// The daemon is asked to create a pending session before the child exists.
+/// If adoption fails, the caller-created child is killed and reaped so it is
+/// never left running outside an observed session.
+pub(crate) fn daemon_run(
+    args: &RunArgs<'_>,
+    deferred: DeferredFlags,
+    sessions: &mut dyn DaemonSessions,
+    spawner: &mut dyn Spawner,
+    summary: &mut dyn SessionSummary,
+) -> Outcome {
+    let (level, spec) = match daemon_prepare(args, deferred) {
+        Ok(prepared) => prepared,
+        Err(outcome) => return outcome,
+    };
+    let request = BeginRunRequest {
+        argv: spec.command.clone(),
+        cwd: spec.cwd.clone(),
+        name: args.name.map(str::to_owned),
+        agent: args.agent.map(str::to_owned),
+    };
+    let launch = match sessions.begin_run(&request) {
+        Ok(launch) => launch,
+        Err(error) => return daemon_error_outcome(error, args.json, false),
+    };
+    let mut child = match spawner.spawn(&spec) {
+        Ok(child) => child,
+        Err(detail) => {
+            let _ = sessions.stop_monitoring(&launch.public_id);
+            return super::error_outcome(exit::GENERAL, "spawn_failed", &detail, args.json);
+        }
+    };
+    if let Err(error) = sessions.adopt(&launch, child.pid()) {
+        child.kill_and_reap();
+        return daemon_error_outcome(error, args.json, true);
+    }
+
+    let (pin_state, pin_warning) = if args.pin {
+        match sessions.pin(&launch.public_id) {
+            Ok(()) => (PinState::Confirmed, None),
+            Err(error) => (
+                PinState::Failed,
+                Some(format!(
+                    "[aw] warning: the daemon did not pin this session: {error}\n"
+                )),
+            ),
+        }
+    } else {
+        (PinState::Unknown, None)
+    };
+    let code = match child.wait() {
+        Ok(code) => code,
+        Err(detail) => {
+            return super::error_outcome(exit::GENERAL, "wait_failed", &detail, args.json)
+        }
+    };
+    if level == SummaryLevel::None || args.quiet {
+        return Outcome {
+            code,
+            stdout: Vec::new(),
+            stderr: pin_warning.unwrap_or_default().into_bytes(),
+        };
+    }
+    let launched = Launched {
+        code,
+        pid: child.pid(),
+        note: None,
+        sampling: false,
+    };
+    let figures = summary.summarize(Some(&launch.public_id));
+    let mut stderr = Vec::new();
+    if let Err(error) = write_summary(
+        &mut stderr,
+        args,
+        level,
+        &launched,
+        &figures,
+        Some(&launch.public_id),
+        pin_state,
+    ) {
+        return super::error_outcome(exit::GENERAL, "summary", &error.to_string(), args.json);
+    }
+    if let Some(warning) = pin_warning {
+        stderr.extend_from_slice(warning.as_bytes());
+    }
+    Outcome {
+        code,
+        stdout: Vec::new(),
+        stderr,
+    }
+}
+
+fn daemon_error_outcome(error: ControlError, json: bool, child_stopped: bool) -> Outcome {
+    let mut message = error.to_string();
+    if child_stopped {
+        message.push_str("; the program was stopped because the daemon did not take it over");
+    }
+    if error.collector_unavailable() {
+        message.push_str("; use --no-daemon on this platform");
+    }
+    super::error_outcome(error.exit_code(), error.machine_code(), &message, json)
 }
 
 /// Why a launch-mode `--proxy` plan has no port.
@@ -608,9 +991,11 @@ fn write_summary(
     level: SummaryLevel,
     launched: &Launched,
     figures: &Result<Option<Summary>, String>,
+    session_id: Option<&str>,
+    pin_state: PinState,
 ) -> io::Result<()> {
     if args.json {
-        let body = summary_json(args, launched, figures);
+        let body = summary_json(args, launched, figures, session_id, pin_state);
         let mut bytes = serde_json::to_vec(&body)
             .map_err(|err| io::Error::other(format!("encode summary: {err}")))?;
         bytes.push(b'\n');
@@ -625,9 +1010,8 @@ fn write_summary(
             let down = bytes_text(summary.bytes_down);
             let gaps = count_text(summary.gaps);
             let domains = domain_text(&summary.top_domains);
-            let session = summary
-                .session_id
-                .as_deref()
+            let session = session_id
+                .or(summary.session_id.as_deref())
                 .or(args.name)
                 .unwrap_or("未命名");
             writeln!(
@@ -645,12 +1029,18 @@ fn write_summary(
             }
         }
         Ok(None) => {
+            if let Some(session_id) = session_id {
+                writeln!(out, "[aw] 会话 {session_id}")?;
+            }
             writeln!(
                 out,
                 "[aw] 摘要不可用 · 本构建没有会话存储，不能用 0 表示未知"
             )?;
         }
         Err(detail) => {
+            if let Some(session_id) = session_id {
+                writeln!(out, "[aw] 会话 {session_id}")?;
+            }
             writeln!(out, "[aw] 摘要不可用 · {detail}")?;
         }
     }
@@ -660,11 +1050,15 @@ fn write_summary(
             "[aw] 已请求采样模式（--no-daemon）；实际采集状态不可得，未经采集器确认"
         )?;
     }
-    if args.pin {
-        writeln!(
-            out,
-            "[aw] 已请求会话保留（--pin）；本构建未执行保留，保留状态不可得"
-        )?;
+    match (args.pin, pin_state) {
+        (true, PinState::Unknown) => {
+            writeln!(
+                out,
+                "[aw] 已请求会话保留（--pin）；本构建未执行保留，保留状态不可得"
+            )?;
+        }
+        (true, PinState::Confirmed) => writeln!(out, "[aw] 会话已标记为保留（--pin）")?,
+        (true, PinState::Failed) | (false, _) => {}
     }
     if args.raw.is_some() {
         writeln!(out, "[aw] --raw 已记录为请求；本构建不写原始事件文件")?;
@@ -680,13 +1074,15 @@ fn summary_json(
     args: &RunArgs<'_>,
     launched: &Launched,
     figures: &Result<Option<Summary>, String>,
+    session_id: Option<&str>,
+    pin_state: PinState,
 ) -> Value {
     let summary = figures.as_ref().ok().and_then(Option::as_ref);
     // Neither the launcher flag nor Summary confirms collector activity or a
     // persisted pin. Keep those results unknown even when figures are present.
     let mut body = json!({
         "available": summary.is_some(),
-        "session": summary.and_then(|item| item.session_id.as_deref()),
+        "session": session_id.or(summary.and_then(|item| item.session_id.as_deref())),
         "processes": summary.and_then(|item| item.processes),
         "bytes_up": summary.and_then(|item| item.bytes_up),
         "bytes_down": summary.and_then(|item| item.bytes_down),
@@ -701,10 +1097,17 @@ fn summary_json(
         "sampling": null,
         "sampling_reason": "实际采集状态不可得，未经采集器确认",
         "sampling_requested": args.no_daemon,
-        "pinned": null,
-        "pinned_reason": "本构建未执行保留，保留状态不可得",
+        "pinned": if pin_state == PinState::Confirmed { Some(true) } else { None },
+        "pinned_reason": if pin_state == PinState::Unknown {
+            Some("本构建未执行保留，保留状态不可得")
+        } else if pin_state == PinState::Failed {
+            Some("daemon 未确认保留状态")
+        } else {
+            None
+        },
         "pin_requested": args.pin,
         "target_exit": launched.code,
+        "launch_note": launched.note,
     });
     match figures {
         Ok(Some(_)) => {}
@@ -757,9 +1160,15 @@ impl<T: UnixLauncher> Launcher for UnixAdapter<T> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::{
-        run, DeferredFlags, DomainCount, EmptySummary, RunArgs, SessionSummary, Summary,
-        UnixAdapter,
+        daemon_run, run, DeferredFlags, DomainCount, EmptySummary, RunArgs, SessionSummary,
+        SpawnedChild, Spawner, Summary, UnixAdapter,
+    };
+    use crate::cmd::attach::{
+        AttachRequest, BeginRunRequest, ControlError, DaemonSessions, LaunchSession, SessionHandle,
     };
     use crate::exit;
     use crate::launch::{LaunchDispatchError, Launched, RunSpec, UnixLauncher};
@@ -803,6 +1212,107 @@ mod tests {
 
     struct FailedSummary {
         calls: usize,
+    }
+
+    struct FakeChild {
+        pid: u32,
+        code: i32,
+        log: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl SpawnedChild for FakeChild {
+        fn pid(&self) -> u32 {
+            self.pid
+        }
+
+        fn wait(&mut self) -> Result<i32, String> {
+            self.log.borrow_mut().push("wait");
+            Ok(self.code)
+        }
+
+        fn kill_and_reap(&mut self) {
+            self.log.borrow_mut().push("kill");
+        }
+    }
+
+    struct FakeSpawner {
+        log: Rc<RefCell<Vec<&'static str>>>,
+        spawned: usize,
+        code: i32,
+        fail: Option<String>,
+    }
+
+    impl Spawner for FakeSpawner {
+        fn spawn(&mut self, _: &RunSpec) -> Result<Box<dyn SpawnedChild>, String> {
+            self.spawned = self.spawned.saturating_add(1);
+            self.log.borrow_mut().push("spawn");
+            if let Some(error) = self.fail.take() {
+                return Err(error);
+            }
+            Ok(Box::new(FakeChild {
+                pid: 71,
+                code: self.code,
+                log: Rc::clone(&self.log),
+            }))
+        }
+    }
+
+    struct FakeSessions {
+        log: Rc<RefCell<Vec<&'static str>>>,
+        begin: Option<ControlError>,
+        adopt: Option<ControlError>,
+        seen_begin: Option<BeginRunRequest>,
+        stops: Vec<String>,
+    }
+
+    impl FakeSessions {
+        fn new(log: Rc<RefCell<Vec<&'static str>>>) -> Self {
+            Self {
+                log,
+                begin: None,
+                adopt: None,
+                seen_begin: None,
+                stops: Vec::new(),
+            }
+        }
+    }
+
+    impl DaemonSessions for FakeSessions {
+        fn begin_run(&mut self, request: &BeginRunRequest) -> Result<LaunchSession, ControlError> {
+            self.log.borrow_mut().push("begin");
+            self.seen_begin = Some(request.clone());
+            match self.begin.take() {
+                Some(error) => Err(error),
+                None => Ok(LaunchSession {
+                    public_id: "s-daemon".to_owned(),
+                    ticket: "ticket".to_owned(),
+                }),
+            }
+        }
+
+        fn adopt(&mut self, _: &LaunchSession, _: u32) -> Result<(), ControlError> {
+            self.log.borrow_mut().push("adopt");
+            match self.adopt.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        fn attach(&mut self, _: &AttachRequest) -> Result<SessionHandle, ControlError> {
+            Err(ControlError::BadReply {
+                detail: "run test must not attach".to_owned(),
+            })
+        }
+
+        fn stop_monitoring(&mut self, session: &str) -> Result<String, ControlError> {
+            self.stops.push(session.to_owned());
+            Ok(session.to_owned())
+        }
+
+        fn pin(&mut self, _: &str) -> Result<(), ControlError> {
+            self.log.borrow_mut().push("pin");
+            Ok(())
+        }
     }
 
     impl SessionSummary for FailedSummary {
@@ -1207,6 +1717,327 @@ mod tests {
         };
         UnixLauncher::forward_interrupt(&mut launcher, 42).expect("forward");
         assert_eq!(launcher.forwarded, vec![42]);
+    }
+
+    #[test]
+    fn daemon_run_orders_begin_spawn_adopt_wait_and_hides_env_from_the_request() {
+        let command = vec!["tool".to_owned(), "argument".to_owned()];
+        let env = vec!["TOKEN=super-secret-value".to_owned()];
+        let mut parsed = args(&command);
+        parsed.env = &env;
+        parsed.cwd = Some("/work");
+        parsed.name = Some("session-name");
+        parsed.agent = Some("agent-a");
+        parsed.pin = true;
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sessions = FakeSessions::new(Rc::clone(&log));
+        let mut spawner = FakeSpawner {
+            log: Rc::clone(&log),
+            spawned: 0,
+            code: 7,
+            fail: None,
+        };
+        let outcome = daemon_run(
+            &parsed,
+            none(),
+            &mut sessions,
+            &mut spawner,
+            &mut EmptySummary,
+        );
+        assert_eq!(outcome.code, 7);
+        assert_eq!(
+            *log.borrow(),
+            vec!["begin", "spawn", "adopt", "pin", "wait"]
+        );
+        let request = sessions.seen_begin.expect("begin request");
+        assert_eq!(request.argv, command);
+        assert_eq!(request.cwd.as_deref(), Some("/work"));
+        assert_eq!(request.name.as_deref(), Some("session-name"));
+        assert_eq!(request.agent.as_deref(), Some("agent-a"));
+        assert!(!format!("{request:?}").contains("super-secret-value"));
+        let text = text(&outcome.stderr);
+        assert!(text.contains("会话 s-daemon"), "{text}");
+    }
+
+    #[test]
+    fn adopt_failure_kills_and_reaps_the_child() {
+        let command = vec!["tool".to_owned()];
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sessions = FakeSessions::new(Rc::clone(&log));
+        sessions.adopt = Some(ControlError::Status {
+            status: 410,
+            code: None,
+            message: "adopt_timeout".to_owned(),
+        });
+        let mut spawner = FakeSpawner {
+            log: Rc::clone(&log),
+            spawned: 0,
+            code: 0,
+            fail: None,
+        };
+        let mut parsed = args(&command);
+        parsed.json = true;
+        let outcome = daemon_run(
+            &parsed,
+            none(),
+            &mut sessions,
+            &mut spawner,
+            &mut EmptySummary,
+        );
+        assert_eq!(outcome.code, exit::USAGE);
+        assert_eq!(*log.borrow(), vec!["begin", "spawn", "adopt", "kill"]);
+        assert!(text(&outcome.stderr)
+            .contains("program was stopped because the daemon did not take it over"));
+    }
+
+    #[test]
+    fn unreachable_begin_does_not_spawn() {
+        let command = vec!["tool".to_owned()];
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sessions = FakeSessions::new(Rc::clone(&log));
+        sessions.begin = Some(ControlError::Unreachable {
+            detail: "down".to_owned(),
+        });
+        let mut spawner = FakeSpawner {
+            log: Rc::clone(&log),
+            spawned: 0,
+            code: 0,
+            fail: None,
+        };
+        let outcome = daemon_run(
+            &args(&command),
+            none(),
+            &mut sessions,
+            &mut spawner,
+            &mut EmptySummary,
+        );
+        assert_eq!(outcome.code, exit::UNREACHABLE);
+        assert_eq!(spawner.spawned, 0);
+        assert_eq!(*log.borrow(), vec!["begin"]);
+    }
+
+    /// Forced fallback: the cgroup attempt fails the way this box does
+    /// ("no delegated controllers"); a real child must still run and its exit
+    /// code come back, with the missing capability named.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_without_delegation_really_runs_the_child_by_process_tree() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 4".to_owned()];
+        let mut spec = RunSpec::new(command).expect("spec");
+        spec.no_daemon = true;
+        let mut attempts = 0;
+        let launched = super::launch_linux(&spec, &mut |_, _, _, _| {
+            attempts += 1;
+            Err(crate::launch::LinuxLaunchError::CreateFailed {
+                detail: "cgroup mkdir: /sys/fs/cgroup/agent/cgroup.subtree_control has no delegated controllers".to_owned(),
+            })
+        })
+        .expect("fallback launch");
+        assert_eq!(attempts, 1);
+        assert_eq!(launched.code, 4, "real child exit code");
+        assert!(launched.pid > 0);
+        assert_eq!(launched.note, Some(super::PID_TREE_FALLBACK_NOTE));
+    }
+
+    /// The fallback decision: only pre-spawn cgroup failures fall back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_pre_spawn_cgroup_failures_fall_back() {
+        use crate::launch::LinuxLaunchError as E;
+        assert!(super::cgroup_fallback_allowed(&E::CgroupV1NoLaunch));
+        assert!(super::cgroup_fallback_allowed(&E::CreateFailed {
+            detail: "no delegated controllers".to_owned()
+        }));
+        for after in [
+            E::ForkFailed {
+                detail: "x".to_owned(),
+            },
+            E::WriteProcsFailed {
+                detail: "x".to_owned(),
+            },
+            E::WaitFailed {
+                detail: "x".to_owned(),
+            },
+        ] {
+            assert!(!super::cgroup_fallback_allowed(&after), "{after}");
+        }
+        // A failure after the child started is reported, not retried.
+        let spec = RunSpec::new(vec!["true".to_owned()]).expect("spec");
+        let err = super::launch_linux(&spec, &mut |_, _, _, _| {
+            Err(E::WriteProcsFailed {
+                detail: "denied".to_owned(),
+            })
+        })
+        .expect_err("no fallback");
+        assert!(err.to_string().contains("cgroup.procs"), "{err}");
+    }
+
+    /// The production launcher on this machine: really spawns, and the note
+    /// says which path it took. Without delegation (CI runners, this box) it
+    /// must be the process-tree fallback, never an error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn production_linux_launcher_runs_with_or_without_delegation() {
+        use super::Launcher;
+        let mut spec = RunSpec::new(vec!["sh".to_owned(), "-c".to_owned(), "exit 6".to_owned()])
+            .expect("spec");
+        spec.no_daemon = true;
+        let launched = super::PlatformLauncher.launch(&spec).expect("launch");
+        assert_eq!(launched.code, 6);
+        assert!(
+            launched.note == Some(super::PID_TREE_FALLBACK_NOTE)
+                || launched.note == Some(super::POST_SPAWN_MOVE_NOTE),
+            "{:?}",
+            launched.note
+        );
+    }
+
+    #[test]
+    fn no_follow_children_is_refused_before_the_daemon_is_asked() {
+        let command = vec!["tool".to_owned()];
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sessions = FakeSessions::new(Rc::clone(&log));
+        let mut spawner = FakeSpawner {
+            log: Rc::clone(&log),
+            spawned: 0,
+            code: 0,
+            fail: None,
+        };
+        let mut ran = args(&command);
+        ran.no_follow_children = true;
+        let outcome = daemon_run(&ran, none(), &mut sessions, &mut spawner, &mut EmptySummary);
+        assert_eq!(outcome.code, exit::GENERAL);
+        assert!(text(&outcome.stderr).contains("--no-follow-children"));
+        assert!(log.borrow().is_empty(), "no daemon call, no spawn");
+    }
+
+    /// The production spawner really starts the program as this user, applies
+    /// `--env` only to the child, adopts its real pid, and forwards its exit code.
+    #[cfg(unix)]
+    #[test]
+    fn command_spawner_runs_a_real_child_and_forwards_its_exit_code() {
+        let command = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "exit \"$AW_TEST_CODE\"".to_owned(),
+        ];
+        let env = vec!["AW_TEST_CODE=5".to_owned()];
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sessions = FakeSessions::new(Rc::clone(&log));
+        let mut ran = args(&command);
+        ran.env = &env;
+        let outcome = daemon_run(
+            &ran,
+            none(),
+            &mut sessions,
+            &mut super::CommandSpawner,
+            &mut EmptySummary,
+        );
+        assert_eq!(outcome.code, 5, "{}", text(&outcome.stderr));
+        assert_eq!(*log.borrow(), vec!["begin", "adopt"]);
+        let begin = sessions.seen_begin.expect("begin request");
+        assert_eq!(begin.argv, command);
+        assert!(text(&outcome.stderr).contains("s-daemon"));
+    }
+
+    #[test]
+    fn collector_unavailable_suggests_the_local_mode_without_spawning() {
+        let command = vec!["tool".to_owned()];
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sessions = FakeSessions::new(Rc::clone(&log));
+        sessions.begin = Some(ControlError::Status {
+            status: 503,
+            code: Some("collector_unavailable".to_owned()),
+            message: "collector unavailable".to_owned(),
+        });
+        let mut spawner = FakeSpawner {
+            log,
+            spawned: 0,
+            code: 0,
+            fail: None,
+        };
+        let outcome = daemon_run(
+            &args(&command),
+            none(),
+            &mut sessions,
+            &mut spawner,
+            &mut EmptySummary,
+        );
+        assert_eq!(outcome.code, exit::GENERAL);
+        assert_eq!(spawner.spawned, 0);
+        assert!(text(&outcome.stderr).contains("use --no-daemon on this platform"));
+    }
+
+    #[test]
+    fn spawn_failure_stops_the_pending_session_without_printing_argv() {
+        let command = vec!["private-tool".to_owned(), "--secret".to_owned()];
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sessions = FakeSessions::new(Rc::clone(&log));
+        let mut spawner = FakeSpawner {
+            log: Rc::clone(&log),
+            spawned: 0,
+            code: 0,
+            fail: Some("could not start program: entity not found".to_owned()),
+        };
+        let mut parsed = args(&command);
+        parsed.json = true;
+        let outcome = daemon_run(
+            &parsed,
+            none(),
+            &mut sessions,
+            &mut spawner,
+            &mut EmptySummary,
+        );
+        assert_eq!(outcome.code, exit::GENERAL);
+        assert_eq!(sessions.stops, vec!["s-daemon".to_owned()]);
+        let text = text(&outcome.stderr);
+        let body: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(body["error"]["code"], "spawn_failed");
+        assert!(!text.contains("private-tool"), "{text}");
+        assert!(!text.contains("--secret"), "{text}");
+    }
+
+    #[test]
+    fn daemon_json_summary_keeps_the_real_session_id() {
+        let command = vec!["tool".to_owned()];
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sessions = FakeSessions::new(Rc::clone(&log));
+        let mut spawner = FakeSpawner {
+            log,
+            spawned: 0,
+            code: 0,
+            fail: None,
+        };
+        let mut parsed = args(&command);
+        parsed.json = true;
+        let outcome = daemon_run(
+            &parsed,
+            none(),
+            &mut sessions,
+            &mut spawner,
+            &mut EmptySummary,
+        );
+        let body: serde_json::Value = serde_json::from_slice(&outcome.stderr).expect("json");
+        assert_eq!(body["session"], "s-daemon");
+    }
+
+    #[test]
+    fn no_daemon_uses_the_local_launcher_without_a_daemon_call() {
+        let command = vec!["tool".to_owned()];
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let sessions = FakeSessions::new(log);
+        let mut launcher = fake_exit_7();
+        let mut parsed = args(&command);
+        parsed.no_daemon = true;
+        let outcome = run(
+            &parsed,
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut EmptySummary,
+        );
+        assert_eq!(outcome.code, 7);
+        assert!(sessions.seen_begin.is_none());
+        assert!(sessions.stops.is_empty());
     }
 
     fn sample_summary() -> Summary {

@@ -2772,12 +2772,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[allow(clippy::expect_used)]
     fn attach_records_a_real_process_and_ends_when_it_exits() {
         let (dir, db) = seeded_db("attach", "");
-        let mut child = match std::process::Command::new("sleep").arg("30").spawn() {
-            Ok(child) => child,
-            Err(_) => return,
-        };
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
         let pid = child.id();
         let mut state = ApiState::new(1_000);
         state.query = super::StoreQuery::open_path(db.clone());
@@ -2846,12 +2847,13 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[allow(clippy::expect_used)]
     fn run_then_adopt_watches_the_callers_process_and_wrong_ticket_is_403() {
         let (dir, db) = seeded_db("run", "");
-        let mut child = match std::process::Command::new("sleep").arg("30").spawn() {
-            Ok(child) => child,
-            Err(_) => return,
-        };
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
         let pid = child.id();
         let mut state = ApiState::new(1_000);
         state.query = super::StoreQuery::open_path(db.clone());

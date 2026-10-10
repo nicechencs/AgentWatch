@@ -319,6 +319,7 @@ fn client_to_query(err: ClientError) -> QueryError {
         ClientError::Status {
             status: 404,
             message,
+            ..
         } => QueryError::NotFound {
             session: clip(&message),
         },

@@ -56,6 +56,12 @@ pub use unix_macos::{launch_command, production};
 #[allow(unused_imports)]
 pub use unix_linux::LocalCgroupHost;
 
+/// Linux launch errors, so `aw run` can decide when to fall back from a
+/// cgroup scope to process-tree tracking.
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+pub use unix_linux::{LaunchError as LinuxLaunchError, LaunchResult as LinuxLaunchResult};
+
 /// What `aw run` asks a platform launcher to do.
 ///
 /// `command`, `cwd`, and `env` are inputs, not log fields. A launcher must not

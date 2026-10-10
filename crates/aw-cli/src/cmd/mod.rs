@@ -1,9 +1,4 @@
-//! Command dispatch (P1-CLI-01).
-//!
-//! This card only routes. A recognised command that is not `version` probes the
-//! daemon with `GET /health` and then reports that the command is not implemented.
-//! Unreachable is exit 3. A 2xx health check followed by "not implemented" is
-//! exit 1, so a live daemon is never a silent success.
+//! Command dispatch for CLI commands and the daemon's local API channel.
 
 mod around;
 mod attach;
@@ -117,7 +112,10 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
     if let Some(outcome) = proxy_command(&cli.command, json) {
         return Ok(outcome);
     }
-    if let Some(outcome) = launch_command(&cli, json) {
+    if let Some(outcome) = live_session_preflight(&cli, json) {
+        return Ok(outcome);
+    }
+    if let Some(outcome) = live_launch_command(&cli, json) {
         return Ok(outcome);
     }
     if let Some(detail) = usage_gap(&cli.command) {
@@ -128,7 +126,9 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
         return Ok(outcome);
     }
 
-    let needs_endpoint = is_query(&cli.command) || is_wired_ops(&cli.command);
+    let needs_endpoint = is_query(&cli.command)
+        || is_wired_ops(&cli.command)
+        || is_live_session_command(&cli.command);
     if !needs_endpoint {
         // Stubs that probe `/health`, and ops that stay unwired (export, daemon).
         let mut source = query::UnavailableSource;
@@ -146,6 +146,9 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
         Err(err) => return Ok(endpoint_outcome(err, json)),
     };
     let mut source = http_source::HttpQuerySource::new(endpoint.clone());
+    if let Some(outcome) = session_command(&cli, &endpoint, json) {
+        return Ok(outcome);
+    }
     if let Some(outcome) = query_command(&cli.command, json, lang, &mut source)? {
         return Ok(outcome);
     }
@@ -266,6 +269,167 @@ fn is_wired_ops(command: &Command) -> bool {
         Command::Config(tree::ConfigCmd::Rules(_)) => false,
         Command::Config(_) => true,
         _ => false,
+    }
+}
+
+/// Commands whose production implementation must first resolve the daemon
+/// channel. `--no-daemon` deliberately stays on the existing local launcher.
+fn is_live_session_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Run {
+            no_daemon: false,
+            ..
+        } | Command::Attach { .. }
+            | Command::Stop { .. }
+    )
+}
+
+/// Preserve all session-command refusals before endpoint resolution or a daemon
+/// request. This includes attach switches the daemon cannot apply.
+fn live_session_preflight(cli: &Cli, json: bool) -> Option<Outcome> {
+    match &cli.command {
+        Command::Run {
+            no_daemon: false, ..
+        } => {
+            let (args, deferred) = run_parts(&cli.command, json, cli.quiet)?;
+            run::preflight(&args, deferred).err()
+        }
+        Command::Attach { .. } => {
+            let args = attach_parts(&cli.command, json)?;
+            attach::preflight(&args).err()
+        }
+        _ => None,
+    }
+}
+
+/// Production-only local commands. The injected test dispatcher retains the
+/// broader [`launch_command`] path and never opens a real socket.
+fn live_launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
+    match &cli.command {
+        Command::Run {
+            no_daemon: true, ..
+        }
+        | Command::Ps { .. } => launch_command(cli, json),
+        _ => None,
+    }
+}
+
+/// Build the run arguments shared by the local and daemon-backed paths.
+fn run_parts<'a>(
+    command: &'a Command,
+    json: bool,
+    quiet: bool,
+) -> Option<(run::RunArgs<'a>, run::DeferredFlags<'a>)> {
+    let Command::Run {
+        agent,
+        name,
+        proxy,
+        proxy_on_reject,
+        no_follow_children,
+        include_proc,
+        self_report,
+        cwd,
+        env_vars,
+        summary,
+        pin,
+        group,
+        mcp_tap,
+        no_daemon,
+        raw,
+        unsafe_no_redact,
+        cmd,
+    } = command
+    else {
+        return None;
+    };
+    let args = run::RunArgs {
+        agent: agent.as_deref(),
+        name: name.as_deref(),
+        no_follow_children: *no_follow_children,
+        cwd: cwd.as_deref(),
+        env: env_vars,
+        summary: summary.as_deref(),
+        pin: *pin,
+        no_daemon: *no_daemon,
+        raw: raw.as_deref(),
+        command: cmd,
+        json,
+        quiet,
+    };
+    let deferred = run::DeferredFlags {
+        proxy: *proxy,
+        proxy_on_reject: proxy_on_reject.is_some(),
+        proxy_on_reject_value: proxy_on_reject.as_deref(),
+        self_report: self_report.is_some(),
+        mcp_tap: *mcp_tap,
+        unsafe_no_redact: *unsafe_no_redact,
+        include_proc: !include_proc.is_empty(),
+        group: group.is_some(),
+    };
+    Some((args, deferred))
+}
+
+fn attach_parts<'a>(command: &'a Command, json: bool) -> Option<attach::AttachArgs<'a>> {
+    let Command::Attach {
+        pid,
+        name,
+        no_follow_children,
+        no_existing_children,
+        move_to_cgroup,
+        agent,
+        pin,
+        group,
+        until_exit,
+        duration,
+    } = command
+    else {
+        return None;
+    };
+    Some(attach::AttachArgs {
+        pid: *pid,
+        name: name.as_deref(),
+        no_follow_children: *no_follow_children,
+        no_existing_children: *no_existing_children,
+        move_to_cgroup: *move_to_cgroup,
+        until_exit: *until_exit,
+        duration: duration.as_deref(),
+        agent: agent.as_deref(),
+        pin: *pin,
+        group: group.as_deref(),
+        json,
+    })
+}
+
+/// `aw run` (except `--no-daemon`), `aw attach`, and `aw stop` on the resolved
+/// production channel.
+fn session_command(cli: &Cli, endpoint: &Endpoint, json: bool) -> Option<Outcome> {
+    match &cli.command {
+        Command::Run {
+            no_daemon: false, ..
+        } => {
+            let (args, deferred) = run_parts(&cli.command, json, cli.quiet)?;
+            Some(run::daemon_run(
+                &args,
+                deferred,
+                &mut attach::HttpDaemonSessions::new(endpoint.clone()),
+                &mut run::CommandSpawner,
+                &mut run::DaemonSummary::new(endpoint.clone()),
+            ))
+        }
+        Command::Attach { .. } => {
+            let args = attach_parts(&cli.command, json)?;
+            Some(attach::run(
+                &args,
+                &mut attach::HttpDaemonSessions::new(endpoint.clone()),
+            ))
+        }
+        Command::Stop { session } => Some(stop::run(
+            session,
+            json,
+            &mut attach::HttpDaemonSessions::new(endpoint.clone()),
+        )),
+        _ => None,
     }
 }
 
@@ -440,9 +604,10 @@ fn proxy_command(command: &Command, json: bool) -> Option<Outcome> {
 
 /// `run`, `attach`, `stop`, and `ps` (P1-CLI-02).
 ///
-/// These do not probe `/health`. Each one calls an injected trait; the
-/// production values start no process and open no daemon session. `None` for
-/// every other command.
+/// This is the injected, socket-free dispatch path used by
+/// [`execute_args_with`]. Production dispatch only reaches it for
+/// `run --no-daemon` and `ps`; daemon-backed run, attach, and stop are handled
+/// by [`session_command`]. `None` for every other command.
 ///
 /// `usage_gap` still runs first for an empty `run` or an `attach` with neither
 /// `--pid` nor `--name`, via the check below this function's caller. An empty
@@ -1081,8 +1246,16 @@ mod tests {
 
     #[test]
     fn default_socket_is_unreachable_and_does_not_open() {
+        // Hermetic: a real daemon on this machine's platform socket (for
+        // example a root agentwatchd on /run/agentwatch/api.sock) must not
+        // change the result, so the channel is pointed at a path that cannot
+        // exist instead of the platform default.
+        let missing = std::env::temp_dir()
+            .join(format!("aw-no-daemon-{}", std::process::id()))
+            .join("api.sock");
+        let missing = missing.to_string_lossy().into_owned();
         let mut http = script(200, r#"{"status":"ok"}"#);
-        let outcome = run(&["ui"], None, &mut http);
+        let outcome = run(&["--socket", &missing, "ui"], None, &mut http);
         assert_eq!(outcome.code, exit::UNREACHABLE);
         let err = text(&outcome.stderr);
         assert!(err.contains("aw daemon start"), "{err}");

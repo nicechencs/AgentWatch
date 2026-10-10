@@ -1,7 +1,7 @@
 # 本地 API 与 CLI
 
 > 状态：草案
-> 最后更新：2026-10-07
+> 最后更新：2026-10-10
 > 关联：REQ-02、REQ-05、REQ-07.6、REQ-11、[ADR-0005](../03-adr/0005-privileged-daemon-split.md)、[storage](storage.md)、[ui](ui.md)、[inter-agent-communication](inter-agent-communication.md)
 
 ## 1. 通信与鉴权
@@ -48,6 +48,10 @@ CLI 和 UI 请求到达后走同一套 axum 路由。传输层不同，但请求
 - `-v/--verbose`。
 
 退出码：`0` 成功；`1` 一般错误；`2` 参数错误；`3` daemon 不可达；`4` 权限不足；`run` 透传目标进程的退出码。
+
+本构建中，`aw run` 默认先调用 `POST /sessions/run`，再由 CLI 以调用者身份启动目标程序并调用 `/sessions/{sid}/adopt`；`--env` 仅传给该子进程，不会传给 daemon。`aw attach --pid` 调用 `POST /sessions`（`mode:"attach"`），`aw stop` 调用 `POST /sessions/{sid}/stop`。三者都走与 `aw ui`、`aw daemon stop` 相同的内部通道（socket / 命名管道），daemon 不可达退出码 3，通道无权限或 403 退出码 4。默认 `aw run` 结束后的摘要来自 `GET /sessions/{sid}` 的 `stats`，是目标退出那一刻 daemon 已记录的数字。默认 `aw run` 不接受 `--no-follow-children`（daemon 轮询采样器总是跟随子进程），需要时用 `--no-daemon`。`aw run --no-daemon` 不连接 daemon，保留 CLI 内的本地轮询路径；Linux 上先尝试把子进程放进委派的 cgroup v2 会话目录，本机没有可委派的 cgroup（cgroup v1，或 `cgroup.subtree_control` 没有委派控制器、目录不可写）时退化为按进程树跟踪（scope_pids），照常启动并透传退出码，摘要里写明「没采：cgroup 会话范围」（`--json` 的 `launch_note`）；只有连这样也启动不了程序时才报错。默认 `aw run` 不用 cgroup：子进程由 CLI 直接启动，daemon 按 adopt 的 pid 轮询跟踪进程树，会话的 `collectors` 照实列出没采的类别。记录仅在 Linux 可用；其他平台的会话创建返回 `503 collector_unavailable`，应改用 `--no-daemon`。
+
+`aw attach --name`、`--no-follow-children`、`--no-existing-children` 和 `--move-to-cgroup` 在当前 daemon 轮询采样器中没有对应能力，CLI 会明确拒绝这些参数；请用 `aw ps` 找到 pid 后传入 `--pid`。
 
 ```text
 aw
@@ -160,15 +164,15 @@ $ aw run --proxy -- claude
 | GET | `/compare?a=<SESSION>&b=<SESSION>` | 两个会话对比：进程/文件/域名/流量差异（P5） |
 | GET | `/doctor` | 自检报告（采集器 `probe()` 与 `capabilities()`）。`host.privileged` 是 daemon 进程自身的特权，向操作系统查询：Linux 看有效 uid 为 0 或持有 `CAP_SYS_ADMIN`，macOS 看有效 uid 为 0，Windows 看令牌完整性级别为 High 或 System（未提权的管理员账户算否）。查询失败时为 `null`，不写成 `false` `collectors` 是**运行状态**（由前台采样循环每次采样后写入，不读配置）：`poll` 项带 `status`（`running`/`stopped`/`unknown`，循环还没报告时为 `unknown`）、`daemon_sample`、`watched_roots`、`last_sample_ns` 和 `capabilities`；本平台的内核采集器（eBPF/ETW/eslogger）列为 `not_built`。`capabilities` 与会话回复里 `poll` 的能力是同一份（`kind, evidence, na_reason?`，另加 `available`），新建会话页和概览一致。 |
 | GET | `/processes` | 当前系统进程树（进程选择器）。参数：`?agents_only&q=` |
-| POST | `/sessions` | 创建会话并开始记录（轮询采集，证据 S；本版本仅 Linux，其他平台 503 `collector_unavailable`，不建会话）。`{mode:"attach", pid, name?, agent?}`：pid 须在运行；属于其他用户的进程需管理员（403）。`{mode:"launch", argv, cwd?, env?, name?, agent?}`：程序以**调用方的账户**运行。账户只取自操作系统给出的对端身份（内部通道的对端 uid，或经该通道签给这个对端的 UI 令牌）；body 里的 `uid`/`user` 一律忽略。调用方就是 daemon 自己的账户时原样启动；daemon 以 root 运行时，子进程在 exec 前依次 `setgroups(0)`（不带附加组）→ `setgid` → `setuid`，再以调用方身份进入 `cwd`（缺省为其家目录），环境变量清空后只设 `HOME/USER/LOGNAME/SHELL/PATH`（另保留 `LANG/LC_ALL/TZ`，body 的 `env` 最后覆盖）；启动后读 `/proc/<pid>/status`，真实/有效/保存/文件系统 uid 与 gid 不全是调用方的就杀掉并回 500 `drop_failed`。身份不明 403 `caller_unidentified` / `caller_unknown`，绝不退回以 root 运行；daemon 以普通账户运行而调用方是别的账户时 403 `launch_other_user`。附加组不初始化（需要 fork 后的 unsafe 代码），依赖附加组权限的程序拿不到那部分权限。返回 201 `{id, session_id, mode, root_pid}`。根进程退出时会话结束（`end_reason=exited`，daemon 自己启动的带 `exit_code`）；`stop` 结束记录但不杀进程；daemon 停止时为 `daemon_shutdown`，重启时把上次遗留未结束的会话标为 `daemon_shutdown`。 启动失败按原因给错误码（400）：`program_not_found`（程序或工作目录不存在）、`program_not_permitted`（没有执行权限）、其他 `spawn_failed`；消息是英文短句，界面按错误码显示中文。 |
-| POST | `/sessions/run` | `aw run` 用。`{argv, cwd?, name?, agent?}` 记一条 `mode=launch` 会话，返回 201 `{id, ticket, adopt_timeout_ms: 5000}`。进程由调用方以自己的身份创建，再在 5 秒内调 `/adopt`；超时会话以 `adopt_timeout` 结束。`sessions.argv` 先过内置脱敏再存。 |
+| POST | `/sessions` | 创建会话并开始记录（轮询采集，证据 S；本版本仅 Linux，其他平台 503 `collector_unavailable`，不建会话）。`aw attach --pid` 调用 `{mode:"attach", pid, agent?}`；`aw attach --name` 与 `--no-follow-children`、`--no-existing-children`、`--move-to-cgroup` 由 CLI 拒绝，不静默忽略。`{mode:"attach", pid, name?, agent?}`：pid 须在运行；属于其他用户的进程需管理员（403）。`{mode:"launch", argv, cwd?, env?, name?, agent?}`：程序以**调用方的账户**运行。账户只取自操作系统给出的对端身份（内部通道的对端 uid，或经该通道签给这个对端的 UI 令牌）；body 里的 `uid`/`user` 一律忽略。调用方就是 daemon 自己的账户时原样启动；daemon 以 root 运行时，子进程在 exec 前依次 `setgroups(0)`（不带附加组）→ `setgid` → `setuid`，再以调用方身份进入 `cwd`（缺省为其家目录），环境变量清空后只设 `HOME/USER/LOGNAME/SHELL/PATH`（另保留 `LANG/LC_ALL/TZ`，body 的 `env` 最后覆盖）；启动后读 `/proc/<pid>/status`，真实/有效/保存/文件系统 uid 与 gid 不全是调用方的就杀掉并回 500 `drop_failed`。身份不明 403 `caller_unidentified` / `caller_unknown`，绝不退回以 root 运行；daemon 以普通账户运行而调用方是别的账户时 403 `launch_other_user`。附加组不初始化（需要 fork 后的 unsafe 代码），依赖附加组权限的程序拿不到那部分权限。返回 201 `{id, session_id, mode, root_pid}`。根进程退出时会话结束（`end_reason=exited`，daemon 自己启动的带 `exit_code`）；`stop` 结束记录但不杀进程；daemon 停止时为 `daemon_shutdown`，重启时把上次遗留未结束的会话标为 `daemon_shutdown`。 启动失败按原因给错误码（400）：`program_not_found`（程序或工作目录不存在）、`program_not_permitted`（没有执行权限）、其他 `spawn_failed`；消息是英文短句，界面按错误码显示中文。 |
+| POST | `/sessions/run` | 默认 `aw run` 用。CLI 发送 `{argv, cwd?, name?, agent?}`（绝不发送 `--env` 值），daemon 记一条 `mode=launch` 会话并返回 201 `{id, session_id, mode:"launch", root_pid:null, ticket, adopt_timeout_ms:5000}`；CLI 以调用者身份创建目标程序后，在 5 秒内调 `/sessions/{sid}/adopt {ticket,pid}`。adopt 失败时 CLI 会停止并回收该子进程，避免未受监控运行；超时会话以 `adopt_timeout` 结束。`--no-daemon` 不调用此接口，使用本地轮询路径。`sessions.argv` 先过内置脱敏再存。 |
 | POST | `/sessions/{sid}/adopt` | `{ticket, pid}`。ticket 不符 403，超时 410 `adopt_timeout`，没有等待中的启动 404（他人的也是 404）。 |
 | POST | `/sessions/{sid}/attach` | `{pid}`：在自己的、未结束的会话里再多记录一个根进程；他人进程需管理员。会话已结束 409。没有打开会话数据库的 daemon（前台运行总会打开 `agentwatch.db`，只在测试桩里出现）回 503 `store_unavailable`，不是 501。 |
 | GET | `/sessions` | 列表。参数：`?since&until&agent&active&q&cursor&limit`。每行带 `collectors`（同会话详情）和 `stats`（同 `/summary` 的计数），列表和概览的数字一致；类别没采时界面两处都写「没采」。 每行另带 `argv`（存储时已脱敏的命令，数组；没有为 null），没有名字的会话界面显示命令（如 `sleep 90`）。 |
 | GET | `/sessions/{sid}` | 会话详情 + `stats`（与会话列表、`/summary` 同一个计数函数 `aw_store::session_counts`：`process_count, flow_count, dns_count, gap_count, bytes_up, bytes_down, finding_count`；库里还没有 `findings` 表时 `finding_count` 为 null，不是 0），另带 `mode` 和 `collectors`。`collectors` 是数组，每项 `{name, mode, capabilities:[{kind, evidence, na_reason?}]}`：轮询采集器 `poll` 列 `proc`=S，`file`、`dns`=NA（`collector_unavailable`），`net` 在 Windows 为 S、其他平台为 NA。库里存的采集器名没有能力描述时（未知名字），该项 `capabilities` 为空并带 `note: "collector_not_described"`，界面据此说“不能确认是否采集”，不说“没有发生”。`/summary` 同样带这两个字段。 |
 | PATCH | `/sessions/{sid}` | `{name?, pinned?}` |
 | PATCH | `/sessions/{sid}/findings/{id}` | body：`{user_state: "confirmed"\|"ignored"\|null}`。只接受这三个值。`null` 清除标记。写入 `user_state_by`（当前用户）和 `user_state_ns`（Unix 纳秒）。不属于该用户的会话或发现返回 404。 |
-| POST | `/sessions/{sid}/stop` | 停止监控。写入 `ended_ns`；之后不再往这个会话写新记录。daemon 自带的 `daemon-sample` 会话也一样：采样器每次采样前读一次 `ended_ns`，已停止就停掉，daemon 重启后也不再恢复采样。 |
+| POST | `/sessions/{sid}/stop` | `aw stop <SESSION>` 调用此接口。接口只认 public id（`s-…`）；`@last` 和会话名由 CLI 先查 `GET /sessions` 换成 public id（`@last` 取自己最新开始的一条；同名多条时报错，请改用 public id）。停止监控但不结束目标进程，写入 `ended_ns`；之后不再往这个会话写新记录。daemon 自带的 `daemon-sample` 会话也一样：采样器每次采样前读一次 `ended_ns`，已停止就停掉，daemon 重启后也不再恢复采样。 |
 | DELETE | `/sessions/{sid}` | 删除 |
 | GET | `/sessions/{sid}/summary` | 概览页数据：Top 目录、Top 域名、按类别计数、按证据等级计数、缺口摘要 |
 | GET | `/sessions/{sid}/timeline` | 参数：`?filter&from&to&cats&cursor&limit`。每行在视图列（`session_id, ts_ns, cat, id, proc_uid, evidence`）之外带 `summary`（按 `cat` 从来源表的已存列拼一行，NULL 的列不出现，不推测）、`fields`（拼 summary 用到的列，原样）和 `proc: {pid, exe_name}`。来源行不存在时 `summary` 为空串。`/around` 同样。 `proc` 行带 `pre_existing`：仅当会话是 `attach`、该进程属于采样器开始时的基线（`processes.how = snapshot`）且开始时间早于 `sessions.started_ns` 时为 true。`launch` 会话里的进程都由会话启动，即使根进程的开始时间（/proc 只到整秒）读出来比会话早一点，也不算。界面的「会话开始前已存在」只看这个字段。 |

@@ -1,19 +1,19 @@
 //! `aw stop <SESSION>` (P1-CLI-02).
 //!
-//! Stops monitoring. It does not end the watched process. The only control
-//! method this command calls is [`super::attach::SessionControl::stop_monitoring`],
-//! which has no terminate counterpart.
+//! Stops monitoring through the daemon session API. It does not end the watched
+//! process. `@last` and names are resolved to a public id first (the daemon
+//! routes take public ids only); the printed id is the one that was stopped.
 
 use serde_json::json;
 
 use crate::exit;
 use crate::output::{parse_session, SessionRef};
 
-use super::attach::{ControlError, SessionControl};
+use super::attach::DaemonSessions;
 use super::Outcome;
 
 /// Run `aw stop`.
-pub(crate) fn run(session: &str, json: bool, control: &mut dyn SessionControl) -> Outcome {
+pub(crate) fn run(session: &str, json: bool, control: &mut dyn DaemonSessions) -> Outcome {
     let parsed = match parse_session(session) {
         Ok(parsed) => parsed,
         Err(detail) => {
@@ -25,13 +25,14 @@ pub(crate) fn run(session: &str, json: bool, control: &mut dyn SessionControl) -
         SessionRef::IdOrName(name) => name.as_str(),
     };
     match control.stop_monitoring(key) {
-        Ok(()) => stopped_outcome(key, json),
-        Err(ControlError::Unreachable { detail }) => {
-            super::error_outcome(exit::UNREACHABLE, "unreachable", &detail, json)
-        }
-        Err(ControlError::Rejected { detail }) => {
-            super::error_outcome(exit::GENERAL, "rejected", &detail, json)
-        }
+        Ok(public_id) => stopped_outcome(&public_id, json),
+        Err(error) if error.not_found() => super::error_outcome(
+            error.exit_code(),
+            "not_found",
+            "session not found (or not yours)",
+            json,
+        ),
+        Err(error) => super::attach::control_outcome(error, json),
     }
 }
 
@@ -59,7 +60,9 @@ fn stopped_outcome(session: &str, json: bool) -> Outcome {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::run;
-    use crate::cmd::attach::{AttachRequest, ControlError, SessionControl, SessionHandle};
+    use crate::cmd::attach::{
+        AttachRequest, BeginRunRequest, ControlError, DaemonSessions, LaunchSession, SessionHandle,
+    };
     use crate::exit;
 
     #[derive(Default)]
@@ -68,17 +71,35 @@ mod tests {
         attached: u32,
     }
 
-    impl SessionControl for FakeControl {
+    impl DaemonSessions for FakeControl {
+        fn begin_run(&mut self, _: &BeginRunRequest) -> Result<LaunchSession, ControlError> {
+            Err(ControlError::BadReply {
+                detail: "stop must not start a run".to_owned(),
+            })
+        }
+
+        fn adopt(&mut self, _: &LaunchSession, _: u32) -> Result<(), ControlError> {
+            Err(ControlError::BadReply {
+                detail: "stop must not adopt".to_owned(),
+            })
+        }
+
         fn attach(&mut self, _request: &AttachRequest) -> Result<SessionHandle, ControlError> {
             self.attached += 1;
-            Err(ControlError::Rejected {
+            Err(ControlError::BadReply {
                 detail: "stop must not attach".to_owned(),
             })
         }
 
-        fn stop_monitoring(&mut self, session: &str) -> Result<(), ControlError> {
+        fn stop_monitoring(&mut self, session: &str) -> Result<String, ControlError> {
             self.stopped.push(session.to_owned());
-            Ok(())
+            Ok(session.to_owned())
+        }
+
+        fn pin(&mut self, _: &str) -> Result<(), ControlError> {
+            Err(ControlError::BadReply {
+                detail: "stop must not pin".to_owned(),
+            })
         }
     }
 
@@ -92,5 +113,51 @@ mod tests {
         assert!(text.contains("目标进程未被结束"), "{text}");
         assert_eq!(control.stopped, vec!["s-1".to_owned()]);
         assert_eq!(control.attached, 0);
+    }
+
+    #[test]
+    fn not_found_is_a_plain_session_error() {
+        struct Missing;
+
+        impl DaemonSessions for Missing {
+            fn begin_run(&mut self, _: &BeginRunRequest) -> Result<LaunchSession, ControlError> {
+                Err(ControlError::BadReply {
+                    detail: "not called".to_owned(),
+                })
+            }
+
+            fn adopt(&mut self, _: &LaunchSession, _: u32) -> Result<(), ControlError> {
+                Err(ControlError::BadReply {
+                    detail: "not called".to_owned(),
+                })
+            }
+
+            fn attach(&mut self, _: &AttachRequest) -> Result<SessionHandle, ControlError> {
+                Err(ControlError::BadReply {
+                    detail: "not called".to_owned(),
+                })
+            }
+
+            fn stop_monitoring(&mut self, _: &str) -> Result<String, ControlError> {
+                Err(ControlError::Status {
+                    status: 404,
+                    code: None,
+                    message: "not_found".to_owned(),
+                })
+            }
+
+            fn pin(&mut self, _: &str) -> Result<(), ControlError> {
+                Err(ControlError::BadReply {
+                    detail: "not called".to_owned(),
+                })
+            }
+        }
+
+        let outcome = run("s-missing", false, &mut Missing);
+        assert_eq!(outcome.code, exit::USAGE);
+        assert_eq!(
+            String::from_utf8(outcome.stderr).expect("utf8"),
+            "aw: session not found (or not yours)\n"
+        );
     }
 }

@@ -139,6 +139,8 @@ pub enum ClientError {
     Status {
         /// HTTP status.
         status: u16,
+        /// Daemon machine error code, when the JSON error object provided one.
+        code: Option<String>,
         /// Short message taken from the JSON body, or a fallback. No token.
         message: String,
     },
@@ -156,7 +158,9 @@ impl fmt::Display for ClientError {
                 "the daemon is running, but this account may not open its channel ({detail}). Ask an administrator to add you to the agentwatch group (Windows: AgentWatch Users)"
             ),
             Self::Transport { detail } => write!(f, "daemon request failed: {detail}"),
-            Self::Status { status, message } => {
+            Self::Status {
+                status, message, ..
+            } => {
                 write!(f, "daemon returned HTTP {status}: {message}")
             }
         }
@@ -216,6 +220,7 @@ impl<T: Transport> Client<T> {
         } else {
             Err(ClientError::Status {
                 status: reply.status,
+                code: status_code(&reply),
                 message: status_message(&reply),
             })
         }
@@ -241,6 +246,12 @@ fn status_message(reply: &ApiReply) -> String {
         return format!("{code} ({op})");
     }
     format!("HTTP {}", reply.status)
+}
+
+fn status_code(reply: &ApiReply) -> Option<String> {
+    reply
+        .json()
+        .and_then(|value| value.get("error")?.get("code")?.as_str().map(str::to_owned))
 }
 
 /// Production HTTP transport. Dials `127.0.0.1` only, writes one HTTP/1.1

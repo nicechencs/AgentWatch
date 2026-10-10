@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use channel::Failure;
 use tauri::ipc::Channel;
+use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
 /// The daemon this window is pinned to, else the documented lookup.
@@ -63,8 +64,9 @@ async fn aw_save_export(
     app: tauri::AppHandle,
     sid: String,
     format: String,
+    tz: Option<i32>,
 ) -> Result<export::Saved, Failure> {
-    let target = export::target(&sid, &format)?;
+    let target = export::target(&sid, &format, tz)?;
     let path = channel_path();
     tauri::async_runtime::spawn_blocking(move || {
         let response = channel::exchange_response(&path, "GET", &target, "")?;
@@ -73,6 +75,10 @@ async fn aw_save_export(
         }
         let name = export::file_name(&sid, &format, response.header("content-disposition"));
         let mut dialog = app.dialog().file().set_file_name(&name);
+        let paths = app.path();
+        if let Some(dir) = export::default_dir(paths.download_dir().ok(), paths.home_dir().ok()) {
+            dialog = dialog.set_directory(dir);
+        }
         if let Some((label, extensions)) = export::filter(&format) {
             dialog = dialog.add_filter(label, &extensions);
         }

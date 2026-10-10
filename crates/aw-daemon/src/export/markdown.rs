@@ -44,6 +44,9 @@ pub(crate) fn export_markdown(
     };
     let redact_paths = flag_on(pairs.get("redact_paths").map(String::as_str));
     let redact_hosts = flag_on(pairs.get("redact_hosts").map(String::as_str));
+    // `tz`: the reader's offset from UTC in minutes (the page sends it), so
+    // times read in their own clock. Absent or invalid: UTC, labelled so.
+    let tz = parse_tz(pairs.get("tz").map(String::as_str));
 
     let opened = match open_owned(state, &caller.user_id, sid) {
         Ok(Some(pair)) => pair,
@@ -55,7 +58,7 @@ pub(crate) fn export_markdown(
         &store,
         session_id,
         &caller.user_id,
-        lang,
+        Reader { lang, tz },
         redact_paths,
         redact_hosts,
     ) {
@@ -65,19 +68,104 @@ pub(crate) fn export_markdown(
     }
 }
 
+#[derive(Debug)]
 enum ReportError {
     Store(String),
     Lint(Vec<Violation>),
+}
+
+/// Who reads the report: language and UTC offset (minutes).
+#[derive(Debug, Clone, Copy)]
+struct Reader {
+    lang: Lang,
+    tz: i32,
+}
+
+/// `tz` query value: minutes east of UTC, within ±14 h. Anything else is UTC.
+fn parse_tz(raw: Option<&str>) -> i32 {
+    raw.and_then(|text| text.trim().parse::<i32>().ok())
+        .filter(|minutes| minutes.abs() <= 14 * 60)
+        .unwrap_or(0)
+}
+
+/// `2026-10-10 21:15:03 (UTC+08:00)` for Unix nanoseconds at `tz` minutes.
+fn local_time(ns: i64, tz: i32) -> String {
+    let secs = ns.div_euclid(1_000_000_000) + i64::from(tz) * 60;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let sign = if tz < 0 { '-' } else { '+' };
+    let off = tz.unsigned_abs();
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} (UTC{sign}{:02}:{:02})",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60,
+        off / 60,
+        off % 60
+    )
+}
+
+/// `6s`, `1m 05s`, `2h 03m`.
+fn duration_text(ns: i64) -> String {
+    let secs = ns.max(0) / 1_000_000_000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Days since 1970-01-01 to (year, month, day). Howard Hinnant's algorithm.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (
+        year,
+        u32::try_from(month).unwrap_or(1),
+        u32::try_from(day).unwrap_or(1),
+    )
+}
+
+/// The session's display name, as the session list shows it: the name, else
+/// the command (`argv`, redacted when stored), else nothing.
+fn session_label(summary: &SessionSummary) -> Option<String> {
+    if let Some(name) = summary
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
+        return Some(name.to_owned());
+    }
+    let argv: Vec<String> = summary
+        .argv
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    let command = argv.join(" ");
+    let command = command.trim();
+    (!command.is_empty()).then(|| command.to_owned())
 }
 
 fn build_report(
     store: &Store,
     session_id: i64,
     user_id: &str,
-    lang: Lang,
+    reader: Reader,
     redact_paths: bool,
     redact_hosts: bool,
 ) -> Result<String, ReportError> {
+    let lang = reader.lang;
     let conn = store.connection();
     let summary = session_summary(conn, user_id, session_id)
         .map_err(|err| ReportError::Store(err.to_string()))?
@@ -101,7 +189,7 @@ fn build_report(
     };
 
     let mut prose = String::new();
-    push_overview(&mut prose, &summary, &header, lang);
+    push_overview(&mut prose, &summary, &header, reader);
     push_capabilities(&mut prose, &header, lang);
     push_gaps(&mut prose, &gaps, lang);
     let match_sentences = push_findings(&mut prose, &findings, lang)?;
@@ -330,21 +418,31 @@ fn load_files(
     Ok(out)
 }
 
-fn push_overview(out: &mut String, summary: &SessionSummary, header: &HeaderBits, lang: Lang) {
+fn push_overview(out: &mut String, summary: &SessionSummary, header: &HeaderBits, reader: Reader) {
+    let lang = reader.lang;
+    let label = session_label(summary);
+    let started = local_time(summary.started_ns, reader.tz);
+    let ended = summary.ended_ns.map(|ns| local_time(ns, reader.tz));
+    let duration = summary
+        .ended_ns
+        .map(|ns| duration_text(ns.saturating_sub(summary.started_ns)));
     if lang == Lang::En {
         out.push_str("# Session report\n\n");
         out.push_str("This report lists what was recorded. It does not judge the session.\n\n");
         out.push_str("## Session\n\n");
         en_line(out, "public id", Some(summary.public_id.as_str()));
-        en_line(out, "name", summary.name.as_deref());
+        en_line(out, "name", label.as_deref());
         en_line(out, "agent", summary.agent.as_deref());
         en_line(out, "mode", Some(header.mode.as_str()));
         en_line(out, "platform", header.platform.as_deref());
         en_line(out, "os", header.os_version.as_deref());
-        out.push_str(&format!("- started_ns: {}\n", summary.started_ns));
-        match summary.ended_ns {
-            Some(ns) => out.push_str(&format!("- ended_ns: {ns}\n")),
-            None => out.push_str("- ended_ns: unavailable (session has no end timestamp)\n"),
+        out.push_str(&format!("- started: {started}\n"));
+        match (&ended, &duration) {
+            (Some(at), Some(took)) => {
+                out.push_str(&format!("- ended: {at}\n"));
+                out.push_str(&format!("- duration: {took}\n"));
+            }
+            _ => out.push_str("- ended: not yet (still recording, or no end time was recorded)\n"),
         }
         out.push_str(&format!("- process rows: {}\n", summary.process_count));
         out.push_str(&format!("- flow rows: {}\n", summary.flow_count));
@@ -368,15 +466,18 @@ fn push_overview(out: &mut String, summary: &SessionSummary, header: &HeaderBits
         out.push_str("本报告只列出已记录的内容，不对会话下结论。\n\n");
         out.push_str("## 会话\n\n");
         zh_line(out, "public id", Some(summary.public_id.as_str()));
-        zh_line(out, "名称", summary.name.as_deref());
+        zh_line(out, "名称", label.as_deref());
         zh_line(out, "agent", summary.agent.as_deref());
         zh_line(out, "模式", Some(header.mode.as_str()));
         zh_line(out, "平台", header.platform.as_deref());
         zh_line(out, "系统版本", header.os_version.as_deref());
-        out.push_str(&format!("- started_ns: {}\n", summary.started_ns));
-        match summary.ended_ns {
-            Some(ns) => out.push_str(&format!("- ended_ns: {ns}\n")),
-            None => out.push_str("- ended_ns: 不可得（会话没有结束时间）\n"),
+        out.push_str(&format!("- 开始: {started}\n"));
+        match (&ended, &duration) {
+            (Some(at), Some(took)) => {
+                out.push_str(&format!("- 结束: {at}\n"));
+                out.push_str(&format!("- 时长: {took}\n"));
+            }
+            _ => out.push_str("- 结束: 还没有（仍在录制，或没有记录结束时间）\n"),
         }
         out.push_str(&format!("- 进程行数: {}\n", summary.process_count));
         out.push_str(&format!("- 流记录行数: {}\n", summary.flow_count));
@@ -757,7 +858,90 @@ fn rule_name(rule: RuleId) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_gaps, markdown_response};
+    use super::{
+        build_report, duration_text, load_gaps, local_time, markdown_response, parse_tz, Reader,
+    };
+    use aw_pipeline::wording::Lang;
+
+    /// Test-bot #144: the report said 「名称: 不可得（未记录）」 while the list
+    /// showed `sleep 9`, and times were raw `started_ns`.
+    #[test]
+    fn report_names_an_unnamed_session_by_its_command_and_shows_local_times() {
+        let dir = std::env::temp_dir().join(format!(
+            "aw-md-label-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let Ok(store) = aw_store::Store::open(dir.join("t.db")) else {
+            panic!("store");
+        };
+        let inserted = store.connection().execute(
+            "INSERT INTO sessions (id, public_id, name, mode, started_ns, ended_ns, platform, user_id, collectors, argv) \
+             VALUES (1, 's-1', NULL, 'launch', 1791638103000000000, 1791638112000000000, 'linux', 'u', '[\"poll\"]', '[\"sleep\",\"9\"]')",
+            [],
+        );
+        assert!(inserted.is_ok(), "{inserted:?}");
+        let zh = build_report(
+            &store,
+            1,
+            "u",
+            Reader {
+                lang: Lang::Zh,
+                tz: 480,
+            },
+            false,
+            false,
+        );
+        let zh = zh.unwrap_or_else(|err| panic!("{err:?}"));
+        assert!(zh.contains("- 名称: sleep 9\n"), "{zh}");
+        assert!(
+            zh.contains("- 开始: 2026-10-10 21:15:03 (UTC+08:00)\n"),
+            "{zh}"
+        );
+        assert!(
+            zh.contains("- 结束: 2026-10-10 21:15:12 (UTC+08:00)\n"),
+            "{zh}"
+        );
+        assert!(zh.contains("- 时长: 9s\n"), "{zh}");
+        assert!(!zh.contains("started_ns"), "{zh}");
+        let en = build_report(
+            &store,
+            1,
+            "u",
+            Reader {
+                lang: Lang::En,
+                tz: 0,
+            },
+            false,
+            false,
+        );
+        let en = en.unwrap_or_else(|err| panic!("{err:?}"));
+        assert!(en.contains("- name: sleep 9\n"), "{en}");
+        assert!(
+            en.contains("- started: 2026-10-10 13:15:03 (UTC+00:00)\n"),
+            "{en}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn report_times_are_local_date_times_not_raw_ns() {
+        // 2026-10-10 13:15:03 UTC.
+        let ns = 1_791_638_103_000_000_000;
+        assert_eq!(local_time(ns, 0), "2026-10-10 13:15:03 (UTC+00:00)");
+        assert_eq!(local_time(ns, 480), "2026-10-10 21:15:03 (UTC+08:00)");
+        assert_eq!(local_time(ns, -420), "2026-10-10 06:15:03 (UTC-07:00)");
+        assert_eq!(parse_tz(Some("480")), 480);
+        assert_eq!(parse_tz(Some("9999")), 0);
+        assert_eq!(parse_tz(None), 0);
+        assert_eq!(duration_text(6_400_000_000), "6s");
+        assert_eq!(duration_text(65_000_000_000), "1m 05s");
+        assert_eq!(duration_text(7_380_000_000_000), "2h 03m");
+    }
 
     #[test]
     fn markdown_file_is_named_after_the_session() {

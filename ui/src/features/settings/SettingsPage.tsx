@@ -7,7 +7,7 @@ import { Bytes } from "@/components/Bytes";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ErrorNote, Loading } from "@/components/QueryState";
 import { useAuth } from "@/lib/auth";
-import { kindLabel } from "@/lib/capabilities";
+import { kindInSentence } from "@/lib/capabilities";
 import { diskUnavailableText, diskUsed } from "@/lib/disk";
 import { useI18n } from "@/lib/i18n";
 import { redactPreview } from "@/lib/redact-preview";
@@ -249,7 +249,7 @@ export function Collectors() {
             {collector.capabilities && collector.capabilities.length > 0 ? (
               <span className="text-ink-faint">
                 {collector.capabilities
-                  .map((cap) => `${kindLabel(t, cap.kind)} ${cap.evidence && cap.evidence !== "NA" ? t("settings.capYes") : t("settings.capNo")}`)
+                  .map((cap) => `${kindInSentence(t, cap.kind)} ${cap.evidence && cap.evidence !== "NA" ? t("settings.capYes") : t("settings.capNo")}`)
                   .join(t("common.listSep"))}
               </span>
             ) : null}

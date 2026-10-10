@@ -48,15 +48,20 @@ fn encode_segment(segment: &str) -> String {
 /// # Errors
 ///
 /// `refused` for an empty session id or a format the daemon does not export.
-pub fn target(sid: &str, format: &str) -> Result<String, Failure> {
+/// `tz` is the reader's UTC offset in minutes; the Markdown report shows its
+/// times in that clock.
+pub fn target(sid: &str, format: &str, tz: Option<i32>) -> Result<String, Failure> {
     if sid.is_empty() {
         return Err(Failure::refused("empty session id"));
     }
     if format_info(format).is_none() {
         return Err(Failure::refused(&format!("export format {format}")));
     }
+    let tz = tz
+        .filter(|minutes| minutes.abs() <= 14 * 60)
+        .map_or_else(String::new, |minutes| format!("&tz={minutes}"));
     Ok(format!(
-        "/api/v1/sessions/{}/export?format={format}",
+        "/api/v1/sessions/{}/export?format={format}{tz}",
         encode_segment(sid)
     ))
 }
@@ -90,6 +95,18 @@ pub fn file_name(sid: &str, format: &str, disposition: Option<&str>) -> String {
     } else {
         cleaned
     }
+}
+
+/// Folder the dialog opens in: the user's Downloads folder, else home.
+/// Without it the dialog opened in the app's launch directory (for example
+/// `/tmp/...` when started from a terminal there). A folder that does not
+/// exist is skipped.
+#[must_use]
+pub fn default_dir(downloads: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    [downloads, home]
+        .into_iter()
+        .flatten()
+        .find(|dir| dir.is_dir())
 }
 
 /// Dialog filter for `format`: (label, extensions without the dot).
@@ -230,7 +247,27 @@ pub fn finish(response: &aw_channel::Response, chosen: Option<PathBuf>) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{daemon_error, file_name, filter, finish, target, write, write_with};
+    use super::{daemon_error, default_dir, file_name, filter, finish, target, write, write_with};
+
+    #[test]
+    fn the_dialog_opens_in_downloads_then_home_never_the_launch_dir() {
+        let base = std::env::temp_dir().join(format!("aw-dir-test-{}", std::process::id()));
+        let downloads = base.join("Downloads");
+        let home = base.join("home");
+        let _ = std::fs::create_dir_all(&downloads);
+        let _ = std::fs::create_dir_all(&home);
+        assert_eq!(
+            default_dir(Some(downloads.clone()), Some(home.clone())),
+            Some(downloads)
+        );
+        assert_eq!(default_dir(None, Some(home.clone())), Some(home.clone()));
+        assert_eq!(
+            default_dir(Some(base.join("missing")), Some(home.clone())),
+            Some(home)
+        );
+        assert_eq!(default_dir(None, None), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn response(status: u16, body: &[u8]) -> aw_channel::Response {
         aw_channel::Response {
@@ -280,15 +317,28 @@ mod tests {
     #[test]
     fn target_encodes_the_session_and_checks_the_format() {
         assert_eq!(
-            target("s-215d0b338ce3", "md").ok().as_deref(),
+            target("s-215d0b338ce3", "md", None).ok().as_deref(),
             Some("/api/v1/sessions/s-215d0b338ce3/export?format=md")
         );
         assert_eq!(
-            target("a b/c", "csv").ok().as_deref(),
+            target("a b/c", "csv", None).ok().as_deref(),
             Some("/api/v1/sessions/a%20b%2Fc/export?format=csv")
         );
-        assert!(target("", "md").is_err());
-        assert!(target("s-1", "pdf").is_err());
+        assert!(target("", "md", None).is_err());
+        assert!(target("s-1", "pdf", None).is_err());
+        assert_eq!(
+            target("s-1", "md", Some(480)).ok().as_deref(),
+            Some("/api/v1/sessions/s-1/export?format=md&tz=480")
+        );
+        assert_eq!(
+            target("s-1", "md", Some(-420)).ok().as_deref(),
+            Some("/api/v1/sessions/s-1/export?format=md&tz=-420")
+        );
+        // Out of range: left out, the daemon labels UTC.
+        assert_eq!(
+            target("s-1", "md", Some(5000)).ok().as_deref(),
+            Some("/api/v1/sessions/s-1/export?format=md")
+        );
     }
 
     #[test]

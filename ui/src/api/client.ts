@@ -572,10 +572,15 @@ export function dispositionName(header: string | null): string | null {
  * internal channel (app), read as bytes so the CSV zip is not mangled as text.
  * A daemon error is thrown as {@link ApiError}; the page shows it in place.
  */
+/** The reader's UTC offset in minutes; the Markdown report shows local times. */
+export function readerTz(): number {
+  return -new Date().getTimezoneOffset();
+}
+
 export async function fetchExport(sid: string, format: ExportFormat): Promise<ExportFile> {
   const headers = new Headers();
   if (token) headers.set("authorization", `Bearer ${token}`);
-  const response = await transportSendBytes(`${API}/sessions/${encodeURIComponent(sid)}/export?format=${format}`, {
+  const response = await transportSendBytes(`${API}/sessions/${encodeURIComponent(sid)}/export?format=${format}&tz=${readerTz()}`, {
     method: "GET",
     headers,
   });
@@ -616,7 +621,7 @@ export type ExportOutcome =
  * save (native dialog) and writes the file; in a browser it is a download.
  */
 export async function exportToFile(sid: string, format: ExportFormat): Promise<ExportOutcome> {
-  const inApp = await saveExportInApp(sid, format);
+  const inApp = await saveExportInApp(sid, format, readerTz());
   if (inApp === null) {
     const file = await fetchExport(sid, format);
     saveFile(file);

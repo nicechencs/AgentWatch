@@ -53,11 +53,11 @@ export interface SavedExport {
  * browser (the caller downloads instead). A rejected command (daemon not
  * reachable, write failed) comes back as the same error {@link send} gives.
  */
-export async function saveExportInApp(sid: string, format: string): Promise<SavedExport | Response | null> {
+export async function saveExportInApp(sid: string, format: string, tz?: number): Promise<SavedExport | Response | null> {
   const invoke = tauriInvoke();
   if (!invoke) return null;
   try {
-    return (await invoke("aw_save_export", { sid, format })) as SavedExport;
+    return (await invoke("aw_save_export", { sid, format, tz })) as SavedExport;
   } catch (err) {
     return channelFailure(err);
   }

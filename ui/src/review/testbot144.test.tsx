@@ -41,7 +41,8 @@ describe("Test-bot #144 real-window findings", () => {
   it("1: in the app, export goes through the shell's Save As and reports the path", async () => {
     const invoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
       expect(cmd).toBe("aw_save_export");
-      expect(args).toEqual({ sid: "s-1", format: "md" });
+      // The reader's UTC offset rides along so the report shows local times.
+      expect(args).toEqual({ sid: "s-1", format: "md", tz: -new Date().getTimezoneOffset() });
       return { status: 200, path: "/home/u/Documents/s-1.md", cancelled: false, error_body: null, bytes: 10 };
     });
     (window as unknown as W).__TAURI_INTERNALS__ = { invoke };

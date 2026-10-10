@@ -75,7 +75,7 @@ Each call runs on its own thread; a large export does not block other calls.
 ### `aw_save_export`
 
 ```ts
-invoke('aw_save_export', { sid: 's-1', format: 'jsonl' | 'csv' | 'md' })
+invoke('aw_save_export', { sid: 's-1', format: 'jsonl' | 'csv' | 'md', tz?: number /* minutes east of UTC */ })
   -> Promise<{
        status: number,              // export request status
        path: string | null,         // where the file was written
@@ -87,7 +87,8 @@ invoke('aw_save_export', { sid: 's-1', format: 'jsonl' | 'csv' | 'md' })
 
 The shell fetches `/api/v1/sessions/{sid}/export?format=…` on the channel. A
 daemon error comes back without opening a dialog. Otherwise the native "Save
-As" dialog (`tauri-plugin-dialog`, capability `dialog:allow-save`) opens with
+As" dialog (`tauri-plugin-dialog`, capability `dialog:allow-save`) opens in the
+user's Downloads folder (home if there is none; never the launch directory) with
 the daemon's file name (`agentwatch-<sid>.jsonl`, `.csv.zip`, `.md`); the exact
 bytes are written to the chosen path and the page shows "已保存到 <path>".
 A browser keeps the normal download. Rejects with `{ code, message }` as

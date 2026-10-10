@@ -8,6 +8,7 @@ import { useI18n, type Lang } from "@/lib/i18n";
 
 const zh = {
   title: "代理",
+  colon: "：",
   caFingerprint: "CA 指纹",
   caCreated: "创建时间",
   caExpires: "到期时间",
@@ -37,6 +38,7 @@ export type ProxyStrings = { [K in keyof typeof zh]: string };
 
 const en: ProxyStrings = {
   title: "Proxy",
+  colon: ": ",
   caFingerprint: "CA fingerprint",
   caCreated: "Created",
   caExpires: "Expires",
@@ -62,7 +64,9 @@ const en: ProxyStrings = {
   copied: "Copied",
 };
 
-const catalogs: Record<Lang, ProxyStrings> = { zh, en };
+/** Both catalogs, for the locale tests. */
+export const proxyCatalogs: Record<Lang, ProxyStrings> = { zh, en };
+const catalogs = proxyCatalogs;
 
 export function useProxyStrings(): ProxyStrings {
   return catalogs[useI18n().lang] ?? zh;

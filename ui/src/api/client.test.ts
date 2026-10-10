@@ -104,7 +104,7 @@ describe("export and live go through the request layer", () => {
     );
     const file = await fetchExport("s1", "csv");
     const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe("/api/v1/sessions/s1/export?format=csv");
+    expect(url).toBe(`/api/v1/sessions/s1/export?format=csv&tz=${-new Date().getTimezoneOffset()}`);
     expect(new Headers((init as RequestInit).headers).get("authorization")).toBe("Bearer k-test");
     expect(file.name).toBe("s1.zip");
     expect(new Uint8Array(await file.blob.arrayBuffer())).toEqual(zip);
@@ -117,7 +117,7 @@ describe("export and live go through the request layer", () => {
       .mockResolvedValue({ status: 200, headers: {}, body: "PK\u0003\u0004\ufffd", body_base64: btoa("PK\u0003\u0004\u00ff") });
     (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = { invoke };
     const file = await fetchExport("s1", "csv");
-    expect(invoke).toHaveBeenCalledWith("aw_request", expect.objectContaining({ target: "/api/v1/sessions/s1/export?format=csv" }));
+    expect(invoke).toHaveBeenCalledWith("aw_request", expect.objectContaining({ target: `/api/v1/sessions/s1/export?format=csv&tz=${-new Date().getTimezoneOffset()}` }));
     expect(Array.from(new Uint8Array(await file.blob.arrayBuffer()))).toEqual([0x50, 0x4b, 3, 4, 0xff]);
     // No disposition header: the default name says it is a zip of CSVs.
     expect(file.name).toBe("s1.csv.zip");

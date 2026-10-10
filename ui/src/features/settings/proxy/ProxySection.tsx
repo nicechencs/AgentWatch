@@ -53,9 +53,9 @@ export function ProxyView({ admin, config, ca, onTlsReject, notice, busy, onRota
         {ca.kind === "unavailable" ? <p className="text-ink-faint" data-ca="unavailable">{s.caUnavailable}</p> : null}
         {ca.kind === "none" ? <p className="text-ink-faint" data-ca="none">{s.caNone}</p> : null}
         {ca.kind === "error" ? <p className="text-ink-soft">{ca.message}</p> : null}
-        <p>{s.caFingerprint}：<span className="break-all font-mono" data-field="fingerprint">{fingerprint ?? unavailable}</span></p>
-        <p>{s.caCreated}：{createdNs ? <RelTime ns={createdNs} /> : unavailable}</p>
-        <p>{s.caExpires}：{expiresNs ? <RelTime ns={expiresNs} /> : unavailable}</p>
+        <p>{s.caFingerprint}{s.colon}<span className="break-all font-mono" data-field="fingerprint">{fingerprint ?? unavailable}</span></p>
+        <p>{s.caCreated}{s.colon}{createdNs ? <RelTime ns={createdNs} /> : unavailable}</p>
+        <p>{s.caExpires}{s.colon}{expiresNs ? <RelTime ns={expiresNs} /> : unavailable}</p>
         {ca.kind === "ok" && !ca.info.protected ? (
           <p className="text-ink-soft">{fill(s.caUnprotected, { reason: ca.info.unprotected_reason ?? "–" })}</p>
         ) : null}

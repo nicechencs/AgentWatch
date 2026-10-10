@@ -13,6 +13,7 @@ import { api } from "@/api/client";
 import type { Session } from "@/api/types";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { EmptyNote, ErrorNote, Loading } from "@/components/QueryState";
+import { capabilitiesUnknown, coverage, kindInSentence, uncollectedKinds } from "@/lib/capabilities";
 import { useI18n } from "@/lib/i18n";
 import { sessionTitle } from "@/lib/session-title";
 import { loadSide, type CompareSide } from "./api";
@@ -186,10 +187,39 @@ function PairView({
   );
 }
 
+/**
+ * Where the session ran. The session list leaves `platform` off (it is a column
+ * of the session row, not of the list item), so an empty string is "not sent",
+ * shown as 「不可得」 — never a blank after the colon.
+ */
+export function platformText(session: Pick<Session, "platform" | "os_version">, unavailable: string): string {
+  const platform = session.platform.trim();
+  if (!platform) return unavailable;
+  return session.os_version ? `${platform} ${session.os_version}` : platform;
+}
+
+/**
+ * Capabilities as the Settings page words them: 「进程 可采，文件 / 网络 / DNS
+ * 没采」. Kinds the collectors list only as NA are "not collected", not extra
+ * capabilities. No capability list at all is 「不可得」.
+ */
+export function capabilityText(
+  session: Pick<Session, "collectors">,
+  t: (key: string, vars?: Record<string, string | number>) => string,
+): string {
+  if (capabilitiesUnknown(session)) return t("common.unavailable");
+  const kinds = [...new Set(session.collectors.flatMap((collector) => collector.capabilities.map((item) => item.kind)))];
+  const collected = kinds.filter((kind) => coverage(session, kind) === "collected").map((kind) => kindInSentence(t, kind));
+  const missing = uncollectedKinds(session).map((kind) => kindInSentence(t, kind));
+  const parts: string[] = [];
+  if (collected.length > 0) parts.push(`${collected.join(t("common.listSep"))} ${t("settings.capYes")}`);
+  if (missing.length > 0) parts.push(`${missing.join(t("compare.kindSep"))} ${t("settings.capNo")}`);
+  return parts.join(t("common.listSep"));
+}
+
 function SideCard({ side, label }: { side: CompareSide; label: string }) {
   const { t } = useI18n();
   const { session } = side;
-  const kinds = session.collectors.flatMap((collector) => collector.capabilities.map((item) => item.kind));
   return (
     <section className="rounded border border-line p-3 text-xs">
       <h2 className="text-ink-faint">{label}</h2>
@@ -199,13 +229,12 @@ function SideCard({ side, label }: { side: CompareSide; label: string }) {
         </Link>
       </p>
       <p>{session.name ?? session.argv?.[0] ?? t("common.unavailable")}</p>
-      <p className="text-ink-faint">
-        {t("compare.platform")}{t("common.colon")}{session.platform}
-        {session.os_version ? ` ${session.os_version}` : ""}
+      <p className="text-ink-faint" data-platform="">
+        {t("compare.platform")}{t("common.colon")}{platformText(session, t("common.unavailable"))}
         {session.agent ? ` · ${session.agent}` : ""}
       </p>
-      <p className="mt-1 text-ink-faint">
-        {t("compare.collectors")}{t("common.colon")}{kinds.length > 0 ? kinds.join(", ") : t("common.unavailable")}
+      <p className="mt-1 text-ink-faint" data-capabilities="">
+        {t("compare.collectors")}{t("common.colon")}{capabilityText(session, t)}
       </p>
     </section>
   );

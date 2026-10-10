@@ -38,12 +38,16 @@ export function NewSessionPage() {
     }
   }, [client, navigate, t]);
 
+  // The error is about the last attempt. Editing the command or directory, or
+  // picking a process to attach, is a new attempt, so the old message goes.
+  const clearError = useCallback(() => setError(null), []);
+
   return (
     <main className="px-4 py-3">
       <h1 className="text-base font-semibold">{t("new.title")}</h1>
       <div className="mt-3 grid gap-4 lg:grid-cols-2">
-        <LaunchForm pending={pending} onStart={start} />
-        <AttachForm pending={pending} onStart={start} />
+        <LaunchForm pending={pending} onStart={start} onEdit={clearError} />
+        <AttachForm pending={pending} onStart={start} onPick={clearError} />
       </div>
       {error ? <ErrorNote error={error} /> : null}
       <section className="mt-4">
@@ -115,9 +119,12 @@ export function CapabilityList({ capabilities }: { capabilities: DoctorCapabilit
 export const LaunchForm = memo(function LaunchForm({
   pending,
   onStart,
+  onEdit,
 }: {
   pending: boolean;
   onStart: (body: Parameters<typeof api.createSession>[0]) => void;
+  /** Called when the command or directory is edited. The inputs stay uncontrolled. */
+  onEdit?: () => void;
 }) {
   const { t } = useI18n();
   const commandRef = useRef<HTMLInputElement>(null);
@@ -158,6 +165,7 @@ export const LaunchForm = memo(function LaunchForm({
           autoCapitalize="off"
           autoCorrect="off"
           spellCheck={false}
+          onInput={onEdit}
           className="mt-1 w-full rounded border border-line bg-paper px-2 py-1 font-mono"
         />
       </label>
@@ -171,6 +179,7 @@ export const LaunchForm = memo(function LaunchForm({
           autoCapitalize="off"
           autoCorrect="off"
           spellCheck={false}
+          onInput={onEdit}
           className="mt-1 w-full rounded border border-line bg-paper px-2 py-1 font-mono"
         />
       </label>
@@ -205,7 +214,16 @@ export const LaunchForm = memo(function LaunchForm({
   );
 });
 
-function AttachForm({ pending, onStart }: { pending: boolean; onStart: (body: Parameters<typeof api.createSession>[0]) => void }) {
+function AttachForm({
+  pending,
+  onStart,
+  onPick,
+}: {
+  pending: boolean;
+  onStart: (body: Parameters<typeof api.createSession>[0]) => void;
+  /** Called when a process is picked. A failed launch must not stay on screen. */
+  onPick?: () => void;
+}) {
   const { t } = useI18n();
   const [q, setQ] = useState("");
   // Off by default: the picker must show the program the user is looking
@@ -235,11 +253,12 @@ function AttachForm({ pending, onStart }: { pending: boolean; onStart: (body: Pa
         setCursor((current) => Math.max(0, current - 1));
       } else if (event.key === "Enter" && flat[cursor]) {
         setSelected(flat[cursor].pid);
+        onPick?.();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [flat, cursor]);
+  }, [flat, cursor, onPick]);
 
   return (
     <form
@@ -263,7 +282,10 @@ function AttachForm({ pending, onStart }: { pending: boolean; onStart: (body: Pa
           <li key={row.pid}>
             <button
               type="button"
-              onClick={() => setSelected(row.pid)}
+              onClick={() => {
+                setSelected(row.pid);
+                onPick?.();
+              }}
               className={`flex w-full items-center gap-2 px-2 py-1 text-left ${
                 selected === row.pid ? "bg-ink text-paper" : index === cursor ? "bg-paper-sunken" : ""
               }`}

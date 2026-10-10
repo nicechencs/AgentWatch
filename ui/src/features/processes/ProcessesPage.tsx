@@ -75,6 +75,7 @@ export function ProcessesPage() {
         <thead className="sticky top-0 bg-paper">
           <tr className="border-b border-line text-left text-ink-faint">
             <th className="px-3 py-1 font-normal">{t("procs.col.process")}</th>
+            <th className="px-2 py-1 font-normal">{t("procs.col.exitCode")}</th>
             <th className="px-2 py-1 font-normal">{t("procs.col.files")}</th>
             <th className="px-2 py-1 font-normal">{t("procs.col.writeDelete")}</th>
             <th className="px-2 py-1 font-normal">{t("procs.col.traffic")}</th>
@@ -153,6 +154,9 @@ function ProcessRow({
           ) : null}
         </div>
       </td>
+      <td className="px-2 py-1 font-mono" data-exit-code="">
+        <ExitCode code={node.exit_code} />
+      </td>
       <td className="px-2 py-1" title={folded ? t("procs.subtree") : t("procs.own")}>
         {fileCoverage === "not_collected" ? <NotCollected kind="file" /> : <Count value={files} />}
       </td>
@@ -204,6 +208,23 @@ function ContextMenu({ state, sid, onClose }: { state: MenuState; sid: string; o
       ))}
     </ul>
   );
+}
+
+/**
+ * Exit status as the daemon sent it. `null` was not observed (the poll sampler
+ * does not see a non-child's status), so it reads 「没采」, never `0` or blank.
+ * A real `0` is `0`.
+ */
+export function ExitCode({ code }: { code: number | null }) {
+  const { t } = useI18n();
+  if (code === null) {
+    return (
+      <span className="text-ink-faint" title={t("procs.exitNaTip")}>
+        {t("coverage.notCollectedShort")}
+      </span>
+    );
+  }
+  return <>{code}</>;
 }
 
 /**

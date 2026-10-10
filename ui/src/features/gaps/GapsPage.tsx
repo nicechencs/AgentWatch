@@ -44,7 +44,7 @@ export function GapsPage() {
           const missing = collector.capabilities.filter((item) => item.evidence === "NA");
           return (
             <section key={collector.name} className="rounded border border-line p-3 text-xs">
-              <h3 className="font-mono text-sm">{collector.name}</h3>
+              <h3 className="text-sm">{collectorName(t, collector.name)}</h3>
               {collector.mode ? <p className="text-ink-faint">{collector.mode}</p> : null}
               {collector.capabilities.length === 0 ? <p className="mt-2 text-ink-faint">{t("gaps.capsNotDescribed")}</p> : null}
               <CapabilityList title={t("gaps.provides")} items={available} />
@@ -73,8 +73,8 @@ export function GapsPage() {
                     {formatClockRange(gap.from_ns, gap.to_ns, timeFormat === "utc")}
                   </button>
                 </td>
-                <td className="px-2 py-1 font-mono">{gap.collector}</td>
-                <td className="px-2 py-1">{gap.kinds.join(", ")}</td>
+                <td className="px-2 py-1">{collectorLabel(t, gap)}</td>
+                <td className="px-2 py-1">{gap.kinds.map((kind) => kindLabel(t, kind)).join(t("common.listSep"))}</td>
                 <td className="px-2 py-1">{gap.affected.join(", ")}</td>
                 <td className="px-2 py-1"><Count value={gap.count} /></td>
                 <td className="px-2 py-1">
@@ -88,6 +88,28 @@ export function GapsPage() {
       ) : null}
     </div>
   );
+}
+
+/**
+ * The collector as Settings names it (`poll` → 「进程轮询」). A name with no
+ * catalog entry keeps its raw text.
+ */
+export function collectorName(t: (key: string) => string, name: string): string {
+  const key = `settings.collectorName.${name}`;
+  const text = t(key);
+  return text === key ? name : text;
+}
+
+/**
+ * The gap's collector, plus its source when that names a different collector.
+ * `source == collector` (both `poll`) used to read 「poll poll」.
+ */
+export function collectorLabel(t: (key: string) => string, gap: Pick<Gap, "collector"> & { source?: string | null }): string {
+  const name = collectorName(t, gap.collector);
+  const source = gap.source?.trim();
+  if (!source || source === gap.collector) return name;
+  const via = collectorName(t, source);
+  return via === name ? name : `${name} (${via})`;
 }
 
 function CapabilityList({ title, items }: { title: string; items: CollectorCapability[] }) {

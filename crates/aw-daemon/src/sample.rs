@@ -387,8 +387,8 @@ impl HostSampler {
         if batch_is_empty(&batch) {
             return Ok(());
         }
-        let mut store = Store::open(&self.db_path).map_err(store_io)?;
-        let mut writer = SqliteSink::new(&mut store).map_err(store_io)?;
+        let mut store = Store::open(&self.db_path).map_err(|err| store_io(&err))?;
+        let mut writer = SqliteSink::new(&mut store).map_err(|err| store_io(&err))?;
         match writer.write_batch(&batch) {
             Ok(()) => {
                 if !batch.sessions.is_empty() {
@@ -396,10 +396,13 @@ impl HostSampler {
                 }
                 Ok(())
             }
-            Err(_err) => {
-                // `_err` can name a filesystem path. The log line stays fixed.
+            Err(err) => {
+                // The SQLite reason is what tells a constraint failure from a
+                // locked or full disk. It used to be swallowed into a fixed
+                // string (BUGS B4). `store_reason` keeps the reason and drops
+                // any filesystem path.
                 self.pending_store_failure = true;
-                Err(io::Error::other("store_failure"))
+                Err(store_io(&err))
             }
         }
     }
@@ -426,8 +429,18 @@ fn batch_is_empty(batch: &WriteBatch) -> bool {
         && batch.gaps.is_empty()
 }
 
-fn store_io(_err: aw_store::StoreError) -> io::Error {
-    io::Error::other("store_failure")
+fn store_io(err: &aw_store::StoreError) -> io::Error {
+    io::Error::other(format!("store_failure: {}", store_reason(err)))
+}
+
+/// Why a store call failed, for the log. The operation and the SQLite or OS
+/// message only. An `Io` error's path is left out; row values are never part of
+/// a `StoreError`.
+fn store_reason(err: &aw_store::StoreError) -> String {
+    match err {
+        aw_store::StoreError::Io { op, source, .. } => format!("{op}: {}", source.kind()),
+        other => other.to_string(),
+    }
 }
 
 /// [`ProcUid`] of pid 1, hashed the way the poll collector hashes a row.
@@ -593,7 +606,9 @@ fn session_row(started_ns: i64) -> SessionRow {
     }
 }
 
-fn current_user_id() -> String {
+/// User id the daemon-wide sample session is recorded under. The preview UI
+/// ticket binds to the same id so a preview browser can see that session.
+pub(crate) fn current_user_id() -> String {
     #[cfg(unix)]
     {
         unix_uid_string()
@@ -1089,6 +1104,7 @@ fn json_string(text: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod depth_tests {
     use super::depths_by_pid;
     use aw_core::{Evidence, ProcUid, Source, StartHow};
@@ -1114,6 +1130,103 @@ mod depth_tests {
             source: Source::new("poll/test"),
             agent: None,
         }
+    }
+
+    fn proc_event(seq: u64, pid: u32, kind: aw_core::EventKind) -> aw_core::RawEvent {
+        aw_core::RawEvent::try_new(aw_core::RawEventParts {
+            seq,
+            ts_mono_ns: seq * 1_000,
+            ts_wall_ns: 1_700_000_000_000_000_000,
+            session_id: Some(aw_core::SessionId(1)),
+            proc: Some(aw_core::ProcRef {
+                uid: ProcUid(u64::from(pid) + 0x5000),
+                pid,
+                tid: None,
+            }),
+            source: Source::new("poll/sysinfo"),
+            evidence: Evidence::S,
+            kind,
+        })
+        .expect("event")
+    }
+
+    /// BUGS B4: a baseline process's exit arrived in a later tick as a second
+    /// `processes` row with the same key. The insert hit the primary key, the
+    /// whole batch rolled back, and the log only said `store_failure`.
+    #[test]
+    fn exit_of_a_baseline_process_is_stored_on_its_row() {
+        let dir = std::env::temp_dir().join(format!("aw-sample-exit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = dir.join("agentwatch.db");
+        let mut sampler = super::HostSampler::new(&db);
+        let start = aw_core::ProcessStart::new(
+            1,
+            None,
+            1_700_000_000_000_000_000,
+            None,
+            None,
+            None,
+            None,
+            StartHow::Snapshot,
+            None,
+            None,
+        );
+        let baseline = proc_event(1, 42, aw_core::EventKind::ProcessStart(start));
+        sampler.persist(&[baseline], 1).expect("baseline batch");
+        // A later tick: the exit, plus an unrelated new process.
+        let exit = proc_event(
+            2,
+            42,
+            aw_core::EventKind::ProcessExit(aw_core::ProcessExit::new(Some(0), None)),
+        );
+        let child = aw_core::ProcessStart::new(
+            1,
+            None,
+            1_700_000_001_000_000_000,
+            None,
+            None,
+            None,
+            None,
+            StartHow::Spawn,
+            None,
+            None,
+        );
+        let newcomer = proc_event(3, 43, aw_core::EventKind::ProcessStart(child));
+        sampler
+            .persist(&[exit, newcomer], 2)
+            .expect("the exit must not fail the batch");
+        assert!(!sampler.pending_store_failure);
+
+        let store = aw_store::Store::open(&db).expect("open");
+        let exit_ns: Option<i64> = store
+            .connection()
+            .query_row("SELECT exit_ns FROM processes WHERE pid = 42", [], |row| {
+                row.get(0)
+            })
+            .expect("row 42");
+        assert_eq!(exit_ns, Some(2_000));
+        let count: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM processes", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 2, "the new process in the same batch is stored");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_reason_keeps_the_cause_and_drops_the_path() {
+        let err = aw_store::StoreError::Io {
+            op: "backup",
+            path: Some(std::path::PathBuf::from(
+                "/home/someone/secret-dir/agentwatch.db",
+            )),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        let reason = super::store_reason(&err);
+        assert!(!reason.contains("secret-dir"), "path must not be logged");
+        assert!(reason.starts_with("backup: "), "{reason}");
     }
 
     #[test]

@@ -1,33 +1,16 @@
 /**
- * Findings endpoints (api-and-cli §3). They live beside the feature because
- * `src/api/client.ts` is outside this task's file scope; the request shape
- * (bearer token, JSON body, ApiError) mirrors that client.
+ * Findings endpoints (api-and-cli §3). Requests go through the shared
+ * `apiCall` in `src/api/client.ts`.
  */
 import { infiniteQueryOptions, queryOptions } from "@tanstack/react-query";
-import { api, getToken } from "@/api/client";
-import { ApiError } from "@/api/errors";
-import type { ApiErrorBody, TimelineItem } from "@/api/types";
+import { api, apiCall } from "@/api/client";
+import type { TimelineItem } from "@/api/types";
 import type { Lang } from "@/lib/i18n";
 import type { Finding, FindingRef, FindingsPage, UserState } from "./types";
 
-const API = "/api/v1";
 const PAGE = 500;
 
-async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const headers = new Headers();
-  if (body !== undefined) headers.set("content-type", "application/json");
-  const token = getToken();
-  if (token) headers.set("authorization", `Bearer ${token}`);
-  const response = await fetch(`${API}${path}`, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const text = response.status === 204 ? "" : await response.text();
-  const parsed = text ? (JSON.parse(text) as unknown) : null;
-  if (!response.ok) throw new ApiError(response.status, parsed as ApiErrorBody | null, response.statusText);
-  return parsed as T;
-}
+const call = apiCall;
 
 export function listFindings(sid: string, query: { lang: Lang; cursor?: string; limit?: number }): Promise<FindingsPage> {
   const search = new URLSearchParams({ lang: query.lang, limit: String(query.limit ?? PAGE) });

@@ -15,6 +15,7 @@
 mod eslogger;
 mod nettop;
 mod pktap;
+pub mod privilege;
 mod scope;
 mod sni;
 mod tier;

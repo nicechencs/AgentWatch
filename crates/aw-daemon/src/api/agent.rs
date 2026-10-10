@@ -725,3 +725,96 @@ impl OtlpRegistry {
         self.endpoints.remove(session_id);
     }
 }
+
+/// `GET /sessions/{sid}/agent-events?cursor=&limit=`: the session's E3
+/// self-reports, oldest first. Every row says `evidence: "E3"` (or `NA` with
+/// its reason) exactly as stored; nothing here upgrades it.
+///
+/// A database without the `agent_events` table (no hook ever reported) is an
+/// empty page with `reason: "no_self_reports"`, not an error.
+pub(crate) fn list_agent_events(
+    state: &super::routes::ApiState,
+    caller: &super::auth::Caller,
+    sid: &str,
+    raw_query: &str,
+) -> super::routes::ApiResponse {
+    use super::http_events::{json_response, open_owned, page_limit, query_pairs};
+    use super::routes::error_response;
+
+    let pairs = query_pairs(raw_query);
+    let limit = match page_limit(pairs.get("limit").map(String::as_str)) {
+        Ok(limit) => limit,
+        Err(response) => return response,
+    };
+    let after = match pairs.get("cursor").map(String::as_str) {
+        None | Some("") => 0_i64,
+        Some(text) => match text.parse::<i64>() {
+            Ok(id) => id,
+            Err(_) => return error_response(400, "bad_argument", "cursor: expected an integer"),
+        },
+    };
+    let (store, session_id) = match open_owned(state, &caller.user_id, sid) {
+        Ok(Some(pair)) => pair,
+        Ok(None) => return error_response(404, "not_found", "session not found"),
+        Err(response) => return response,
+    };
+    let conn = store.connection();
+    let present: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [AGENT_EVENTS_TABLE],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !present {
+        return json_response(
+            200,
+            &json!({ "events": [], "next_cursor": null, "reason": "no_self_reports" }),
+        );
+    }
+    let rows = conn
+        .prepare(
+            "SELECT id, ts_ns, agent, tool, phase, call_id, command, path, url, query, \
+                    evidence, source, na_reason \
+             FROM agent_events WHERE session_id = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![session_id, after, limit + 1], |row| {
+                Ok(json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "ts_ns": row.get::<_, i64>(1)?,
+                    "agent": row.get::<_, String>(2)?,
+                    "tool": row.get::<_, Option<String>>(3)?,
+                    "phase": row.get::<_, Option<String>>(4)?,
+                    "call_id": row.get::<_, Option<String>>(5)?,
+                    "command": row.get::<_, Option<String>>(6)?,
+                    "path": row.get::<_, Option<String>>(7)?,
+                    "url": row.get::<_, Option<String>>(8)?,
+                    "query": row.get::<_, Option<String>>(9)?,
+                    "evidence": row.get::<_, String>(10)?,
+                    "source": row.get::<_, String>(11)?,
+                    "na_reason": row.get::<_, Option<String>>(12)?,
+                }))
+            })?
+            .collect::<Result<Vec<Value>, _>>()
+        });
+    let mut events = match rows {
+        Ok(rows) => rows,
+        Err(err) => return error_response(500, "store", &err.to_string()),
+    };
+    let more = i64::try_from(events.len()).unwrap_or(i64::MAX) > limit;
+    if more {
+        events.truncate(usize::try_from(limit).unwrap_or(0));
+    }
+    let next = if more {
+        events
+            .last()
+            .and_then(|row| row.get("id"))
+            .and_then(Value::as_i64)
+            .map(|id| json!(id.to_string()))
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    json_response(200, &json!({ "events": events, "next_cursor": next }))
+}

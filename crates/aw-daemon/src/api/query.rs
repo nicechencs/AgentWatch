@@ -298,6 +298,7 @@ pub trait SessionQuery {
         admin: bool,
         older_than_ns: Option<i64>,
         all: bool,
+        dry_run: bool,
     ) -> Result<serde_json::Value, QueryBackendError>;
 
     /// `POST /db/vacuum`. Admin only.
@@ -969,6 +970,7 @@ impl SessionQuery for StoreQuery {
         admin: bool,
         older_than_ns: Option<i64>,
         all: bool,
+        dry_run: bool,
     ) -> Result<serde_json::Value, QueryBackendError> {
         if !admin {
             return Err(QueryBackendError::BadArgument {
@@ -991,6 +993,16 @@ impl SessionQuery for StoreQuery {
         let mut store = self.open_mut()?;
         let path = self.db_path.clone().ok_or_else(missing_db)?;
         let mut retention = Retention::new(&mut store, &path, RetentionConfig::default());
+        if dry_run {
+            let candidates = retention.purge_candidates(scope).map_err(map_store)?;
+            return Ok(serde_json::json!({
+                "dry_run": true,
+                "would_purge": candidates.iter().map(|(id, public_id)| serde_json::json!({
+                    "public_id": public_id,
+                    "session_id": id,
+                })).collect::<Vec<_>>(),
+            }));
+        }
         let reports = retention.purge(scope).map_err(map_store)?;
         Ok(serde_json::json!({
             "purged": reports.iter().map(|report| serde_json::json!({

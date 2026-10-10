@@ -9,6 +9,9 @@
 //! DDL itself makes: `INTEGER NOT NULL DEFAULT 0`, because those columns are
 //! accumulators. A missing flow byte count stays NULL and is not added in as zero.
 //!
+//! `processes` UPSERTs on its primary key `(session_id, proc_uid)`: a later exit
+//! fills the exit columns of the row its start wrote. See [`write_processes`].
+//!
 //! `net_flows` has no natural UNIQUE beyond `id`. The UPSERT is `ON CONFLICT(id)`.
 //! Callers pass the flow id. This crate does not invent a 5-tuple unique key.
 //!
@@ -540,6 +543,14 @@ fn write_sessions(tx: &Transaction<'_>, rows: &[SessionRow]) -> Result<(), Store
     Ok(())
 }
 
+/// Insert or merge `processes` rows on `(session_id, proc_uid)`.
+///
+/// One process is often written twice: its start in one batch and its exit in a
+/// later one (a poll exit for a baseline process carries no start). A plain
+/// INSERT hit the primary key and rolled back the whole batch (BUGS B4). The
+/// second write now only fills what the first left unknown: exit columns take
+/// the new value when it is known, and identity columns keep the first value.
+/// `start_ns`, `how`, `depth`, `evidence`, and `source` of the first row stay.
 fn write_processes(tx: &Transaction<'_>, rows: &[ProcessRow]) -> Result<(), StoreError> {
     if rows.is_empty() {
         return Ok(());
@@ -554,7 +565,16 @@ fn write_processes(tx: &Transaction<'_>, rows: &[ProcessRow]) -> Result<(), Stor
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                 ?8, ?9, ?10, ?11, ?12, ?13,
                 ?14, ?15, ?16, ?17
-             )",
+             )
+             ON CONFLICT (session_id, proc_uid) DO UPDATE SET
+                exit_ns     = COALESCE(excluded.exit_ns, processes.exit_ns),
+                exit_code   = COALESCE(excluded.exit_code, processes.exit_code),
+                exit_signal = COALESCE(excluded.exit_signal, processes.exit_signal),
+                parent_uid  = COALESCE(processes.parent_uid, excluded.parent_uid),
+                ppid        = COALESCE(processes.ppid, excluded.ppid),
+                user_id     = COALESCE(processes.user_id, excluded.user_id),
+                signer      = COALESCE(processes.signer, excluded.signer),
+                agent       = COALESCE(processes.agent, excluded.agent)",
         )
         .map_err(|err| StoreError::sqlite("prepare_processes", err))?;
     for row in rows {
@@ -989,6 +1009,73 @@ mod tests {
             )
             .expect("bucket");
         assert_eq!(bucket, 10);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// BUGS B4: a baseline process's exit arrives in a later batch as a second
+    /// row with the same `(session_id, proc_uid)`. That used to fail the whole
+    /// batch on the primary key, losing every other row in it.
+    #[test]
+    fn exit_for_an_existing_process_merges_instead_of_failing_the_batch() {
+        let path = temp_db("exit-merge");
+        let _ = std::fs::remove_file(&path);
+        let mut store = Store::open(&path).expect("open");
+        {
+            let mut sink = SqliteSink::new(&mut store).expect("sink");
+            let mut batch = WriteBatch::default();
+            batch.sessions.push(session(1));
+            let mut start = process(1, 7);
+            start.ppid = Some(1);
+            start.start_ns = 100;
+            start.how = "snapshot".to_string();
+            batch.processes.push(start);
+            sink.write_batch(&batch).expect("start batch");
+        }
+        {
+            let mut sink = SqliteSink::new(&mut store).expect("sink");
+            let mut batch = WriteBatch::default();
+            // Exit-only row as the daemon builds it: no ppid, start = exit time.
+            let mut exit = process(1, 7);
+            exit.start_ns = 900;
+            exit.exit_ns = Some(900);
+            exit.exit_code = Some(3);
+            exit.how = "unknown".to_string();
+            batch.processes.push(exit.clone());
+            // The same exit twice in one batch is merged too.
+            batch.processes.push(exit);
+            // An unrelated row in the same batch must still land.
+            batch.processes.push(process(1, 8));
+            sink.write_batch(&batch)
+                .expect("an exit for a known process must not fail the batch");
+        }
+        let conn = store.connection();
+        assert_eq!(count_rows(conn, "processes").expect("count"), 2);
+        let (start_ns, exit_ns, exit_code, ppid, how): (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT start_ns, exit_ns, exit_code, ppid, how FROM processes WHERE proc_uid = 7",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("row");
+        assert_eq!(start_ns, 100, "the observed start is kept");
+        assert_eq!(exit_ns, Some(900));
+        assert_eq!(exit_code, Some(3));
+        assert_eq!(ppid, Some(1), "a known ppid is not overwritten by NULL");
+        assert_eq!(how, "snapshot");
         let _ = std::fs::remove_file(&path);
     }
 

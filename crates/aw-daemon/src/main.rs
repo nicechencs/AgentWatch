@@ -32,6 +32,7 @@ mod collectors;
 mod config;
 mod file_hasher;
 mod paths;
+mod privilege;
 mod runtime;
 mod sample;
 mod service;

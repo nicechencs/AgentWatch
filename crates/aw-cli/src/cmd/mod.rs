@@ -33,6 +33,7 @@ mod sessions;
 mod stop;
 mod timeline;
 mod tree;
+mod ui;
 
 use std::io::{self, Write};
 
@@ -122,6 +123,10 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
         return Ok(error_outcome(exit::USAGE, "usage", &detail, json));
     }
 
+    if let Some(outcome) = channel_command(&cli, env_token.clone(), json) {
+        return Ok(outcome);
+    }
+
     let needs_endpoint = is_query(&cli.command) || is_wired_ops(&cli.command);
     if !needs_endpoint {
         // Stubs that probe `/health`, and ops that stay unwired (export, daemon).
@@ -155,6 +160,56 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
         ),
         json,
     ))
+}
+
+/// `aw ui`, `aw daemon start`, and `aw daemon status`: the commands that need
+/// the internal channel itself (api-and-cli §1). Production path only.
+fn channel_command(cli: &Cli, env_token: Option<String>, json: bool) -> Option<Outcome> {
+    let wanted = matches!(
+        cli.command,
+        Command::Ui { .. }
+            | Command::Daemon(tree::DaemonCmd::Start)
+            | Command::Daemon(tree::DaemonCmd::Status)
+    );
+    if !wanted {
+        return None;
+    }
+    let input = EndpointInput {
+        socket: cli.socket.clone(),
+        http: cli.http.clone(),
+        token: cli.token.clone(),
+        token_env: env_token,
+    };
+    let endpoint = match endpoint::resolve(&input) {
+        Ok(endpoint) => endpoint,
+        Err(err) => return Some(endpoint_outcome(err, json)),
+    };
+    let open = |endpoint: &Endpoint| -> Box<dyn Transport> {
+        match LoopbackHttp::new(endpoint) {
+            Ok(transport) => Box::new(transport),
+            Err(_) => Box::new(crate::client::MemoryTransport::failing(
+                "transport not built",
+            )),
+        }
+    };
+    Some(match &cli.command {
+        Command::Ui { no_open, port } => ui::ui(
+            &endpoint,
+            open(&endpoint),
+            *port,
+            *no_open,
+            json,
+            &mut ui::SystemOpener,
+        ),
+        Command::Daemon(tree::DaemonCmd::Start) => ui::daemon_start(
+            &endpoint,
+            &mut || open(&endpoint),
+            &mut ui::ProcessStarter,
+            ui::START_WAIT,
+            json,
+        ),
+        _ => ui::daemon_status(&endpoint, open(&endpoint), json),
+    })
 }
 
 fn is_query(command: &Command) -> bool {
@@ -586,7 +641,15 @@ fn ops_command(
     lang: Option<&str>,
     endpoint: Option<&Endpoint>,
 ) -> Option<Outcome> {
-    let privilege = daemon::NotAdmin;
+    // The production path (an endpoint) asks the OS. The test path keeps the
+    // fixed "not admin" so a test run as root or elevated stays deterministic.
+    let host_privilege = daemon::HostPrivilege;
+    let not_admin = daemon::NotAdmin;
+    let privilege: &dyn daemon::Privilege = if endpoint.is_some() {
+        &host_privilege
+    } else {
+        &not_admin
+    };
     match command {
         Command::Export {
             session,
@@ -635,7 +698,7 @@ fn ops_command(
             Some(daemon::run(
                 op,
                 json,
-                &privilege,
+                privilege,
                 &mut daemon::PlannedControl,
             ))
         }
@@ -660,7 +723,7 @@ fn ops_command(
                 Some(db::run(
                     op,
                     json,
-                    &privilege,
+                    privilege,
                     &db::FixedClock(0),
                     &mut db::HttpDbApi::new(endpoint.clone()),
                     &mut db::NotInteractive,
@@ -669,7 +732,7 @@ fn ops_command(
                 Some(db::run(
                     op,
                     json,
-                    &privilege,
+                    privilege,
                     &db::FixedClock(0),
                     &mut db::UnwiredApi,
                     &mut db::NotInteractive,
@@ -752,9 +815,8 @@ fn version_outcome(check: bool, json: bool) -> Outcome {
 fn probe(endpoint: &Endpoint, http: &mut dyn HttpFactory) -> Result<(), ClientError> {
     let transport: Box<dyn Transport> = match endpoint {
         Endpoint::Http { .. } => http.open(endpoint)?,
-        Endpoint::Unix { .. } | Endpoint::Pipe { .. } => {
-            Box::new(crate::client::MemoryTransport::default())
-        }
+        // The internal channel is dialled for real: a missing socket is exit 3.
+        Endpoint::Unix { .. } | Endpoint::Pipe { .. } => Box::new(LoopbackHttp::new(endpoint)?),
     };
     let mut client = Client::new(endpoint.clone(), transport);
     let _reply = client.call(&ApiRequest::get("/health"))?;

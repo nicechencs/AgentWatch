@@ -1,7 +1,7 @@
 # ADR-0001 使用单一 Rust workspace 实现核心
 
 > 状态：已接受
-> 最后更新：2026-10-06
+> 最后更新：2026-10-10
 > 关联：REQ-01、NFR-01~04、NFR-07、NFR-08、ADR-0010
 
 ## 背景
@@ -14,6 +14,8 @@
   `aw-core`、`aw-pipeline`、`aw-store`、`aw-proxy`、`aw-daemon`、`aw-cli`、`aw-collector-{linux,windows,macos,poll}`、`aw-ebpf`、`aw-agent-adapters`。
 - 只有 macOS 的 Network Extension 用 Swift 写（放在 `macos-ext/`），因为系统扩展的入口只能用 Swift/ObjC。
 - 前端用 TypeScript，见 ADR-0002。
+- 桌面 App 是主要形态（2026-10-10 修订，见 ADR-0002）：外壳用 **Tauri 2（Rust）**，放在 `app/src-tauri/`（crate `aw-desktop`）。它自带一个 `[workspace]`，**不是**根 workspace 的成员：Linux 上编译它需要 webkit2gtk 等系统库，留在根 workspace 会让每个 runner 的 `cargo build/test --workspace` 都依赖这些库。外壳只依赖 Tauri 和标准库，不依赖 `aw-daemon` 等核心 crate，与 daemon 之间只走内部通道（ADR-0005）。
+- 不引入 Go。外壳、daemon、CLI 都留在 Rust；本 ADR 的备选表里 Go 的结论不变。
 - 依赖方向：平台 crate 只依赖 `aw-core`；`aw-pipeline` 和 `aw-store` 不依赖任何平台 crate；只有 `aw-daemon` 把它们组装起来。
 - 编译提速：
   - 平台 crate 用 `cfg(target_os)` 隔离，非当前平台的 crate 编译为空。

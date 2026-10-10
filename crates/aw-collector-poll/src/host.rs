@@ -1,12 +1,16 @@
 //! Live process and connection adapters.
 //!
-//! Tests do not construct these types. [`crate::PollCollector::with_host`] is the
-//! only constructor that does, and unit tests use the static sources instead.
+//! [`crate::PollCollector::with_host`] is the only production constructor, and
+//! collector unit tests use the static sources instead. One test in this module
+//! builds a [`HostProcessSource`] restricted to the test process itself, to prove
+//! that a child started after the baseline is returned.
 //!
 //! `sysinfo::System` and raw `netstat` text are not `Debug`: both can carry command
 //! lines. Nothing in this module prints a process row.
 
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use std::collections::HashSet;
+
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use aw_core::NaReason;
 
@@ -20,8 +24,8 @@ use crate::source::{
 /// Not `Debug`: the inner [`System`] retains command lines.
 pub struct HostProcessSource {
     system: System,
-    /// `None` refreshes every process. `Some` refreshes only those pids, and an
-    /// empty slice refreshes nothing.
+    /// `None` returns every process. `Some(pids)` returns those pids and their
+    /// descendants, and an empty slice touches nothing.
     restrict: Option<Vec<u32>>,
 }
 
@@ -41,34 +45,30 @@ impl ProcessSource for HostProcessSource {
             .with_exe(UpdateKind::OnlyIfNotSet)
             .with_cmd(UpdateKind::OnlyIfNotSet)
             .with_cwd(UpdateKind::OnlyIfNotSet);
-        match self.restrict.as_deref() {
-            Some([]) => {
-                // Launch mode, or an attach whose roots are not in the table yet.
-                // Do not scan the machine.
-            }
-            Some(pids) => {
-                let owned: Vec<Pid> = pids.iter().copied().map(Pid::from_u32).collect();
-                self.system.refresh_processes_specifics(
-                    ProcessesToUpdate::Some(&owned),
-                    true,
-                    kind,
-                );
-            }
-            None => {
-                self.system
-                    .refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
-            }
+        if matches!(self.restrict.as_deref(), Some([])) {
+            // Launch mode, or an attach whose roots are not in the table yet.
+            // Do not scan the machine.
+            return Ok(ProcessSnapshot {
+                boot_id: read_boot_id(),
+                rows: Vec::new(),
+            });
         }
-        let mut rows = Vec::new();
-        for process in self.system.processes().values() {
-            let pid = process.pid().as_u32();
-            if let Some(only) = self.restrict.as_deref() {
-                if !only.contains(&pid) {
-                    continue;
-                }
-            }
-            rows.push(row_from_process(process));
-        }
+        // A pid list is not enough to refresh: `sysinfo` only discovers a pid it
+        // is asked to enumerate, so refreshing just the watched pids would never
+        // show a child started after the baseline (BUGS B4). The table is read
+        // in full and narrowed to the watched subtree afterwards.
+        self.system
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+        let all: Vec<ProcessRow> = self
+            .system
+            .processes()
+            .values()
+            .map(row_from_process)
+            .collect();
+        let rows = match self.restrict.as_deref() {
+            Some(roots) => keep_subtrees(all, roots),
+            None => all,
+        };
         Ok(ProcessSnapshot {
             boot_id: read_boot_id(),
             rows,
@@ -78,6 +78,29 @@ impl ProcessSource for HostProcessSource {
     fn set_restrict(&mut self, restrict: Option<&[u32]>) {
         self.restrict = restrict.map(<[u32]>::to_vec);
     }
+}
+
+/// Rows for `roots` and every descendant of them, by `ppid`.
+///
+/// A child whose parent is in the set is kept even when it appeared after the
+/// last sample, and so is a grandchild started in the same interval. Rows
+/// outside the subtrees are dropped here so the collector never sees them.
+fn keep_subtrees(rows: Vec<ProcessRow>, roots: &[u32]) -> Vec<ProcessRow> {
+    let mut keep: HashSet<u32> = roots.iter().copied().collect();
+    loop {
+        let before = keep.len();
+        for row in &rows {
+            if !keep.contains(&row.pid) && row.ppid.is_some_and(|ppid| keep.contains(&ppid)) {
+                keep.insert(row.pid);
+            }
+        }
+        if keep.len() == before {
+            break;
+        }
+    }
+    rows.into_iter()
+        .filter(|row| keep.contains(&row.pid))
+        .collect()
 }
 
 fn row_from_process(process: &sysinfo::Process) -> ProcessRow {
@@ -239,5 +262,86 @@ fn read_sysinfo_boot_seconds() -> Option<Vec<u8>> {
         None
     } else {
         Some(secs.to_string().into_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keep_subtrees;
+    use crate::source::{ProcessRow, ProcessSource, ProcessStartTime};
+
+    fn row(pid: u32, ppid: Option<u32>) -> ProcessRow {
+        ProcessRow::bare(pid, ppid, ProcessStartTime::UnixSeconds(1_700_000_000))
+    }
+
+    fn pids(rows: &[ProcessRow]) -> Vec<u32> {
+        let mut out: Vec<u32> = rows.iter().map(|row| row.pid).collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn subtree_keeps_new_children_and_grandchildren_only() {
+        let rows = vec![
+            row(1, None),
+            row(10, Some(1)),
+            row(11, Some(10)),
+            row(12, Some(11)),
+            row(20, Some(2)),
+        ];
+        assert_eq!(pids(&keep_subtrees(rows.clone(), &[10])), vec![10, 11, 12]);
+        assert_eq!(pids(&keep_subtrees(rows, &[1])), vec![1, 10, 11, 12]);
+    }
+
+    /// BUGS B4: the host source only refreshed the watched pids, so a process
+    /// started after the baseline never appeared. This spawns a real child of
+    /// the test process and expects the restricted snapshot to return it.
+    #[test]
+    fn restricted_host_snapshot_sees_a_child_started_later() {
+        let me = std::process::id();
+        let mut source = super::HostProcessSource::new();
+        source.set_restrict(Some(&[me]));
+        let before = source.snapshot().map(|snap| pids(&snap.rows));
+        assert!(before.as_ref().is_ok_and(|rows| rows.contains(&me)));
+
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        // Re-run this test binary on a test that only sleeps, so the child is
+        // alive while the next snapshot is taken. Works on every runner.
+        let child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "host::tests::sleeper_for_child_test",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            panic!("could not spawn the child test process");
+        };
+        let child_pid = child.id();
+        let mut seen = false;
+        for _ in 0..20 {
+            if source
+                .snapshot()
+                .is_ok_and(|snap| snap.rows.iter().any(|row| row.pid == child_pid))
+            {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(seen, "a child started after the baseline must be returned");
+    }
+
+    #[test]
+    #[ignore = "helper process for restricted_host_snapshot_sees_a_child_started_later"]
+    fn sleeper_for_child_test() {
+        std::thread::sleep(std::time::Duration::from_secs(5));
     }
 }

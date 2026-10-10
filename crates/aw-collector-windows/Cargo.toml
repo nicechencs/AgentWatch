@@ -28,6 +28,9 @@ aw-core = { workspace = true }
 ferrisetw = "=1.2.0"
 windows = { version = "=0.57.0", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_Performance",
@@ -36,6 +39,9 @@ windows = { version = "=0.57.0", features = [
 ] }
 arc-swap = "=1.7.1"
 widestring = "=1.0.2"
+# tokio is MIT, a workspace dependency already. `pipe.rs` creates the daemon's
+# named pipe with an explicit DACL through tokio's raw security-attributes API.
+tokio = { workspace = true }
 
 # Not `workspace = true`. Inheriting the workspace table forces
 # `--forbid=unsafe_code` on the rustc command line, and a command-line forbid

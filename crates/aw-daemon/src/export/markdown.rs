@@ -83,11 +83,22 @@ fn build_report(
         .map_err(|err| ReportError::Store(err.to_string()))?
         .ok_or_else(|| ReportError::Store("session not found".to_owned()))?;
     let header = load_header(conn, session_id, user_id)?;
-    let findings =
-        findings_for_report(conn, session_id, user_id, lang).map_err(ReportError::Store)?;
+    // A database whose http/findings migration never ran has no `findings`
+    // table: no rule has written anything, so the section is empty. Any other
+    // error is still a 500.
+    let findings = if table_exists(conn, "findings") {
+        findings_for_report(conn, session_id, user_id, lang).map_err(ReportError::Store)?
+    } else {
+        Vec::new()
+    };
     let gaps = load_gaps(conn, session_id, user_id)?;
     let domains = load_domains(conn, session_id, user_id, redact_hosts)?;
-    let files = load_files(conn, session_id, user_id, redact_paths)?;
+    // Same for `file_access` (migration 0003): absent means no file rows.
+    let files = if table_exists(conn, "file_access") {
+        load_files(conn, session_id, user_id, redact_paths)?
+    } else {
+        Vec::new()
+    };
 
     let mut prose = String::new();
     push_overview(&mut prose, &summary, &header, lang);
@@ -155,6 +166,15 @@ fn load_header(
     .map_err(|err| ReportError::Store(err.to_string()))
 }
 
+fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [name],
+        |row| row.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
 struct GapLine {
     collector: String,
     kind: String,
@@ -169,7 +189,7 @@ fn load_gaps(
 ) -> Result<Vec<GapLine>, ReportError> {
     let mut stmt = conn
         .prepare(
-            "SELECT collector, kind, count, reason FROM gaps \
+            "SELECT collector, kind, count, detail FROM gaps \
              WHERE session_id = ?1 \
                AND EXISTS ( \
                  SELECT 1 FROM sessions s \
@@ -727,5 +747,32 @@ fn rule_name(rule: RuleId) -> &'static str {
         RuleId::InstructedSteal => "instructed_steal",
         RuleId::UploadedVia => "uploaded_via",
         RuleId::ContentMatchPhrase => "content_match_phrase",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_gaps;
+
+    #[test]
+    fn gap_query_matches_the_migrated_schema() {
+        // `gaps` has `detail`, not `reason`. The report query ran only against a
+        // real database, so a wrong column was a 500 on every md export.
+        let dir = std::env::temp_dir().join(format!(
+            "aw-md-gaps-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let store = aw_store::Store::open(dir.join("t.db"));
+        assert!(store.is_ok());
+        if let Ok(store) = store {
+            let rows = load_gaps(store.connection(), 1, "u");
+            assert!(rows.is_ok());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

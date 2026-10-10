@@ -49,6 +49,27 @@ rusqlite = { version = "0.32.1", features = ["bundled"] }
 rust-embed = { version = "8.7.2", default-features = false, features = ["include-exclude"] }
 flate2 = { version = "1.1.2", default-features = false, features = ["rust_backend"] }
 ureq = { version = "3.3.0", default-features = false }
+# getrandom 0.3: MIT OR Apache-2.0, already in Cargo.lock. OS CSPRNG for UI
+# tickets and tokens (256-bit), so a local process cannot guess them.
+getrandom = { version = "0.3.4", default-features = false }
+
+# Internal channel peer credential (api/ipc.rs). rustix 1.1.4: Apache-2.0 WITH
+# LLVM-exception OR Apache-2.0 OR MIT, already in Cargo.lock. `SO_PEERCRED`
+# without `unsafe` in this crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["std", "net"] }
+
+# Unix: getpeereid (macOS peer uid), geteuid (daemon owner), getgrnam (the
+# `agentwatch` socket group). nix is MIT; std has no stable peer credential
+# API and rustix exposes SO_PEERCRED only on Linux.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", default-features = false, features = ["user", "socket"] }
+
+# Windows named pipe listener (api/ipc.rs). tokio is MIT, already a workspace
+# dependency (aw-proxy); `net` carries `named_pipe` on Windows. The pipe DACL
+# and client token live in aw-collector-windows::pipe (this crate forbids unsafe).
+[target.'cfg(windows)'.dependencies]
+tokio = { workspace = true }
 
 [lints]
 workspace = true

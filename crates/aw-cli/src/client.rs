@@ -1,12 +1,13 @@
 //! Daemon client.
 //!
 //! The transport is a trait so tests can answer HTTP without a socket. The
-//! production transport ([`LoopbackHttp`]) speaks the loopback stub in
-//! `aw-daemon`'s `api/routes.rs`: `GET`/`POST`, a `Host` of `127.0.0.1:<port>`
-//! or `localhost:<port>`, and `Authorization: Bearer <token>`. Unix sockets and
-//! named pipes are the CLI's real channel (api-and-cli §1) but this daemon
-//! build does not listen on them, so those endpoints return
-//! [`ClientError::Unreachable`] instead of pretending a connection succeeded.
+//! production transport ([`LoopbackHttp`]) writes one HTTP/1.1 request to the
+//! daemon and reads one response. On the internal channel (Unix socket or
+//! named pipe, api-and-cli §1) no `Authorization` is sent: the daemon
+//! identifies the peer by its OS credential. On loopback HTTP the request
+//! carries a `Host` of `127.0.0.1:<port>` or `localhost:<port>` and
+//! `Authorization: Bearer <token>`. A socket or pipe nobody listens on is
+//! [`ClientError::Unreachable`] (exit 3), not a pretend success.
 //!
 //! No request is sent unless [`Client::call`] is used. The binary's `--help`
 //! path never constructs a client.
@@ -198,34 +199,18 @@ impl<T: Transport> Client<T> {
     ///
     /// # Errors
     ///
-    /// [`ClientError::Unreachable`] for socket and pipe endpoints in this card
-    /// (the daemon stub does not listen there) and for a refused HTTP connect.
+    /// [`ClientError::Unreachable`] when nothing answers on the socket, pipe,
+    /// or loopback port.
     /// [`ClientError::Status`] when the daemon answers with a non-2xx status.
     pub fn call(&mut self, request: &ApiRequest) -> Result<ApiReply, ClientError> {
-        match &self.endpoint {
-            Endpoint::Unix { path } => Err(ClientError::Unreachable {
-                detail: format!(
-                    "unix socket {} is the CLI channel, but this daemon build has no socket listener",
-                    path.display()
-                ),
-            }),
-            Endpoint::Pipe { path } => Err(ClientError::Unreachable {
-                detail: format!(
-                    "named pipe {} is the CLI channel, but this daemon build has no pipe listener",
-                    path.display()
-                ),
-            }),
-            Endpoint::Http { .. } => {
-                let reply = self.transport.exchange(request)?;
-                if (200..300).contains(&reply.status) {
-                    Ok(reply)
-                } else {
-                    Err(ClientError::Status {
-                        status: reply.status,
-                        message: status_message(&reply),
-                    })
-                }
-            }
+        let reply = self.transport.exchange(request)?;
+        if (200..300).contains(&reply.status) {
+            Ok(reply)
+        } else {
+            Err(ClientError::Status {
+                status: reply.status,
+                message: status_message(&reply),
+            })
         }
     }
 }
@@ -258,74 +243,157 @@ fn status_message(reply: &ApiReply) -> String {
 /// name the host and port, never the token.
 #[derive(Clone)]
 pub struct LoopbackHttp {
-    base: HttpBase,
-    token: String,
+    target: Target,
     timeout: Duration,
 }
 
+/// Where [`LoopbackHttp`] dials.
+#[derive(Clone)]
+enum Target {
+    Http { base: HttpBase, token: String },
+    Socket { path: std::path::PathBuf },
+    Pipe { path: std::path::PathBuf },
+}
+
 impl LoopbackHttp {
-    /// Transport for `endpoint`. Non-HTTP endpoints still construct, and fail at
-    /// [`Transport::exchange`] time: the caller should have used [`Client::call`],
-    /// which refuses them first.
+    /// Transport for `endpoint`. Does not dial.
     ///
     /// # Errors
     ///
-    /// [`ClientError::Transport`] when `endpoint` is not HTTP. That is a programming
-    /// error, not a missing daemon.
+    /// Never today. Kept fallible so callers do not change when a transport
+    /// needs setup.
     pub fn new(endpoint: &Endpoint) -> Result<Self, ClientError> {
-        match endpoint {
-            Endpoint::Http { base, token } => Ok(Self {
+        let target = match endpoint {
+            Endpoint::Http { base, token } => Target::Http {
                 base: base.clone(),
                 token: token.clone(),
-                timeout: Duration::from_secs(2),
-            }),
-            Endpoint::Unix { .. } | Endpoint::Pipe { .. } => Err(ClientError::Transport {
-                detail: "LoopbackHttp only dials an http endpoint".to_owned(),
-            }),
-        }
+            },
+            Endpoint::Unix { path } => Target::Socket { path: path.clone() },
+            Endpoint::Pipe { path } => Target::Pipe { path: path.clone() },
+        };
+        Ok(Self {
+            target,
+            timeout: Duration::from_secs(5),
+        })
     }
 }
 
 impl Transport for LoopbackHttp {
     fn exchange(&mut self, request: &ApiRequest) -> Result<ApiReply, ClientError> {
-        if self.base.host.eq_ignore_ascii_case("localhost") {
-            // The stub accepts a Host of `localhost:<port>`, but the TCP dial
-            // stays numeric so a DNS answer cannot redirect it.
+        match &self.target {
+            Target::Http { base, token } => http_exchange(base, token, self.timeout, request),
+            Target::Socket { path } => socket_exchange(path, self.timeout, request),
+            Target::Pipe { path } => pipe_exchange(path, request),
         }
-        let addr = SocketAddr::from(([127, 0, 0, 1], self.base.port));
-        let mut stream = TcpStream::connect_timeout(&addr, self.timeout).map_err(|_| {
-            ClientError::Unreachable {
-                detail: format!(
-                    "tcp connect to {} timed out or was refused (token {})",
-                    self.base.origin(),
-                    token_hint(&self.token)
-                ),
-            }
-        })?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .map_err(|err| ClientError::Transport {
-                detail: format!("set read timeout: {err}"),
-            })?;
-        stream
-            .set_write_timeout(Some(self.timeout))
-            .map_err(|err| ClientError::Transport {
-                detail: format!("set write timeout: {err}"),
-            })?;
-        let bytes = encode_request(&self.base, &self.token, request);
-        stream
-            .write_all(&bytes)
-            .map_err(|err| ClientError::Transport {
-                detail: format!("write request: {err}"),
-            })?;
-        let mut buf = Vec::new();
-        stream
-            .read_to_end(&mut buf)
-            .map_err(|err| ClientError::Transport {
-                detail: format!("read response: {err}"),
-            })?;
-        parse_response(&buf).map_err(|detail| ClientError::Transport { detail })
     }
+}
+
+fn http_exchange(
+    base: &HttpBase,
+    token: &str,
+    timeout: Duration,
+    request: &ApiRequest,
+) -> Result<ApiReply, ClientError> {
+    // The dial stays numeric even for `localhost`, so a DNS answer cannot redirect it.
+    let addr = SocketAddr::from(([127, 0, 0, 1], base.port));
+    let mut stream =
+        TcpStream::connect_timeout(&addr, timeout).map_err(|_| ClientError::Unreachable {
+            detail: format!(
+                "tcp connect to {} timed out or was refused (token {})",
+                base.origin(),
+                token_hint(token)
+            ),
+        })?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| ClientError::Transport {
+            detail: format!("set read timeout: {err}"),
+        })?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| ClientError::Transport {
+            detail: format!("set write timeout: {err}"),
+        })?;
+    let bytes = encode_request(base, token, request);
+    roundtrip(&mut stream, &bytes)
+}
+
+#[cfg(unix)]
+fn socket_exchange(
+    path: &std::path::Path,
+    timeout: Duration,
+    request: &ApiRequest,
+) -> Result<ApiReply, ClientError> {
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(path).map_err(|err| ClientError::Unreachable {
+            detail: format!("unix socket {}: {}", path.display(), err.kind()),
+        })?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    roundtrip(&mut stream, &encode_local_request(request))
+}
+
+#[cfg(not(unix))]
+fn socket_exchange(
+    path: &std::path::Path,
+    _timeout: Duration,
+    _request: &ApiRequest,
+) -> Result<ApiReply, ClientError> {
+    Err(ClientError::Unreachable {
+        detail: format!(
+            "unix socket {} is not available on this operating system",
+            path.display()
+        ),
+    })
+}
+
+/// A Windows named pipe opens like a file. No platform API is named here.
+fn pipe_exchange(path: &std::path::Path, request: &ApiRequest) -> Result<ApiReply, ClientError> {
+    let mut pipe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|err| ClientError::Unreachable {
+            detail: format!("named pipe {}: {}", path.display(), err.kind()),
+        })?;
+    roundtrip(&mut pipe, &encode_local_request(request))
+}
+
+fn roundtrip<S: Read + Write>(stream: &mut S, bytes: &[u8]) -> Result<ApiReply, ClientError> {
+    stream
+        .write_all(bytes)
+        .map_err(|err| ClientError::Transport {
+            detail: format!("write request: {err}"),
+        })?;
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .map_err(|err| ClientError::Transport {
+            detail: format!("read response: {err}"),
+        })?;
+    parse_response(&buf).map_err(|detail| ClientError::Transport { detail })
+}
+
+/// Request bytes for the socket or pipe: no `Authorization`, the peer
+/// credential is the identity.
+fn encode_local_request(request: &ApiRequest) -> Vec<u8> {
+    let path = if request.query.is_empty() {
+        request.path.clone()
+    } else {
+        format!("{}?{}", request.path, request.query)
+    };
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: agentwatch.local\r\nConnection: close\r\nAccept: application/json\r\nContent-Length: {len}\r\n",
+        method = request.method,
+        len = request.body.len(),
+    );
+    if !request.body.is_empty() {
+        head.push_str("Content-Type: application/json\r\n");
+    }
+    head.push_str("\r\n");
+    let mut out = head.into_bytes();
+    out.extend_from_slice(&request.body);
+    out
 }
 
 /// HTTP/1.1 request bytes. `Authorization` is included. Callers must not log `bytes`.
@@ -481,15 +549,16 @@ mod tests {
     }
 
     #[test]
-    fn socket_endpoint_is_unreachable_without_dialing() {
+    fn missing_socket_is_unreachable_exit_3() {
         let endpoint = resolve(&EndpointInput {
-            socket: Some("/tmp/does-not-exist.sock".to_owned()),
+            socket: Some("/tmp/aw-does-not-exist.sock".to_owned()),
             http: None,
             token: None,
             token_env: None,
         })
         .expect("socket");
-        let mut client = Client::new(endpoint, MemoryTransport::replying(200, Vec::new()));
+        let transport = super::LoopbackHttp::new(&endpoint).expect("transport");
+        let mut client = Client::new(endpoint, transport);
         let err = client
             .call(&ApiRequest::get("/health"))
             .expect_err("socket");
@@ -497,10 +566,49 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("aw daemon start"), "{text}");
         assert!(text.contains("--no-daemon"), "{text}");
+    }
+
+    /// The bug: socket endpoints were refused before any dial, so `aw` could
+    /// never reach a daemon on its documented channel.
+    #[cfg(unix)]
+    #[test]
+    fn socket_endpoint_dials_and_sends_no_bearer() {
+        use std::io::{Read, Write};
+        let dir = std::env::temp_dir().join(format!("aw-cli-sock-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("api.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0_u8; 4096];
+            let n = stream.read(&mut buf).expect("read");
+            let seen = String::from_utf8_lossy(&buf[..n]).into_owned();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"status\":\"ok\"}",
+                )
+                .expect("write");
+            seen
+        });
+        let endpoint = resolve(&EndpointInput {
+            socket: Some(path.display().to_string()),
+            http: None,
+            token: Some("unit-test-token-ABCD".to_owned()),
+            token_env: None,
+        })
+        .expect("socket");
+        let transport = super::LoopbackHttp::new(&endpoint).expect("transport");
+        let mut client = Client::new(endpoint, transport);
+        let reply = client.call(&ApiRequest::get("/health")).expect("call");
+        assert_eq!(reply.status, 200);
+        let seen = server.join().expect("join");
+        assert!(seen.starts_with("GET /health HTTP/1.1\r\n"), "{seen}");
         assert!(
-            client.transport.seen.is_empty(),
-            "socket path must not hit the transport"
+            !seen.to_ascii_lowercase().contains("authorization"),
+            "{seen}"
         );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

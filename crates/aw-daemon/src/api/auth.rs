@@ -104,12 +104,32 @@ pub struct UiTicket {
 /// In-memory tickets and the tokens they redeem into.
 ///
 /// Nothing here is written to disk. Dropping the store drops every token.
+/// Ticket and token secrets are 256 bits from the operating system CSPRNG,
+/// hex-encoded. A counter or a timestamp would let any local process guess
+/// the next value.
 #[derive(Debug, Default)]
 pub struct TicketStore {
     tickets: HashMap<String, UiTicket>,
     /// token → (user_id, admin, expires_at_unix).
     tokens: HashMap<String, (String, bool, u64)>,
-    next_id: u64,
+}
+
+/// Random secret bytes. 32 bytes = 256 bits.
+const SECRET_BYTES: usize = 32;
+
+/// `prefix` + 64 hex chars from the OS CSPRNG.
+///
+/// If the OS refuses randomness the secret is empty, and callers refuse to
+/// store it: an empty or predictable secret is never handed out.
+fn random_secret(prefix: &str) -> Option<String> {
+    let mut bytes = [0_u8; SECRET_BYTES];
+    getrandom::fill(&mut bytes).ok()?;
+    let mut out = String::with_capacity(prefix.len() + SECRET_BYTES * 2);
+    out.push_str(prefix);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    Some(out)
 }
 
 impl TicketStore {
@@ -122,17 +142,37 @@ impl TicketStore {
     /// Issue a one-time ticket for `user_id` at `now` (unix seconds).
     ///
     /// Returns `(ticket, secret)`. The secret is the only copy of the ticket
-    /// id. Callers must not log it.
+    /// id. Callers must not log it. Expired tickets are dropped first, so an
+    /// unredeemed ticket does not stay in memory forever.
+    ///
+    /// If the OS CSPRNG fails, the returned secret is empty and nothing is
+    /// stored; redeeming an empty ticket is refused.
     pub fn issue_ui_ticket(&mut self, user_id: &str, admin: bool, now: u64) -> (UiTicket, String) {
-        self.next_id = self.next_id.saturating_add(1);
-        let secret = format!("t-{}-{now}", self.next_id);
+        self.prune(now);
         let ticket = UiTicket {
             user_id: user_id.to_owned(),
             admin,
             issued_at: now,
         };
+        let Some(secret) = random_secret("t-") else {
+            return (ticket, String::new());
+        };
         self.tickets.insert(secret.clone(), ticket.clone());
         (ticket, secret)
+    }
+
+    /// Drop tickets and tokens whose lifetime ended at or before `now`.
+    pub fn prune(&mut self, now: u64) {
+        self.tickets
+            .retain(|_, ticket| now < ticket.issued_at.saturating_add(UI_TICKET_TTL));
+        self.tokens
+            .retain(|_, (_, _, expires_at)| now < *expires_at);
+    }
+
+    /// Number of live tickets. Tests and `Debug` only; never the secrets.
+    #[must_use]
+    pub fn ticket_count(&self) -> usize {
+        self.tickets.len()
     }
 
     /// Redeem `ticket` at `now`. Second use fails. `now + 61` after issue fails.
@@ -154,8 +194,9 @@ impl TicketStore {
             Some(issued) => issued,
             None => return Err(TicketError::UnknownOrUsed),
         };
-        self.next_id = self.next_id.saturating_add(1);
-        let token = format!("k-{}-{now}", self.next_id);
+        let Some(token) = random_secret("k-") else {
+            return Err(TicketError::UnknownOrUsed);
+        };
         let expires_at = now.saturating_add(UI_TOKEN_TTL);
         self.tokens
             .insert(token.clone(), (issued.user_id, issued.admin, expires_at));
@@ -310,6 +351,31 @@ mod tests {
         };
         let decision = authorize(&http_input(Some("evil.com"), Some(user), "sessions_list"));
         assert_eq!(decision, AuthDecision::Misdirected);
+    }
+
+    #[test]
+    fn secrets_are_random_and_not_counter_shaped() {
+        let mut store = TicketStore::new();
+        let (_a, first) = store.issue_ui_ticket("alice", false, 1_000);
+        let (_b, second) = store.issue_ui_ticket("alice", false, 1_000);
+        assert_ne!(first, second);
+        for secret in [&first, &second] {
+            assert_eq!(secret.len(), 2 + 64, "t- plus 256 bits in hex");
+            assert!(secret[2..].chars().all(|ch| ch.is_ascii_hexdigit()));
+            assert!(!secret.ends_with("-1000"), "no timestamp suffix");
+        }
+        let token = store.redeem(&first, 1_000).unwrap_or_default();
+        assert!(token.starts_with("k-"));
+        assert_eq!(token.len(), 2 + 64);
+    }
+
+    #[test]
+    fn expired_tickets_are_pruned_on_issue() {
+        let mut store = TicketStore::new();
+        let _ = store.issue_ui_ticket("alice", false, 1_000);
+        assert_eq!(store.ticket_count(), 1);
+        let _ = store.issue_ui_ticket("alice", false, 1_000 + UI_TICKET_TTL);
+        assert_eq!(store.ticket_count(), 1);
     }
 
     #[test]

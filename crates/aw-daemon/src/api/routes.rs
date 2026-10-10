@@ -180,7 +180,7 @@ pub struct ApiState {
     pub live: LiveHub,
     /// `AW_UI_DEV_URL`, captured at construction. Empty means embedded assets.
     pub ui_dev_url: Option<String>,
-    /// `debug.preview_ui`. When true, `GET /` redirects to `/#ticket=` so a
+    /// `debug.preview_ui`. When true, `GET /` redirects to `/index.html#ticket=` so a
     /// browser opened by hand reaches the UI. Default false: a normal daemon
     /// never hands out a ticket over HTTP.
     pub preview_ui: bool,
@@ -729,6 +729,38 @@ pub fn dispatch(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     route_authed(state, req, &caller)
 }
 
+/// Dispatch one request that arrived on the internal channel (Unix socket or
+/// named pipe, see `api/ipc.rs`).
+///
+/// The transport already identified the peer by its operating-system
+/// credential, so there is no bearer and no `Host` check. Only the API and
+/// `/health` are served here: the UI is not an asset site on this channel. Any
+/// `Authorization` header is dropped so `POST /api/v1/auth/ui-ticket` is
+/// issued to the peer, as api-and-cli §1 requires.
+pub(crate) fn dispatch_peer(
+    state: &mut ApiState,
+    req: &HttpRequest,
+    caller: &Caller,
+) -> ApiResponse {
+    if req.body_too_large {
+        return error_response(413, "payload_too_large", "request body exceeds 64 KiB");
+    }
+    let get = req.method.eq_ignore_ascii_case("GET");
+    if get && (req.path == "/health" || req.path == "/api/v1/health") {
+        return health(state);
+    }
+    if !req.path.starts_with("/api/") {
+        return error_response(
+            404,
+            "not_found",
+            "the internal channel serves /health and /api/v1 only",
+        );
+    }
+    let mut peer_req = req.clone();
+    peer_req.headers.remove("authorization");
+    route_authed(state, &peer_req, caller)
+}
+
 /// `POST /api/v1/agent/hook`. Loopback only. No bearer: the hook process has no ticket.
 ///
 /// `dropped: true` records a `self_report_dropped` gap and does not insert a
@@ -957,8 +989,11 @@ fn health(state: &ApiState) -> ApiResponse {
 fn authenticate(state: &mut ApiState, req: &HttpRequest) -> Result<Caller, ApiResponse> {
     let header = req.headers.get("authorization").map(String::as_str);
     let token = bearer_token(header);
+    // Same clock as issuance. `state.now` alone is 0 in production, which made
+    // every expiry check compare against 1970 and never fire.
+    let now = clock(state);
     let caller = match token {
-        Some(token) => state.tickets.caller_for_token(token, state.now).ok(),
+        Some(token) => state.tickets.caller_for_token(token, now).ok(),
         None => None,
     };
     // Host is checked even when the token is missing, but a foreign host wins
@@ -1071,7 +1106,7 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                             "agent": row.agent,
                             "started_ns": row.started_ns,
                             "ended_ns": row.ended_ns,
-                            "pinned": row.pinned,
+                            "pinned": row.pinned != 0,
                         })
                     })
                     .collect();
@@ -1136,11 +1171,17 @@ enum StoreOp {
     Migrate,
 }
 
-/// `POST /db/purge`. A non-admin is 403. An admin purges.
+/// `POST /db/purge`. A non-admin is 403.
 ///
-/// The body is `{ "older_than"?: "<duration>", "all"?: bool }`. `older_than`
-/// is a duration (`30d`, `12h`, `30m`, or the `<n>s` / `<n>ms` / `<n>ns` forms),
-/// measured back from now. A body that names neither field is a 400.
+/// The body is `{ "older_than"?: "<duration>", "all"?: bool, "dry_run"?: bool,
+/// "confirm"?: bool }`. `older_than` is a duration (`30d`, `12h`, `30m`, or the
+/// `<n>s` / `<n>ms` / `<n>ns` forms), measured back from now. A body that names
+/// neither scope is a 400.
+///
+/// Deleting is two-step: `dry_run: true` lists what would go and deletes
+/// nothing; the deletion itself needs `confirm: true`, otherwise 400
+/// `confirm_required`. Pinned and active sessions are never deleted, and each
+/// deletion leaves a `purged:<public_id>` audit row (storage §5).
 fn db_purge(state: &ApiState, caller: &Caller, body: &[u8]) -> ApiResponse {
     if !caller_is_admin(caller) {
         return forbidden();
@@ -1158,6 +1199,15 @@ fn db_purge(state: &ApiState, caller: &Caller, body: &[u8]) -> ApiResponse {
     if all.is_none() && older.is_none() {
         return error_response(400, "bad_argument", "body: expected older_than or all");
     }
+    let flag = |key: &str| value.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+    let dry_run = flag("dry_run");
+    if !dry_run && !flag("confirm") {
+        return error_response(
+            400,
+            "confirm_required",
+            "purge deletes sessions: send dry_run=true to list them, then confirm=true to delete",
+        );
+    }
     let older_than_ns = match older {
         None => None,
         Some(text) => match older_than_cutoff_ns(text) {
@@ -1165,10 +1215,13 @@ fn db_purge(state: &ApiState, caller: &Caller, body: &[u8]) -> ApiResponse {
             Err(response) => return response,
         },
     };
-    match state
-        .query
-        .db_purge(&caller.user_id, true, older_than_ns, all.unwrap_or(false))
-    {
+    match state.query.db_purge(
+        &caller.user_id,
+        true,
+        older_than_ns,
+        all.unwrap_or(false),
+        dry_run,
+    ) {
         Ok(value) => ApiResponse::json(200, &value),
         Err(err) => from_backend(err),
     }
@@ -1450,9 +1503,12 @@ fn session_name_from_body(body: &[u8]) -> String {
 
 /// `GET /` while `debug.preview_ui` is on.
 ///
-/// Issues one ticket for a fixed local-preview identity and redirects to
-/// `/#ticket=...`. The fragment is not sent back to the server, and the page
-/// strips it after redeeming. A non-loopback Host is refused like every other
+/// Issues one ticket for the daemon's own user and redirects to
+/// [`PREVIEW_LANDING`]`#ticket=...`. The fragment is not sent back to the
+/// server, so the target must be a path that does not reach this function
+/// again: redirecting to `/#ticket=` came back as `GET /` and looped, issuing a
+/// fresh ticket on every hop. The page strips the fragment after redeeming and
+/// rewrites the landing path to `/`. A non-loopback Host is refused like every other
 /// ticket path. The ticket secret is the redirect target, never a log line.
 fn preview_ticket_redirect(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     if req_host_bad(&req.headers.get("host").cloned(), req.listen_port) {
@@ -1460,9 +1516,12 @@ fn preview_ticket_redirect(state: &mut ApiState, req: &HttpRequest) -> ApiRespon
     }
     let (_ticket, secret) = state
         .tickets
-        .issue_ui_ticket(PREVIEW_UI_USER, false, clock(state));
+        .issue_ui_ticket(&preview_user(), false, clock(state));
     let mut headers = BTreeMap::new();
-    headers.insert("location".to_owned(), format!("/#ticket={secret}"));
+    headers.insert(
+        "location".to_owned(),
+        format!("{PREVIEW_LANDING}#ticket={secret}"),
+    );
     headers.insert(
         "content-type".to_owned(),
         "text/plain; charset=utf-8".to_owned(),
@@ -1476,10 +1535,17 @@ fn preview_ticket_redirect(state: &mut ApiState, req: &HttpRequest) -> ApiRespon
     }
 }
 
-/// Identity the preview redirect binds its ticket to. Not a real account: the
-/// preview switch is a local convenience, and this name only scopes the
-/// resulting token. It is not read from the request.
-const PREVIEW_UI_USER: &str = "local-preview";
+/// Page the preview redirect lands on. Served by [`static_asset`] as the
+/// embedded `index.html`, never by [`preview_ticket_redirect`].
+pub const PREVIEW_LANDING: &str = "/index.html";
+
+/// Identity the preview redirect binds its ticket to: the daemon's own user,
+/// the same id the daemon-wide sample session is stored under. A fixed
+/// placeholder name owned no session, so the preview UI listed nothing.
+/// Never admin: the preview switch must not widen what the page may change.
+fn preview_user() -> String {
+    crate::sample::current_user_id()
+}
 
 fn redeem_token(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     if req_host_bad(&req.headers.get("host").cloned(), req.listen_port) {
@@ -1489,7 +1555,8 @@ fn redeem_token(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     if ticket.is_empty() {
         return unauthorized();
     }
-    match state.tickets.redeem(&ticket, state.now) {
+    let now = clock(state);
+    match state.tickets.redeem(&ticket, now) {
         Ok(token) => ApiResponse::json(200, &json!({ "token": token, "ttl_s": 12 * 60 * 60 })),
         Err(_) => ApiResponse::json(
             401,
@@ -1566,8 +1633,8 @@ fn list_query(raw: &str) -> Result<ListQuery, ApiResponse> {
         cursor: pairs.get("cursor").cloned(),
         q: pairs.get("q").cloned(),
         kind: pairs.get("kind").cloned(),
-        since_ns: optional_i64(&pairs, "since")?,
-        until_ns: optional_i64(&pairs, "until")?,
+        since_ns: optional_time_ns(&pairs, "since")?,
+        until_ns: optional_time_ns(&pairs, "until")?,
         agent: pairs.get("agent").cloned(),
         active_only: pairs
             .get("active")
@@ -1591,6 +1658,46 @@ fn optional_i64(
             error_response(400, "bad_argument", &format!("{key}: expected an integer"))
         }),
     }
+}
+
+/// `since` / `until`: Unix nanoseconds, or a relative `-<n><s|m|h|d>` such as
+/// `-7d` (what the UI and `aw … --since` send), measured back from now.
+fn optional_time_ns(
+    pairs: &std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> Result<Option<i64>, ApiResponse> {
+    let Some(text) = pairs.get(key).map(String::as_str).filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    if let Ok(value) = text.parse::<i64>() {
+        return Ok(Some(value));
+    }
+    let bad = || {
+        error_response(
+            400,
+            "bad_argument",
+            &format!("{key}: expected Unix nanoseconds or -<n><s|m|h|d>"),
+        )
+    };
+    let rest = text.strip_prefix('-').ok_or_else(bad)?;
+    let unit_ns: i64 = match rest.chars().last() {
+        Some('s') => 1_000_000_000,
+        Some('m') => 60_000_000_000,
+        Some('h') => 3_600_000_000_000,
+        Some('d') => 86_400_000_000_000,
+        _ => return Err(bad()),
+    };
+    let count = rest[..rest.len() - 1]
+        .parse::<i64>()
+        .ok()
+        .filter(|n| *n >= 0)
+        .ok_or_else(bad)?;
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
+        .unwrap_or(0);
+    Ok(Some(now_ns.saturating_sub(count.saturating_mul(unit_ns))))
 }
 
 fn query_pairs(raw: &str) -> std::collections::BTreeMap<String, String> {
@@ -1660,7 +1767,11 @@ fn session_query_route(
         ("GET", "summary") => map_summary(state.query.session_summary(user, sid)),
         ("GET", "timeline") => match state.query.timeline(user, sid, &parsed) {
             Ok(None) => not_found_session(),
-            Ok(Some(page)) => ApiResponse::json(200, &timeline_json(&page)),
+            Ok(Some(page)) => {
+                let mut body = timeline_json(&page);
+                add_row_details(state, &mut body);
+                ApiResponse::json(200, &body)
+            }
             Err(err) => from_backend(err),
         },
         ("GET", "timeline/histogram") => map_opt(state.query.histogram(user, sid, &parsed)),
@@ -1669,7 +1780,13 @@ fn session_query_route(
         ("GET", "traffic") => map_opt(state.query.traffic(user, sid, &parsed)),
         ("GET", "dns") => map_opt(state.query.dns(user, sid, &parsed)),
         ("GET", "gaps") => map_opt(state.query.gaps(user, sid)),
-        ("GET", "around") => map_opt(state.query.around(user, sid, &parsed)),
+        ("GET", "around") => match state.query.around(user, sid, &parsed) {
+            Ok(Some(mut body)) => {
+                add_row_details(state, &mut body);
+                ApiResponse::json(200, &body)
+            }
+            other => map_opt(other),
+        },
         ("GET", "files") => map_opt(state.query.files(user, sid, &parsed)),
         ("GET", "live") => live_snapshot(state, sid, caller, &parsed),
         ("POST", "stop") => match state.query.stop_session(user, sid) {
@@ -1742,6 +1859,18 @@ fn session_p3_route(state: &ApiState, route: &P3Route<'_>) -> Option<ApiResponse
             state, caller, sid, raw_query,
         ));
     }
+    if (method == "GET" || method == "POST") && tail == "export" {
+        if let Some(format) = crate::export::data::DataFormat::from_query(raw_query) {
+            return Some(crate::export::data::export_data(
+                state, caller, sid, raw_query, format,
+            ));
+        }
+    }
+    if method == "GET" && tail == "agent-events" {
+        return Some(super::agent::list_agent_events(
+            state, caller, sid, raw_query,
+        ));
+    }
     session_tail_more(state, method, sid, tail, &caller.user_id, parsed)
 }
 
@@ -1805,6 +1934,52 @@ fn stop_memory(state: &mut ApiState, sid: &str, caller: &Caller) -> ApiResponse 
     }
     // The stub has no process. Stopping records the intent without deleting the row.
     ApiResponse::json(200, &json!({ "stopped": sid, "persisted": false }))
+}
+
+/// Fill `summary`, `fields` and `proc` on every row of a timeline-shaped body
+/// (`rows: [{session_id, cat, id, proc_uid}]`). Read-only connection: this
+/// never migrates or writes. Without a database the rows stay as they are.
+fn add_row_details(state: &ApiState, body: &mut serde_json::Value) {
+    let Some(path) = state.query.db_path.as_deref() else {
+        return;
+    };
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return;
+    };
+    let Some(rows) = body
+        .get_mut("rows")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for row in rows {
+        let Some(obj) = row.as_object_mut() else {
+            continue;
+        };
+        let session_id = obj.get("session_id").and_then(serde_json::Value::as_i64);
+        let cat = obj
+            .get("cat")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let id = obj.get("id").and_then(serde_json::Value::as_i64);
+        let (Some(session_id), Some(cat), Some(id)) = (session_id, cat, id) else {
+            continue;
+        };
+        let proc_uid = obj
+            .get("proc_uid")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            .map(|bits| i64::from_ne_bytes(bits.to_ne_bytes()));
+        let detail = super::timeline_rows::row_detail(&conn, session_id, &cat, id, proc_uid);
+        obj.insert("summary".to_owned(), json!(detail.summary));
+        obj.insert(
+            "fields".to_owned(),
+            serde_json::Value::Object(detail.fields),
+        );
+        obj.insert("proc".to_owned(), detail.proc);
+    }
 }
 
 fn timeline_json(page: &aw_store::TimelinePage) -> serde_json::Value {
@@ -1904,13 +2079,20 @@ fn filter_mentions_body(filter: &str, json_body: &str) -> bool {
 
 fn doctor(state: &ApiState) -> ApiResponse {
     let _ = state;
-    // No collector is probed on the HTTP thread. The report says so.
+    // No collector is probed on the HTTP thread. The report says so. The host
+    // block is the daemon's own privilege, read from the OS (BUGS B5); `null`
+    // means the check failed, not "not privileged".
     ApiResponse::json(
         200,
         &json!({
             "probed": false,
             "reason": "collector probe is not run on the request path",
             "collectors": [],
+            "host": {
+                "os": std::env::consts::OS,
+                "privileged": crate::privilege::current(),
+                "privileged_note": "poll collector only in this build; eBPF, ETW, and eslogger are not attached even when privileged",
+            },
         }),
     )
 }
@@ -2197,6 +2379,311 @@ mod tests {
     }
 
     #[test]
+    fn preview_redirect_target_does_not_redirect_again() {
+        let mut state = ApiState::new(1_000);
+        state.preview_ui = true;
+        let first = dispatch(
+            &mut state,
+            &req("GET", "/", Some("127.0.0.1:7456"), None, b""),
+        );
+        assert_eq!(first.status, 302);
+        let location = first.header("location").unwrap_or_default().to_owned();
+        let (path, fragment) = location.split_once('#').unwrap_or((location.as_str(), ""));
+        assert!(fragment.starts_with("ticket="));
+        // A browser follows the Location without the fragment. That request
+        // must reach the page, not another redirect with another ticket.
+        let follow = dispatch(
+            &mut state,
+            &req("GET", path, Some("127.0.0.1:7456"), None, b""),
+        );
+        assert_ne!(follow.status, 302);
+        assert!(follow.header("location").is_none());
+        // The ticket from the first hop still redeems exactly once.
+        let ticket = fragment.trim_start_matches("ticket=");
+        let body = format!(r#"{{"ticket":"{ticket}"}}"#);
+        let redeem = |state: &mut ApiState| {
+            dispatch(
+                state,
+                &req(
+                    "POST",
+                    "/api/v1/auth/ui-token",
+                    Some("127.0.0.1:7456"),
+                    None,
+                    body.as_bytes(),
+                ),
+            )
+            .status
+        };
+        let first_redeem = dispatch(
+            &mut state,
+            &req(
+                "POST",
+                "/api/v1/auth/ui-token",
+                Some("127.0.0.1:7456"),
+                None,
+                body.as_bytes(),
+            ),
+        );
+        assert_eq!(first_redeem.status, 200);
+        assert_eq!(redeem(&mut state), 401);
+        // The token belongs to the user the daemon-wide sample session is
+        // stored under, so the preview page can list that session.
+        let token = json_body(&first_redeem)["token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let caller = state.tickets.caller_for_token(&token, 1_000);
+        assert_eq!(
+            caller.map(|c| (c.user_id, c.admin)),
+            Ok((crate::sample::current_user_id(), false))
+        );
+    }
+
+    #[test]
+    fn production_clock_enforces_ticket_and_token_expiry() {
+        // `now == 0` is the production state: the handler reads the wall clock.
+        let mut state = ApiState::new(0);
+        let wall = super::clock(&state);
+        // A ticket issued 61 s ago must be refused, not redeemed against 1970.
+        let (_ticket, stale) =
+            state
+                .tickets
+                .issue_ui_ticket("alice", false, wall - UI_TICKET_TTL - 1);
+        let body = format!(r#"{{"ticket":"{stale}"}}"#);
+        let late = dispatch(
+            &mut state,
+            &req(
+                "POST",
+                "/api/v1/auth/ui-token",
+                Some("127.0.0.1:7456"),
+                None,
+                body.as_bytes(),
+            ),
+        );
+        assert_eq!(late.status, 401);
+        // A token whose 12 h ran out is refused on a real request.
+        let (_ticket, old) = state.tickets.issue_ui_ticket("alice", false, 1_000);
+        let token = state.tickets.redeem(&old, 1_000).unwrap_or_default();
+        assert!(!token.is_empty());
+        let response = dispatch(
+            &mut state,
+            &req(
+                "GET",
+                "/api/v1/sessions",
+                Some("127.0.0.1:7456"),
+                Some(&token),
+                b"",
+            ),
+        );
+        assert_eq!(response.status, 401);
+    }
+
+    /// Migrated database at a fresh temp path, with `sql` run on it.
+    fn seeded_db(tag: &str, sql: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "aw-routes-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let db = dir.join("agentwatch.db");
+        let seeded = aw_store::Store::open(&db).map(|store| {
+            let result = store.connection().execute_batch(sql);
+            assert!(result.is_ok(), "{result:?}");
+        });
+        assert!(seeded.is_ok());
+        (dir, db)
+    }
+
+    #[test]
+    fn db_purge_is_admin_only_dry_run_first_and_needs_confirm() {
+        let (dir, db) = seeded_db(
+            "purge",
+            "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, ended_ns, platform, collectors, pinned) VALUES \
+               (1, 'old', 'attach', 'alice', 1, 2, 'linux', '[]', 0), \
+               (2, 'kept', 'attach', 'alice', 1, 2, 'linux', '[]', 1), \
+               (3, 'live', 'attach', 'alice', 1, NULL, 'linux', '[]', 0);",
+        );
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let user = token_for(&mut state, "alice", false);
+        let admin = token_for(&mut state, "root", true);
+        let mut purge = |token: &str, body: &str| {
+            let response = dispatch(
+                &mut state,
+                &req(
+                    "POST",
+                    "/api/v1/db/purge",
+                    Some("127.0.0.1:7456"),
+                    Some(token),
+                    body.as_bytes(),
+                ),
+            );
+            (response.status, json_body(&response))
+        };
+        let count = || {
+            rusqlite::Connection::open(&db)
+                .and_then(|c| {
+                    c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+                })
+                .unwrap_or(-1)
+        };
+        assert_eq!(purge(&user, r#"{"all":true,"confirm":true}"#).0, 403);
+        let (status, body) = purge(&admin, r#"{"all":true}"#);
+        assert_eq!(
+            (status, body["error"]["code"].as_str()),
+            (400, Some("confirm_required"))
+        );
+        assert_eq!(count(), 3);
+        let (status, body) = purge(&admin, r#"{"all":true,"dry_run":true}"#);
+        assert_eq!(status, 200);
+        assert_eq!(body["would_purge"][0]["public_id"], "old");
+        assert_eq!(body["would_purge"].as_array().map(Vec::len), Some(1));
+        assert_eq!(count(), 3, "dry run deletes nothing");
+        let (status, body) = purge(&admin, r#"{"all":true,"confirm":true}"#);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["purged"][0]["public_id"], "old");
+        // Pinned and active sessions stay.
+        assert_eq!(count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn timeline_rows_carry_a_summary_from_their_source_table() {
+        let (dir, db) = seeded_db(
+            "timeline",
+            "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors) \
+               VALUES (1, 'sx', 'attach', 'alice', 1, 'linux', '[]'); \
+             INSERT INTO processes (session_id, proc_uid, pid, ppid, start_ns, how, evidence, source, exit_code) \
+               VALUES (1, 77, 4242, 1, 10, 'snapshot', 'S', 'poll/sysinfo', 3); \
+             INSERT INTO process_images (session_id, proc_uid, seq, ts_ns, exe, argv, evidence, source) \
+               VALUES (1, 77, 0, 10, '/usr/bin/curl', '[\"curl\",\"-s\",\"https://example.com\"]', 'S', 'poll/sysinfo'); \
+             INSERT INTO net_flows (id, session_id, proc_uid, proto, direction, local_ip, local_port, remote_ip, remote_port, domain, start_ns, bytes_up, bytes_down, evidence, source) \
+               VALUES (5, 1, 77, 'tcp', 'out', '10.0.0.2', 50000, '93.184.216.34', 443, 'example.com', 20, 120, 4096, 'S', 'poll/sysinfo'); \
+             INSERT INTO gaps (id, session_id, collector, kind, affects, from_ns, to_ns, count, detail) \
+               VALUES (9, 1, 'daemon/poll', 'unknown', '[\"store\"]', 30, 30, 2, 'store_failure');",
+        );
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+        let token = token_for(&mut state, "alice", false);
+        let mut request = req(
+            "GET",
+            "/api/v1/sessions/sx/timeline",
+            Some("127.0.0.1:7456"),
+            Some(&token),
+            b"",
+        );
+        request.query = "limit=50".to_owned();
+        let response = dispatch(&mut state, &request);
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let body = json_body(&response);
+        let rows = body["rows"].as_array().cloned().unwrap_or_default();
+        let by_cat = |cat: &str| {
+            rows.iter()
+                .find(|row| row["cat"] == cat)
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            by_cat("proc")["summary"],
+            "curl(4242) curl -s https://example.com exit 3"
+        );
+        assert_eq!(by_cat("proc")["proc"]["exe_name"], "curl");
+        assert_eq!(
+            by_cat("net")["summary"],
+            "tcp → example.com:443 ↑120 B ↓4096 B"
+        );
+        assert_eq!(by_cat("net")["proc"]["pid"], 4242);
+        assert_eq!(
+            by_cat("gap")["summary"],
+            "daemon/poll unknown store_failure ×2"
+        );
+        assert_eq!(by_cat("gap")["fields"]["count"], 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_data_and_agent_events_answer_on_a_real_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "aw-routes-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let db = dir.join("agentwatch.db");
+        let seeded = aw_store::Store::open(&db).map(|store| {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors) \
+                     VALUES (1, 'sx', 'attach', 'alice', 1, 'linux', '[\"poll\"]')",
+                    [],
+                )
+                .is_ok()
+        });
+        assert!(matches!(seeded, Ok(true)));
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+        let token = token_for(&mut state, "alice", false);
+        let mut get = |path: &str, query: &str| {
+            let mut request = req("GET", path, Some("127.0.0.1:7456"), Some(&token), b"");
+            request.query = query.to_owned();
+            dispatch(&mut state, &request)
+        };
+        let jsonl = get("/api/v1/sessions/sx/export", "format=jsonl");
+        assert_eq!(jsonl.status, 200);
+        assert_eq!(jsonl.header("content-type"), Some("application/x-ndjson"));
+        assert!(!jsonl.body.is_empty());
+        let csv = get("/api/v1/sessions/sx/export", "format=csv");
+        assert_eq!(csv.status, 200);
+        assert!(csv.body.starts_with(b"PK"));
+        // This database has no `findings` table (no http/findings migration).
+        let md = get("/api/v1/sessions/sx/export", "format=md");
+        assert_eq!(md.status, 200, "{}", String::from_utf8_lossy(&md.body));
+        let events = get("/api/v1/sessions/sx/agent-events", "");
+        assert_eq!(events.status, 200);
+        assert!(json_body(&events)["events"].is_array());
+        // Another user's session stays hidden.
+        let other = get("/api/v1/sessions/nope/export", "format=jsonl");
+        assert_eq!(other.status, 404);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn since_accepts_relative_durations() {
+        let mut pairs = std::collections::BTreeMap::new();
+        pairs.insert("since".to_owned(), "-7d".to_owned());
+        let got = super::optional_time_ns(&pairs, "since").ok().flatten();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_nanos()).ok())
+            .unwrap_or(0);
+        let week = 7 * 86_400_000_000_000_i64;
+        assert!(got.is_some_and(|v| (now - week - v).abs() < 60_000_000_000));
+        pairs.insert("since".to_owned(), "123".to_owned());
+        assert_eq!(
+            super::optional_time_ns(&pairs, "since").ok().flatten(),
+            Some(123)
+        );
+        for bad in ["7d", "-7w", "-d", "--1d", "abc"] {
+            pairs.insert("since".to_owned(), bad.to_owned());
+            assert!(super::optional_time_ns(&pairs, "since").is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn user_a_does_not_see_user_b_sessions() {
         let mut state = ApiState::new(10);
         let alice = token_for(&mut state, "alice", false);
@@ -2324,6 +2811,14 @@ mod tests {
         assert_eq!(
             json_body(&doctor).get("probed").and_then(Value::as_bool),
             Some(false)
+        );
+        // B5: the daemon's own privilege comes from the OS, not a constant.
+        assert_eq!(
+            json_body(&doctor)
+                .get("host")
+                .and_then(|host| host.get("privileged"))
+                .and_then(Value::as_bool),
+            crate::privilege::current()
         );
         let processes = dispatch(
             &mut state,

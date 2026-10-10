@@ -10,14 +10,22 @@
 |---|---|---|---|
 | Unix 域 socket `/run/agentwatch/api.sock`（Linux）、`/var/run/agentwatch/api.sock`（macOS） | Linux / macOS | CLI 主通道 | `SO_PEERCRED` / `LOCAL_PEERCRED` 拿到对端 uid；socket 权限 0660，属组 `agentwatch` |
 | 命名管道 `\\.\pipe\agentwatch-api` | Windows | CLI 主通道 | `GetNamedPipeClientProcessId` + 客户端 token 拿到 SID；管道 DACL 允许 Administrators + `AgentWatch Users` 组 |
-| HTTP `127.0.0.1:<port>`（默认 7456，可配置） | 全平台 | Web UI | Bearer token（见下）；校验 `Host` 头必须为 `127.0.0.1:<port>` 或 `localhost:<port>`，防 DNS rebinding；不开 CORS |
+| HTTP `127.0.0.1:<port>`（默认 7456，`api.http_port` 可配置，`0` 关闭） | 全平台 | Web UI | Bearer token（见下）；校验 `Host` 头必须为 `127.0.0.1:<port>` 或 `localhost:<port>`，防 DNS rebinding；不开 CORS |
+
+内部通道的实现状态（2026-10-10）：
+- Linux / macOS：`agentwatchd` 前台运行时监听 Unix socket（`crates/aw-daemon/src/api/ipc.rs`），权限 0660；报文与 HTTP 相同（HTTP/1.1 请求和响应），不带 `Authorization`，也不做 `Host` 校验。只提供 `/health` 和 `/api/v1/*`，不提供页面资源。socket 与 HTTP 共用同一份状态，所以在 socket 上签的 ticket 可以在 HTTP 上兑换。
+- Linux 用 `SO_PEERCRED` 取对端 uid，uid 0 为管理员。macOS 暂未取到 `LOCAL_PEERCRED`，对端记为 `unverified-peer`、非管理员，只靠 socket 权限把关。属组 `agentwatch` 尚未设置。
+- Windows：`agentwatchd` 在 `\\.\pipe\agentwatch-api` 上监听（tokio 命名管道），报文同上。管道沿用系统默认 DACL，只有 LocalSystem、Administrators 和 daemon 自己的账户能以读写方式打开，所以连上的客户端记为管理员 `pipe-admin`。`AgentWatch Users` 组的 DACL 和按 `GetNamedPipeClientProcessId` 取客户端 SID 尚未实现：普通 Windows 用户暂时打不开管道。只做了交叉编译检查，没有在 Windows 上实跑。
+- `AW_SOCKET` 环境变量同时覆盖 daemon 的监听路径和 `aw` 的默认连接路径，用于测试和非 root 开发运行。`aw daemon start` 在通道无响应时拉起 `agentwatchd --foreground`（`AW_DAEMON_CONFIG` 作为 `--config` 传入）并等待 `/health`，不注册系统服务。
 
 CLI 和 UI 请求到达后走同一套 axum 路由。传输层不同，但请求体和响应体完全一致。
 
 **会话令牌（UI）**
-1. `aw ui` 经由 socket 或管道向 daemon 申请一个一次性 `ui_ticket`，60 秒有效。
+1. `aw ui` 经由 socket 或管道向 daemon 申请一个一次性 `ui_ticket`，60 秒有效。ticket 与 token 都是操作系统 CSPRNG 生成的 256 位随机数（十六进制），签发、兑换、校验用同一个时钟，过期即拒；过期未兑的 ticket 在下次签发时清掉。
 2. 用 `http://127.0.0.1:7456/#ticket=<t>` 打开浏览器。
-3. 前端用 ticket 换取 `ui_token`（12 小时，只存在内存中，不写 localStorage）。之后的请求都带 `Authorization: Bearer <ui_token>`。
+3. 前端用 ticket 换取 `ui_token`（12 小时）。token 存在内存，并镜像到本标签页的 sessionStorage，同一标签页刷新仍保持登录，不需要再用一次 ticket；不写 localStorage，新标签页或重开浏览器不会继承。之后的请求都带 `Authorization: Bearer <ui_token>`。
+   - 本机预览（`debug.preview_ui = true`）：`GET /` 签一张票并 302 到 `/index.html#ticket=<t>`。片段不会发回服务端，所以落点必须是不会再触发签票的路径，否则会无限跳转；前端换票后把地址改回 `/`。
+   - `Content-Security-Policy`（含 `frame-ancestors 'none'`）只由 daemon 在响应头下发，`index.html` 不带 CSP meta：浏览器会忽略 meta 里的 `frame-ancestors` 并在控制台报错。
 4. token 与申请者的用户身份绑定。
 
 **授权模型**
@@ -146,7 +154,7 @@ $ aw run --proxy -- claude
 | POST | `/auth/ui-ticket` | 仅限 socket/管道：申请 UI ticket |
 | POST | `/auth/ui-token` | 用 ticket 换 token |
 | GET | `/compare?a=<SESSION>&b=<SESSION>` | 两个会话对比：进程/文件/域名/流量差异（P5） |
-| GET | `/doctor` | 自检报告（采集器 `probe()` 与 `capabilities()`） |
+| GET | `/doctor` | 自检报告（采集器 `probe()` 与 `capabilities()`）。`host.privileged` 是 daemon 进程自身的特权，向操作系统查询：Linux 看有效 uid 为 0 或持有 `CAP_SYS_ADMIN`，macOS 看有效 uid 为 0，Windows 看令牌完整性级别为 High 或 System（未提权的管理员账户算否）。查询失败时为 `null`，不写成 `false` |
 | GET | `/processes` | 当前系统进程树（进程选择器）。参数：`?agents_only&q=` |
 | POST | `/sessions` | 创建会话。body：`{mode:"launch"\|"attach", argv?, cwd?, env?, pid?, follow_children, proxy, agent, name, include_procs, self_report, pin, group?, mcp_tap?}` |
 | GET | `/sessions` | 列表。参数：`?since&until&agent&active&q&cursor&limit` |
@@ -156,7 +164,7 @@ $ aw run --proxy -- claude
 | POST | `/sessions/{sid}/stop` | 停止监控 |
 | DELETE | `/sessions/{sid}` | 删除 |
 | GET | `/sessions/{sid}/summary` | 概览页数据：Top 目录、Top 域名、按类别计数、按证据等级计数、缺口摘要 |
-| GET | `/sessions/{sid}/timeline` | 参数：`?filter&from&to&cats&cursor&limit` |
+| GET | `/sessions/{sid}/timeline` | 参数：`?filter&from&to&cats&cursor&limit`。每行在视图列（`session_id, ts_ns, cat, id, proc_uid, evidence`）之外带 `summary`（按 `cat` 从来源表的已存列拼一行，NULL 的列不出现，不推测）、`fields`（拼 summary 用到的列，原样）和 `proc: {pid, exe_name}`。来源行不存在时 `summary` 为空串。`/around` 同样。 |
 | GET | `/sessions/{sid}/timeline/histogram` | 参数：`?filter&from&to&buckets`。返回时间轴密度图数据 |
 | GET | `/sessions/{sid}/processes` | 参数：`?tree=1&filter` |
 | GET | `/sessions/{sid}/processes/{proc_uid}` | 进程详情：镜像链、统计、子进程 |
@@ -166,7 +174,7 @@ $ aw run --proxy -- claude
 | GET | `/sessions/{sid}/traffic` | 参数：`?group_by=domain\|proc&from&to&step`。返回流量时间序列（堆叠图） |
 | GET | `/sessions/{sid}/dns` | |
 | GET | `/sessions/{sid}/http` | 参数：`?filter&cursor&limit&from&to&redact_paths&redact_hosts`。字段与 `http` 表一致，`proc_uid` 为十六进制，另附 `proc: {pid, exe_name}`。游标为 `ts_ns,id`。会话属于当前用户且 `proxy_enabled = 0` 时返回 200：`{"http":[],"reason":"no_proxy","next_cursor":null}`，不是 404。没有数据库的内存会话仍是 501。 |
-| GET | `/sessions/{sid}/agent-events` | E3 |
+| GET | `/sessions/{sid}/agent-events` | E3 自报告，`?cursor&limit`，按 id 升序：`{"events":[...],"next_cursor"}`。证据等级照存储原样返回，不升级。库里还没有 `agent_events` 表时为 200 空页并带 `reason: "no_self_reports"`。 |
 | GET | `/sessions/{sid}/agents` | AgentInstance 列表与角色 |
 | PATCH | `/agents/{id}` | `{role?, label?}` 手工标注 |
 | GET | `/sessions/{sid}/links` | 参数：`?kind&min_evidence` |
@@ -180,12 +188,13 @@ $ aw run --proxy -- claude
 | GET | `/sessions/{sid}/findings` | 参数：`?lang=zh\|en&min_severity=info\|notice\|warn&evidence=E1\|E2\|E3\|S\|I\|NA\|content_match&cursor&limit`。每条含 `wording_id`、`params`，以及 `wording::render` 生成的 `text`。渲染失败时 `text` 为 null，并带 `error`，不拼接替代句。`content_match` 按 `kind` 过滤，其余按 `evidence`。游标为 `first_ns,id`。 |
 | GET | `/sessions/{sid}/gaps` | |
 | GET | `/sessions/{sid}/around` | 参数：`?ref=file_access:123&window=10s` |
-| GET, POST | `/sessions/{sid}/export` | 参数：`?format&filter&redact_paths&redact_hosts&lang`。`format=md`（GET 或 POST）返回 `text/markdown`：会话信息、采集能力、缺口、按证据等级分组的发现（`content_match` 单独一节）、按流记录条数的域名、按访问行数的文件，文末固定附证据等级说明。未知字段写「不可得」并带原因。全文先过 `wording::lint`（内容匹配句只放行 `ContentMatchPhrase`）；有违规时 HTTP 422，body 为 `{"error":{"code":"wording_lint","violations":[...]}}`，不返回报告正文。其他 `format` 以及没有数据库的内存会话仍是 501。JSONL / CSV 不在本接口。 |
+| GET, POST | `/sessions/{sid}/export` | 参数：`?format&filter&redact_paths&redact_hosts&lang`。`format=md`（GET 或 POST）返回 `text/markdown`：会话信息、采集能力、缺口、按证据等级分组的发现（`content_match` 单独一节）、按流记录条数的域名、按访问行数的文件，文末固定附证据等级说明。未知字段写「不可得」并带原因。全文先过 `wording::lint`（内容匹配句只放行 `ContentMatchPhrase`）；有违规时 HTTP 422，body 为 `{"error":{"code":"wording_lint","violations":[...]}}`，不返回报告正文。`format=jsonl` 返回 `application/x-ndjson`，`format=csv` 返回各表 CSV 的 zip（`application/zip`），行与脱敏规则和 `aw export` 相同（`aw-store` 的同一写出函数），`filter`、`redact_paths`、`redact_hosts` 同样生效。其他 `format` 以及没有数据库的内存会话仍是 501。 |
 | GET | `/sessions/{sid}/live` | SSE 实时事件流（已脱敏、已归属的记录增量） |
 | GET | `/search` | 参数：`?q&kind&since&limit`。跨会话搜索 |
 | GET/PUT | `/config` | 读取/修改配置（PUT 仅管理员） |
 | GET | `/rules` | 已加载的规则 |
 | GET | `/db/stats` | |
+| POST | `/db/purge` | 仅管理员（非管理员 403）。body：`{older_than?: "30d", all?: bool, dry_run?: bool, confirm?: bool}`，`older_than` 与 `all` 至少一个。两步：`dry_run: true` 只列出将删除的会话 `{"dry_run":true,"would_purge":[{public_id,session_id}]}`，不删；真正删除必须带 `confirm: true`，否则 400 `confirm_required`。固定（pinned）和未结束的会话永不删除；每删一个在 `schema_meta` 留 `purged:<public_id>` 审计记录（storage §5）。返回 `{"purged":[{public_id,session_id,reason,deleted_ns}]}`。CLI `aw db purge` 在 `--yes` 或交互确认后才发 `confirm: true`。 |
 
 记录的 JSON 字段与 [storage](storage.md) 中的表字段同名，另外有两点增强：
 - `proc_uid` 序列化为十六进制字符串；

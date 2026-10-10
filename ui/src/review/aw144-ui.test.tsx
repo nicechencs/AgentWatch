@@ -28,8 +28,13 @@ describe("UI re-review #144", () => {
     const text = describeError(err, t);
     expect(text).toBe(ZH["error.programNotFound"]);
     expect(text).not.toMatch(/entity|not found/u);
-    // launch_needs_cli is a 403 but has its own sentence.
-    expect(describeError(new ApiError(403, { error: { code: "launch_needs_cli", message: "x" } }, "x"), t)).toBe(ZH["error.launchNeedsCli"]);
+    // Launch refusals are 403s with their own plain Chinese sentence, never
+    // the daemon's English and never "open a terminal".
+    for (const code of ["launch_needs_cli", "launch_other_user", "caller_unidentified", "caller_unknown", "drop_failed"]) {
+      const said = describeError(new ApiError(403, { error: { code, message: "the daemon starts programs only as its own user; use `aw run -- <cmd>`" } }, "x"), t);
+      expect(said).not.toMatch(/\b[a-z]{4,}\b|终端|aw run/u);
+      expect(said).not.toBe(ZH["error.forbidden"]);
+    }
   });
 
   it("新-2: only rows the service marks pre_existing get 「会话开始前已存在」", async () => {

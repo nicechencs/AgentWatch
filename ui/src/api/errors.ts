@@ -38,13 +38,18 @@ type T = (key: string, vars?: Record<string, string | number>) => string;
  */
 /**
  * Daemon error codes that have their own sentence. Checked before the status:
- * `launch_needs_cli` is a 403 but says more than 「没有权限」.
+ * `launch_other_user` and friends are 403s but say more than 「没有权限」.
  */
 const CODE_TEXT: Record<string, string> = {
   program_not_found: "error.programNotFound",
   program_not_permitted: "error.programNotPermitted",
   spawn_failed: "error.spawnFailed",
   launch_needs_cli: "error.launchNeedsCli",
+  launch_other_user: "error.launchOtherUser",
+  caller_unidentified: "error.callerUnidentified",
+  caller_unknown: "error.callerUnidentified",
+  drop_failed: "error.dropFailed",
+  random_unavailable: "error.randomUnavailable",
   collector_unavailable: "error.collectorUnavailable",
   no_such_process: "error.noSuchProcess",
   no_database: "error.noDatabase",

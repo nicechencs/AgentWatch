@@ -2937,6 +2937,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Real uid of a running process, from `/proc/<pid>/status` (all four ids).
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::expect_used)]
+    fn proc_uids(pid: u64) -> Vec<u32> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("status");
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("Uid:"))
+            .expect("Uid line");
+        line[4..]
+            .split_whitespace()
+            .map(|p| p.parse().expect("uid"))
+            .collect()
+    }
+
+    /// A `uid` / `user` in the body never chooses the account: the program
+    /// runs as the verified caller.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn launch_ignores_a_uid_in_the_body() {
+        let (dir, db) = seeded_db("spoof", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let me = crate::sample::current_user_id();
+        let token = token_for(&mut state, &me, false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["sleep","5"],"uid":0,"user":"root","user_id":"0"}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let pid = body["root_pid"].as_u64().expect("root_pid");
+        let want: u32 = me.parse().expect("numeric uid");
+        assert_eq!(proc_uids(pid), vec![want; 4]);
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Root daemon, ordinary caller: the program runs as the caller, not root.
+    /// Needs root, so it is ignored by default (CI runs tests unprivileged):
+    /// `sudo -E env PATH=$PATH cargo test -p aw-daemon -- --ignored launch_as_root`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root: the daemon must be able to switch accounts"]
+    #[allow(clippy::expect_used)]
+    fn launch_as_root_drops_to_the_caller() {
+        assert_eq!(nix::unistd::geteuid().as_raw(), 0, "run this test as root");
+        let nobody = nix::unistd::User::from_name("nobody")
+            .ok()
+            .flatten()
+            .expect("this test needs the `nobody` account");
+        let caller = nobody.uid.as_raw();
+        let (dir, db) = seeded_db("asroot", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &caller.to_string(), false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["sleep","5"],"cwd":"/","uid":0}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let pid = body["root_pid"].as_u64().expect("root_pid");
+        assert_eq!(
+            proc_uids(pid),
+            vec![caller; 4],
+            "dropped to the caller, cannot regain root"
+        );
+        let env = std::fs::read(format!("/proc/{pid}/environ")).expect("environ");
+        let env = String::from_utf8_lossy(&env);
+        assert!(env.contains(&format!("USER={}", nobody.name)), "{env}");
+        assert!(!env.contains("HOME=/root"), "{env}");
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+        // A directory the caller cannot enter is checked as the caller.
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["true"],"cwd":"/root"}"#,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["error"]["code"], "program_not_permitted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn launch_from_the_api_starts_the_program_and_records_its_exit_code() {
@@ -2952,7 +3044,7 @@ mod tests {
                 r#"{"mode":"launch","argv":["true"]}"#
             )
             .1["error"]["code"],
-            "launch_needs_cli"
+            "caller_unidentified"
         );
         let token = token_for(&mut state, &crate::sample::current_user_id(), false);
         let (status, body) = post(

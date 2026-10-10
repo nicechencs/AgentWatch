@@ -7,10 +7,10 @@
 //!
 //! - Attaching to a process of another OS user needs an administrator (403).
 //! - Launch from the API (`POST /sessions`, `mode: "launch"`) starts the
-//!   program as the daemon's own user, so it is only accepted when the caller
-//!   *is* that user. Otherwise 403 `launch_needs_cli`: `aw run` creates the
-//!   process as the caller and hands it over with `/sessions/run` + `/adopt`.
-//!   The daemon never picks a user to run as (security-privacy, E threat).
+//!   program as the caller: as is when the caller is the daemon's account, and
+//!   dropped to the caller's uid/gid when the daemon runs as root
+//!   ([`super::launch_as`]). The account comes only from the OS peer
+//!   credential; an unknown one is refused, never run as root.
 //! - Only Linux reads process identity for the poll sampler today; elsewhere
 //!   these routes answer 503 `collector_unavailable` and create nothing.
 
@@ -77,6 +77,18 @@ fn redacted_argv_json(argv: &[String]) -> String {
         .map(|arg| redactor.scrub_text(arg))
         .collect();
     serde_json::to_string(&scrubbed).unwrap_or_else(|_| "[]".to_owned())
+}
+
+/// The daemon's effective uid (0 when it runs as root).
+fn daemon_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        nix::unistd::geteuid().as_raw()
+    }
+    #[cfg(not(unix))]
+    {
+        u32::MAX
+    }
 }
 
 fn collector_available() -> Result<(), ApiResponse> {
@@ -237,21 +249,26 @@ fn create_inner(
         Some("launch") => {
             let argv = argv_field(&value)?;
             collector_available()?;
-            if caller.user_id != crate::sample::current_user_id() {
-                return Err(error_response(
-                    403,
-                    "launch_needs_cli",
-                    "the daemon starts programs only as its own user; use `aw run -- <cmd>`",
-                ));
-            }
+            // Whose account: only the OS-verified caller (see `launch_as`).
+            // A `uid` / `user` in the body is never read.
+            let who = super::launch_as::identity_for(&caller.user_id, daemon_uid())?;
             let mut command = std::process::Command::new(&argv[0]);
             command
                 .args(&argv[1..])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
-            if let Some(cwd) = opt_text(&value, "cwd") {
-                command.current_dir(cwd);
+            let cwd = opt_text(&value, "cwd");
+            match &who {
+                #[cfg(unix)]
+                Some(who) => super::launch_as::drop_to(&mut command, who, cwd.as_deref()),
+                #[cfg(not(unix))]
+                Some(_) => {}
+                None => {
+                    if let Some(cwd) = &cwd {
+                        command.current_dir(cwd);
+                    }
+                }
             }
             if let Some(env) = value.get("env").and_then(Value::as_object) {
                 for (key, val) in env {
@@ -260,8 +277,26 @@ fn create_inner(
                     }
                 }
             }
-            let child = command.spawn().map_err(|err| spawn_error(&err))?;
+            #[allow(unused_mut)]
+            let mut child = command.spawn().map_err(|err| spawn_error(&err))?;
             let pid = child.id();
+            #[cfg(target_os = "linux")]
+            if let Some(who) = &who {
+                if !super::launch_as::verify_dropped(pid, who) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::error!(
+                        pid,
+                        uid = who.uid,
+                        "launched child did not drop to the caller; killed"
+                    );
+                    return Err(error_response(
+                        500,
+                        "drop_failed",
+                        "the program did not switch to the caller's account and was stopped",
+                    ));
+                }
+            }
             let mut target = target_for(caller, &value, "launch", pid, Some(&argv))?;
             insert_session(&path, &mut target)?;
             let response = created(&target, json!({}));
@@ -463,7 +498,7 @@ fn spawn_error(err: &std::io::Error) -> ApiResponse {
         std::io::ErrorKind::PermissionDenied => error_response(
             400,
             "program_not_permitted",
-            "the program is not executable by the daemon's user",
+            "the program or the working directory is not accessible to this account",
         ),
         _ => error_response(400, "spawn_failed", "the program could not be started"),
     }

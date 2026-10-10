@@ -18,6 +18,7 @@ mod findings;
 mod http;
 mod http_events;
 mod ipc;
+mod launch_as;
 mod openapi;
 mod proxy;
 mod query;

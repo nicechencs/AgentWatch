@@ -702,6 +702,10 @@ pub struct LaunchResult {
     pub cgroup_path: String,
     /// Fixed note: the pid was written after `Command` had already started.
     pub detail: String,
+    /// `false`: the session cgroup was created but the pid could not be moved
+    /// into it (`cgroup.procs` refused). The program was already running, so
+    /// it is not killed or re-run; it is tracked by process tree instead.
+    pub scoped: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -717,8 +721,9 @@ impl LocalCgroupHost {
     ///
     /// [`LaunchError::CgroupV1NoLaunch`] on cgroup v1 or an unreadable hierarchy.
     /// [`LaunchError::CreateFailed`] when the parent is not a delegated,
-    /// user-writable cgroup (`cgroup mkdir`). [`LaunchError::WriteProcsFailed`]
-    /// when `cgroup.procs` rejects the pid; the child is then killed.
+    /// user-writable cgroup (`cgroup mkdir`). When `cgroup.procs` rejects the
+    /// pid the program is already running: it is kept and waited, and the
+    /// result has `scoped: false` (process-tree tracking), not an error.
     /// [`LaunchError::ForkFailed`] when `Command` could not start. No error
     /// variant includes argv.
     pub fn launch(
@@ -905,11 +910,22 @@ fn move_and_wait(
     let procs = session.join("cgroup.procs");
     let write = std::fs::write(&procs, format!("{pid}"));
     if let Err(err) = write {
-        let _ = spawned.kill();
-        let _ = spawned.wait();
+        // The program has already started (spawn comes before the move), so
+        // killing it would lose the user's work and re-running would run it
+        // twice. Keep it, drop the unused cgroup, track by process tree.
         let _ = std::fs::remove_dir(session);
-        return Err(LaunchError::WriteProcsFailed {
-            detail: format!("cgroup.procs {}: {err}", procs.display()),
+        let status = spawned.wait().map_err(|err| LaunchError::WaitFailed {
+            detail: format!("wait failed: {err}"),
+        })?;
+        return Ok(LaunchResult {
+            code: status.code(),
+            pid,
+            cgroup_path: String::new(),
+            detail: format!(
+                "cgroup.procs {} refused the pid ({err}); tracked by process tree",
+                procs.display()
+            ),
+            scoped: false,
         });
     }
     let status = spawned.wait().map_err(|err| LaunchError::WaitFailed {
@@ -925,6 +941,7 @@ fn move_and_wait(
             "pid written to {} after spawn; the move is not atomic with exec (gap)",
             procs.display()
         ),
+        scoped: true,
     })
 }
 
@@ -932,6 +949,23 @@ fn move_and_wait(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod launch_tests {
     use super::*;
+
+    /// `cgroup.procs` refuses the pid (here: the session directory is gone):
+    /// the already-running program is not killed; it finishes and its exit
+    /// code comes back, marked as not scoped.
+    #[test]
+    fn refused_cgroup_procs_keeps_the_running_program() {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 5"])
+            .spawn()
+            .expect("spawn sh");
+        let missing = std::env::temp_dir().join(format!("aw-no-cgroup-{}", std::process::id()));
+        let result = move_and_wait(child, &missing).expect("not an error");
+        assert_eq!(result.code, Some(5), "the program ran to its own end");
+        assert!(!result.scoped);
+        assert!(result.cgroup_path.is_empty());
+        assert!(result.detail.contains("process tree"), "{}", result.detail);
+    }
 
     #[derive(Debug)]
     struct FakeLaunch {

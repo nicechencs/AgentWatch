@@ -425,7 +425,11 @@ fn launch_linux(
             // A signalled child has no exit code. That is not success.
             code: done.code.unwrap_or(exit::GENERAL),
             pid: done.pid,
-            note: Some(POST_SPAWN_MOVE_NOTE),
+            note: Some(if done.scoped {
+                POST_SPAWN_MOVE_NOTE
+            } else {
+                PID_TREE_FALLBACK_NOTE
+            }),
             sampling: spec.no_daemon,
         }),
         Err(err) if cgroup_fallback_allowed(&err) => {
@@ -469,7 +473,7 @@ fn launch_linux(
 /// missing capability; not a claim about the target.
 #[cfg(target_os = "linux")]
 pub(crate) const PID_TREE_FALLBACK_NOTE: &str =
-    "没采：cgroup 会话范围（本机没有可委派的 cgroup v2），已退化为按进程树跟踪（scope_pids）；脱离进程树的子进程可能漏记";
+    "没采：cgroup 会话范围（本机没有可委派、可用的 cgroup v2），已退化为按进程树跟踪（scope_pids）；脱离进程树的子进程可能漏记";
 
 /// Fixed sentence for the post-spawn cgroup move. Not a claim about the target.
 #[cfg(target_os = "linux")]

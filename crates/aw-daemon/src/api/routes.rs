@@ -1987,7 +1987,23 @@ fn session_query_route(
         ("POST", "stop") => match state.query.stop_session(user, sid) {
             Ok(None) => stop_memory(state, sid, caller),
             Ok(Some(())) => {
+                // A `/sessions/run` the CLI never adopted (it could not start the
+                // program) has no process to record. Stopping it discards the
+                // empty row instead of leaving a session that never ran.
+                let unadopted = state.pending_launches.contains_key(sid);
                 super::watch_routes::stopped(state, sid);
+                if unadopted {
+                    match state.query.delete_session(user, sid) {
+                        Ok(Some(())) => {
+                            return Some(ApiResponse::json(
+                                200,
+                                &json!({ "stopped": sid, "discarded": true }),
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(err) => return Some(from_backend(err)),
+                    }
+                }
                 ApiResponse::json(200, &json!({ "stopped": sid }))
             }
             Err(err) => from_backend(err),
@@ -2926,6 +2942,148 @@ mod tests {
         assert!(!argv.contains("hunter2"), "argv is redacted: {argv}");
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn session_count(db: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(db)
+            .and_then(|c| c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)))
+            .unwrap_or(-1)
+    }
+
+    /// Pid 1 is owned by root. A non-root caller cannot attach to it, and cannot
+    /// adopt it either — not even with an administrator token.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn another_accounts_pid_is_refused_for_attach_and_for_adopt() {
+        if nix::unistd::geteuid().as_raw() == 0 {
+            return;
+        }
+        let (dir, db) = seeded_db("notyours", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let me = crate::sample::current_user_id();
+        let user = token_for(&mut state, &me, false);
+        let admin = token_for(&mut state, &me, true);
+        let before = session_count(&db);
+        let (status, body) = post(
+            &mut state,
+            &user,
+            "/api/v1/sessions",
+            r#"{"mode":"attach","pid":1}"#,
+        );
+        assert_eq!(status, 403, "{body}");
+        assert_eq!(body["error"]["code"], "not_your_process");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("不属于你的账户"), "{message}");
+        assert_eq!(session_count(&db), before, "a refused attach writes no row");
+
+        let (status, body) = post(
+            &mut state,
+            &user,
+            "/api/v1/sessions/run",
+            r#"{"argv":["sleep","30"]}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        let ticket = body["ticket"].as_str().unwrap_or_default().to_owned();
+        let adopt = format!("/api/v1/sessions/{sid}/adopt");
+        for token in [&user, &admin] {
+            let (status, body) = post(
+                &mut state,
+                token,
+                &adopt,
+                &format!(r#"{{"ticket":"{ticket}","pid":1}}"#),
+            );
+            assert_eq!(status, 403, "{body}");
+            assert_eq!(body["error"]["code"], "not_your_process");
+        }
+        // Still waiting: the refused adopt did not consume the launch.
+        assert!(state.pending_launches.contains_key(&sid));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `/sessions/run` whose program the CLI could not start is an empty row.
+    /// Stopping it discards the row. A launch that fails to spawn writes none.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stopping_an_unadopted_run_discards_the_empty_session() {
+        let (dir, db) = seeded_db("discard", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &crate::sample::current_user_id(), false);
+        let before = session_count(&db);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions/run",
+            r#"{"argv":["/nonexistent/prog"]}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(session_count(&db), before + 1);
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        let (status, body) = post(
+            &mut state,
+            &token,
+            &format!("/api/v1/sessions/{sid}/stop"),
+            "",
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["discarded"], true);
+        assert_eq!(session_count(&db), before, "the empty row is gone");
+
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["/nonexistent/prog"]}"#,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["error"]["code"], "program_not_found");
+        assert_eq!(session_count(&db), before, "a failed launch writes no row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No `name` in the body: the label is the program base name plus the
+    /// redacted arguments. A given `name` wins, and a secret never lands in it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_name_comes_from_the_argv_when_not_given() {
+        let (dir, db) = seeded_db("label", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &crate::sample::current_user_id(), false);
+        let name_of = |state: &mut ApiState, body: &str| {
+            let (status, response) = post(state, &token, "/api/v1/sessions/run", body);
+            assert_eq!(status, 201, "{response}");
+            let sid = response["id"].as_str().unwrap_or_default().to_owned();
+            rusqlite::Connection::open(&db)
+                .and_then(|c| {
+                    c.query_row(
+                        "SELECT name FROM sessions WHERE public_id = ?1",
+                        [&sid],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        };
+        let derived = name_of(
+            &mut state,
+            r#"{"argv":["/usr/bin/python3","tool.py","--token=hunter2"]}"#,
+        );
+        assert!(
+            derived.starts_with("python3 tool.py"),
+            "label from argv: {derived}"
+        );
+        assert!(!derived.contains("hunter2"), "secret stays out: {derived}");
+        assert!(derived.chars().count() <= 60, "capped at 60: {derived}");
+        let given = name_of(
+            &mut state,
+            r#"{"argv":["/usr/bin/python3","tool.py"],"name":"mine"}"#,
+        );
+        assert_eq!(given, "mine");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -103,14 +103,16 @@ fn collector_available() -> Result<(), ApiResponse> {
     }
 }
 
-/// OS user that owns `pid`, as the numeric uid string `Caller.user_id` uses.
+/// Real uid of `pid`: the first field of the `Uid:` line in
+/// `/proc/<pid>/status` (real, not effective). Not the owner of the `/proc/<pid>`
+/// directory, which is root for every process. `None` when the line cannot be read.
 fn pid_owner(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(format!("/proc/{pid}"))
-            .ok()
-            .map(|meta| meta.uid().to_string())
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let line = status.lines().find(|line| line.starts_with("Uid:"))?;
+        let real = line[4..].split_whitespace().next()?;
+        real.parse::<u32>().ok().map(|uid| uid.to_string())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -119,9 +121,11 @@ fn pid_owner(pid: u32) -> Option<String> {
     }
 }
 
-/// The pid must be running and identifiable, and belong to the caller unless
-/// the caller is an administrator.
-fn check_pid(caller: &Caller, pid: u32) -> Result<(), ApiResponse> {
+/// The pid must be running and identifiable, and its real uid must be the
+/// caller's. `allow_admin` lets an administrator attach to another account's
+/// process; adopt never does (`allow_admin` false), so an administrator cannot
+/// take over a process that belongs to someone else.
+fn check_pid_owner(caller: &Caller, pid: u32, allow_admin: bool) -> Result<(), ApiResponse> {
     collector_available()?;
     if crate::sample::proc_uid_of(pid).is_none() {
         return Err(error_response(
@@ -131,14 +135,15 @@ fn check_pid(caller: &Caller, pid: u32) -> Result<(), ApiResponse> {
         ));
     }
     let owner = pid_owner(pid);
-    if !caller.admin && owner.as_deref() != Some(caller.user_id.as_str()) {
-        return Err(error_response(
-            403,
-            "forbidden",
-            "attaching to another user's process needs an administrator",
-        ));
+    if owner.as_deref() == Some(caller.user_id.as_str()) || (allow_admin && caller.admin) {
+        return Ok(());
     }
-    Ok(())
+    let message = if allow_admin {
+        "这个进程不属于你的账户；记录别的账户的进程需要管理员权限"
+    } else {
+        "这个进程不属于你的账户，不能接管"
+    };
+    Err(error_response(403, "not_your_process", message))
 }
 
 fn db_path(state: &ApiState) -> Result<std::path::PathBuf, ApiResponse> {
@@ -186,6 +191,29 @@ fn new_public_id() -> Result<String, ApiResponse> {
         })
 }
 
+/// Label from the command line when the body gives no `name`: the program's
+/// base name, then each redacted argument, joined by spaces. Capped at 60
+/// characters (59 plus `…`).
+fn label_from_argv(argv: &[String]) -> String {
+    let redacted: Vec<String> = serde_json::from_str(&redacted_argv_json(argv)).unwrap_or_default();
+    let mut parts = Vec::with_capacity(redacted.len());
+    for (index, arg) in redacted.iter().enumerate() {
+        if index == 0 {
+            parts.push(arg.rsplit(['/', '\\']).next().unwrap_or(arg).to_owned());
+        } else {
+            parts.push(arg.clone());
+        }
+    }
+    let label = parts.join(" ");
+    let mut chars = label.chars();
+    let head: String = chars.by_ref().take(59).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        label
+    }
+}
+
 fn target_for(
     caller: &Caller,
     body: &Value,
@@ -193,10 +221,11 @@ fn target_for(
     root_pid: u32,
     argv: Option<&[String]>,
 ) -> Result<SampleTarget, ApiResponse> {
+    let name = opt_text(body, "name").or_else(|| argv.map(label_from_argv));
     Ok(SampleTarget {
         db_id: 0,
         public_id: new_public_id()?,
-        name: opt_text(body, "name"),
+        name,
         mode,
         root_pid,
         user_id: caller.user_id.clone(),
@@ -236,7 +265,7 @@ fn create_inner(
     match value.get("mode").and_then(Value::as_str) {
         Some("attach") => {
             let pid = pid_field(&value)?;
-            check_pid(caller, pid)?;
+            check_pid_owner(caller, pid, true)?;
             let mut target = target_for(caller, &value, "attach", pid, None)?;
             insert_session(&path, &mut target)?;
             let response = created(&target, json!({}));
@@ -386,7 +415,8 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
             ));
         }
         let pid = pid_field(&value)?;
-        check_pid(caller, pid)?;
+        // Never `allow_admin`: an administrator cannot adopt another account's pid.
+        check_pid_owner(caller, pid, false)?;
         let Some(mut pending) = state.pending_launches.remove(sid) else {
             return Err(not_found());
         };
@@ -452,7 +482,7 @@ pub(super) fn attach(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u
                 "session is not open for attach",
             ));
         }
-        check_pid(caller, pid)?;
+        check_pid_owner(caller, pid, true)?;
         let target = SampleTarget {
             db_id,
             public_id: sid.to_owned(),

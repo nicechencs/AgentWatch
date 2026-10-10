@@ -3,7 +3,8 @@
  * fetch("/api/v1…") itself keeps its own token and error handling, and a
  * transport change (desktop IPC) would silently miss it.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { setToken } from "./client";
 
 const sources = import.meta.glob<string>("/src/**/*.{ts,tsx}", { query: "?raw", import: "default", eager: true });
 
@@ -83,5 +84,68 @@ describe("network flow grouping", () => {
   it("groups by port and process", () => {
     expect(groupFlows(rows, "port").map((g) => g.key).sort()).toEqual(["443", "53"]);
     expect(groupFlows(rows, "proc").map((g) => g.connections).sort()).toEqual([1, 2]);
+  });
+});
+
+import { dispositionName, fetchExport, parseSse, subscribeLive } from "./client";
+
+describe("export and live go through the request layer", () => {
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    vi.restoreAllMocks();
+    setToken(null);
+  });
+
+  it("browser: export sends the bearer token and keeps zip bytes intact", async () => {
+    setToken("k-test");
+    const zip = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0xff, 0x00, 0x80]);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(zip, { status: 200, headers: { "content-disposition": 'attachment; filename="s1.zip"' } }),
+    );
+    const file = await fetchExport("s1", "csv");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/v1/sessions/s1/export?format=csv");
+    expect(new Headers((init as RequestInit).headers).get("authorization")).toBe("Bearer k-test");
+    expect(file.name).toBe("s1.zip");
+    expect(new Uint8Array(await file.blob.arrayBuffer())).toEqual(zip);
+  });
+
+  it("desktop: export uses the binary-safe channel command", async () => {
+    const invoke = vi.fn().mockResolvedValue({ status: 200, headers: {}, body_base64: btoa("PK\u0003\u0004\u00ff") });
+    (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = { invoke };
+    const file = await fetchExport("s1", "csv");
+    expect(invoke).toHaveBeenCalledWith("aw_request_bytes", expect.objectContaining({ target: "/api/v1/sessions/s1/export?format=csv" }));
+    expect(Array.from(new Uint8Array(await file.blob.arrayBuffer()))).toEqual([0x50, 0x4b, 3, 4, 0xff]);
+    expect(file.name).toBe("s1.zip");
+  });
+
+  it("an export error is thrown, not navigated to", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response('{"error":{"code":"unauthorized","message":"bearer token required"}}', { status: 401 }),
+    );
+    await expect(fetchExport("s1", "md")).rejects.toMatchObject({ status: 401, code: "unauthorized" });
+  });
+
+  it("parses the daemon's SSE frames and filename headers", () => {
+    const frames = parseSse('retry: 1000\nid: 7\nevent: record\ndata: {"a":1}\n\n: keepalive\n\n');
+    expect(frames).toEqual([{ event: "record", data: '{"a":1}', id: "7" }]);
+    expect(dispositionName('attachment; filename="x.md"')).toBe("x.md");
+  });
+
+  it("live: polls /live with the token and advances the cursor", async () => {
+    vi.useFakeTimers();
+    setToken("k-live");
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response('id: 3\nevent: record\ndata: {"cat":"proc"}\n\n', { status: 200 }))
+      .mockResolvedValue(new Response(": keepalive\n\n", { status: 200 }));
+    const records: unknown[] = [];
+    const close = subscribeLive("s1", "", { onRecord: (r) => records.push(r), onLagged: () => {}, onError: () => {} });
+    await vi.waitFor(() => expect(records).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(1000);
+    close();
+    vi.useRealTimers();
+    expect(new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers).get("authorization")).toBe("Bearer k-live");
+    expect(String(fetchMock.mock.calls[1][0])).toContain("cursor=3");
   });
 });

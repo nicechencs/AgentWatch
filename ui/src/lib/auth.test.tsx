@@ -94,4 +94,39 @@ describe("desktop app entry", () => {
     screen.getByRole("button", { name: "Retry" }).click();
     await waitFor(() => expect(screen.getByText("signed-in")).toBeInTheDocument());
   });
+
+  const renderDesktop = (invoke: ReturnType<typeof vi.fn>) => {
+    (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = { invoke };
+    render(
+      <I18nProvider lang="en">
+        <AuthProvider>
+          <Status />
+          <SignIn />
+        </AuthProvider>
+      </I18nProvider>,
+    );
+  };
+
+  it("a refused channel is a permission message, not 'not running'", async () => {
+    const invoke = vi.fn().mockRejectedValue("daemon_forbidden: permission denied");
+    renderDesktop(invoke);
+    await waitFor(() => expect(screen.getByText("forbidden")).toBeInTheDocument());
+    expect(screen.getByText("Not allowed to connect to the AgentWatch service")).toBeInTheDocument();
+    expect(screen.queryByText("The AgentWatch service is not running")).toBeNull();
+  });
+
+  it("a daemon that answers with an error says so, and retry asks again", async () => {
+    const invoke = vi
+      .fn()
+      .mockResolvedValue({ status: 500, body: '{"error":{"code":"store","message":"disk I/O error"}}' });
+    renderDesktop(invoke);
+    await waitFor(() => expect(screen.getByText("failed")).toBeInTheDocument());
+    expect(screen.getByText("The service is running but returned an error: disk I/O error")).toBeInTheDocument();
+    expect(screen.queryByText("The AgentWatch service is not running")).toBeNull();
+    const calls = invoke.mock.calls.length;
+    invoke.mockResolvedValue({ status: 200, body: '{"user_id":"1000","admin":false}' });
+    screen.getByRole("button", { name: "Retry" }).click();
+    await waitFor(() => expect(screen.getByText("signed-in")).toBeInTheDocument());
+    expect(invoke.mock.calls.length).toBeGreaterThan(calls);
+  });
 });

@@ -12,6 +12,7 @@ import { RelTime } from "@/components/RelTime";
 import { formatDuration } from "@/lib/format";
 import { diskUnavailableText, diskUsed } from "@/lib/disk";
 import { useI18n } from "@/lib/i18n";
+import { useExport } from "@/lib/use-export";
 
 const RANGES = ["7d", "30d", "all"] as const;
 
@@ -195,6 +196,7 @@ function SessionRow({
   onDelete: () => void;
 }) {
   const { t } = useI18n();
+  const exporter = useExport();
   const [draft, setDraft] = useState(session.name ?? "");
   const active = session.ended_ns === null && !session.purged;
   const duration = session.ended_ns ? formatDuration((session.ended_ns - session.started_ns) / 1_000_000) : active ? "…" : "–";
@@ -255,7 +257,14 @@ function SessionRow({
             <button type="button" onClick={onRenameStart}>{t("sessions.rename")}</button>
             <button type="button" onClick={onPin}>{session.pinned ? t("sessions.unpin") : t("sessions.pin")}</button>
             <button type="button" onClick={onDelete}>{t("sessions.delete")}</button>
-            <a href={api.exportUrl(session.public_id, "jsonl")}>{t("session.export")}</a>
+            <button
+              type="button"
+              disabled={exporter.pending !== null}
+              onClick={() => void exporter.run(session.public_id, "jsonl")}
+            >
+              {t("session.export")}
+            </button>
+            {exporter.error ? <span role="alert" className="text-gap">{exporter.error}</span> : null}
           </span>
         )}
       </td>

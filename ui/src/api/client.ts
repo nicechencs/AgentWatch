@@ -5,7 +5,7 @@
  * a later browser start does not inherit the token.
  */
 import { ApiError } from "./errors";
-import { send as transportSend } from "./transport";
+import { send as transportSend, sendBytes as transportSendBytes } from "./transport";
 import type {
   ApiErrorBody,
   ConfigView,
@@ -447,8 +447,8 @@ export const api = {
   stopSession: (sid: string) => send<Session>("POST", `/sessions/${sid}/stop`),
   deleteSession: (sid: string) => send<void>("DELETE", `/sessions/${sid}`),
   summary: async (sid: string) => toSummary(await get<unknown>(`/sessions/${sid}/summary`)),
-  exportUrl: (sid: string, format: "jsonl" | "csv" | "md") =>
-    `${API}/sessions/${sid}/export?format=${format}`,
+  /** Raw bytes of an export, through the same request layer as every call. */
+  exportFile: (sid: string, format: ExportFormat) => fetchExport(sid, format),
 
   timeline: async (sid: string, query: Record<string, unknown>) =>
     toPage(await get<unknown>(`/sessions/${sid}/timeline${qs(query)}`), ["rows"], toTimelineItem),
@@ -510,6 +510,61 @@ export const api = {
   /** Call only after the user confirmed: the daemon refuses a purge without `confirm`. */
   purge: (body: { older_than?: string; all?: boolean }) => send<void>("POST", "/db/purge", { ...body, confirm: true }),
 };
+
+export type ExportFormat = "jsonl" | "csv" | "md";
+
+const EXPORT_EXT: Record<ExportFormat, string> = { jsonl: "jsonl", csv: "zip", md: "md" };
+
+export interface ExportFile {
+  name: string;
+  blob: Blob;
+}
+
+/** `filename="…"` from a content-disposition header, or null. */
+export function dispositionName(header: string | null): string | null {
+  const match = header ? /filename="?([^";]+)"?/iu.exec(header) : null;
+  return match ? match[1] : null;
+}
+
+/**
+ * `GET /sessions/{sid}/export?format=` with the token (browser) or over the
+ * internal channel (app), read as bytes so the CSV zip is not mangled as text.
+ * A daemon error is thrown as {@link ApiError}; the page shows it in place.
+ */
+export async function fetchExport(sid: string, format: ExportFormat): Promise<ExportFile> {
+  const headers = new Headers();
+  if (token) headers.set("authorization", `Bearer ${token}`);
+  const response = await transportSendBytes(`${API}/sessions/${encodeURIComponent(sid)}/export?format=${format}`, {
+    method: "GET",
+    headers,
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    let body: ApiErrorBody | null = null;
+    try {
+      body = text ? (JSON.parse(text) as ApiErrorBody) : null;
+    } catch {
+      body = null;
+    }
+    throw new ApiError(response.status, body, response.statusText);
+  }
+  const blob = await response.blob();
+  const name = dispositionName(response.headers.get("content-disposition")) ?? `${sid}.${EXPORT_EXT[format]}`;
+  return { name, blob };
+}
+
+/** Hand a file to the user as a download without leaving the page. */
+export function saveFile(file: ExportFile): void {
+  const url = URL.createObjectURL(file.blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = file.name;
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
 
 export interface LiveHandlers {
   onRecord: (item: TimelineItem) => void;

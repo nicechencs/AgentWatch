@@ -10,6 +10,14 @@
  *
  * Both paths return a standard `Response`, so `client.ts` handles status and
  * JSON the same way.
+ *
+ * Commands the page calls in the app (interface in app/README.md):
+ * - `aw_request {method, target, body?}` → `{status, body}`: JSON/text.
+ * - `aw_request_bytes {method, target, body?}` → `{status, headers, body_base64}`:
+ *   binary-safe, used for exports (the CSV export is a zip).
+ * A rejected command's error text starts with `daemon_unreachable:` (nothing
+ * is listening), `daemon_forbidden:` (the socket/pipe refused this OS user),
+ * or anything else (the channel itself failed).
  */
 
 type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -17,6 +25,12 @@ type Invoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
 interface ChannelReply {
   status: number;
   body: string;
+}
+
+interface BytesReply {
+  status: number;
+  headers?: Record<string, string>;
+  body_base64: string;
 }
 
 function tauriInvoke(): Invoke | null {
@@ -58,11 +72,54 @@ export async function send(url: string, init: RequestInit & { method: string }):
       headers: { "content-type": "application/json" },
     });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const code = message.startsWith("daemon_unreachable") ? "daemon_unreachable" : "channel_error";
-    return new Response(JSON.stringify({ error: { code, message } }), {
-      status: 503,
-      headers: { "content-type": "application/json" },
+    return channelFailure(err);
+  }
+}
+
+/**
+ * The error a rejected app command becomes. `daemon_unreachable` (503) is the
+ * only case the page calls "service not running"; a refused socket is
+ * `daemon_forbidden` (403); anything else is `channel_error` (502).
+ */
+export function channelFailure(err: unknown): Response {
+  const message = err instanceof Error ? err.message : String(err);
+  const [code, status]: [string, number] = message.startsWith("daemon_unreachable")
+    ? ["daemon_unreachable", 503]
+    : message.startsWith("daemon_forbidden")
+      ? ["daemon_forbidden", 403]
+      : ["channel_error", 502];
+  return new Response(JSON.stringify({ error: { code, message } }), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function decodeBase64(text: string): Uint8Array {
+  const binary = atob(text);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+/**
+ * Like {@link send}, but the body is never decoded as text, so a zip survives.
+ * In a browser this is the same `fetch`; in the app it uses `aw_request_bytes`.
+ */
+export async function sendBytes(url: string, init: RequestInit & { method: string }): Promise<Response> {
+  const invoke = tauriInvoke();
+  if (!invoke) return fetch(url, init);
+  try {
+    const reply = (await invoke("aw_request_bytes", {
+      method: init.method,
+      target: url,
+      body: bodyText(init.body),
+    })) as BytesReply;
+    const bytes = decodeBase64(reply.body_base64 ?? "");
+    return new Response(bytes.byteLength ? (bytes as unknown as BodyInit) : null, {
+      status: reply.status,
+      headers: reply.headers ?? {},
     });
+  } catch (err) {
+    return channelFailure(err);
   }
 }

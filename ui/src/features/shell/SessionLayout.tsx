@@ -9,6 +9,7 @@ import { FilterBar } from "@/components/FilterBar";
 import { RelTime } from "@/components/RelTime";
 import { ErrorNote, Loading } from "@/components/QueryState";
 import { composedFilter, useSessionQuery } from "@/lib/session-query";
+import { useExport } from "@/lib/use-export";
 import { useI18n } from "@/lib/i18n";
 
 const TABS = [
@@ -25,6 +26,7 @@ const TABS = [
 /** Top bar, tabs, shared filter and density strip for every in-session page. */
 export function SessionLayout() {
   const { t } = useI18n();
+  const exporter = useExport();
   const { sid } = useParams({ strict: false }) as { sid: string };
   const { query, patch } = useSessionQuery();
   const [stopping, setStopping] = useState(false);
@@ -100,15 +102,23 @@ export function SessionLayout() {
             <Dropdown.Portal>
               <Dropdown.Content className="rounded border border-line bg-paper p-1 text-xs shadow">
                 {(["jsonl", "csv", "md"] as const).map((format) => (
-                  <Dropdown.Item key={format} asChild>
-                    <a className="block rounded px-2 py-1 hover:bg-paper-sunken" href={api.exportUrl(sid, format)}>
-                      {t(`session.export.${format}`)}
-                    </a>
+                  <Dropdown.Item
+                    key={format}
+                    className="block cursor-pointer rounded px-2 py-1 hover:bg-paper-sunken"
+                    disabled={exporter.pending !== null}
+                    onSelect={() => void exporter.run(sid, format)}
+                  >
+                    {t(`session.export.${format}`)}
                   </Dropdown.Item>
                 ))}
               </Dropdown.Content>
             </Dropdown.Portal>
           </Dropdown.Root>
+          {exporter.error ? (
+            <span role="alert" className="text-xs text-gap">
+              {exporter.error}
+            </span>
+          ) : null}
         </div>
       </header>
       {stopError ? <ErrorNote error={stopError} /> : null}

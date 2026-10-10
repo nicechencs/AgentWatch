@@ -1483,6 +1483,8 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
                 "agent": summary.agent,
                 "started_ns": summary.started_ns,
                 "ended_ns": summary.ended_ns,
+                "mode": summary.mode,
+                "collectors": stored_collectors_json(&summary.collectors),
                 "stats": {
                     "process_count": summary.process_count,
                     "flow_count": summary.flow_count,
@@ -1495,6 +1497,51 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
         ),
         Err(err) => from_backend(err),
     }
+}
+
+/// What each collector named on a session row can observe in this build.
+///
+/// `sessions.collectors` stores names only (`["poll"]`). Without a capability
+/// list the overview printed an empty 「采集能力」 and then 「缺口：无」, and the
+/// files and network pages said 「没有记录」 for categories that were never
+/// collected. Each name becomes `{name, mode, capabilities: [{kind, evidence,
+/// na_reason}]}`. A name this build does not know gets an empty list and a
+/// `note`, never a guessed capability.
+fn stored_collectors_json(stored: &str) -> serde_json::Value {
+    let names: Vec<String> = serde_json::from_str(stored).unwrap_or_default();
+    let collectors: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| match name.as_str() {
+            "poll" => json!({
+                "name": "poll",
+                "mode": "poll",
+                "capabilities": poll_capabilities(),
+            }),
+            other => json!({
+                "name": other,
+                "mode": null,
+                "capabilities": [],
+                "note": "collector_not_described",
+            }),
+        })
+        .collect();
+    serde_json::Value::Array(collectors)
+}
+
+/// The poll collector: process table samples everywhere; connection table
+/// only on Windows (`netstat -ano`). Files and DNS are never polled.
+fn poll_capabilities() -> serde_json::Value {
+    let net = if cfg!(windows) {
+        json!({ "kind": "net", "evidence": "S" })
+    } else {
+        json!({ "kind": "net", "evidence": "NA", "na_reason": "collector_unavailable" })
+    };
+    json!([
+        { "kind": "proc", "evidence": "S" },
+        { "kind": "file", "evidence": "NA", "na_reason": "collector_unavailable" },
+        net,
+        { "kind": "dns", "evidence": "NA", "na_reason": "collector_unavailable" },
+    ])
 }
 
 fn session_name_from_body(body: &[u8]) -> String {
@@ -2916,5 +2963,35 @@ mod tests {
         // address was loopback and that the function returned a real port.
         assert_ne!(bound.port(), 0);
         Ok(())
+    }
+
+    /// UI review P1-5: a poll-only session must say which categories were not
+    /// collected, so the pages do not read 「没有记录」 as "nothing happened".
+    #[test]
+    fn stored_poll_collector_lists_uncollected_categories() {
+        let value = super::stored_collectors_json(r#"["poll","mystery"]"#);
+        let empty = Vec::new();
+        let list = value.as_array().unwrap_or(&empty);
+        assert_eq!(list.len(), 2);
+        let caps = list[0]["capabilities"].as_array().unwrap_or(&empty);
+        let by_kind = |kind: &str| {
+            caps.iter()
+                .find(|cap| cap["kind"] == kind)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        };
+        assert_eq!(by_kind("proc")["evidence"], "S");
+        assert_eq!(by_kind("file")["evidence"], "NA");
+        assert_eq!(by_kind("file")["na_reason"], "collector_unavailable");
+        assert_eq!(by_kind("dns")["evidence"], "NA");
+        if !cfg!(windows) {
+            assert_eq!(by_kind("net")["evidence"], "NA");
+        }
+        assert_eq!(list[1]["capabilities"], serde_json::json!([]));
+        assert_eq!(list[1]["note"], "collector_not_described");
+        assert_eq!(
+            super::stored_collectors_json("not json"),
+            serde_json::json!([])
+        );
     }
 }

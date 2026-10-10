@@ -602,6 +602,9 @@ fn write_processes(tx: &Transaction<'_>, rows: &[ProcessRow]) -> Result<(), Stor
     Ok(())
 }
 
+/// Insert `process_images` rows. A repeat of `(session_id, proc_uid, seq)` is
+/// ignored: a sampler that restarts on the same database writes the same first
+/// image again, and a plain INSERT rolled back the whole batch.
 fn write_images(
     tx: &Transaction<'_>,
     rows: &[ProcessImageRow],
@@ -618,30 +621,41 @@ fn write_images(
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
                 ?10, ?11, ?12
-             )",
+             )
+             ON CONFLICT (session_id, proc_uid, seq) DO NOTHING",
         )
         .map_err(|err| StoreError::sqlite("prepare_images", err))?;
     for row in rows {
-        stmt.execute(params![
-            row.id,
-            row.session_id,
-            row.proc_uid,
-            row.seq,
-            row.ts_ns,
-            row.exe,
-            row.argv,
-            row.cwd,
-            row.env,
-            row.evidence,
-            row.field_evidence,
-            row.source,
-        ])
-        .map_err(|err| StoreError::sqlite("insert_image", err))?;
-        if let Some(id) = row.id {
-            // argv is already redacted. An unknown argv is not indexed as "".
-            if file_schema_present(tx)? {
-                fts::upsert(tx, fts, FtsSource::ProcessImage, id, row.argv.as_deref())?;
-            }
+        let inserted = stmt
+            .execute(params![
+                row.id,
+                row.session_id,
+                row.proc_uid,
+                row.seq,
+                row.ts_ns,
+                row.exe,
+                row.argv,
+                row.cwd,
+                row.env,
+                row.evidence,
+                row.field_evidence,
+                row.source,
+            ])
+            .map_err(|err| StoreError::sqlite("insert_image", err))?;
+        if inserted == 0 {
+            // Already stored (same session, process and seq): its FTS row is
+            // already there too.
+            continue;
+        }
+        // The poll sampler leaves `id` to SQLite; index the row it got. Without
+        // this, process names were stored but cross-session search never
+        // found them (UI review #6).
+        let id = row.id.unwrap_or_else(|| tx.last_insert_rowid());
+        // argv is already redacted. With no argv the executable path is the
+        // searchable text; neither known means nothing is indexed (not "").
+        let text = row.argv.as_deref().or(row.exe.as_deref());
+        if file_schema_present(tx)? {
+            fts::upsert(tx, fts, FtsSource::ProcessImage, id, text)?;
         }
     }
     Ok(())

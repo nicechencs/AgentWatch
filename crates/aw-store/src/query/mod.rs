@@ -136,6 +136,10 @@ pub struct SessionSummary {
     pub bytes_up: Option<i64>,
     /// Sum of `bytes_down`. `None` when every flow left the column NULL.
     pub bytes_down: Option<i64>,
+    /// `launch` or `attach`.
+    pub mode: String,
+    /// `sessions.collectors`: JSON array of collector names, as stored.
+    pub collectors: String,
 }
 
 /// One process in a session tree.
@@ -353,7 +357,8 @@ pub fn session_summary(
                     (SELECT COUNT(*) FROM dns d WHERE d.session_id = s.id), \
                     (SELECT COUNT(*) FROM gaps g WHERE g.session_id = s.id), \
                     (SELECT SUM(bytes_up) FROM net_flows f WHERE f.session_id = s.id), \
-                    (SELECT SUM(bytes_down) FROM net_flows f WHERE f.session_id = s.id) \
+                    (SELECT SUM(bytes_down) FROM net_flows f WHERE f.session_id = s.id), \
+                    s.mode, s.collectors \
              FROM sessions s WHERE s.id = ? AND s.user_id = ?",
             rusqlite::params![session_id, user_id],
             |row| {
@@ -370,6 +375,8 @@ pub fn session_summary(
                     gap_count: row.get(9)?,
                     bytes_up: row.get(10)?,
                     bytes_down: row.get(11)?,
+                    mode: row.get(12)?,
+                    collectors: row.get(13)?,
                 })
             },
         )

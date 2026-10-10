@@ -352,10 +352,14 @@ pub(crate) enum DaemonCmd {
         #[arg(long)]
         check: bool,
     },
-    /// 日志
+    /// 日志：daemon 日志文件的最后若干行；`-f` 持续输出新增内容
     Logs {
-        #[arg(long)]
+        /// 持续输出新写入的行，Ctrl-C 结束
+        #[arg(long, short = 'f')]
         follow: bool,
+        /// 先输出最后多少行（最多 5000）
+        #[arg(long, short = 'n', default_value_t = 200)]
+        lines: usize,
     },
 }
 

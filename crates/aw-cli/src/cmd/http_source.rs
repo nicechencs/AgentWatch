@@ -327,7 +327,8 @@ fn client_to_query(err: ClientError) -> QueryError {
         } => QueryError::BadArgument {
             detail: clip(&err.to_string()),
         },
-        ClientError::Status {
+        ClientError::Forbidden { .. }
+        | ClientError::Status {
             status: 401 | 403, ..
         } => QueryError::Unavailable {
             detail: clip(&format!("auth: {err}")),

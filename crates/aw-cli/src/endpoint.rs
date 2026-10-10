@@ -36,17 +36,8 @@ use std::path::PathBuf;
 #[allow(dead_code)]
 pub const DEFAULT_HTTP_PORT: u16 = 7456;
 
-/// Linux CLI socket (api-and-cli §1).
-#[allow(dead_code)]
-pub const LINUX_SOCKET: &str = "/run/agentwatch/api.sock";
-
-/// macOS CLI socket (api-and-cli §1).
-#[allow(dead_code)]
-pub const MACOS_SOCKET: &str = "/var/run/agentwatch/api.sock";
-
-/// Windows CLI named pipe (api-and-cli §1).
-#[cfg(target_os = "windows")]
-pub const WINDOWS_PIPE: &str = r"\\.\pipe\agentwatch-api";
+// Socket and pipe paths (and their order) live in aw-channel, shared with
+// the daemon and the desktop app.
 
 /// Environment variable read when `--token` is absent on an HTTP address.
 pub const TOKEN_ENV: &str = "AW_TOKEN";
@@ -217,27 +208,13 @@ fn platform_default() -> Option<Endpoint> {
     if let Some(path) = blank_to_none(env::var(SOCKET_ENV).ok()) {
         return Some(classify_socket_path(path));
     }
-    #[cfg(target_os = "linux")]
-    {
-        Some(Endpoint::Unix {
-            path: PathBuf::from(LINUX_SOCKET),
-        })
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Some(Endpoint::Unix {
-            path: PathBuf::from(MACOS_SOCKET),
-        })
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Some(Endpoint::Pipe {
-            path: PathBuf::from(WINDOWS_PIPE),
-        })
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        None
+    // Same order as the daemon and the desktop app: system path, then the
+    // per-user path an unprivileged daemon falls back to (aw-channel).
+    let path = aw_channel::resolve_from_env()?;
+    if cfg!(windows) {
+        Some(Endpoint::Pipe { path })
+    } else {
+        Some(Endpoint::Unix { path })
     }
 }
 

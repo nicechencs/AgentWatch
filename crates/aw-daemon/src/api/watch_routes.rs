@@ -768,7 +768,7 @@ mod attach_target_name_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 #[allow(clippy::expect_used)]
 mod ownership_tests {
     use super::{check_pid_owner, Caller};

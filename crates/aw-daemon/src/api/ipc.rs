@@ -82,15 +82,20 @@ pub fn socket_mode(grouped: bool) -> u32 {
 /// `None` on a platform with no channel.
 #[must_use]
 pub fn socket_path() -> Option<PathBuf> {
-    socket_path_from(std::env::var(AW_SOCKET).ok())
+    socket_path_from(std::env::var(AW_SOCKET).ok(), &|key| {
+        std::env::var(key).ok()
+    })
 }
 
-fn socket_path_from(env: Option<String>) -> Option<PathBuf> {
+fn socket_path_from(
+    env: Option<String>,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
     if let Some(value) = env.filter(|value| !value.trim().is_empty()) {
         return Some(PathBuf::from(value.trim()));
     }
     // `AW_SYSTEM_SOCKET` stands in for the system path in tests only.
-    aw_channel::system_path_from(&|key| std::env::var(key).ok())
+    aw_channel::system_path_from(lookup)
 }
 
 /// Per-user socket an unprivileged daemon binds when it may not create the
@@ -757,14 +762,22 @@ mod tests {
         assert!(!super::should_fall_back(&std::io::Error::from(
             std::io::ErrorKind::AddrInUse
         )));
+        // Empty lookup: ignore `AW_SYSTEM_SOCKET` and friends from the shell.
+        let none = |_: &str| None;
         assert_eq!(
-            socket_path_from(Some("/tmp/x.sock".to_owned())),
+            socket_path_from(Some("/tmp/x.sock".to_owned()), &none),
             Some(PathBuf::from("/tmp/x.sock"))
         );
-        let default = socket_path_from(Some("  ".to_owned()));
+        let default = socket_path_from(Some("  ".to_owned()), &none);
         if cfg!(target_os = "linux") {
             assert_eq!(default, Some(PathBuf::from(super::LINUX_SOCKET)));
         }
+        // Blank override falls through to `AW_SYSTEM_SOCKET` (not on Windows).
+        let lookup = |key: &str| (key == "AW_SYSTEM_SOCKET").then(|| "/tmp/sys.sock".to_owned());
+        assert_eq!(
+            socket_path_from(Some("  ".to_owned()), &lookup),
+            Some(PathBuf::from("/tmp/sys.sock"))
+        );
     }
 
     #[test]

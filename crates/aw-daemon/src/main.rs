@@ -92,6 +92,11 @@ fn dispatch(args: impl IntoIterator<Item = String>) -> Result<ExitCode, CliError
     if args[0] == "config" {
         return command_config(&args[1..]);
     }
+    // Internal: the root daemon's account-switch helper (see `api::launch_as`).
+    #[cfg(target_os = "linux")]
+    if args[0] == api::LAUNCH_AS_HELPER_ARG {
+        return Ok(api::launch_as_helper());
+    }
 
     let mut foreground = false;
     let mut log_probe = false;

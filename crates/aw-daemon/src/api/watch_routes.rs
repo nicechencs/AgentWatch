@@ -8,8 +8,8 @@
 //! - Attaching to a process of another OS user needs an administrator (403).
 //! - Launch from the API (`POST /sessions`, `mode: "launch"`) starts the
 //!   program as the caller: as is when the caller is the daemon's account, and
-//!   dropped to the caller's uid/gid when the daemon runs as root
-//!   ([`super::launch_as`]). The account comes only from the OS peer
+//!   dropped to the caller's uid, gid and login group list when the daemon
+//!   runs as root ([`super::launch_as`]). The account comes only from the OS peer
 //!   credential; an unknown one is refused, never run as root.
 //! - Only Linux reads process identity for the poll sampler today; elsewhere
 //!   these routes answer 503 `collector_unavailable` and create nothing.
@@ -252,33 +252,48 @@ fn create_inner(
             // Whose account: only the OS-verified caller (see `launch_as`).
             // A `uid` / `user` in the body is never read.
             let who = super::launch_as::identity_for(&caller.user_id, daemon_uid())?;
-            let mut command = std::process::Command::new(&argv[0]);
-            command
-                .args(&argv[1..])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
             let cwd = opt_text(&value, "cwd");
-            match &who {
+            let env: Vec<(String, String)> = value
+                .get("env")
+                .and_then(Value::as_object)
+                .map(|env| {
+                    env.iter()
+                        .filter_map(|(key, val)| val.as_str().map(|v| (key.clone(), v.to_owned())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            #[allow(unused_mut)]
+            let mut child = match &who {
                 #[cfg(unix)]
-                Some(who) => super::launch_as::drop_to(&mut command, who, cwd.as_deref()),
+                Some(who) => super::launch_as::spawn_as(who, &argv, cwd.as_deref(), &env)
+                    .map_err(|err| match err {
+                        super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
+                        super::launch_as::SpawnAsError::Drop(step) => {
+                            tracing::error!(uid = who.uid, step, "account switch failed");
+                            error_response(
+                                500,
+                                "drop_failed",
+                                "the program did not switch to the caller's account and was stopped",
+                            )
+                        }
+                    })?,
+                // No account switch here: never start it as the service account.
                 #[cfg(not(unix))]
-                Some(_) => {}
+                Some(_) => return Err(super::launch_as::no_account_switch()),
                 None => {
+                    let mut command = std::process::Command::new(&argv[0]);
+                    command
+                        .args(&argv[1..])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null());
                     if let Some(cwd) = &cwd {
                         command.current_dir(cwd);
                     }
+                    command.envs(env.iter().map(|(k, v)| (k, v)));
+                    command.spawn().map_err(|err| spawn_error(&err))?
                 }
-            }
-            if let Some(env) = value.get("env").and_then(Value::as_object) {
-                for (key, val) in env {
-                    if let Some(val) = val.as_str() {
-                        command.env(key, val);
-                    }
-                }
-            }
-            #[allow(unused_mut)]
-            let mut child = command.spawn().map_err(|err| spawn_error(&err))?;
+            };
             let pid = child.id();
             #[cfg(target_os = "linux")]
             if let Some(who) = &who {

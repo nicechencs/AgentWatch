@@ -33,6 +33,8 @@ pub(crate) use findings::share;
 pub(crate) use control::Control;
 pub(crate) use http::HttpServer;
 pub(crate) use ipc::{fallback_socket_path, should_fall_back, socket_path, IpcServer};
+#[cfg(target_os = "linux")]
+pub(crate) use launch_as::{helper_main as launch_as_helper, HELPER_ARG as LAUNCH_AS_HELPER_ARG};
 pub(crate) use query::StoreQuery;
 pub(crate) use routes::ApiState;
 

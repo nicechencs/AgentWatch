@@ -3021,6 +3021,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Root daemon, caller in a supplementary group: the program carries the
+    /// caller's login group list (as `id -G` reports it), not just the
+    /// primary group. The caller is the account that ran `sudo` (`SUDO_UID`),
+    /// which must be in at least one supplementary group; the test fails
+    /// otherwise, it does not pass vacuously.
+    /// `sudo -E env PATH=$PATH cargo test -p aw-daemon -- --ignored launch_as_root`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root: the daemon must be able to switch accounts"]
+    #[allow(clippy::expect_used)]
+    fn launch_as_root_keeps_the_callers_supplementary_groups() {
+        assert_eq!(nix::unistd::geteuid().as_raw(), 0, "run this test as root");
+        let caller: u32 = std::env::var("SUDO_UID")
+            .expect("run through sudo so SUDO_UID names the caller")
+            .parse()
+            .expect("numeric SUDO_UID");
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(caller))
+            .ok()
+            .flatten()
+            .expect("caller account");
+        let out = std::process::Command::new("id")
+            .args(["-G", &user.name])
+            .output()
+            .expect("id -G");
+        let mut want: Vec<u32> = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(|g| g.parse().expect("gid"))
+            .collect();
+        want.sort_unstable();
+        want.dedup();
+        assert!(
+            want.iter().any(|g| *g != user.gid.as_raw()),
+            "the caller must be in a supplementary group: {want:?}"
+        );
+        let (dir, db) = seeded_db("asrootgroups", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &caller.to_string(), false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["sleep","5"],"cwd":"/"}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let pid = body["root_pid"].as_u64().expect("root_pid");
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("status");
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("Groups:"))
+            .expect("Groups line");
+        let mut have: Vec<u32> = line[7..]
+            .split_whitespace()
+            .map(|g| g.parse().expect("gid"))
+            .collect();
+        have.push(user.gid.as_raw());
+        have.sort_unstable();
+        have.dedup();
+        assert_eq!(have, want, "login groups of the caller");
+        assert_eq!(proc_uids(pid), vec![caller; 4]);
+        assert!(
+            !have.contains(&0) || want.contains(&0),
+            "no root group leaked"
+        );
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn launch_from_the_api_starts_the_program_and_records_its_exit_code() {

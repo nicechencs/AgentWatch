@@ -11,8 +11,8 @@
 //! the [`ProcUid`] into a pid, then keeps that pid and its children. This
 //! sampler attaches to pid 1. Pid 1 is init; the children are the processes
 //! the host source returns. The [`ProcUid`] is `ProcessIdentity::from_parts`
-//! over the boot id, pid, and the precise `/proc` start time
-//! (`btime_ns + starttime * 1e9 / clk_tck`).
+//! over the boot id, pid, and the `/proc` start time rounded down to seconds.
+//! Stored process start times remain precise (`btime_ns + starttime * 1e9 / clk_tck`).
 //!
 //! The first `start_at` is a baseline and emits nothing for processes already
 //! running. Later `poll_once` calls emit starts and exits that appeared between
@@ -255,15 +255,8 @@ impl HostSampler {
             );
             return false;
         }
-        let Some(scope_uid) = proc_scope_uid_of(self.target.root_pid) else {
-            tracing::warn!(
-                pid = self.target.root_pid,
-                "poll sampler not started: root process scope identity unavailable"
-            );
-            return false;
-        };
         self.root_uid = Some(uid);
-        let Ok(scope) = Scope::attach([scope_uid]) else {
+        let Ok(scope) = Scope::attach([uid]) else {
             tracing::warn!("poll sampler not started: attach scope rejected");
             return false;
         };
@@ -829,8 +822,9 @@ fn proc_table() -> Vec<ProcFact> {
             let Some(ppid) = read_ppid(pid) else {
                 continue;
             };
+            let start_secs = start_ns / 1_000_000_000;
             let Some(identity) =
-                ProcessIdentity::from_parts(&boot, pid, start_ns, StartTimeUnit::Nanoseconds)
+                ProcessIdentity::from_parts(&boot, pid, start_secs, StartTimeUnit::Seconds)
             else {
                 continue;
             };
@@ -899,16 +893,17 @@ fn read_ppid(_pid: u32) -> Option<u32> {
 /// [`ProcUid`] of `pid`, hashed the way the poll collector hashes a row.
 /// `None` when the process is gone or its identity cannot be read.
 pub(crate) fn proc_uid_of(pid: u32) -> Option<ProcUid> {
-    let boot = read_boot_id()?;
     let start_ns = read_pid_start_ns(pid)?;
-    ProcessIdentity::from_parts(&boot, pid, start_ns, StartTimeUnit::Nanoseconds).map(|id| id.uid)
+    proc_uid_from_start_ns(pid, start_ns)
 }
 
-/// Identity used by the generic poll collector, which only exposes start time
-/// in seconds. Storage and adopted-root checks use [`proc_uid_of`] instead.
-fn proc_scope_uid_of(pid: u32) -> Option<ProcUid> {
+/// Build the poll collector's identity from a precise `/proc` start time.
+///
+/// The value retained in the row stays precise, but the uid uses seconds:
+/// that is the only start-time granularity the poll collector exposes.
+fn proc_uid_from_start_ns(pid: u32, start_ns: u64) -> Option<ProcUid> {
     let boot = read_boot_id()?;
-    let start_secs = read_pid_start_ns(pid)? / 1_000_000_000;
+    let start_secs = start_ns / 1_000_000_000;
     ProcessIdentity::from_parts(&boot, pid, start_secs, StartTimeUnit::Seconds).map(|id| id.uid)
 }
 
@@ -916,11 +911,12 @@ fn proc_scope_uid_of(pid: u32) -> Option<ProcUid> {
 /// gate. `None` means one required `/proc` fact was unavailable; callers keep
 /// the adoption valid, but cannot later claim a root snapshot they lack.
 pub(crate) fn root_hint(pid: u32, name: Option<String>) -> Option<RootHint> {
+    let start_ns = read_pid_start_ns(pid)?;
     Some(RootHint {
         pid,
         ppid: read_ppid(pid)?,
-        start_ns: read_pid_start_ns(pid)?,
-        uid: proc_uid_of(pid)?,
+        start_ns,
+        uid: proc_uid_from_start_ns(pid, start_ns)?,
         name,
     })
 }
@@ -1607,6 +1603,30 @@ mod depth_tests {
         let second = super::start_ns_from_ticks(btime, 42_001).expect("second tick");
         assert_eq!(second - first, 1_000_000_000 / super::LINUX_CLK_TCK);
         assert_ne!(first, second);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn root_hint_and_sampler_share_the_poll_identity_and_precise_start_time() {
+        let pid = std::process::id();
+        let hint = super::root_hint(pid, None).expect("root hint for this test process");
+        let row = super::proc_table()
+            .into_iter()
+            .find(|row| row.pid == pid)
+            .expect("this test process in sampler table");
+        let boot = super::read_boot_id().expect("boot id");
+        let expected = aw_core::proc::ProcessIdentity::from_parts(
+            &boot,
+            pid,
+            hint.start_ns / 1_000_000_000,
+            aw_core::proc::StartTimeUnit::Seconds,
+        )
+        .expect("poll identity")
+        .uid;
+
+        assert_eq!(hint.uid, expected);
+        assert_eq!(row.uid, expected);
+        assert_eq!(hint.start_ns, row.start_ns);
     }
 
     /// Gap rows were stored with the collector's monotonic tick, which the

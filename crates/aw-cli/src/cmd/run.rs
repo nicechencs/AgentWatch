@@ -643,9 +643,6 @@ fn write_summary(
                     "[aw] 摘要级别 full · 域名列出前 5 个 · 未知的计数显示为不可得，不显示为 0"
                 )?;
             }
-            if launched.sampling {
-                writeln!(out, "[aw] 采样模式 · 等级 S · 短事件可能未被采到")?;
-            }
         }
         Ok(None) => {
             writeln!(
@@ -657,8 +654,17 @@ fn write_summary(
             writeln!(out, "[aw] 摘要不可用 · {detail}")?;
         }
     }
+    if args.no_daemon {
+        writeln!(
+            out,
+            "[aw] 已请求采样模式（--no-daemon）；实际采集状态不可得，未经采集器确认"
+        )?;
+    }
     if args.pin {
-        writeln!(out, "[aw] 会话已标记为保留，不参与自动清理")?;
+        writeln!(
+            out,
+            "[aw] 已请求会话保留（--pin）；本构建未执行保留，保留状态不可得"
+        )?;
     }
     if args.raw.is_some() {
         writeln!(out, "[aw] --raw 已记录为请求；本构建不写原始事件文件")?;
@@ -675,36 +681,37 @@ fn summary_json(
     launched: &Launched,
     figures: &Result<Option<Summary>, String>,
 ) -> Value {
+    let summary = figures.as_ref().ok().and_then(Option::as_ref);
+    // Neither the launcher flag nor Summary confirms collector activity or a
+    // persisted pin. Keep those results unknown even when figures are present.
+    let mut body = json!({
+        "available": summary.is_some(),
+        "session": summary.and_then(|item| item.session_id.as_deref()),
+        "processes": summary.and_then(|item| item.processes),
+        "bytes_up": summary.and_then(|item| item.bytes_up),
+        "bytes_down": summary.and_then(|item| item.bytes_down),
+        "top_domains": summary.map(|item| {
+            item.top_domains.iter().take(5).map(|domain| json!({
+                "name": domain.name,
+                "flows": domain.flows,
+            })).collect::<Vec<_>>()
+        }),
+        "gaps": summary.and_then(|item| item.gaps),
+        "level_note": summary.map(|item| item.level_note.as_str()),
+        "sampling": null,
+        "sampling_reason": "实际采集状态不可得，未经采集器确认",
+        "sampling_requested": args.no_daemon,
+        "pinned": null,
+        "pinned_reason": "本构建未执行保留，保留状态不可得",
+        "pin_requested": args.pin,
+        "target_exit": launched.code,
+    });
     match figures {
-        Ok(Some(summary)) => json!({
-            "available": true,
-            "session": summary.session_id,
-            "processes": summary.processes,
-            "bytes_up": summary.bytes_up,
-            "bytes_down": summary.bytes_down,
-            "top_domains": summary.top_domains.iter().take(5).map(|item| json!({
-                "name": item.name,
-                "flows": item.flows,
-            })).collect::<Vec<_>>(),
-            "gaps": summary.gaps,
-            "level_note": summary.level_note,
-            "sampling": launched.sampling,
-            "pinned": args.pin,
-            "target_exit": launched.code,
-        }),
-        Ok(None) => json!({
-            "available": false,
-            "reason": "摘要不可用",
-            "sampling": launched.sampling,
-            "target_exit": launched.code,
-        }),
-        Err(detail) => json!({
-            "available": false,
-            "reason": detail,
-            "sampling": launched.sampling,
-            "target_exit": launched.code,
-        }),
+        Ok(Some(_)) => {}
+        Ok(None) => body["reason"] = json!("摘要不可用"),
+        Err(detail) => body["reason"] = json!(detail),
     }
+    body
 }
 
 fn count_text(value: Option<u64>) -> String {
@@ -791,6 +798,56 @@ mod tests {
     impl SessionSummary for FixedSummary {
         fn summarize(&mut self, _: Option<&str>) -> Result<Option<Summary>, String> {
             Ok(self.0.clone())
+        }
+    }
+
+    struct FailedSummary {
+        calls: usize,
+    }
+
+    impl SessionSummary for FailedSummary {
+        fn summarize(&mut self, _: Option<&str>) -> Result<Option<Summary>, String> {
+            self.calls += 1;
+            Err("摘要源不可用".to_owned())
+        }
+    }
+
+    fn fake_exit_7() -> FakeLaunch {
+        FakeLaunch {
+            code: 7,
+            sampling_seen: None,
+            forwarded: Vec::new(),
+            env_len: None,
+            fail: None,
+        }
+    }
+
+    fn assert_unknown_json(body: &serde_json::Value, pin: bool, no_daemon: bool) {
+        for field in ["sampling", "pinned"] {
+            assert_eq!(body.get(field), Some(&serde_json::Value::Null), "{field}");
+        }
+        assert_eq!(body["pin_requested"], pin);
+        assert_eq!(body["sampling_requested"], no_daemon);
+        assert_eq!(body["target_exit"], 7);
+        assert_eq!(
+            body["sampling_reason"],
+            "实际采集状态不可得，未经采集器确认"
+        );
+        assert_eq!(body["pinned_reason"], "本构建未执行保留，保留状态不可得");
+    }
+
+    fn assert_unavailable_json(body: &serde_json::Value) {
+        assert_eq!(body["available"], false);
+        for field in [
+            "session",
+            "processes",
+            "bytes_up",
+            "bytes_down",
+            "top_domains",
+            "gaps",
+            "level_note",
+        ] {
+            assert_eq!(body.get(field), Some(&serde_json::Value::Null), "{field}");
         }
     }
 
@@ -942,46 +999,201 @@ mod tests {
     }
 
     #[test]
-    fn env_values_never_appear_in_the_summary() {
-        let command = vec!["tool".to_owned(), "--secret".to_owned()];
+    fn sensitive_inputs_never_appear_in_summary_output() {
+        let command = vec!["private-tool".to_owned(), "--secret".to_owned()];
         let env = vec!["TOKEN=super-secret-value".to_owned()];
-        let mut ran = args(&command);
-        ran.env = &env;
-        let mut launcher = FakeLaunch {
-            code: 0,
-            sampling_seen: None,
-            forwarded: Vec::new(),
-            env_len: None,
-            fail: None,
-        };
-        let mut summary = EmptySummary;
-        let outcome = run(&ran, none(), &mut UnixAdapter(&mut launcher), &mut summary);
-        let err = text(&outcome.stderr);
-        assert!(!err.contains("super-secret-value"), "{err}");
-        assert!(!err.contains("--secret"), "{err}");
-        assert!(!err.contains("TOKEN"), "{err}");
-        assert_eq!(launcher.env_len, Some(1));
+        for json in [false, true] {
+            let mut ran = args(&command);
+            ran.env = &env;
+            ran.cwd = Some("/private/cwd-marker");
+            ran.raw = Some("/private/raw-marker");
+            ran.pin = true;
+            ran.no_daemon = true;
+            ran.json = json;
+            let mut empty = EmptySummary;
+            let mut fixed = FixedSummary(Some(sample_summary()));
+            let mut failed = FailedSummary { calls: 0 };
+            let sources: [&mut dyn SessionSummary; 3] = [&mut empty, &mut fixed, &mut failed];
+            for summary in sources {
+                let mut launcher = fake_exit_7();
+                let outcome = run(&ran, none(), &mut UnixAdapter(&mut launcher), summary);
+                assert_eq!(outcome.code, 7);
+                assert!(outcome.stdout.is_empty());
+                let err = text(&outcome.stderr);
+                for marker in [
+                    "private-tool",
+                    "--secret",
+                    "super-secret-value",
+                    "TOKEN",
+                    "cwd-marker",
+                    "raw-marker",
+                ] {
+                    assert!(!err.contains(marker), "input marker appeared: {marker}");
+                }
+                assert_eq!(launcher.env_len, Some(1));
+            }
+        }
     }
 
     #[test]
-    fn no_daemon_marks_sampling_mode() {
+    fn requests_do_not_override_fixed_summary_evidence_or_confirm_a_pin() {
+        let command = vec!["tool".to_owned()];
+        for json in [false, true] {
+            let mut ran = args(&command);
+            ran.no_daemon = true;
+            ran.pin = true;
+            ran.summary = Some("full");
+            ran.json = json;
+            let mut launcher = fake_exit_7();
+            let mut summary = FixedSummary(Some(sample_summary()));
+            let outcome = run(&ran, none(), &mut UnixAdapter(&mut launcher), &mut summary);
+            assert_eq!(outcome.code, 7);
+            assert!(outcome.stdout.is_empty());
+            assert_eq!(launcher.sampling_seen, Some(true));
+            let err = text(&outcome.stderr);
+            if json {
+                let body: serde_json::Value = serde_json::from_str(&err).expect("json summary");
+                assert_unknown_json(&body, true, true);
+                assert_eq!(body["available"], true);
+                assert_eq!(body["level_note"], sample_summary().level_note);
+                assert_eq!(body["processes"], 3);
+                assert_eq!(body["bytes_up"], 10);
+                assert_eq!(body["bytes_down"], 20);
+                assert_eq!(body["gaps"], 1);
+                assert_eq!(body["top_domains"][0]["name"], "example.test");
+                assert_eq!(body["top_domains"][0]["flows"], 2);
+            } else {
+                assert!(err.contains("已请求采样模式（--no-daemon）"), "{err}");
+                assert!(err.contains("实际采集状态不可得"), "{err}");
+                assert!(err.contains("已请求会话保留（--pin）"), "{err}");
+                assert!(err.contains("保留状态不可得"), "{err}");
+                assert!(err.contains(&sample_summary().level_note), "{err}");
+                assert!(!err.contains("等级 S"), "{err}");
+                assert!(!err.contains("会话已标记为保留"), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn empty_summary_keeps_pin_and_sampling_unknown() {
+        let command = vec!["tool".to_owned()];
+        for pin in [false, true] {
+            for no_daemon in [false, true] {
+                for json in [false, true] {
+                    let mut ran = args(&command);
+                    ran.pin = pin;
+                    ran.no_daemon = no_daemon;
+                    ran.json = json;
+                    let mut launcher = fake_exit_7();
+                    let outcome = run(
+                        &ran,
+                        none(),
+                        &mut UnixAdapter(&mut launcher),
+                        &mut EmptySummary,
+                    );
+                    assert_eq!(outcome.code, 7);
+                    assert!(outcome.stdout.is_empty());
+                    assert_eq!(launcher.sampling_seen, Some(no_daemon));
+                    let err = text(&outcome.stderr);
+                    if json {
+                        let body: serde_json::Value =
+                            serde_json::from_str(&err).expect("json summary");
+                        assert_unknown_json(&body, pin, no_daemon);
+                        assert_unavailable_json(&body);
+                        assert_eq!(body["reason"], "摘要不可用");
+                    } else {
+                        assert!(err.contains("摘要不可用"), "{err}");
+                        assert_eq!(err.contains("已请求会话保留"), pin, "{err}");
+                        assert_eq!(err.contains("已请求采样模式"), no_daemon, "{err}");
+                        assert!(!err.contains("会话已标记为保留"), "{err}");
+                        assert!(!err.contains("等级 S"), "{err}");
+                        assert!(!err.contains("进程 0"), "{err}");
+                        assert!(!err.contains("缺口 0"), "{err}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn summary_failure_keeps_target_exit_and_unknown_results() {
+        let command = vec!["tool".to_owned()];
+        for json in [false, true] {
+            let mut ran = args(&command);
+            ran.pin = true;
+            ran.no_daemon = true;
+            ran.json = json;
+            let mut launcher = fake_exit_7();
+            let mut summary = FailedSummary { calls: 0 };
+            let outcome = run(&ran, none(), &mut UnixAdapter(&mut launcher), &mut summary);
+            assert_eq!(outcome.code, 7);
+            assert!(outcome.stdout.is_empty());
+            assert_eq!(summary.calls, 1);
+            let err = text(&outcome.stderr);
+            if json {
+                let body: serde_json::Value = serde_json::from_str(&err).expect("json summary");
+                assert_unknown_json(&body, true, true);
+                assert_unavailable_json(&body);
+                assert_eq!(body["reason"], "摘要源不可用");
+            } else {
+                assert!(err.contains("摘要不可用 · 摘要源不可用"), "{err}");
+                assert!(err.contains("保留状态不可得"), "{err}");
+                assert!(err.contains("实际采集状态不可得"), "{err}");
+                assert!(!err.contains("会话已标记为保留"), "{err}");
+                assert!(!err.contains("等级 S"), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn quiet_or_summary_none_skips_requests_and_summary_source() {
+        let command = vec!["tool".to_owned()];
+        for json in [false, true] {
+            for (quiet, level) in [(true, Some("full")), (false, Some("none"))] {
+                let mut ran = args(&command);
+                ran.pin = true;
+                ran.no_daemon = true;
+                ran.json = json;
+                ran.quiet = quiet;
+                ran.summary = level;
+                let mut launcher = fake_exit_7();
+                let mut summary = FailedSummary { calls: 0 };
+                let outcome = run(&ran, none(), &mut UnixAdapter(&mut launcher), &mut summary);
+                assert_eq!(outcome.code, 7);
+                assert!(outcome.stdout.is_empty());
+                assert!(outcome.stderr.is_empty());
+                assert_eq!(summary.calls, 0);
+                assert_eq!(launcher.sampling_seen, Some(true));
+            }
+        }
+    }
+
+    #[test]
+    fn json_unknown_counts_are_null_and_domain_array_is_preserved() {
         let command = vec!["tool".to_owned()];
         let mut ran = args(&command);
-        ran.no_daemon = true;
-        ran.summary = Some("full");
-        let mut launcher = FakeLaunch {
-            code: 0,
-            sampling_seen: None,
-            forwarded: Vec::new(),
-            env_len: None,
-            fail: None,
-        };
-        let mut summary = FixedSummary(Some(sample_summary()));
+        ran.json = true;
+        let mut launcher = fake_exit_7();
+        let mut summary = FixedSummary(Some(Summary {
+            session_id: None,
+            processes: None,
+            bytes_up: None,
+            bytes_down: None,
+            top_domains: Vec::new(),
+            gaps: None,
+            level_note: "等级不可得".to_owned(),
+        }));
         let outcome = run(&ran, none(), &mut UnixAdapter(&mut launcher), &mut summary);
-        let err = text(&outcome.stderr);
-        assert!(err.contains("采样模式"), "{err}");
-        assert!(err.contains('S'), "{err}");
-        assert_eq!(launcher.sampling_seen, Some(true));
+        assert_eq!(outcome.code, 7);
+        let body: serde_json::Value =
+            serde_json::from_slice(&outcome.stderr).expect("json summary");
+        assert_unknown_json(&body, false, false);
+        assert_eq!(body["available"], true);
+        assert_eq!(body["level_note"], "等级不可得");
+        assert_eq!(body["top_domains"], serde_json::json!([]));
+        for field in ["session", "processes", "bytes_up", "bytes_down", "gaps"] {
+            assert_eq!(body.get(field), Some(&serde_json::Value::Null), "{field}");
+        }
     }
 
     #[test]

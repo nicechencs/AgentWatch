@@ -1071,6 +1071,20 @@ fn strip_prefix_ci<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
+/// Strip `device` from the front of `path`, requiring a `\` boundary so
+/// `HarddiskVolume1` does not match `HarddiskVolume10`.
+fn strip_device<'a>(path: &'a str, device: &str) -> Option<&'a str> {
+    let rest = strip_prefix_ci(path, device)?;
+    if rest.is_empty() {
+        return Some("");
+    }
+    if rest.starts_with('\\') || rest.starts_with('/') {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1157,7 +1171,9 @@ mod tests {
         let write = events
             .iter()
             .find(|event| matches!(event.kind, EventKind::FileWrite(_)));
-        let write = write.expect("aggregated write");
+        let Some(write) = write else {
+            panic!("aggregated write");
+        };
         assert_eq!(write.proc.as_ref().map(|proc| proc.pid), Some(40));
         assert_eq!(
             write.field_evidence.get("proc"),
@@ -1234,19 +1250,5 @@ mod tests {
             EventKind::FileRead(row) => assert_eq!(row.bytes, Some(30)),
             _ => unreachable!(),
         }
-    }
-}
-
-/// Strip `device` from the front of `path`, requiring a `\` boundary so
-/// `HarddiskVolume1` does not match `HarddiskVolume10`.
-fn strip_device<'a>(path: &'a str, device: &str) -> Option<&'a str> {
-    let rest = strip_prefix_ci(path, device)?;
-    if rest.is_empty() {
-        return Some("");
-    }
-    if rest.starts_with('\\') || rest.starts_with('/') {
-        Some(rest)
-    } else {
-        None
     }
 }

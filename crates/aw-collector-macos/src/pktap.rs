@@ -51,7 +51,7 @@
 //! not dropped silently.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use aw_core::{
     DnsAnswer, DnsQuery, DnsRecord, EventKind, Evidence, Gap, GapKind, NaReason, RawEvent,
@@ -612,75 +612,75 @@ impl std::fmt::Display for PktapError {
     }
 }
 
-/// Build a minimal DNS query payload: one question, no answers.
-///
-/// Tests use this. The name is a sequence of labels separated by `.`. A root
-/// name (`.`) is the empty label. This is not a general encoder.
-pub fn encode_query(id: u16, qname: &str, qtype: u16) -> Vec<u8> {
-    let mut buf = vec![0_u8; 12];
-    buf[0..2].copy_from_slice(&id.to_be_bytes());
-    // RD = 1. Not a response.
-    buf[2] = 0x01;
-    buf[3] = 0x00;
-    buf[4] = 0x00;
-    buf[5] = 0x01; // qdcount = 1
-    write_name(&mut buf, qname);
-    buf.extend_from_slice(&qtype.to_be_bytes());
-    buf.extend_from_slice(&1_u16.to_be_bytes()); // class IN
-    buf
-}
-
-/// Build a minimal DNS response with one A or AAAA answer.
-///
-/// `addr` selects the type (A for v4, AAAA for v6). `ttl` is the record TTL.
-pub fn encode_a_answer(id: u16, qname: &str, addr: IpAddr, ttl: u32) -> Vec<u8> {
-    let qtype: u16 = match addr {
-        IpAddr::V4(_) => 1,
-        IpAddr::V6(_) => 28,
-    };
-    let mut buf = encode_query(id, qname, qtype);
-    // QR = 1, rcode = 0.
-    buf[2] = 0x81;
-    buf[3] = 0x80;
-    buf[6] = 0x00;
-    buf[7] = 0x01; // ancount = 1
-    write_name(&mut buf, qname);
-    buf.extend_from_slice(&qtype.to_be_bytes());
-    buf.extend_from_slice(&1_u16.to_be_bytes());
-    buf.extend_from_slice(&ttl.to_be_bytes());
-    match addr {
-        IpAddr::V4(v4) => {
-            buf.extend_from_slice(&4_u16.to_be_bytes());
-            buf.extend_from_slice(&v4.octets());
-        }
-        IpAddr::V6(v6) => {
-            buf.extend_from_slice(&16_u16.to_be_bytes());
-            buf.extend_from_slice(&v6.octets());
-        }
-    }
-    buf
-}
-
-fn write_name(buf: &mut Vec<u8>, qname: &str) {
-    if qname == "." || qname.is_empty() {
-        buf.push(0);
-        return;
-    }
-    let trimmed = qname.trim_end_matches('.');
-    for label in trimmed.split('.') {
-        let bytes = label.as_bytes();
-        buf.push(u8::try_from(bytes.len()).unwrap_or(0));
-        buf.extend_from_slice(bytes);
-    }
-    buf.push(0);
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// Build a minimal DNS query payload: one question, no answers.
+    ///
+    /// Tests use this. The name is a sequence of labels separated by `.`. A root
+    /// name (`.`) is the empty label. This is not a general encoder.
+    pub fn encode_query(id: u16, qname: &str, qtype: u16) -> Vec<u8> {
+        let mut buf = vec![0_u8; 12];
+        buf[0..2].copy_from_slice(&id.to_be_bytes());
+        // RD = 1. Not a response.
+        buf[2] = 0x01;
+        buf[3] = 0x00;
+        buf[4] = 0x00;
+        buf[5] = 0x01; // qdcount = 1
+        write_name(&mut buf, qname);
+        buf.extend_from_slice(&qtype.to_be_bytes());
+        buf.extend_from_slice(&1_u16.to_be_bytes()); // class IN
+        buf
+    }
+
+    /// Build a minimal DNS response with one A or AAAA answer.
+    ///
+    /// `addr` selects the type (A for v4, AAAA for v6). `ttl` is the record TTL.
+    pub fn encode_a_answer(id: u16, qname: &str, addr: IpAddr, ttl: u32) -> Vec<u8> {
+        let qtype: u16 = match addr {
+            IpAddr::V4(_) => 1,
+            IpAddr::V6(_) => 28,
+        };
+        let mut buf = encode_query(id, qname, qtype);
+        // QR = 1, rcode = 0.
+        buf[2] = 0x81;
+        buf[3] = 0x80;
+        buf[6] = 0x00;
+        buf[7] = 0x01; // ancount = 1
+        write_name(&mut buf, qname);
+        buf.extend_from_slice(&qtype.to_be_bytes());
+        buf.extend_from_slice(&1_u16.to_be_bytes());
+        buf.extend_from_slice(&ttl.to_be_bytes());
+        match addr {
+            IpAddr::V4(v4) => {
+                buf.extend_from_slice(&4_u16.to_be_bytes());
+                buf.extend_from_slice(&v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                buf.extend_from_slice(&16_u16.to_be_bytes());
+                buf.extend_from_slice(&v6.octets());
+            }
+        }
+        buf
+    }
+
+    fn write_name(buf: &mut Vec<u8>, qname: &str) {
+        if qname == "." || qname.is_empty() {
+            buf.push(0);
+            return;
+        }
+        let trimmed = qname.trim_end_matches('.');
+        for label in trimmed.split('.') {
+            let bytes = label.as_bytes();
+            buf.push(u8::try_from(bytes.len()).unwrap_or(0));
+            buf.extend_from_slice(bytes);
+        }
+        buf.push(0);
+    }
 
     const CLOCK: PktapClock = PktapClock {
         ts_mono_ns: 2_000_000_000,

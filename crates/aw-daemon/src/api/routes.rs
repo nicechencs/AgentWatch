@@ -1106,7 +1106,7 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                             "agent": row.agent,
                             "started_ns": row.started_ns,
                             "ended_ns": row.ended_ns,
-                            "pinned": row.pinned,
+                            "pinned": row.pinned != 0,
                         })
                     })
                     .collect();

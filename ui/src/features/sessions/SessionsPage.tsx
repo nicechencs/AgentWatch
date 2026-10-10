@@ -1,7 +1,7 @@
 import { isWallTime } from "@/lib/format";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useRef, useState } from "react";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/api/client";
 import { refreshListWhileRecording } from "@/lib/live-session";
 import type { DbStats, Session } from "@/api/types";
@@ -14,10 +14,12 @@ import { formatDuration } from "@/lib/format";
 import { NotCollected } from "@/components/NotCollected";
 import { coverage } from "@/lib/capabilities";
 import { diskUnavailableText, diskUsed } from "@/lib/disk";
-import { sessionMatchesQuery } from "@/lib/session-match";
 import { sessionTitle } from "@/lib/session-title";
 import { useI18n } from "@/lib/i18n";
 import { useExport } from "@/lib/use-export";
+
+/** Wait for a pause before the list query follows the search box. */
+const SEARCH_DEBOUNCE_MS = 250;
 
 const RANGES = ["7d", "30d", "all"] as const;
 
@@ -25,9 +27,9 @@ export function SessionsPage() {
   const { t } = useI18n();
   const navigate = useNavigate();
   const client = useQueryClient();
-  // The search box is uncontrolled (see SearchBox): this state is only what the
-  // list filters on, and React never writes it back into the field.
+  // The box reports its current text on input; this state only drives the query.
   const [q, setQ] = useState("");
+  const query = useDebounced(q, SEARCH_DEBOUNCE_MS);
   const [agent, setAgent] = useState("");
   const [range, setRange] = useState<(typeof RANGES)[number]>("7d");
   const [activeOnly, setActiveOnly] = useState(false);
@@ -36,11 +38,22 @@ export function SessionsPage() {
   const [renaming, setRenaming] = useState<string | null>(null);
 
   const since = range === "all" ? undefined : range === "7d" ? "-7d" : "-30d";
+  const searched = query.trim();
   const sessions = useQuery({
-    // `q` is not part of the key: the daemon list ignores it, so typing must
-    // not refetch (that flashed 「加载中」 and returned the same unfiltered rows).
-    queryKey: ["sessions", agent, range, activeOnly],
-    queryFn: () => api.sessions({ agent: agent || undefined, since, active: activeOnly || undefined, limit: 200 }),
+    // The daemon matches `q` (name, command, public id) before paging, so the
+    // cursor carries the filter and older sessions are searchable too.
+    queryKey: ["sessions", agent, range, activeOnly, searched],
+    queryFn: () =>
+      api.sessions({
+        agent: agent || undefined,
+        since,
+        active: activeOnly || undefined,
+        q: searched || undefined,
+        limit: 200,
+      }),
+    // A new query keeps the previous rows on screen: typing must not flash
+    // 「加载中」. The first load has no previous data, so it still shows Loading.
+    placeholderData: keepPreviousData,
     // A program that exits on its own ends its session: the row must turn
     // 「已停止」 without reopening the page.
     refetchInterval: refreshListWhileRecording,
@@ -53,11 +66,11 @@ export function SessionsPage() {
     return [...names].sort();
   }, [sessions.data]);
 
-  // The daemon list ignores `q`, so the fetched rows are filtered here.
-  const items = useMemo(
-    () => (sessions.data?.items ?? []).filter((session) => sessionMatchesQuery(session, q)),
-    [sessions.data, q],
-  );
+  // Rows the daemon already filtered. While a new query loads, placeholder
+  // data keeps the previous rows; they belong to the previous term, so the
+  // empty state waits until this term's answer arrives.
+  const items = sessions.data?.items ?? [];
+  const settled = !sessions.isPlaceholderData;
 
   const mutate = useMutation({
     mutationFn: async (action: { kind: "pin" | "delete" | "rename"; session: Session; name?: string }) => {
@@ -126,9 +139,9 @@ export function SessionsPage() {
 
       {sessions.isLoading ? <Loading /> : null}
       {sessions.isError ? <ErrorNote error={sessions.error} onRetry={() => void sessions.refetch()} /> : null}
-      {sessions.data && items.length === 0 ? (
+      {settled && sessions.data && items.length === 0 ? (
         <EmptyNote>
-          {(sessions.data.items.length > 0 ? t("sessions.noMatch", { q: q.trim() }) : t("sessions.empty"))}
+          {searched ? t("sessions.noMatch", { q: searched }) : t("sessions.empty")}
         </EmptyNote>
       ) : null}
 
@@ -183,28 +196,23 @@ export function SessionsPage() {
 }
 
 /**
- * Uncontrolled, like the launch command box: React never writes the value
- * after the first render. A controlled input re-rendered between a keystroke
- * and its change handler (the desktop window re-renders on channel replies;
- * an input method's pending text is not yet an input event) wrote the old
- * state back, dropping characters, and select-all then delete did not clear.
- * The text is read on input only to filter the list already fetched.
+ * Uncontrolled: nothing assigns the field's value. Events read their target
+ * directly, with no ref; the clear regression test guards against stale writes.
  */
 function SearchBox({ onQuery }: { onQuery: (query: string) => void }) {
   const { t } = useI18n();
-  const inputRef = useRef<HTMLInputElement>(null);
-  const read = () => onQuery(inputRef.current?.value ?? "");
+  const read = (event: { currentTarget: HTMLInputElement }) => onQuery(event.currentTarget.value);
   return (
     <form
       role="search"
       onSubmit={(event) => {
-        // Enter keeps the filter; it must not reload the page or refetch.
+        // Enter keeps the filter; it must not reload the page.
         event.preventDefault();
-        read();
+        const field = event.currentTarget.elements.namedItem("q");
+        onQuery(field instanceof HTMLInputElement ? field.value : "");
       }}
     >
       <input
-        ref={inputRef}
         name="q"
         type="search"
         defaultValue=""
@@ -220,6 +228,24 @@ function SearchBox({ onQuery }: { onQuery: (query: string) => void }) {
       />
     </form>
   );
+}
+
+/**
+ * The list query follows the box only after typing pauses. The first value is
+ * used at once: the page must not wait out a debounce before its first fetch.
+ */
+function useDebounced(value: string, ms: number): string {
+  const [debounced, setDebounced] = useState(value);
+  // The value already handed to the query. A re-render that did not change it
+  // (the effect running once on mount) must not start a timer.
+  const seen = useRef(value);
+  useEffect(() => {
+    if (seen.current === value) return;
+    seen.current = value;
+    const timer = setTimeout(() => setDebounced(value), ms);
+    return () => clearTimeout(timer);
+  }, [value, ms]);
+  return debounced;
 }
 
 function Disk({ stats }: { stats: DbStats }) {

@@ -4,7 +4,7 @@
 //! Production uses [`HttpExport`], which fetches the daemon's export. Tests
 //! inject records and assert the bytes this module writes.
 //!
-//! `md` is refused with exit 2. `--format` defaults to `jsonl`.
+//! `--format` accepts JSONL, CSV, and Markdown. It defaults to `jsonl`.
 
 use std::io::{self, Write};
 
@@ -99,19 +99,23 @@ impl ExportSource for EmptyExport {
 pub(crate) enum ExportFetchError {
     /// The session is not this caller's. `session` is what the user typed.
     NotFound { session: String },
+    /// `@last` has no session for this caller to resolve.
+    NoSessions,
     /// The daemon refused the query, or the channel failed. Already Chinese.
     Failed { detail: String },
 }
 
 /// `GET /api/v1/sessions/{session}/export`. The body is the daemon's file,
-/// passed through unchanged (JSONL text, or a zip when `format=csv`).
+/// passed through unchanged (JSONL text, a CSV zip, or Markdown).
 pub(crate) trait ExportFetch {
     /// Ask the daemon for one export.
     ///
     /// # Errors
     ///
-    /// [`ExportFetchError::NotFound`] names `session`. [`ExportFetchError::Failed`]
-    /// is a channel or daemon failure whose text is already safe to print.
+    /// [`ExportFetchError::NotFound`] names `session`.
+    /// [`ExportFetchError::NoSessions`] preserves the `@last` explanation.
+    /// [`ExportFetchError::Failed`] is a channel or daemon failure whose text
+    /// is already safe to print.
     fn fetch(&mut self, session: &str, query: &str) -> Result<Vec<u8>, ExportFetchError>;
 }
 
@@ -119,7 +123,7 @@ pub(crate) trait ExportFetch {
 /// redaction happen on the daemon (`filter`, `redact_paths`, `redact_hosts`).
 pub(crate) struct DaemonExport<F: ExportFetch> {
     fetch: F,
-    /// `format=jsonl` or `format=csv`, decided by [`run`] before the load.
+    /// The daemon `format` token decided by [`run`] before the load.
     format: &'static str,
     /// Body from the last successful load. [`ExportSource::take_export_body`] returns it.
     bytes: Option<Vec<u8>>,
@@ -134,6 +138,7 @@ impl<F: ExportFetch> DaemonExport<F> {
             format: match format {
                 ExportFormat::Jsonl => "jsonl",
                 ExportFormat::Csv => "csv",
+                ExportFormat::Markdown => "md",
             },
             bytes: None,
         }
@@ -168,6 +173,7 @@ impl<F: ExportFetch> ExportSource for DaemonExport<F> {
                 }))
             }
             Err(ExportFetchError::NotFound { .. }) => Ok(None),
+            Err(ExportFetchError::NoSessions) => Err("还没有你的会话，@last 无处可指".to_owned()),
             Err(ExportFetchError::Failed { detail }) => Err(detail),
         }
     }
@@ -227,6 +233,11 @@ impl<T: Transport> ExportFetch for HttpExport<T> {
         );
         match self.exchange(&ApiRequest::get_query(&path, query)) {
             Ok(reply) => Ok(reply.body),
+            Err(ClientError::Status {
+                status: 404,
+                code: Some(code),
+                ..
+            }) if code == "no_sessions" => Err(ExportFetchError::NoSessions),
             Err(ClientError::Status { status: 404, .. }) => Err(ExportFetchError::NotFound {
                 session: session.to_owned(),
             }),
@@ -253,20 +264,20 @@ fn session_key(session: &SessionRef) -> String {
     }
 }
 
-/// `jsonl` or `csv`. `md` is a separate error so it stays exit 2.
+/// Formats supported by the daemon export endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExportFormat {
     /// One JSON object per line.
     Jsonl,
     /// One CSV file of the same records.
     Csv,
+    /// A Markdown session report.
+    Markdown,
 }
 
 /// Why `--format` was rejected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FormatError {
-    /// `md` is P3. Named so the message can say so.
-    Markdown,
     /// Anything else.
     Unknown(String),
 }
@@ -274,9 +285,8 @@ pub(crate) enum FormatError {
 impl FormatError {
     fn message(&self) -> String {
         match self {
-            Self::Markdown => "不支持格式 `md`（P3）；请使用 jsonl 或 csv".to_owned(),
             Self::Unknown(name) => {
-                format!("不支持格式 `{name}`；请使用 jsonl 或 csv")
+                format!("不支持格式 `{name}`；请使用 jsonl、csv 或 md")
             }
         }
     }
@@ -289,7 +299,7 @@ pub(crate) fn parse_format(text: Option<&str>) -> Result<ExportFormat, FormatErr
         Some(name) => match name {
             "jsonl" => Ok(ExportFormat::Jsonl),
             "csv" => Ok(ExportFormat::Csv),
-            "md" => Err(FormatError::Markdown),
+            "md" | "markdown" => Ok(ExportFormat::Markdown),
             other => Err(FormatError::Unknown(other.to_owned())),
         },
     }
@@ -485,6 +495,7 @@ pub(crate) fn run_to(
     let count = match format {
         ExportFormat::Jsonl => write_jsonl(&mut bytes, &batch),
         ExportFormat::Csv => write_csv(&mut bytes, &batch),
+        ExportFormat::Markdown => Err(io::Error::other("Markdown 导出必须由后台生成报告正文")),
     };
     let count = match count {
         Ok(count) => count,
@@ -503,6 +514,7 @@ pub(crate) fn run_to(
             "format": match format {
                 ExportFormat::Jsonl => "jsonl",
                 ExportFormat::Csv => "csv",
+                ExportFormat::Markdown => "md",
             },
             "output": output,
         });
@@ -540,6 +552,7 @@ fn finish_daemon_body(
     let format_name = match format {
         ExportFormat::Jsonl => "jsonl",
         ExportFormat::Csv => "csv",
+        ExportFormat::Markdown => "md",
     };
     if let Some(path) = output_file {
         if let Err(err) = std::fs::write(path, &body) {
@@ -579,7 +592,7 @@ fn finish_daemon_body(
 mod tests {
     use super::{
         parse_format, run, run_to, write_csv, write_jsonl, DaemonExport, ExportArgs, ExportBatch,
-        ExportFormat, ExportHeader, ExportRecord, FormatError, HttpExport,
+        ExportFormat, ExportHeader, ExportRecord, HttpExport,
     };
     use crate::client::{ApiReply, ApiRequest, ClientError, Transport};
     use crate::endpoint::{Endpoint, HttpBase};
@@ -599,6 +612,7 @@ mod tests {
             ExportFormat::Csv => {
                 write_csv(&mut bytes, batch)?;
             }
+            ExportFormat::Markdown => unreachable!("Markdown comes from the daemon"),
         }
         Ok(bytes)
     }
@@ -664,14 +678,15 @@ mod tests {
     }
 
     #[test]
-    fn markdown_is_rejected() {
-        assert_eq!(parse_format(Some("md")), Err(FormatError::Markdown));
-        assert!(parse_format(Some("md"))
-            .unwrap_err()
-            .message()
-            .contains("不支持"));
+    fn markdown_formats_are_accepted() {
+        assert_eq!(parse_format(Some("md")), Ok(ExportFormat::Markdown));
+        assert_eq!(parse_format(Some("markdown")), Ok(ExportFormat::Markdown));
         assert_eq!(parse_format(None), Ok(ExportFormat::Jsonl));
         assert_eq!(parse_format(Some("csv")), Ok(ExportFormat::Csv));
+        assert!(parse_format(Some("pdf"))
+            .unwrap_err()
+            .message()
+            .contains("jsonl、csv 或 md"));
     }
 
     struct Script {
@@ -685,7 +700,7 @@ mod tests {
             self.seen
                 .borrow_mut()
                 .push((request.path.clone(), request.query.clone()));
-            let body = if self.status == 404 {
+            let body = if self.status == 404 && self.body.is_empty() {
                 br#"{"error":{"code":"not_found","message":"session not found"}}"#.to_vec()
             } else {
                 self.body.clone()
@@ -749,6 +764,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn daemon_markdown_bytes_pass_through_to_stdout() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let body = b"# Session report\n";
+        let script = Script {
+            seen: Rc::clone(&seen),
+            status: 200,
+            body: body.to_vec(),
+        };
+        let mut source = DaemonExport::new(
+            HttpExport::with_transport(endpoint(), script),
+            ExportFormat::Markdown,
+        );
+        let outcome = run(
+            ExportArgs {
+                session: "s-typed",
+                format: Some("md"),
+                output: None,
+                filter: None,
+                redact_paths: false,
+                redact_hosts: false,
+                json: false,
+            },
+            &mut source,
+        );
+        assert_eq!(outcome.code, exit::OK);
+        assert_eq!(outcome.stdout, body);
+        assert_eq!(
+            seen.borrow().clone(),
+            vec![(
+                "/api/v1/sessions/s-typed/export".to_owned(),
+                "format=md".to_owned(),
+            )]
+        );
+    }
+
+    #[test]
+    fn daemon_export_leaves_at_last_for_the_daemon_resolver() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let script = Script {
+            seen: Rc::clone(&seen),
+            status: 200,
+            body: b"{\"type\":\"header\"}\n".to_vec(),
+        };
+        let mut source = DaemonExport::new(
+            HttpExport::with_transport(endpoint(), script),
+            ExportFormat::Jsonl,
+        );
+        let outcome = run(
+            ExportArgs {
+                session: "@last",
+                format: None,
+                output: None,
+                filter: None,
+                redact_paths: false,
+                redact_hosts: false,
+                json: false,
+            },
+            &mut source,
+        );
+        assert_eq!(outcome.code, exit::OK);
+        assert_eq!(
+            seen.borrow().clone(),
+            vec![(
+                "/api/v1/sessions/@last/export".to_owned(),
+                "format=jsonl".to_owned(),
+            )]
+        );
+    }
+
     /// `-o` writes the same bytes and prints a Chinese summary, not the body.
     #[test]
     fn daemon_bytes_go_to_the_output_path() {
@@ -789,6 +874,81 @@ mod tests {
         assert!(!text.contains("header"), "{text}");
         assert_eq!(std::fs::read(&path).expect("file"), body);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_markdown_bytes_go_to_the_output_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "aw-export-md-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("out.md");
+        let body = b"# Session report\n";
+        let script = Script {
+            seen: Rc::new(RefCell::new(Vec::new())),
+            status: 200,
+            body: body.to_vec(),
+        };
+        let mut source = DaemonExport::new(
+            HttpExport::with_transport(endpoint(), script),
+            ExportFormat::Markdown,
+        );
+        let outcome = run_to(
+            ExportArgs {
+                session: "s-typed",
+                format: Some("markdown"),
+                output: Some(path.to_str().expect("utf8 path")),
+                filter: None,
+                redact_paths: false,
+                redact_hosts: false,
+                json: false,
+            },
+            &mut source,
+            Some(path.as_path()),
+        );
+        assert_eq!(outcome.code, exit::OK);
+        assert_eq!(
+            String::from_utf8(outcome.stdout).expect("utf8"),
+            format!("已写入 {}（{} 字节）\n", path.display(), body.len())
+        );
+        assert_eq!(std::fs::read(&path).expect("file"), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn daemon_no_sessions_keeps_the_at_last_message() {
+        let script = Script {
+            seen: Rc::new(RefCell::new(Vec::new())),
+            status: 404,
+            body: br#"{"error":{"code":"no_sessions","message":"this account has no sessions"}}"#
+                .to_vec(),
+        };
+        let mut source = DaemonExport::new(
+            HttpExport::with_transport(endpoint(), script),
+            ExportFormat::Jsonl,
+        );
+        let outcome = run(
+            ExportArgs {
+                session: "@last",
+                format: None,
+                output: None,
+                filter: None,
+                redact_paths: false,
+                redact_hosts: false,
+                json: false,
+            },
+            &mut source,
+        );
+        assert_eq!(outcome.code, exit::GENERAL);
+        assert_eq!(
+            String::from_utf8(outcome.stderr).expect("utf8"),
+            "aw: 还没有你的会话，@last 无处可指\n"
+        );
     }
 
     /// A 404 names the id the user typed, in Chinese.

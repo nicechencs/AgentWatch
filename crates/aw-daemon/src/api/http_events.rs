@@ -16,13 +16,13 @@ use std::collections::BTreeMap;
 use aw_core::filter::{self, Expr as CoreExpr, Op as CoreOp, Value as CoreValue};
 use aw_pipeline::wording::Lang;
 use aw_store::{
-    compile_predicate, redact_host_field, redact_host_text, redact_user_paths,
-    session_by_public_id, CompileCtx, Store, StoreExpr, StoreField, StoreOp, StoreParam,
-    StoreTarget, StoreTerm, StoreValue,
+    compile_predicate, redact_host_field, redact_host_text, redact_user_paths, CompileCtx, Store,
+    StoreExpr, StoreField, StoreOp, StoreParam, StoreTarget, StoreTerm, StoreValue,
 };
 use rusqlite::OptionalExtension;
 
 use super::auth::Caller;
+use super::query::QueryBackendError;
 use super::routes::{error_response, ApiResponse, ApiState};
 
 const MAX_PAGE: i64 = 2000;
@@ -49,19 +49,12 @@ pub(crate) fn get_http(state: &ApiState, caller: &Caller, sid: &str, query: &str
     let redact_paths = flag_on(pairs.get("redact_paths").map(String::as_str));
     let redact_hosts = flag_on(pairs.get("redact_hosts").map(String::as_str));
 
-    let Some(path) = state.query.db_path.as_deref() else {
-        return error_response(404, "not_found", "session not found");
-    };
-    let store = match Store::open(path) {
-        Ok(store) => store,
-        Err(err) => return error_response(500, "store", &err.to_string()),
+    let (store, session_id) = match open_owned(state, &caller.user_id, sid) {
+        Ok(Some(pair)) => pair,
+        Ok(None) => return error_response(404, "not_found", "session not found"),
+        Err(response) => return response,
     };
     let conn = store.connection();
-    let session_id = match resolve_session(conn, &caller.user_id, sid) {
-        Ok(Some(id)) => id,
-        Ok(None) => return error_response(404, "not_found", "session not found"),
-        Err(message) => return error_response(500, "store", &message),
-    };
 
     let proxy = match proxy_enabled(conn, session_id, &caller.user_id) {
         Ok(Some(on)) => on,
@@ -335,26 +328,6 @@ fn exe_file_name(path: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
-/// Shared session lookup. Numeric `sid` is `sessions.id` owned by `user_id`.
-/// Anything else is `public_id` via [`session_by_public_id`].
-pub(crate) fn resolve_session(
-    conn: &rusqlite::Connection,
-    user_id: &str,
-    sid: &str,
-) -> Result<Option<i64>, String> {
-    if let Ok(id) = sid.parse::<i64>() {
-        return conn
-            .query_row(
-                "SELECT id FROM sessions WHERE id = ?1 AND user_id = ?2",
-                rusqlite::params![id, user_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|err| err.to_string());
-    }
-    session_by_public_id(conn, user_id, sid).map_err(|err| err.to_string())
-}
-
 fn proxy_enabled(
     conn: &rusqlite::Connection,
     session_id: i64,
@@ -388,10 +361,15 @@ pub(crate) fn open_owned(
         return Ok(None);
     };
     let store = Store::open(path).map_err(|err| error_response(500, "store", &err.to_string()))?;
-    match resolve_session(store.connection(), user_id, sid) {
+    match state.query.resolve_id(&store, user_id, sid) {
         Ok(Some(id)) => Ok(Some((store, id))),
         Ok(None) => Ok(None),
-        Err(message) => Err(error_response(500, "store", &message)),
+        Err(QueryBackendError::NoSessions) => Err(error_response(
+            404,
+            "no_sessions",
+            "this account has no sessions",
+        )),
+        Err(error) => Err(error_response(500, "store", &error.to_string())),
     }
 }
 

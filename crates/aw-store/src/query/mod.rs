@@ -71,6 +71,9 @@ pub fn ensure_timeline(conn: &Connection) -> Result<(), QueryError> {
 /// Optional constraints for [`list_sessions`].
 #[derive(Debug, Clone, Default)]
 pub struct SessionFilter {
+    /// Free-text search across the session label, command, and public id.
+    /// Whitespace-only text is not a constraint.
+    pub q: Option<String>,
     /// Only sessions whose `agent` equals this string.
     pub agent: Option<String>,
     /// `true` keeps sessions with `ended_ns IS NULL`.
@@ -384,6 +387,21 @@ pub fn list_sessions(
          FROM sessions WHERE user_id = ?",
     );
     let mut bind: Vec<Param> = vec![Param::Text(user_id.to_string())];
+    if let Some(q) = filter.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        // `instr` treats every byte in user text literally, unlike `LIKE`.
+        // `argv` is a redacted JSON array when present. Check validity before
+        // expanding it so a malformed legacy value cannot make listing fail.
+        sql.push_str(
+            " AND (instr(lower(COALESCE(name, '')), lower(?)) > 0 \
+             OR instr(lower(public_id), lower(?)) > 0 \
+             OR instr(lower(CASE WHEN json_valid(argv) THEN \
+                    COALESCE((SELECT group_concat(value, ' ') FROM json_each(argv)), '') \
+                    ELSE '' END), lower(?)) > 0)",
+        );
+        bind.push(Param::Text(q.to_owned()));
+        bind.push(Param::Text(q.to_owned()));
+        bind.push(Param::Text(q.to_owned()));
+    }
     if let Some(agent) = &filter.agent {
         sql.push_str(" AND agent = ?");
         bind.push(Param::Text(agent.clone()));
@@ -2372,6 +2390,71 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(gaps(&conn, "user-a", 2).unwrap().is_none());
+    }
+
+    #[test]
+    fn session_search_matches_name_argv_and_public_id_without_crossing_users() {
+        let conn = conn();
+        session(&conn, 1, "alice", 10);
+        session(&conn, 2, "alice", 20);
+        session(&conn, 3, "alice", 30);
+        session(&conn, 4, "alice", 40);
+        session(&conn, 5, "alice", 50);
+        session(&conn, 6, "bob", 60);
+        conn.execute(
+            "UPDATE sessions SET name = 'Quarterly Review' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET argv = '[\"sh\",\"-c\",\"exit 3\"]' WHERE id = 2",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET public_id = 'public-fragment-cue' WHERE id = 3",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET name = 'literal %_ marker' WHERE id = 4",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET name = 'literal xx marker' WHERE id = 5",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET name = 'private needle' WHERE id = 6",
+            [],
+        )
+        .unwrap();
+
+        let ids = |q: &str| {
+            list_sessions(
+                &conn,
+                "alice",
+                &SessionFilter {
+                    q: Some(q.to_owned()),
+                    ..SessionFilter::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids("quarterly"), vec![1]);
+        assert_eq!(ids("C EXIT 3"), vec![2]);
+        assert_eq!(ids("sh -c"), vec![2]);
+        assert_eq!(ids("FRAGMENT"), vec![3]);
+        assert_eq!(ids("%_"), vec![4]);
+        assert!(ids("absent").is_empty());
+        assert!(ids("private needle").is_empty());
+        assert_eq!(ids(" \t ").len(), 5);
     }
 
     #[test]

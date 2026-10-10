@@ -445,7 +445,7 @@ impl StoreQuery {
     /// `started_ns`), never the newest session in the database and never a
     /// remembered id. A caller with no sessions of their own is
     /// [`QueryBackendError::NoSessions`], not a lookup of another user's row.
-    fn resolve_id(
+    pub(crate) fn resolve_id(
         &self,
         store: &Store,
         user_id: &str,
@@ -494,6 +494,7 @@ impl SessionQuery for StoreQuery {
         let cursor = parse_cursor(query.cursor.as_deref())?;
         let ask = query.limit.saturating_add(1);
         let filter = SessionFilter {
+            q: query.q.clone(),
             agent: query.agent.clone(),
             active_only: query.active_only,
             since_ns: query.since_ns,

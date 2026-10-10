@@ -15,6 +15,7 @@ import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { EmptyNote, ErrorNote, Loading } from "@/components/QueryState";
 import { capabilitiesUnknown, coverage, kindInSentence, uncollectedKinds } from "@/lib/capabilities";
 import { useI18n } from "@/lib/i18n";
+import { platformName } from "@/lib/platform";
 import { sessionTitle } from "@/lib/session-title";
 import { loadSide, type CompareSide } from "./api";
 
@@ -188,14 +189,22 @@ function PairView({
 }
 
 /**
- * Where the session ran. The session list leaves `platform` off (it is a column
- * of the session row, not of the list item), so an empty string is "not sent",
- * shown as 「不可得」 — never a blank after the colon.
+ * The agent row of a compare card. The label is a translated word (「智能体」),
+ * never the raw English "Agent"; the value after it is the session's own agent
+ * name, which is data and stays as stored.
  */
+export function agentText(
+  agent: string,
+  t: (key: string, vars?: Record<string, string | number>) => string,
+): string {
+  return `${t("compare.agent")}${t("common.colon")}${agent}`;
+}
+
 export function platformText(session: Pick<Session, "platform" | "os_version">, unavailable: string): string {
   const platform = session.platform.trim();
   if (!platform) return unavailable;
-  return session.os_version ? `${platform} ${session.os_version}` : platform;
+  const name = platformName(platform);
+  return session.os_version ? `${name} ${session.os_version}` : name;
 }
 
 /**
@@ -231,7 +240,7 @@ function SideCard({ side, label }: { side: CompareSide; label: string }) {
       <p>{session.name ?? session.argv?.[0] ?? t("common.unavailable")}</p>
       <p className="text-ink-faint" data-platform="">
         {t("compare.platform")}{t("common.colon")}{platformText(session, t("common.unavailable"))}
-        {session.agent ? ` · ${session.agent}` : ""}
+        {session.agent ? ` · ${agentText(session.agent, t)}` : ""}
       </p>
       <p className="mt-1 text-ink-faint" data-capabilities="">
         {t("compare.collectors")}{t("common.colon")}{capabilityText(session, t)}

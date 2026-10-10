@@ -149,11 +149,13 @@ pub trait ProcessSource {
     /// Tell a live source which pids the next [`snapshot`](Self::snapshot) should refresh.
     ///
     /// `None` means a full enumeration. `Some(&[])` means do not touch the process
-    /// table. `Some(pids)` means refresh only those pids.
+    /// table. `Some(pids)` means return those pids and every descendant of them,
+    /// including children that did not exist at the previous sample.
     ///
     /// The default is a no-op. [`StaticProcessSource`] ignores it and still returns
     /// the scripted table, so tests can inject a child the collector has not seen
-    /// yet. The host adapter uses it to avoid a whole-machine scan every tick.
+    /// yet. The host adapter uses it to skip the scan entirely in launch mode and to
+    /// return only the watched subtree otherwise.
     fn set_restrict(&mut self, _restrict: Option<&[u32]>) {}
 }
 

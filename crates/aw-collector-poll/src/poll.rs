@@ -331,15 +331,16 @@ where
             Some(before) => before,
             None => return Ok(()),
         };
-        // Keep a row whose parent is watched even when the row itself is not yet
-        // in `watched`. Otherwise a child with no ppid (which cannot be hashed
-        // into the set) would vanish instead of becoming a gap.
+        // Keep a row in the watched subtree even when the row itself is not yet
+        // in `watched`. A child and a grandchild started in the same interval
+        // are both kept. A child with a missing start time becomes a gap here
+        // instead of vanishing.
         let visible = self.pids_touching_watch(&sample);
         let filtered = filter_processes(&sample, &visible);
         let deltas = diff_processes(&before, &filtered);
         let source = Source::new(PROC_SOURCE);
         for delta in &deltas {
-            if !self.delta_in_scope(delta) {
+            if !self.delta_in_scope(delta, &visible) {
                 continue;
             }
             let parent = match delta {
@@ -494,26 +495,27 @@ where
         }
     }
 
+    /// Watched pids plus every descendant in `sample`.
+    ///
+    /// Not only direct children: `sh -c 'sleep 4'` forks its grandchild inside one
+    /// interval, and that row's parent is not in `watched` yet.
     fn pids_touching_watch(&self, sample: &ProcessSnapshot) -> Vec<u32> {
         let mut pids = self.watched.clone();
-        for row in &sample.rows {
-            let parent_watched = row.ppid.is_some_and(|ppid| self.watched.contains(&ppid));
-            if (self.watched.contains(&row.pid) || parent_watched) && !pids.contains(&row.pid) {
-                pids.push(row.pid);
+        for pid in child_pids(sample, &self.watched) {
+            if !pids.contains(&pid) {
+                pids.push(pid);
             }
         }
         pids
     }
 
-    fn delta_in_scope(&self, delta: &ProcessDelta) -> bool {
-        let row = match delta {
-            ProcessDelta::Started(row) | ProcessDelta::Exited(row) => row,
-        };
-        if self.watched.contains(&row.pid) {
-            return true;
+    /// An exit counts only for a watched pid. A start counts for any row in the
+    /// watched subtree of this sample (`visible`).
+    fn delta_in_scope(&self, delta: &ProcessDelta, visible: &[u32]) -> bool {
+        match delta {
+            ProcessDelta::Exited(row) => self.watched.contains(&row.pid),
+            ProcessDelta::Started(row) => visible.contains(&row.pid),
         }
-        matches!(delta, ProcessDelta::Started(_))
-            && row.ppid.is_some_and(|ppid| self.watched.contains(&ppid))
     }
 
     fn apply_restrict(&mut self) {
@@ -1093,6 +1095,56 @@ mod tests {
             panic!("start");
         };
         assert_eq!(start.ppid, 10);
+    }
+
+    /// BUGS B4: `sh -c 'sleep 4'` forks a grandchild inside one interval. Only
+    /// direct children of a watched pid used to count, so the grandchild was
+    /// dropped and never watched.
+    #[test]
+    fn child_and_grandchild_started_in_one_interval_are_both_kept() {
+        let first = snap(vec![row(10, Some(1))]);
+        let second = snap(vec![row(10, Some(1)), row(12, Some(11)), row(11, Some(10))]);
+        let third = snap(vec![row(10, Some(1))]);
+        let mut c = collector(
+            vec![first, second, third],
+            vec![
+                ConnectionSnapshot::default(),
+                ConnectionSnapshot::default(),
+                ConnectionSnapshot::default(),
+            ],
+        );
+        let mut sink = VecSink::with_capacity(8);
+        c.start_at(
+            &Scope::attach([uid_of(10)]).expect("root"),
+            &mut sink,
+            MONO,
+            WALL,
+        )
+        .expect("start");
+        c.poll_once(&mut sink, MONO + 1, WALL).expect("tick");
+        assert_eq!(kinds(&sink), vec!["process_start", "process_start"]);
+        let mut ppids: Vec<u32> = sink
+            .events()
+            .iter()
+            .filter_map(|event| match &event.kind {
+                EventKind::ProcessStart(start) => Some(start.ppid),
+                _ => None,
+            })
+            .collect();
+        ppids.sort_unstable();
+        assert_eq!(ppids, vec![10, 11]);
+
+        // Both are watched now, so both exits are reported.
+        c.poll_once(&mut sink, MONO + 2, WALL).expect("tick");
+        assert_eq!(
+            kinds(&sink),
+            vec![
+                "process_start",
+                "process_start",
+                "process_exit",
+                "process_exit"
+            ]
+        );
     }
 
     #[test]

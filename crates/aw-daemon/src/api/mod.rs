@@ -29,7 +29,7 @@ pub(crate) use findings::share;
 
 pub(crate) use control::Control;
 pub(crate) use http::HttpServer;
-pub(crate) use ipc::{socket_path, IpcServer};
+pub(crate) use ipc::{fallback_socket_path, should_fall_back, socket_path, IpcServer};
 pub(crate) use query::StoreQuery;
 pub(crate) use routes::ApiState;
 

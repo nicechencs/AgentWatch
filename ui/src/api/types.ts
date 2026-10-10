@@ -362,8 +362,21 @@ export interface SystemProcess {
   ppid: number | null;
   name: string;
   exe: string | null;
+  /** Redacted by the service before it is sent. Null when unreadable. */
+  argv: string[] | null;
+  /** Owner uid or SID. Null when the service could not read it. */
+  user_id: string | null;
   agent: string | null;
   children: SystemProcess[];
+}
+
+/** `GET /processes`. `available: false` is "not collected", not an empty table. */
+export interface SystemProcessTable {
+  available: boolean;
+  reason: string | null;
+  /** "all" for an administrator, "own" for everyone else. */
+  scope: string | null;
+  roots: SystemProcess[];
 }
 
 export interface SearchHit {

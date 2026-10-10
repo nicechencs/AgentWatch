@@ -2,7 +2,8 @@ import { useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "@/api/client";
-import type { SystemProcess } from "@/api/types";
+import type { SystemProcess, SystemProcessTable } from "@/api/types";
+import { describeError } from "@/api/errors";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { ErrorNote } from "@/components/QueryState";
 import { kindLabel } from "@/lib/capabilities";
@@ -148,7 +149,9 @@ function LaunchForm({ pending, onStart }: { pending: boolean; onStart: (body: Pa
 function AttachForm({ pending, onStart }: { pending: boolean; onStart: (body: Parameters<typeof api.createSession>[0]) => void }) {
   const { t } = useI18n();
   const [q, setQ] = useState("");
-  const [agentsOnly, setAgentsOnly] = useState(true);
+  // Off by default: the picker must show the program the user is looking
+  // for (real-window #144: searching `sleep` found nothing).
+  const [agentsOnly, setAgentsOnly] = useState(false);
   const [includeChildren, setIncludeChildren] = useState(true);
   const [selected, setSelected] = useState<number | null>(null);
   const [cursor, setCursor] = useState(0);
@@ -207,14 +210,21 @@ function AttachForm({ pending, onStart }: { pending: boolean; onStart: (body: Pa
               }`}
               style={{ paddingLeft: `${8 + row.depth * 14}px` }}
             >
-              <span className="font-mono">{row.name}</span>
+              <span className="font-mono" title={row.argv ? row.argv.join(" ") : undefined}>{row.name}</span>
               <span className="text-ink-faint">({row.pid})</span>
               {row.agent ? <span>{row.agent}</span> : null}
             </button>
           </li>
         ))}
-        {flat.length === 0 ? <li className="px-2 py-2 text-ink-faint">{t("common.empty")}</li> : null}
+        {flat.length === 0 ? (
+          <li className="px-2 py-2 text-ink-faint">
+            <PickerStatus data={processes.data} error={processes.error} loading={processes.isPending} agentsOnly={agentsOnly} />
+          </li>
+        ) : null}
       </ul>
+      {processes.data?.available && processes.data.scope === "own" ? (
+        <p className="mt-1 text-[11px] text-ink-faint">{t("new.procScopeOwn")}</p>
+      ) : null}
       <label className="mt-2 flex items-center gap-1 text-xs">
         <input type="checkbox" checked={includeChildren} onChange={(event) => setIncludeChildren(event.target.checked)} />
         {t("new.includeChildren")}
@@ -224,6 +234,29 @@ function AttachForm({ pending, onStart }: { pending: boolean; onStart: (body: Pa
       </button>
     </form>
   );
+}
+
+/**
+ * What an empty picker says. A table the service could not read (or a failed
+ * request) is 「没采」 with the reason, never 「没有记录」: an empty list must
+ * not read as "nothing is running".
+ */
+export function PickerStatus({
+  data,
+  error,
+  loading,
+  agentsOnly,
+}: {
+  data: SystemProcessTable | undefined;
+  error: unknown;
+  loading: boolean;
+  agentsOnly: boolean;
+}) {
+  const { t } = useI18n();
+  if (error) return <>{t("new.procNotCollected", { reason: describeError(error, t) })}</>;
+  if (!data) return <>{loading ? t("common.loading") : t("new.procNotCollected", { reason: t("new.procReasonUnknown") })}</>;
+  if (!data.available) return <>{t("new.procNotCollected", { reason: data.reason ?? t("new.procReasonUnknown") })}</>;
+  return <>{agentsOnly ? t("new.procNoAgent") : t("new.procNoMatch")}</>;
 }
 
 interface FlatProc extends SystemProcess {

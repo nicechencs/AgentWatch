@@ -25,6 +25,7 @@ import type {
   SessionListQuery,
   SessionSummary,
   SystemProcess,
+  SystemProcessTable,
   TimelineItem,
   TrafficSeries,
 } from "./types";
@@ -188,6 +189,32 @@ export function toSearchResult(raw: unknown): SearchResult {
  * page must still render its forms, so the list defaults to empty and the
  * reason is kept for the "不可得" note.
  */
+function toSystemProcess(raw: unknown): SystemProcess | null {
+  if (!isObj(raw) || typeof raw.pid !== "number") return null;
+  return {
+    pid: raw.pid,
+    ppid: numOrNull(raw.ppid),
+    name: typeof raw.name === "string" && raw.name ? raw.name : `pid ${raw.pid}`,
+    exe: strOrNull(raw.exe),
+    argv: Array.isArray(raw.argv) ? raw.argv.filter((a): a is string => typeof a === "string") : null,
+    user_id: strOrNull(raw.user_id),
+    agent: strOrNull(raw.agent),
+    children: arr(raw.children).map(toSystemProcess).filter((p): p is SystemProcess => p !== null),
+  };
+}
+
+/** Only an explicit `available: true` is a table; anything else is "not collected". */
+export function toSystemProcessTable(raw: unknown): SystemProcessTable {
+  const r = isObj(raw) ? raw : {};
+  const available = r.available === true;
+  return {
+    available,
+    reason: strOrNull(r.reason),
+    scope: strOrNull(r.scope),
+    roots: available ? arr(r.roots).map(toSystemProcess).filter((p): p is SystemProcess => p !== null) : [],
+  };
+}
+
 export function toDoctor(raw: unknown): DoctorReport {
   const r = isObj(raw) ? raw : {};
   const host = isObj(r.host) ? r.host : {};
@@ -510,8 +537,8 @@ export const api = {
   search: async (query: Record<string, unknown>) => toSearchResult(await get<unknown>(`/search${qs(query)}`)),
 
   doctor: async () => toDoctor(await get<unknown>("/doctor")),
-  systemProcesses: (query: { agents_only?: boolean; q?: string }) =>
-    get<{ roots: SystemProcess[] }>(`/processes${qs({ ...query })}`),
+  systemProcesses: async (query: { agents_only?: boolean; q?: string }) =>
+    toSystemProcessTable(await get<unknown>(`/processes${qs({ ...query })}`)),
 
   config: async () => toConfigView(await get<unknown>("/config")),
   putConfig: (body: unknown) => send<ConfigView>("PUT", "/config", body),

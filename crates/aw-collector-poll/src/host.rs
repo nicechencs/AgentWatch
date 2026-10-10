@@ -265,6 +265,63 @@ fn read_sysinfo_boot_seconds() -> Option<Vec<u8>> {
     }
 }
 
+/// One row of the live host process table (attach picker, `aw ps`).
+///
+/// Not `Debug`: `row.argv` and `row.exe` are command lines. Callers redact argv
+/// before it leaves the process.
+#[derive(Clone)]
+pub struct HostProcess {
+    /// pid, parent, start, exe, argv and `user_id` (uid or SID as text).
+    /// `cwd` is not read for the table.
+    pub row: ProcessRow,
+    /// Process name as the OS reports it. `None` when empty or not UTF-8.
+    pub name: Option<String>,
+}
+
+/// Read the whole host process table once, through `sysinfo`.
+///
+/// `None` when this target has no process API in `sysinfo`, or when the table
+/// came back empty (a real table always lists the calling process). `None` is
+/// "not collected", never "no processes".
+#[must_use]
+pub fn host_process_table() -> Option<Vec<HostProcess>> {
+    if !sysinfo::IS_SUPPORTED_SYSTEM {
+        return None;
+    }
+    let mut system = System::new();
+    let kind = ProcessRefreshKind::nothing()
+        .without_tasks()
+        .with_exe(UpdateKind::OnlyIfNotSet)
+        .with_cmd(UpdateKind::OnlyIfNotSet)
+        .with_user(UpdateKind::OnlyIfNotSet);
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+    let rows: Vec<HostProcess> = system
+        .processes()
+        .values()
+        // Linux lists threads as tasks; `without_tasks` keeps them out, and a
+        // thread that slips through is not a process the picker can attach to.
+        .filter(|process| process.thread_kind().is_none())
+        .map(|process| {
+            let mut row = row_from_process(process);
+            row.cwd = None;
+            // `Uid` derefs to the platform id (`uid_t` or `Sid`); both print
+            // as the id itself, never a user name.
+            row.user_id = process.user_id().map(|uid| (**uid).to_string());
+            let name = process
+                .name()
+                .to_str()
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned);
+            HostProcess { row, name }
+        })
+        .collect();
+    if rows.is_empty() {
+        None
+    } else {
+        Some(rows)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::keep_subtrees;
@@ -337,6 +394,46 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert!(seen, "a child started after the baseline must be returned");
+    }
+
+    /// Attach picker / `aw ps`: the live table lists a child this test
+    /// really started, with its parent and a user id. No early return.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn host_table_lists_a_live_child_with_user() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "host::tests::sleeper_for_child_test",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the child test process");
+        let child_pid = child.id();
+        let me = std::process::id();
+        let mut found = None;
+        for _ in 0..20 {
+            let table = super::host_process_table().expect("table is collected");
+            if let Some(hit) = table.into_iter().find(|p| p.row.pid == child_pid) {
+                found = Some(hit);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let hit = found.expect("the live child is in the table");
+        assert_eq!(hit.row.ppid, Some(me));
+        assert!(hit.name.is_some(), "name is read");
+        assert!(
+            hit.row.user_id.as_deref().is_some_and(|id| !id.is_empty()),
+            "user id is read"
+        );
+        assert!(hit.row.cwd.is_none(), "cwd is not read for the table");
     }
 
     #[test]

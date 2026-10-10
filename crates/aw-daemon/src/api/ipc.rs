@@ -743,6 +743,44 @@ mod tests {
         assert_eq!(body["admin"], uid == 0);
     }
 
+    /// Real-window #144 blocker 3: over the real socket, a non-admin peer
+    /// (identified by its uid, not a header) sees a `sleep` it started.
+    #[test]
+    fn process_table_over_the_socket_lists_a_live_sleep() {
+        let path = temp_socket("procs");
+        let state = Arc::new(Mutex::new(ApiState::default()));
+        let _server = IpcServer::bind(&path, state, Control::new(None)).expect("bind");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = u64::from(child.id());
+        let mut seen = serde_json::Value::Null;
+        for _ in 0..40 {
+            let (status, body) = exchange(&path, "GET /api/v1/processes?q=sleep HTTP/1.1\r\n\r\n");
+            assert_eq!(status, 200, "{body}");
+            let hit = body["processes"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["pid"] == pid));
+            seen = body;
+            if hit {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let uid = nix::unistd::geteuid().as_raw();
+        assert_eq!(seen["available"], true, "{seen}");
+        assert_eq!(seen["scope"], if uid == 0 { "all" } else { "own" });
+        let row = seen["processes"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["pid"] == pid))
+            .unwrap_or_else(|| panic!("sleep {pid} listed: {seen}"));
+        assert_eq!(row["name"], "sleep");
+        assert_eq!(row["user_id"], uid.to_string());
+    }
+
     #[test]
     fn live_socket_is_not_stolen_and_assets_are_not_served() {
         let path = temp_socket("busy");

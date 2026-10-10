@@ -166,7 +166,7 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
     ))
 }
 
-/// `aw ui`, `aw daemon start`, and `aw daemon status`: the commands that need
+/// `aw ui`, `aw daemon start|status|stop|restart|logs`, and `aw ps`: the commands that need
 /// the internal channel itself (api-and-cli §1). Production path only.
 fn channel_command(cli: &Cli, env_token: Option<String>, json: bool) -> Option<Outcome> {
     let wanted = matches!(
@@ -177,6 +177,7 @@ fn channel_command(cli: &Cli, env_token: Option<String>, json: bool) -> Option<O
             | Command::Daemon(tree::DaemonCmd::Stop)
             | Command::Daemon(tree::DaemonCmd::Restart)
             | Command::Daemon(tree::DaemonCmd::Logs { .. })
+            | Command::Ps { .. }
     );
     if !wanted {
         return None;
@@ -243,6 +244,15 @@ fn channel_command(cli: &Cli, env_token: Option<String>, json: bool) -> Option<O
             json,
             &mut std::io::stdout(),
         ),
+        Command::Ps {
+            agents_only,
+            filter,
+        } => ps::run(
+            *agents_only,
+            filter.as_deref(),
+            json,
+            &mut ps::DaemonTable::new(endpoint.clone(), open(&endpoint)),
+        ),
         _ => ui::daemon_status(&endpoint, open(&endpoint), json),
     })
 }
@@ -307,10 +317,10 @@ fn live_session_preflight(cli: &Cli, json: bool) -> Option<Outcome> {
 /// broader [`launch_command`] path and never opens a real socket.
 fn live_launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
     match &cli.command {
+        // `aw ps` is a channel command (`channel_command`).
         Command::Run {
             no_daemon: true, ..
-        }
-        | Command::Ps { .. } => launch_command(cli, json),
+        } => launch_command(cli, json),
         _ => None,
     }
 }
@@ -697,15 +707,6 @@ fn launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
             Some(attach::run(&args, &mut attach::UnwiredControl))
         }
         Command::Stop { session } => Some(stop::run(session, json, &mut attach::UnwiredControl)),
-        Command::Ps {
-            agents_only,
-            filter,
-        } => Some(ps::run(
-            *agents_only,
-            filter.as_deref(),
-            json,
-            &mut ps::UnwiredTable,
-        )),
         _ => None,
     }
 }
@@ -1370,7 +1371,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_and_ps_stubs_are_exit_3_and_do_not_open_http() {
+    fn attach_and_stop_stubs_are_exit_3_and_do_not_open_http() {
         let mut http = script(200, "{}");
         let attach = run(&["attach", "--pid", "100"], None, &mut http);
         assert_eq!(attach.code, exit::UNREACHABLE, "{}", text(&attach.stderr));
@@ -1384,13 +1385,8 @@ mod tests {
         let stop = run(&["stop", "s-1"], None, &mut http);
         assert_eq!(stop.code, exit::UNREACHABLE, "{}", text(&stop.stderr));
 
-        let ps = run(&["ps", "--agents-only"], None, &mut http);
-        assert_eq!(ps.code, exit::UNREACHABLE, "{}", text(&ps.stderr));
-        let ps_err = text(&ps.stderr);
-        assert!(
-            ps_err.contains("不可用") || ps_err.contains("not available"),
-            "{ps_err}"
-        );
+        // `aw ps` is a channel command now (it reads the daemon's
+        // `/processes`); `tests/dispatch.rs` runs it over a real socket.
         assert_eq!(http.opened, 0);
     }
 

@@ -23,6 +23,7 @@ mod openapi;
 mod proxy;
 mod query;
 mod routes;
+mod system_procs;
 mod timeline_rows;
 mod watch_routes;
 

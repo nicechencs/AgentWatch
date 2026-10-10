@@ -1243,7 +1243,11 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
             &json!({ "user_id": caller.user_id, "admin": caller.admin }),
         ),
         ("GET", "/api/v1/doctor") => doctor(state),
-        ("GET", "/api/v1/processes") => system_processes(req),
+        ("GET", "/api/v1/processes") => super::system_procs::system_processes(
+            super::system_procs::live_table,
+            caller,
+            &req.query,
+        ),
         ("GET", "/api/v1/db/stats") => db_stats(state, caller),
         ("POST", "/api/v1/db/purge") => db_purge(state, caller, &req.body),
         ("POST", "/api/v1/db/vacuum") => db_admin(state, caller, StoreOp::Vacuum),
@@ -2291,20 +2295,6 @@ fn doctor(state: &ApiState) -> ApiResponse {
                 "privileged": crate::privilege::current(),
                 "privileged_note": "poll collector only in this build; eBPF, ETW, and eslogger are not attached even when privileged",
             },
-        }),
-    )
-}
-
-fn system_processes(req: &HttpRequest) -> ApiResponse {
-    // Reading the OS process table is platform code (task: stay in aw-daemon
-    // API). Report unavailable rather than a partial or invented tree.
-    let _ = req;
-    ApiResponse::json(
-        200,
-        &json!({
-            "processes": [],
-            "available": false,
-            "reason": "system process tree is not collected by this build",
         }),
     )
 }
@@ -3545,7 +3535,8 @@ mod tests {
             json_body(&processes)
                 .get("available")
                 .and_then(Value::as_bool),
-            Some(false)
+            Some(true),
+            "the live process table is wired (real-window #144 blocker 3)"
         );
         // No database is configured on this state, so stats are null, not 0.
         let stats = dispatch(

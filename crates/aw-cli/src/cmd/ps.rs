@@ -1,9 +1,12 @@
 //! `aw ps` (P1-CLI-02).
 //!
 //! Lists processes the caller could attach to, as a tree. Rows come from a
-//! [`ProcessTable`]. The production table is a stub and returns
-//! [`PsError::Unavailable`]: this CLI does not read the operating system's
-//! process list. Tests inject rows.
+//! [`ProcessTable`]. The production table is [`DaemonTable`]: it asks the
+//! daemon (`GET /api/v1/processes`) over the internal channel, so this CLI
+//! does not read the operating system's process list itself. The daemon
+//! decides scope: an administrator sees every process, anyone else their own.
+//! A daemon that cannot read a table answers `available: false`, which is
+//! printed as 「没采」 (not collected), never as an empty list. Tests inject rows.
 //!
 //! `--agents-only` keeps rows whose executable base name is on
 //! [`AGENT_NAMES`]. That list is a name match only. Full agent recognition is
@@ -15,6 +18,8 @@ use serde_json::{json, Value};
 
 use aw_core::Evidence;
 
+use crate::client::{ApiRequest, Client, ClientError, Transport};
+use crate::endpoint::Endpoint;
 use crate::exit;
 use crate::output::{evidence_badge, evidence_code, OutputMode, Row, Table};
 
@@ -39,6 +44,8 @@ pub(crate) struct ProcessRow {
     pub parent: Option<u32>,
     /// Executable base name. Not a path.
     pub name: String,
+    /// Owner id (uid or SID) as the daemon reported it. `None` when unknown.
+    pub user: Option<String>,
     /// How this row was observed.
     pub evidence: Evidence,
 }
@@ -47,7 +54,11 @@ pub(crate) struct ProcessRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum PsError {
-    /// No process source is wired.
+    /// The daemon did not answer, or this account may not open its channel.
+    Unreachable { detail: String },
+    /// The daemon answered but has no process table on this platform.
+    NotCollected { detail: String },
+    /// The exchange or the answer was broken.
     Unavailable { detail: String },
     /// `--filter` was rejected.
     BadFilter { detail: String },
@@ -56,12 +67,15 @@ pub(crate) enum PsError {
 impl std::fmt::Display for PsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unavailable { detail } | Self::BadFilter { detail } => write!(f, "{detail}"),
+            Self::Unreachable { detail }
+            | Self::NotCollected { detail }
+            | Self::Unavailable { detail }
+            | Self::BadFilter { detail } => write!(f, "{detail}"),
         }
     }
 }
 
-/// Process list. Production returns [`PsError::Unavailable`].
+/// Process list. Production is [`DaemonTable`].
 pub(crate) trait ProcessTable {
     /// Processes visible to the caller.
     ///
@@ -71,16 +85,95 @@ pub(crate) trait ProcessTable {
     fn list(&mut self) -> Result<Vec<ProcessRow>, PsError>;
 }
 
-/// Production table. Does not call an OS process API.
-#[derive(Debug, Default)]
-pub(crate) struct UnwiredTable;
+/// Production table: the daemon's `GET /api/v1/processes`.
+pub(crate) struct DaemonTable {
+    endpoint: Endpoint,
+    transport: Option<Box<dyn Transport>>,
+}
 
-impl ProcessTable for UnwiredTable {
-    fn list(&mut self) -> Result<Vec<ProcessRow>, PsError> {
-        Err(PsError::Unavailable {
-            detail: "process table is not available; the daemon process API is not connected. Run `aw daemon start`, or use `aw run --no-daemon` for launch mode (进程表不可用)".to_owned(),
-        })
+impl DaemonTable {
+    /// Bind to `endpoint` over `transport`. Does not connect.
+    pub(crate) fn new(endpoint: Endpoint, transport: Box<dyn Transport>) -> Self {
+        Self {
+            endpoint,
+            transport: Some(transport),
+        }
     }
+}
+
+impl ProcessTable for DaemonTable {
+    fn list(&mut self) -> Result<Vec<ProcessRow>, PsError> {
+        let Some(transport) = self.transport.take() else {
+            return Err(PsError::Unavailable {
+                detail: "process table was already read".to_owned(),
+            });
+        };
+        let mut client = Client::new(self.endpoint.clone(), transport);
+        let reply =
+            client
+                .call(&ApiRequest::get("/api/v1/processes"))
+                .map_err(|err| match err {
+                    ClientError::Unreachable { .. } | ClientError::Forbidden { .. } => {
+                        PsError::Unreachable {
+                            detail: err.to_string(),
+                        }
+                    }
+                    other => PsError::Unavailable {
+                        detail: format!("process table request failed: {other}"),
+                    },
+                })?;
+        let body = reply.json().ok_or_else(|| PsError::Unavailable {
+            detail: "daemon returned a non-JSON process table".to_owned(),
+        })?;
+        rows_from_json(&body)
+    }
+}
+
+/// Parse a `GET /processes` answer. `available: false` (or a missing flag) is
+/// [`PsError::NotCollected`]; a row without a pid or name is rejected rather
+/// than shown with a guessed value.
+fn rows_from_json(body: &Value) -> Result<Vec<ProcessRow>, PsError> {
+    if body.get("available").and_then(Value::as_bool) != Some(true) {
+        let reason = body
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("the daemon did not say why");
+        return Err(PsError::NotCollected {
+            detail: format!("process table not collected (没采): {reason}"),
+        });
+    }
+    let Some(list) = body.get("processes").and_then(Value::as_array) else {
+        return Err(PsError::Unavailable {
+            detail: "daemon process table has no `processes` list".to_owned(),
+        });
+    };
+    list.iter()
+        .map(|row| {
+            let pid = row
+                .get("pid")
+                .and_then(Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok());
+            let name = row.get("name").and_then(Value::as_str);
+            match (pid, name) {
+                (Some(pid), Some(name)) => Ok(ProcessRow {
+                    pid,
+                    parent: row
+                        .get("ppid")
+                        .and_then(Value::as_u64)
+                        .and_then(|ppid| u32::try_from(ppid).ok()),
+                    name: name.to_owned(),
+                    user: row
+                        .get("user_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    evidence: Evidence::S,
+                }),
+                _ => Err(PsError::Unavailable {
+                    detail: "daemon process row without pid or name".to_owned(),
+                }),
+            }
+        })
+        .collect()
 }
 
 /// Run `aw ps`.
@@ -97,8 +190,14 @@ pub(crate) fn run(
     }
     let rows = match table.list() {
         Ok(rows) => rows,
-        Err(PsError::Unavailable { detail }) => {
+        Err(PsError::Unreachable { detail }) => {
             return super::error_outcome(exit::UNREACHABLE, "unreachable", &detail, json);
+        }
+        Err(PsError::NotCollected { detail }) => {
+            return super::error_outcome(exit::GENERAL, "not_collected", &detail, json);
+        }
+        Err(PsError::Unavailable { detail }) => {
+            return super::error_outcome(exit::GENERAL, "unavailable", &detail, json);
         }
         Err(PsError::BadFilter { detail }) => {
             return super::error_outcome(exit::USAGE, "usage", &detail, json);
@@ -157,7 +256,12 @@ pub(crate) fn is_agent_name(name: &str) -> bool {
 fn write_ps(mode: OutputMode, rows: &[ProcessRow], agents_only: bool) -> io::Result<Vec<u8>> {
     let ordered = tree_order(rows);
     let rendered = Table {
-        headers: vec!["tree".to_owned(), "pid".to_owned(), "name".to_owned()],
+        headers: vec![
+            "tree".to_owned(),
+            "pid".to_owned(),
+            "name".to_owned(),
+            "user".to_owned(),
+        ],
         rows: ordered
             .iter()
             .map(|(depth, row)| Row {
@@ -165,6 +269,7 @@ fn write_ps(mode: OutputMode, rows: &[ProcessRow], agents_only: bool) -> io::Res
                     tree_cell(*depth, &row.name),
                     row.pid.to_string(),
                     row.name.clone(),
+                    row.user.clone().unwrap_or_else(|| "—".to_owned()),
                 ],
                 evidence: row.evidence.clone(),
             })
@@ -237,6 +342,7 @@ fn ps_json(rows: &[(usize, ProcessRow)], agents_only: bool) -> Value {
             "pid": row.pid,
             "parent": row.parent,
             "name": row.name,
+            "user_id": row.user,
             "evidence": evidence_code(&row.evidence),
             "badge": evidence_badge(&row.evidence),
         })).collect::<Vec<_>>(),
@@ -246,7 +352,9 @@ fn ps_json(rows: &[(usize, ProcessRow)], agents_only: bool) -> Value {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{is_agent_name, run, ProcessRow, ProcessTable, PsError, AGENT_NAMES};
+    use super::{is_agent_name, run, DaemonTable, ProcessRow, ProcessTable, PsError, AGENT_NAMES};
+    use crate::client::MemoryTransport;
+    use crate::endpoint::Endpoint;
     use crate::exit;
     use aw_core::Evidence;
 
@@ -263,6 +371,7 @@ mod tests {
             pid,
             parent,
             name: name.to_owned(),
+            user: None,
             evidence: Evidence::S,
         }
     }
@@ -288,6 +397,64 @@ mod tests {
         for name in AGENT_NAMES {
             assert!(is_agent_name(name));
         }
+    }
+
+    fn socket() -> Endpoint {
+        Endpoint::Unix {
+            path: std::path::PathBuf::from("/nonexistent/aw-test.sock"),
+        }
+    }
+
+    fn daemon(status: u16, body: &str) -> DaemonTable {
+        DaemonTable::new(
+            socket(),
+            Box::new(MemoryTransport::replying(status, body.as_bytes().to_vec())),
+        )
+    }
+
+    /// Real-window #144 blocker 3: `aw ps` reads the daemon's table and
+    /// prints the running `sleep` with its owner.
+    #[test]
+    fn daemon_rows_are_printed_with_user() {
+        let body = r#"{"available":true,"scope":"own","processes":[
+            {"pid":10,"ppid":1,"name":"bash","user_id":"1000"},
+            {"pid":11,"ppid":10,"name":"sleep","user_id":"1000","argv":["sleep","900"]}
+        ]}"#;
+        let outcome = run(false, Some("sleep"), false, &mut daemon(200, body));
+        assert_eq!(outcome.code, exit::OK);
+        let text = String::from_utf8(outcome.stdout).expect("utf8");
+        assert!(text.contains("sleep") && text.contains("11"), "{text}");
+        assert!(text.contains("1000"), "{text}");
+        assert!(!text.contains("bash"), "{text}");
+        let json = run(false, None, true, &mut daemon(200, body));
+        let doc: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+        assert_eq!(doc["rows"][1]["pid"], 11);
+        assert_eq!(doc["rows"][1]["depth"], 1);
+        assert_eq!(doc["rows"][1]["user_id"], "1000");
+    }
+
+    #[test]
+    fn not_collected_is_not_an_empty_list() {
+        let body = r#"{"available":false,"reason":"no table here","roots":[],"processes":[]}"#;
+        let outcome = run(false, None, false, &mut daemon(200, body));
+        assert_eq!(outcome.code, exit::GENERAL);
+        let text = String::from_utf8(outcome.stderr).expect("utf8");
+        assert!(
+            text.contains("没采") && text.contains("no table here"),
+            "{text}"
+        );
+        assert!(outcome.stdout.is_empty());
+    }
+
+    #[test]
+    fn unreachable_daemon_is_exit_3() {
+        let mut table = DaemonTable::new(socket(), Box::new(MemoryTransport::failing("refused")));
+        let outcome = run(false, None, false, &mut table);
+        assert_eq!(outcome.code, exit::UNREACHABLE);
+        assert!(matches!(
+            DaemonTable::new(socket(), Box::new(MemoryTransport::failing("x"))).list(),
+            Err(PsError::Unreachable { .. })
+        ));
     }
 
     #[test]

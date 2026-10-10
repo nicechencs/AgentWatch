@@ -160,7 +160,10 @@ $ aw run --proxy -- claude
 | GET | `/compare?a=<SESSION>&b=<SESSION>` | 两个会话对比：进程/文件/域名/流量差异（P5） |
 | GET | `/doctor` | 自检报告（采集器 `probe()` 与 `capabilities()`）。`host.privileged` 是 daemon 进程自身的特权，向操作系统查询：Linux 看有效 uid 为 0 或持有 `CAP_SYS_ADMIN`，macOS 看有效 uid 为 0，Windows 看令牌完整性级别为 High 或 System（未提权的管理员账户算否）。查询失败时为 `null`，不写成 `false` |
 | GET | `/processes` | 当前系统进程树（进程选择器）。参数：`?agents_only&q=` |
-| POST | `/sessions` | 创建会话。body：`{mode:"launch"\|"attach", argv?, cwd?, env?, pid?, follow_children, proxy, agent, name, include_procs, self_report, pin, group?, mcp_tap?}` |
+| POST | `/sessions` | 创建会话并开始记录（轮询采集，证据 S；本版本仅 Linux，其他平台 503 `collector_unavailable`，不建会话）。`{mode:"attach", pid, name?, agent?}`：pid 须在运行；属于其他用户的进程需管理员（403）。`{mode:"launch", argv, cwd?, env?, name?, agent?}`：由 daemon 以**它自己的用户**启动程序，所以只接受与 daemon 同一用户的调用方；其他人 403 `launch_needs_cli`，请用 `aw run`（daemon 不替调用方选择运行身份）。返回 201 `{id, session_id, mode, root_pid}`。根进程退出时会话结束（`end_reason=exited`，daemon 自己启动的带 `exit_code`）；`stop` 结束记录但不杀进程；daemon 停止时为 `daemon_shutdown`，重启时把上次遗留未结束的会话标为 `daemon_shutdown`。 |
+| POST | `/sessions/run` | `aw run` 用。`{argv, cwd?, name?, agent?}` 记一条 `mode=launch` 会话，返回 201 `{id, ticket, adopt_timeout_ms: 5000}`。进程由调用方以自己的身份创建，再在 5 秒内调 `/adopt`；超时会话以 `adopt_timeout` 结束。`sessions.argv` 先过内置脱敏再存。 |
+| POST | `/sessions/{sid}/adopt` | `{ticket, pid}`。ticket 不符 403，超时 410 `adopt_timeout`，没有等待中的启动 404（他人的也是 404）。 |
+| POST | `/sessions/{sid}/attach` | `{pid}`：在自己的、未结束的会话里再多记录一个根进程；他人进程需管理员。会话已结束 409。 |
 | GET | `/sessions` | 列表。参数：`?since&until&agent&active&q&cursor&limit` |
 | GET | `/sessions/{sid}` | 会话详情 + `stats`，另带 `mode` 和 `collectors`。`collectors` 是数组，每项 `{name, mode, capabilities:[{kind, evidence, na_reason?}]}`：轮询采集器 `poll` 列 `proc`=S，`file`、`dns`=NA（`collector_unavailable`），`net` 在 Windows 为 S、其他平台为 NA。库里存的采集器名没有能力描述时（未知名字），该项 `capabilities` 为空并带 `note: "collector_not_described"`，界面据此说“不能确认是否采集”，不说“没有发生”。`/summary` 同样带这两个字段。 |
 | PATCH | `/sessions/{sid}` | `{name?, pinned?}` |

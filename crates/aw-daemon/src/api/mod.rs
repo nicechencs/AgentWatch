@@ -23,6 +23,7 @@ mod proxy;
 mod query;
 mod routes;
 mod timeline_rows;
+mod watch_routes;
 
 pub(crate) use agent::OtlpRegistry;
 pub(crate) use findings::share;

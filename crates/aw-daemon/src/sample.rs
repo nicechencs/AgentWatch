@@ -78,12 +78,71 @@ struct ProcFact {
     uid: ProcUid,
 }
 
+/// Which session a sampler writes and which process subtree it watches.
+///
+/// The daemon-wide sample is [`SampleTarget::daemon`]: session 1, rooted at
+/// pid 1. `POST /sessions` (attach) and `/sessions/{sid}/adopt` (run) build
+/// one per watched root ([`crate::watch`]).
+#[derive(Debug, Clone)]
+pub struct SampleTarget {
+    /// `sessions.id`.
+    pub db_id: i64,
+    /// `sessions.public_id`.
+    pub public_id: String,
+    /// `sessions.name`.
+    pub name: Option<String>,
+    /// `attach` or `launch`.
+    pub mode: &'static str,
+    /// Root of the watched subtree.
+    pub root_pid: u32,
+    /// `sessions.user_id`.
+    pub user_id: String,
+    /// `sessions.argv` as a JSON array, already redacted. `None` when not given.
+    pub argv_json: Option<String>,
+    /// `sessions.agent`.
+    pub agent: Option<String>,
+    /// Write the `sessions` row on the first batch. `false` when the route
+    /// already inserted it.
+    pub write_session_row: bool,
+}
+
+impl SampleTarget {
+    /// The daemon-wide attach sample (pid 1, session 1).
+    pub fn daemon() -> Self {
+        Self {
+            db_id: SESSION_DB_ID,
+            public_id: SESSION_PUBLIC_ID.to_owned(),
+            name: Some("daemon-wide attach sample".to_owned()),
+            mode: "attach",
+            root_pid: SAMPLE_ROOT_PID,
+            user_id: current_user_id(),
+            argv_json: None,
+            agent: None,
+            write_session_row: true,
+        }
+    }
+
+    /// The `sessions` row for this target.
+    pub fn session_row(&self, started_ns: i64) -> SessionRow {
+        let mut row = session_row(started_ns);
+        row.id = self.db_id;
+        row.public_id.clone_from(&self.public_id);
+        row.name.clone_from(&self.name);
+        row.mode = self.mode.to_owned();
+        row.user_id.clone_from(&self.user_id);
+        row.argv.clone_from(&self.argv_json);
+        row.agent.clone_from(&self.agent);
+        row
+    }
+}
+
 /// Host poll collector and the session it writes.
 ///
 /// `HostProcessSource` and `HostConnectionSource` are named only so this
 /// struct can hold the value [`PollCollector::with_host`] returns. The
 /// foreground loop calls [`HostSampler::tick`]; there is no sampler thread.
 pub struct HostSampler {
+    target: SampleTarget,
     collector: PollCollector<
         aw_collector_poll::HostProcessSource,
         aw_collector_poll::HostConnectionSource,
@@ -103,48 +162,63 @@ pub struct HostSampler {
     /// Processes whose executable path is already in `process_images`. One
     /// image row per process per run; the store also ignores a repeat.
     imaged: BTreeSet<u64>,
+    /// Identity of the root at `start`, for [`Self::root_alive`].
+    root_uid: Option<ProcUid>,
 }
 
 impl HostSampler {
-    /// Build the collector. Does not read the process table.
+    /// Build the collector for the daemon-wide sample. Does not read the
+    /// process table.
     pub fn new(db_path: impl Into<std::path::PathBuf>) -> Self {
+        Self::for_target(db_path, SampleTarget::daemon())
+    }
+
+    /// Build the collector for `target`. Does not read the process table.
+    pub fn for_target(db_path: impl Into<std::path::PathBuf>, target: SampleTarget) -> Self {
         Self {
+            session_written: !target.write_session_row,
+            target,
             collector: PollCollector::with_host(PollConfig::standard()),
             db_path: db_path.into(),
-            session_written: false,
             started: false,
             seen_pids: BTreeSet::new(),
             seq: 0,
             pending_store_failure: false,
             mono_ns: 1,
             imaged: BTreeSet::new(),
+            root_uid: None,
         }
     }
 
-    /// Attach to pid 1 and take the baseline.
+    /// Attach to the target's root pid and take the baseline.
     ///
     /// A missing boot id or a missing start time does not start the collector.
-    /// Inventing either would attach to a process that is not pid 1.
-    pub fn start(&mut self) {
-        // A database from an earlier run already holds the sample session.
+    /// Inventing either would attach to a different process. Returns whether
+    /// the collector started.
+    pub fn start(&mut self) -> bool {
+        // A database from an earlier run already holds the session row.
         // Inserting it again hit the primary key and failed every batch. A
         // session the user stopped stays stopped: sampling it again would make
         // the UI's 「已停止」 untrue.
-        match sample_session_state(&self.db_path) {
+        match sample_session_state(&self.db_path, self.target.db_id) {
             SampleSessionState::Ended => {
-                tracing::info!("poll sampler not started: the sample session was stopped");
-                return;
+                tracing::info!("poll sampler not started: the session was stopped");
+                return false;
             }
             SampleSessionState::Active => self.session_written = true,
             SampleSessionState::Absent => {}
         }
-        let Some(uid) = init_proc_uid() else {
-            tracing::warn!("poll sampler not started: pid 1 identity unavailable");
-            return;
+        let Some(uid) = proc_uid_of(self.target.root_pid) else {
+            tracing::warn!(
+                pid = self.target.root_pid,
+                "poll sampler not started: root process identity unavailable"
+            );
+            return false;
         };
+        self.root_uid = Some(uid);
         let Ok(scope) = Scope::attach([uid]) else {
             tracing::warn!("poll sampler not started: attach scope rejected");
-            return;
+            return false;
         };
         let mut sink = VecSink::with_capacity(SINK_CAPACITY);
         let wall_ns = wall_now_ns();
@@ -153,7 +227,7 @@ impl HostSampler {
         // every process, and returns pid 1 plus its descendants as
         // `StartHow::Snapshot` at evidence S. `ProcessStart` has no pid and
         // no `ProcUid`, so the rows are paired with `/proc` below.
-        let starts = self.collector.snapshot(SAMPLE_ROOT_PID);
+        let starts = self.collector.snapshot(self.target.root_pid);
         match self
             .collector
             .start_at(&scope, &mut sink, self.mono_ns, wall_ns)
@@ -172,6 +246,18 @@ impl HostSampler {
                 tracing::warn!(error = %err, "poll collector start failed");
             }
         }
+        self.started
+    }
+
+    /// Whether the root process is still the one this sampler attached to:
+    /// same pid and same start time. A reused pid is not the same process.
+    pub fn root_alive(&self) -> bool {
+        proc_uid_of(self.target.root_pid).is_some_and(|uid| Some(uid) == self.root_uid)
+    }
+
+    /// The session this sampler writes.
+    pub fn target(&self) -> &SampleTarget {
+        &self.target
     }
 
     /// Take one sample. The foreground loop decides when this is due.
@@ -201,7 +287,8 @@ impl HostSampler {
         // `POST /sessions/daemon-sample/stop` only writes `ended_ns`. The
         // sampler kept polling into the stopped session, so the page said
         // 「已停止」 while the process count kept rising. Stop here instead.
-        if self.session_written && sample_session_state(&self.db_path) == SampleSessionState::Ended
+        if self.session_written
+            && sample_session_state(&self.db_path, self.target.db_id) == SampleSessionState::Ended
         {
             tracing::info!("poll sampler stopped: the sample session was stopped");
             self.stop();
@@ -229,7 +316,11 @@ impl HostSampler {
     /// which is what `snapshot` kept. A start that matches no `/proc` row
     /// is not given a pid of 0; it is counted in one gap.
     fn events_from_snapshot(&mut self, starts: &[ProcessStart], wall_ns: i64) -> Vec<RawEvent> {
-        let table = proc_table();
+        // Only rows inside the watched subtree may pair. Two processes with the
+        // same parent that started in the same second are otherwise
+        // indistinguishable by `(ppid, start)`, and a sibling outside the
+        // subtree would be recorded under this session.
+        let table = subtree_of(proc_table(), self.target.root_pid);
         let mut used = BTreeSet::new();
         let mut events = Vec::new();
         let mut unmatched = 0_u64;
@@ -238,7 +329,11 @@ impl HostSampler {
         // back. The row is still in `table`. It is added here, evidence S,
         // with no parent uid (not observed as a ProcUid) and ppid 0, which is
         // the ppid `/proc/1/stat` reported.
-        if let Some(init) = table.iter().find(|row| row.pid == SAMPLE_ROOT_PID) {
+        let root_is_init = self.target.root_pid == SAMPLE_ROOT_PID;
+        if let Some(init) = table
+            .iter()
+            .find(|row| root_is_init && row.pid == SAMPLE_ROOT_PID)
+        {
             if let Some(event) = self.init_event(init, wall_ns) {
                 used.insert(init.pid);
                 events.push(event);
@@ -301,7 +396,7 @@ impl HostSampler {
             seq,
             ts_mono_ns: self.mono_ns,
             ts_wall_ns: wall_ns,
-            session_id: Some(SessionId(u64::try_from(SESSION_DB_ID).unwrap_or(1))),
+            session_id: Some(SessionId(u64::try_from(self.target.db_id).unwrap_or(1))),
             proc: Some(ProcRef {
                 uid: row.uid,
                 pid: row.pid,
@@ -356,7 +451,7 @@ impl HostSampler {
             seq,
             ts_mono_ns: self.mono_ns,
             ts_wall_ns: wall_ns,
-            session_id: Some(SessionId(u64::try_from(SESSION_DB_ID).unwrap_or(1))),
+            session_id: Some(SessionId(u64::try_from(self.target.db_id).unwrap_or(1))),
             proc: None,
             source,
             evidence: Evidence::E1,
@@ -367,7 +462,7 @@ impl HostSampler {
             seq,
             ts_mono_ns: self.mono_ns,
             ts_wall_ns: wall_ns,
-            session_id: Some(SessionId(1)),
+            session_id: Some(SessionId(u64::try_from(self.target.db_id).unwrap_or(1))),
             proc: None,
             source: Source::new(PROC_SOURCE),
             evidence: Evidence::E1,
@@ -408,11 +503,25 @@ impl HostSampler {
         batch.dns.extend(from_output.dns);
         batch.gaps.extend(from_output.gaps);
         if !self.session_written {
-            batch.sessions.insert(0, session_row(wall_ns));
+            batch.sessions.insert(0, self.target.session_row(wall_ns));
         }
         if self.pending_store_failure {
             batch.gaps.push(store_failure_gap(wall_ns));
             self.pending_store_failure = false;
+        }
+        // Rows mapped without a session id fall back to the daemon sample's
+        // id; this sampler's rows belong to its own session.
+        let own = self.target.db_id;
+        if own != SESSION_DB_ID {
+            for row in &mut batch.processes {
+                row.session_id = own;
+            }
+            for row in &mut batch.gaps {
+                row.session_id = Some(own);
+            }
+            for row in &mut batch.process_images {
+                row.session_id = own;
+            }
         }
         if batch_is_empty(&batch) {
             return Ok(());
@@ -477,7 +586,7 @@ enum SampleSessionState {
 
 /// Read-only look at the sample session row. A database that cannot be read
 /// is `Absent`; the next write reports its own failure.
-fn sample_session_state(db_path: &std::path::Path) -> SampleSessionState {
+fn sample_session_state(db_path: &std::path::Path, db_id: i64) -> SampleSessionState {
     if !db_path.is_file() {
         return SampleSessionState::Absent;
     }
@@ -488,7 +597,7 @@ fn sample_session_state(db_path: &std::path::Path) -> SampleSessionState {
     };
     let row: Result<Option<i64>, rusqlite::Error> = conn.query_row(
         "SELECT ended_ns FROM sessions WHERE id = ?1",
-        rusqlite::params![SESSION_DB_ID],
+        rusqlite::params![db_id],
         |row| row.get(0),
     );
     match row {
@@ -608,6 +717,26 @@ fn proc_table() -> Vec<ProcFact> {
     }
 }
 
+/// `table` rows that are `root` or descend from it.
+fn subtree_of(table: Vec<ProcFact>, root: u32) -> Vec<ProcFact> {
+    let mut keep: BTreeSet<u32> = BTreeSet::from([root]);
+    loop {
+        let before = keep.len();
+        for row in &table {
+            if keep.contains(&row.ppid) {
+                keep.insert(row.pid);
+            }
+        }
+        if keep.len() == before {
+            break;
+        }
+    }
+    table
+        .into_iter()
+        .filter(|row| keep.contains(&row.pid))
+        .collect()
+}
+
 /// Pair `start` with the unused `/proc` row that has the same parent and start.
 fn find_proc<'a>(
     table: &'a [ProcFact],
@@ -628,10 +757,12 @@ fn read_ppid(pid: u32) -> Option<u32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
-fn init_proc_uid() -> Option<ProcUid> {
+/// [`ProcUid`] of `pid`, hashed the way the poll collector hashes a row.
+/// `None` when the process is gone or its identity cannot be read.
+pub(crate) fn proc_uid_of(pid: u32) -> Option<ProcUid> {
     let boot = read_boot_id()?;
-    let start_secs = read_pid_start_secs(1)?;
-    ProcessIdentity::from_parts(&boot, 1, start_secs, StartTimeUnit::Seconds).map(|id| id.uid)
+    let start_secs = read_pid_start_secs(pid)?;
+    ProcessIdentity::from_parts(&boot, pid, start_secs, StartTimeUnit::Seconds).map(|id| id.uid)
 }
 
 fn read_boot_id() -> Option<Vec<u8>> {
@@ -1573,7 +1704,7 @@ mod depth_tests {
         let first = proc_event(1, 42, start_with_exe(Some("/usr/bin/bash")));
         sampler.persist(&[first], 1).expect("baseline");
         assert_eq!(
-            super::sample_session_state(&db),
+            super::sample_session_state(&db, 1),
             super::SampleSessionState::Active
         );
         {
@@ -1583,7 +1714,7 @@ mod depth_tests {
                 .expect("visible");
         }
         assert_eq!(
-            super::sample_session_state(&db),
+            super::sample_session_state(&db, 1),
             super::SampleSessionState::Ended
         );
         // Pretend the collector is running: the next sample must stop it

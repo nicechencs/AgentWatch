@@ -585,6 +585,9 @@ pub fn run_foreground(
     // not start sampling — that is logged, and the stop loop still runs.
     let mut sampler = HostSampler::new(data_dir.join("agentwatch.db"));
     sampler.start();
+    // Sessions started from the API (`crate::watch`): one sampler per root.
+    let mut watches = crate::watch::Watches::new(data_dir.join("agentwatch.db"));
+    watches.recover();
     let mut polls_until_sample: u32 = SAMPLE_EVERY_POLLS;
 
     while !stop.is_set() {
@@ -595,6 +598,7 @@ pub fn run_foreground(
         polls_until_sample = polls_until_sample.saturating_sub(1);
         if polls_until_sample == 0 {
             sampler.tick();
+            watches.tick(&shared);
             polls_until_sample = SAMPLE_EVERY_POLLS;
         }
         thread::sleep(POLL);
@@ -613,6 +617,7 @@ pub fn run_foreground(
     // this order: tests match them.
     sampler.flush();
     sampler.stop();
+    watches.shutdown();
 
     // Order is part of the acceptance test. Do not reorder these lines.
     tracing::info!("{}", SHUTDOWN_STOP_COLLECTORS);

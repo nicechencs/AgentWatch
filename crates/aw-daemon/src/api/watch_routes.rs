@@ -1,0 +1,455 @@
+//! `POST /sessions` (attach / launch), `POST /sessions/run`,
+//! `POST /sessions/{sid}/adopt`, `POST /sessions/{sid}/attach`.
+//!
+//! Each inserts or finds the `sessions` row and queues a
+//! [`WatchRequest::Start`] for the foreground loop ([`crate::watch`]), which
+//! runs the poll sampler on that root (evidence S). Rules (api-and-cli §2):
+//!
+//! - Attaching to a process of another OS user needs an administrator (403).
+//! - Launch from the API (`POST /sessions`, `mode: "launch"`) starts the
+//!   program as the daemon's own user, so it is only accepted when the caller
+//!   *is* that user. Otherwise 403 `launch_needs_cli`: `aw run` creates the
+//!   process as the caller and hands it over with `/sessions/run` + `/adopt`.
+//!   The daemon never picks a user to run as (security-privacy, E threat).
+//! - Only Linux reads process identity for the poll sampler today; elsewhere
+//!   these routes answer 503 `collector_unavailable` and create nothing.
+
+use serde_json::{json, Value};
+
+use super::auth::{random_secret, Caller};
+use super::routes::{error_response, ApiResponse, ApiState};
+use crate::sample::SampleTarget;
+use crate::watch::{now_ns, PendingLaunch, WatchRequest, ADOPT_TIMEOUT_NS};
+
+fn parse(body: &[u8]) -> Result<Value, ApiResponse> {
+    if body.is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_slice(body).map_err(|_| error_response(400, "bad_request", "body is not JSON"))
+}
+
+fn opt_text(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+fn pid_field(value: &Value) -> Result<u32, ApiResponse> {
+    value
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| error_response(400, "bad_argument", "pid: expected a positive integer"))
+}
+
+fn argv_field(value: &Value) -> Result<Vec<String>, ApiResponse> {
+    let argv: Vec<String> = value
+        .get("argv")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    if argv.is_empty() || argv[0].trim().is_empty() {
+        return Err(error_response(
+            400,
+            "bad_argument",
+            "argv: expected a non-empty array of strings",
+        ));
+    }
+    Ok(argv)
+}
+
+/// `sessions.argv` as stored: each argument through the built-in redactor.
+fn redacted_argv_json(argv: &[String]) -> String {
+    let redactor = aw_pipeline::Redactor::new(&aw_pipeline::config::RedactionConfig::default());
+    let scrubbed: Vec<String> = redactor
+        .redact_args(argv)
+        .iter()
+        .map(|arg| redactor.scrub_text(arg))
+        .collect();
+    serde_json::to_string(&scrubbed).unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn collector_available() -> Result<(), ApiResponse> {
+    if cfg!(target_os = "linux") {
+        Ok(())
+    } else {
+        Err(error_response(
+            503,
+            "collector_unavailable",
+            "the poll sampler reads process identity only on Linux in this build",
+        ))
+    }
+}
+
+/// OS user that owns `pid`, as the numeric uid string `Caller.user_id` uses.
+fn pid_owner(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(format!("/proc/{pid}"))
+            .ok()
+            .map(|meta| meta.uid().to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// The pid must be running and identifiable, and belong to the caller unless
+/// the caller is an administrator.
+fn check_pid(caller: &Caller, pid: u32) -> Result<(), ApiResponse> {
+    collector_available()?;
+    if crate::sample::proc_uid_of(pid).is_none() {
+        return Err(error_response(
+            400,
+            "no_such_process",
+            "pid is not running (or its identity cannot be read)",
+        ));
+    }
+    let owner = pid_owner(pid);
+    if !caller.admin && owner.as_deref() != Some(caller.user_id.as_str()) {
+        return Err(error_response(
+            403,
+            "forbidden",
+            "attaching to another user's process needs an administrator",
+        ));
+    }
+    Ok(())
+}
+
+fn db_path(state: &ApiState) -> Result<std::path::PathBuf, ApiResponse> {
+    state.query.db_path.clone().ok_or_else(|| {
+        error_response(
+            503,
+            "no_database",
+            "this daemon has no database to record sessions in",
+        )
+    })
+}
+
+/// Allocate `sessions.id` and insert the row. Id 1 stays the daemon sample's.
+fn insert_session(path: &std::path::Path, target: &mut SampleTarget) -> Result<(), ApiResponse> {
+    let store_error = |what: &str| error_response(500, "store", what);
+    let mut store =
+        aw_store::Store::open(path).map_err(|_| store_error("cannot open the database"))?;
+    let max: i64 = store
+        .connection()
+        .query_row("SELECT COALESCE(MAX(id), 1) FROM sessions", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| store_error("cannot read session ids"))?;
+    target.db_id = max.max(1).saturating_add(1);
+    let mut batch = aw_store::WriteBatch::default();
+    batch.sessions.push(target.session_row(now_ns()));
+    let mut sink =
+        aw_store::SqliteSink::new(&mut store).map_err(|_| store_error("cannot open the writer"))?;
+    use aw_store::RecordSink;
+    sink.write_batch(&batch)
+        .map_err(|_| store_error("cannot write the session row"))?;
+    target.write_session_row = false;
+    Ok(())
+}
+
+fn new_public_id() -> Result<String, ApiResponse> {
+    random_secret("s-")
+        .map(|secret| secret.chars().take(14).collect())
+        .ok_or_else(|| {
+            error_response(
+                503,
+                "random_unavailable",
+                "the OS random source failed; no session was created",
+            )
+        })
+}
+
+fn target_for(
+    caller: &Caller,
+    body: &Value,
+    mode: &'static str,
+    root_pid: u32,
+    argv: Option<&[String]>,
+) -> Result<SampleTarget, ApiResponse> {
+    Ok(SampleTarget {
+        db_id: 0,
+        public_id: new_public_id()?,
+        name: opt_text(body, "name"),
+        mode,
+        root_pid,
+        user_id: caller.user_id.clone(),
+        argv_json: argv.map(redacted_argv_json),
+        agent: opt_text(body, "agent"),
+        write_session_row: true,
+    })
+}
+
+fn created(target: &SampleTarget, extra: Value) -> ApiResponse {
+    let mut body = json!({
+        "id": target.public_id,
+        "session_id": target.db_id,
+        "mode": target.mode,
+        "root_pid": if target.root_pid == 0 { Value::Null } else { json!(target.root_pid) },
+    });
+    if let (Some(obj), Some(more)) = (body.as_object_mut(), extra.as_object()) {
+        obj.extend(more.clone());
+    }
+    ApiResponse::json(201, &body)
+}
+
+/// `POST /sessions` with a database. `mode` is `attach` or `launch`.
+pub(super) fn create(state: &mut ApiState, caller: &Caller, body: &[u8]) -> ApiResponse {
+    match create_inner(state, caller, body) {
+        Ok(response) | Err(response) => response,
+    }
+}
+
+fn create_inner(
+    state: &mut ApiState,
+    caller: &Caller,
+    body: &[u8],
+) -> Result<ApiResponse, ApiResponse> {
+    let value = parse(body)?;
+    let path = db_path(state)?;
+    match value.get("mode").and_then(Value::as_str) {
+        Some("attach") => {
+            let pid = pid_field(&value)?;
+            check_pid(caller, pid)?;
+            let mut target = target_for(caller, &value, "attach", pid, None)?;
+            insert_session(&path, &mut target)?;
+            let response = created(&target, json!({}));
+            state.watch_requests.push(WatchRequest::Start {
+                target,
+                child: None,
+            });
+            Ok(response)
+        }
+        Some("launch") => {
+            let argv = argv_field(&value)?;
+            collector_available()?;
+            if caller.user_id != crate::sample::current_user_id() {
+                return Err(error_response(
+                    403,
+                    "launch_needs_cli",
+                    "the daemon starts programs only as its own user; use `aw run -- <cmd>`",
+                ));
+            }
+            let mut command = std::process::Command::new(&argv[0]);
+            command
+                .args(&argv[1..])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if let Some(cwd) = opt_text(&value, "cwd") {
+                command.current_dir(cwd);
+            }
+            if let Some(env) = value.get("env").and_then(Value::as_object) {
+                for (key, val) in env {
+                    if let Some(val) = val.as_str() {
+                        command.env(key, val);
+                    }
+                }
+            }
+            let child = command.spawn().map_err(|err| {
+                error_response(
+                    400,
+                    "spawn_failed",
+                    &format!("could not start the program: {}", err.kind()),
+                )
+            })?;
+            let pid = child.id();
+            let mut target = target_for(caller, &value, "launch", pid, Some(&argv))?;
+            insert_session(&path, &mut target)?;
+            let response = created(&target, json!({}));
+            state.watch_requests.push(WatchRequest::Start {
+                target,
+                child: Some(child),
+            });
+            Ok(response)
+        }
+        _ => Err(error_response(
+            400,
+            "bad_argument",
+            "mode: expected \"attach\" or \"launch\"",
+        )),
+    }
+}
+
+/// `POST /sessions/run`: record the session and hand back an adopt ticket.
+/// The caller (`aw run`) starts the process itself, as itself, then posts
+/// `/sessions/{id}/adopt` within [`ADOPT_TIMEOUT_NS`].
+pub(super) fn run(state: &mut ApiState, caller: &Caller, body: &[u8]) -> ApiResponse {
+    let mut inner = || -> Result<ApiResponse, ApiResponse> {
+        let value = parse(body)?;
+        let argv = argv_field(&value)?;
+        collector_available()?;
+        let path = db_path(state)?;
+        let mut target = target_for(caller, &value, "launch", 0, Some(&argv))?;
+        let ticket = random_secret("r-").ok_or_else(|| {
+            error_response(503, "random_unavailable", "the OS random source failed")
+        })?;
+        insert_session(&path, &mut target)?;
+        let response = created(
+            &target,
+            json!({ "ticket": ticket, "adopt_timeout_ms": ADOPT_TIMEOUT_NS / 1_000_000 }),
+        );
+        state.pending_launches.insert(
+            target.public_id.clone(),
+            PendingLaunch {
+                ticket,
+                deadline_ns: now_ns().saturating_add(ADOPT_TIMEOUT_NS),
+                target,
+            },
+        );
+        Ok(response)
+    };
+    match inner() {
+        Ok(response) | Err(response) => response,
+    }
+}
+
+/// `POST /sessions/{sid}/adopt` with `{ticket, pid}`.
+pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8]) -> ApiResponse {
+    let inner = |state: &mut ApiState| -> Result<ApiResponse, ApiResponse> {
+        let value = parse(body)?;
+        let not_found = || error_response(404, "not_found", "no launch is waiting for adopt");
+        let pending = state.pending_launches.get(sid).ok_or_else(not_found)?;
+        if pending.target.user_id != caller.user_id && !caller.admin {
+            return Err(not_found());
+        }
+        if opt_text(&value, "ticket").as_deref() != Some(pending.ticket.as_str()) {
+            return Err(error_response(
+                403,
+                "forbidden",
+                "adopt ticket does not match",
+            ));
+        }
+        if pending.deadline_ns <= now_ns() {
+            return Err(error_response(
+                410,
+                "adopt_timeout",
+                "adopt arrived after the timeout; the session was closed",
+            ));
+        }
+        let pid = pid_field(&value)?;
+        check_pid(caller, pid)?;
+        let Some(mut pending) = state.pending_launches.remove(sid) else {
+            return Err(not_found());
+        };
+        pending.target.root_pid = pid;
+        let response = ApiResponse::json(200, &json!({ "id": sid, "root_pid": pid }));
+        state.watch_requests.push(WatchRequest::Start {
+            target: pending.target,
+            child: None,
+        });
+        Ok(response)
+    };
+    match inner(state) {
+        Ok(response) | Err(response) => response,
+    }
+}
+
+/// `POST /sessions/{sid}/attach` with `{pid}`: watch one more root in an open
+/// session the caller owns.
+pub(super) fn attach(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8]) -> ApiResponse {
+    let inner = |state: &mut ApiState| -> Result<ApiResponse, ApiResponse> {
+        let value = parse(body)?;
+        let path = db_path(state)?;
+        let pid = pid_field(&value)?;
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|_| error_response(500, "store", "cannot open the database"))?;
+        type Row = (
+            i64,
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        );
+        let row: Option<Row> = conn
+            .query_row(
+                "SELECT id, user_id, mode, ended_ns, name, agent FROM sessions WHERE public_id = ?1",
+                [sid],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .ok();
+        let Some((db_id, owner, mode, ended, name, agent)) = row else {
+            return Err(error_response(404, "not_found", "session not found"));
+        };
+        if owner != caller.user_id && !caller.admin {
+            return Err(error_response(404, "not_found", "session not found"));
+        }
+        if ended.is_some() || db_id == 1 {
+            return Err(error_response(
+                409,
+                "session_ended",
+                "session is not open for attach",
+            ));
+        }
+        check_pid(caller, pid)?;
+        let target = SampleTarget {
+            db_id,
+            public_id: sid.to_owned(),
+            name,
+            mode: if mode == "launch" { "launch" } else { "attach" },
+            root_pid: pid,
+            user_id: owner,
+            argv_json: None,
+            agent,
+            write_session_row: false,
+        };
+        state.watch_requests.push(WatchRequest::Start {
+            target,
+            child: None,
+        });
+        Ok(ApiResponse::json(
+            200,
+            &json!({ "id": sid, "root_pid": pid }),
+        ))
+    };
+    match inner(state) {
+        Ok(response) | Err(response) => response,
+    }
+}
+
+/// After `POST /sessions/{sid}/stop` marked the row ended: stop its samplers.
+pub(super) fn stopped(state: &mut ApiState, sid: &str) {
+    state.pending_launches.remove(sid);
+    let Some(path) = state.query.db_path.clone() else {
+        return;
+    };
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return;
+    };
+    if let Ok(db_id) = conn.query_row(
+        "SELECT id FROM sessions WHERE public_id = ?1",
+        [sid],
+        |row| row.get::<_, i64>(0),
+    ) {
+        state.watch_requests.push(WatchRequest::Stop { db_id });
+    }
+}

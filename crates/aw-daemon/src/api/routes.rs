@@ -113,7 +113,7 @@ pub struct ApiResponse {
 }
 
 impl ApiResponse {
-    fn json(status: u16, value: &Value) -> Self {
+    pub(crate) fn json(status: u16, value: &Value) -> Self {
         let mut headers = BTreeMap::new();
         headers.insert("content-type".to_owned(), "application/json".to_owned());
         let body = match serde_json::to_vec(value) {
@@ -184,6 +184,11 @@ pub struct ApiState {
     /// browser opened by hand reaches the UI. Default false: a normal daemon
     /// never hands out a ticket over HTTP.
     pub preview_ui: bool,
+    /// Sessions the routes asked the foreground loop to start or stop
+    /// ([`crate::watch`]). Drained on every sample tick.
+    pub watch_requests: Vec<crate::watch::WatchRequest>,
+    /// `POST /sessions/run` tickets waiting for `/adopt`, by public id.
+    pub pending_launches: crate::watch::PendingLaunches,
 }
 
 impl Default for ApiState {
@@ -201,6 +206,8 @@ impl Default for ApiState {
                 crate::assets::AssetMode::Embedded => None,
             },
             preview_ui: false,
+            watch_requests: Vec::new(),
+            pending_launches: crate::watch::PendingLaunches::new(),
         }
     }
 }
@@ -1065,10 +1072,14 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                 }),
             );
         }
-        let (_ticket, secret) =
+        let now = clock(state);
+        let Ok((_ticket, secret)) =
             state
                 .tickets
-                .issue_ui_ticket(&caller.user_id, caller.admin, clock(state));
+                .issue_ui_ticket(&caller.user_id, caller.admin, now)
+        else {
+            return random_unavailable();
+        };
         // The secret is the response body, not a log line.
         return ApiResponse::json(200, &json!({ "ticket": secret, "ttl_s": 60 }));
     }
@@ -1122,6 +1133,23 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
         };
     }
 
+    if path == "/api/v1/sessions/run" && method == "POST" {
+        return super::watch_routes::run(state, caller, &req.body);
+    }
+    if path == "/api/v1/sessions" && method == "POST" && state.query.db_path.is_some() {
+        return super::watch_routes::create(state, caller, &req.body);
+    }
+    if method == "POST" && state.query.db_path.is_some() {
+        if let Some(rest) = path.strip_prefix("/api/v1/sessions/") {
+            if let Some(sid) = rest.strip_suffix("/adopt") {
+                return super::watch_routes::adopt(state, caller, sid, &req.body);
+            }
+            if let Some(sid) = rest.strip_suffix("/attach") {
+                return super::watch_routes::attach(state, caller, sid, &req.body);
+            }
+        }
+    }
+
     if path == "/api/v1/sessions" && method == "POST" {
         state.next_session = state.next_session.saturating_add(1);
         let id = format!("s-{}", state.next_session);
@@ -1145,7 +1173,6 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
         ),
         ("GET", "/api/v1/doctor") => doctor(state),
         ("GET", "/api/v1/processes") => system_processes(req),
-        ("POST", "/api/v1/sessions/run") => not_implemented("run"),
         ("GET", "/api/v1/db/stats") => db_stats(state, caller),
         ("POST", "/api/v1/db/purge") => db_purge(state, caller, &req.body),
         ("POST", "/api/v1/db/vacuum") => db_admin(state, caller, StoreOp::Vacuum),
@@ -1561,9 +1588,10 @@ fn preview_ticket_redirect(state: &mut ApiState, req: &HttpRequest) -> ApiRespon
     if req_host_bad(&req.headers.get("host").cloned(), req.listen_port) {
         return misdirected();
     }
-    let (_ticket, secret) = state
-        .tickets
-        .issue_ui_ticket(&preview_user(), false, clock(state));
+    let now = clock(state);
+    let Ok((_ticket, secret)) = state.tickets.issue_ui_ticket(&preview_user(), false, now) else {
+        return random_unavailable();
+    };
     let mut headers = BTreeMap::new();
     headers.insert(
         "location".to_owned(),
@@ -1605,11 +1633,21 @@ fn redeem_token(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     let now = clock(state);
     match state.tickets.redeem(&ticket, now) {
         Ok(token) => ApiResponse::json(200, &json!({ "token": token, "ttl_s": 12 * 60 * 60 })),
+        Err(super::auth::TicketError::RandomUnavailable) => random_unavailable(),
         Err(_) => ApiResponse::json(
             401,
             &json!({ "error": { "code": "unauthorized", "message": "ticket refused" } }),
         ),
     }
+}
+
+/// 503 when the OS random source failed. No ticket or token is issued.
+fn random_unavailable() -> ApiResponse {
+    error_response(
+        503,
+        "random_unavailable",
+        "the OS random source failed; no ticket or token was issued",
+    )
 }
 
 /// JSON error. `offset` is included only for filter parse failures.
@@ -1838,7 +1876,10 @@ fn session_query_route(
         ("GET", "live") => live_snapshot(state, sid, caller, &parsed),
         ("POST", "stop") => match state.query.stop_session(user, sid) {
             Ok(None) => stop_memory(state, sid, caller),
-            Ok(Some(())) => ApiResponse::json(200, &json!({ "stopped": sid })),
+            Ok(Some(())) => {
+                super::watch_routes::stopped(state, sid);
+                ApiResponse::json(200, &json!({ "stopped": sid }))
+            }
             Err(err) => from_backend(err),
         },
         _ => {
@@ -2341,7 +2382,10 @@ mod tests {
     }
 
     fn token_for(state: &mut ApiState, user: &str, admin: bool) -> String {
-        let (_ticket, secret) = state.tickets.issue_ui_ticket(user, admin, state.now);
+        let (_ticket, secret) = state
+            .tickets
+            .issue_ui_ticket(user, admin, state.now)
+            .unwrap_or_default();
         state.tickets.redeem(&secret, state.now).unwrap_or_default()
     }
 
@@ -2404,12 +2448,17 @@ mod tests {
     fn ticket_second_use_fails_and_late_use_fails() {
         let mut tickets = TicketStore::new();
         let now = 5_000_u64;
-        let (_ticket, secret) = tickets.issue_ui_ticket("alice", false, now);
+        let (_ticket, secret) = tickets
+            .issue_ui_ticket("alice", false, now)
+            .unwrap_or_default();
         assert!(tickets.redeem(&secret, now).is_ok());
         assert!(tickets.redeem(&secret, now).is_err());
 
         let mut state = ApiState::new(now);
-        let (_ticket, secret) = state.tickets.issue_ui_ticket("alice", false, now);
+        let (_ticket, secret) = state
+            .tickets
+            .issue_ui_ticket("alice", false, now)
+            .unwrap_or_default();
         state.now = now + UI_TICKET_TTL + 1;
         let body = format!(r#"{{"ticket":"{secret}"}}"#);
         let response = dispatch(
@@ -2492,10 +2541,10 @@ mod tests {
         let mut state = ApiState::new(0);
         let wall = super::clock(&state);
         // A ticket issued 61 s ago must be refused, not redeemed against 1970.
-        let (_ticket, stale) =
-            state
-                .tickets
-                .issue_ui_ticket("alice", false, wall - UI_TICKET_TTL - 1);
+        let (_ticket, stale) = state
+            .tickets
+            .issue_ui_ticket("alice", false, wall - UI_TICKET_TTL - 1)
+            .unwrap_or_default();
         let body = format!(r#"{{"ticket":"{stale}"}}"#);
         let late = dispatch(
             &mut state,
@@ -2509,7 +2558,10 @@ mod tests {
         );
         assert_eq!(late.status, 401);
         // A token whose 12 h ran out is refused on a real request.
-        let (_ticket, old) = state.tickets.issue_ui_ticket("alice", false, 1_000);
+        let (_ticket, old) = state
+            .tickets
+            .issue_ui_ticket("alice", false, 1_000)
+            .unwrap_or_default();
         let token = state.tickets.redeem(&old, 1_000).unwrap_or_default();
         assert!(!token.is_empty());
         let response = dispatch(
@@ -2543,6 +2595,280 @@ mod tests {
         });
         assert!(seeded.is_ok());
         (dir, db)
+    }
+
+    type SessionEnd = (String, Option<i64>, Option<String>, Option<i64>);
+
+    /// Session row `(mode, ended_ns, end_reason, exit_code)` by public id.
+    fn session_end(db: &std::path::Path, sid: &str) -> Option<SessionEnd> {
+        rusqlite::Connection::open(db)
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT mode, ended_ns, end_reason, exit_code FROM sessions WHERE public_id = ?1",
+                    [sid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+            })
+            .ok()
+    }
+
+    fn proc_rows(db: &std::path::Path, sid: &str, pid: u32) -> i64 {
+        rusqlite::Connection::open(db)
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM processes p JOIN sessions s ON s.id = p.session_id \
+                     WHERE s.public_id = ?1 AND p.pid = ?2",
+                    rusqlite::params![sid, pid],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap_or(-1)
+    }
+
+    fn post(state: &mut ApiState, token: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
+        let response = dispatch(
+            state,
+            &req(
+                "POST",
+                path,
+                Some("127.0.0.1:7456"),
+                Some(token),
+                body.as_bytes(),
+            ),
+        );
+        (response.status, json_body(&response))
+    }
+
+    /// None of these may answer 501 any more (the bug this card fixes).
+    #[test]
+    fn attach_run_adopt_and_purge_never_answer_501() {
+        let (dir, db) = seeded_db("no501", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+        let me = crate::sample::current_user_id();
+        let token = token_for(&mut state, &me, true);
+        for (path, body) in [
+            ("/api/v1/sessions", r#"{"mode":"attach","pid":1}"#),
+            ("/api/v1/sessions/run", r#"{"argv":["true"]}"#),
+            ("/api/v1/sessions/nope/adopt", r#"{"ticket":"x","pid":1}"#),
+            ("/api/v1/sessions/nope/attach", r#"{"pid":1}"#),
+            ("/api/v1/db/purge", r#"{"all":true,"dry_run":true}"#),
+        ] {
+            let (status, body) = post(&mut state, &token, path, body);
+            assert_ne!(status, 501, "{path}: {body}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn attach_records_a_real_process_and_ends_when_it_exits() {
+        let (dir, db) = seeded_db("attach", "");
+        let mut child = match std::process::Command::new("sleep").arg("30").spawn() {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let pid = child.id();
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let me = crate::sample::current_user_id();
+        let token = token_for(&mut state, &me, false);
+        let other = token_for(&mut state, "someone-else", false);
+        assert_eq!(
+            post(
+                &mut state,
+                &other,
+                "/api/v1/sessions",
+                &format!(r#"{{"mode":"attach","pid":{pid}}}"#)
+            )
+            .0,
+            403,
+            "another user's process needs an administrator"
+        );
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            &format!(r#"{{"mode":"attach","pid":{pid},"name":"t"}}"#),
+        );
+        assert_eq!(status, 201, "{body}");
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        assert!(sid.starts_with("s-"));
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut watches = crate::watch::Watches::new(db.clone());
+        watches.tick(&shared);
+        assert_eq!(watches.len(), 1);
+        assert_eq!(
+            proc_rows(&db, &sid, pid),
+            1,
+            "the attached root is a process row"
+        );
+        assert_eq!(
+            session_end(&db, &sid).map(|r| r.1),
+            Some(None),
+            "still open"
+        );
+        // It shows in the list next to whatever else is there.
+        let list = {
+            let mut guard = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            dispatch(
+                &mut guard,
+                &req(
+                    "GET",
+                    "/api/v1/sessions",
+                    Some("127.0.0.1:7456"),
+                    Some(&token),
+                    b"",
+                ),
+            )
+        };
+        assert!(String::from_utf8_lossy(&list.body).contains(&sid));
+        let _ = child.kill();
+        let _ = child.wait();
+        watches.tick(&shared);
+        assert_eq!(watches.len(), 0);
+        let end = session_end(&db, &sid);
+        assert_eq!(end.as_ref().map(|r| r.2.as_deref()), Some(Some("exited")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_then_adopt_watches_the_callers_process_and_wrong_ticket_is_403() {
+        let (dir, db) = seeded_db("run", "");
+        let mut child = match std::process::Command::new("sleep").arg("30").spawn() {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        let pid = child.id();
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &crate::sample::current_user_id(), false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions/run",
+            r#"{"argv":["sleep","30","--token=hunter2"]}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        let ticket = body["ticket"].as_str().unwrap_or_default().to_owned();
+        assert!(ticket.len() > 20);
+        assert_eq!(body["adopt_timeout_ms"], 5000);
+        let adopt = format!("/api/v1/sessions/{sid}/adopt");
+        assert_eq!(
+            post(
+                &mut state,
+                &token,
+                &adopt,
+                &format!(r#"{{"ticket":"bad","pid":{pid}}}"#)
+            )
+            .0,
+            403
+        );
+        let (status, body) = post(
+            &mut state,
+            &token,
+            &adopt,
+            &format!(r#"{{"ticket":"{ticket}","pid":{pid}}}"#),
+        );
+        assert_eq!(status, 200, "{body}");
+        // A second adopt finds nothing waiting.
+        assert_eq!(
+            post(
+                &mut state,
+                &token,
+                &adopt,
+                &format!(r#"{{"ticket":"{ticket}","pid":{pid}}}"#)
+            )
+            .0,
+            404
+        );
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut watches = crate::watch::Watches::new(db.clone());
+        watches.tick(&shared);
+        assert_eq!(proc_rows(&db, &sid, pid), 1);
+        let end = session_end(&db, &sid);
+        assert_eq!(end.as_ref().map(|r| r.0.as_str()), Some("launch"));
+        // `stop` ends the session and the sampler; it does not kill the target.
+        {
+            let mut guard = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (status, _) = post(
+                &mut guard,
+                &token,
+                &format!("/api/v1/sessions/{sid}/stop"),
+                "",
+            );
+            assert_eq!(status, 200);
+        }
+        watches.tick(&shared);
+        assert_eq!(watches.len(), 0);
+        assert!(session_end(&db, &sid).and_then(|r| r.1).is_some());
+        assert!(
+            child.try_wait().ok().flatten().is_none(),
+            "target still running"
+        );
+        let argv: String = rusqlite::Connection::open(&db)
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT argv FROM sessions WHERE public_id = ?1",
+                    [&sid],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap_or_default();
+        assert!(!argv.contains("hunter2"), "argv is redacted: {argv}");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_from_the_api_starts_the_program_and_records_its_exit_code() {
+        let (dir, db) = seeded_db("launch", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let other = token_for(&mut state, "someone-else", false);
+        assert_eq!(
+            post(
+                &mut state,
+                &other,
+                "/api/v1/sessions",
+                r#"{"mode":"launch","argv":["true"]}"#
+            )
+            .1["error"]["code"],
+            "launch_needs_cli"
+        );
+        let token = token_for(&mut state, &crate::sample::current_user_id(), false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["sh","-c","sleep 1; exit 7"]}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut watches = crate::watch::Watches::new(db.clone());
+        watches.tick(&shared);
+        assert_eq!(watches.len(), 1);
+        let started = std::time::Instant::now();
+        while watches.len() > 0 && started.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            watches.tick(&shared);
+        }
+        let end = session_end(&db, &sid);
+        assert_eq!(
+            end.as_ref().and_then(|r| r.2.clone()).as_deref(),
+            Some("exited")
+        );
+        assert_eq!(end.and_then(|r| r.3), Some(7));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

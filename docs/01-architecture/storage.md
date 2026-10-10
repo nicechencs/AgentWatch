@@ -55,7 +55,7 @@ CREATE TABLE sessions (
   user_id         TEXT NOT NULL,                 -- 发起会话的用户（uid / SID）
   started_ns      INTEGER NOT NULL,
   ended_ns        INTEGER,
-  end_reason      TEXT,                          -- exited / stopped / daemon_shutdown / crashed
+  end_reason      TEXT,                          -- exited / stopped / daemon_shutdown / daemon_restart / attach_failed / adopt_timeout / crashed
   exit_code       INTEGER,
   proxy_enabled   INTEGER NOT NULL DEFAULT 0,
   proxy_port      INTEGER,

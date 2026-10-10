@@ -1,6 +1,7 @@
 import type { Query } from "@tanstack/react-query";
 import { api } from "@/api/client";
 import type { Session, SessionSummary } from "@/api/types";
+import { sessionStatus } from "@/lib/session-status";
 
 /**
  * How often an open session's header and overview are re-read while it is
@@ -10,8 +11,8 @@ import type { Session, SessionSummary } from "@/api/types";
  */
 export const RECORDING_REFRESH_MS = 3_000;
 
-function recording(session: Pick<Session, "ended_ns" | "purged"> | undefined): boolean {
-  return session !== undefined && session.ended_ns == null && !session.purged;
+function recording(session: Pick<Session, "ended_ns" | "end_reason" | "purged"> | undefined): boolean {
+  return session !== undefined && sessionStatus(session, (key) => key).kind === "recording";
 }
 
 /** Re-read while recording; stop once the session has ended. */

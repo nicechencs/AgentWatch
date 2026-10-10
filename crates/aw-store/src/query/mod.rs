@@ -71,6 +71,9 @@ pub fn ensure_timeline(conn: &Connection) -> Result<(), QueryError> {
 /// Optional constraints for [`list_sessions`].
 #[derive(Debug, Clone, Default)]
 pub struct SessionFilter {
+    /// Free-text search across the session label, command, and public id.
+    /// Whitespace-only text is not a constraint.
+    pub q: Option<String>,
     /// Only sessions whose `agent` equals this string.
     pub agent: Option<String>,
     /// `true` keeps sessions with `ended_ns IS NULL`.
@@ -108,6 +111,8 @@ pub struct SessionListItem {
     pub started_ns: i64,
     /// End, or still running.
     pub ended_ns: Option<i64>,
+    /// Why recording ended, or still running / unknown.
+    pub end_reason: Option<String>,
     /// `1` when excluded from retention.
     pub pinned: i64,
     /// `sessions.collectors`: JSON array of collector names, as stored.
@@ -200,6 +205,8 @@ pub struct SessionSummary {
     pub started_ns: i64,
     /// End, or still running.
     pub ended_ns: Option<i64>,
+    /// Why recording ended, or still running / unknown.
+    pub end_reason: Option<String>,
     /// Session exit status, or unknown. `None` is not `0`.
     pub exit_code: Option<i64>,
     /// Process rows.
@@ -380,10 +387,25 @@ pub fn list_sessions(
 ) -> Result<Vec<SessionListItem>, QueryError> {
     let pred = compile_optional(filter.expr.as_deref(), Target::Sessions, None, None)?;
     let mut sql = String::from(
-        "SELECT id, public_id, name, mode, platform, os_version, agent, started_ns, ended_ns, pinned, collectors, argv \
+        "SELECT id, public_id, name, mode, platform, os_version, agent, started_ns, ended_ns, end_reason, pinned, collectors, argv \
          FROM sessions WHERE user_id = ?",
     );
     let mut bind: Vec<Param> = vec![Param::Text(user_id.to_string())];
+    if let Some(q) = filter.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        // `instr` treats every byte in user text literally, unlike `LIKE`.
+        // `argv` is a redacted JSON array when present. Check validity before
+        // expanding it so a malformed legacy value cannot make listing fail.
+        sql.push_str(
+            " AND (instr(lower(COALESCE(name, '')), lower(?)) > 0 \
+             OR instr(lower(public_id), lower(?)) > 0 \
+             OR instr(lower(CASE WHEN json_valid(argv) THEN \
+                    COALESCE((SELECT group_concat(value, ' ') FROM json_each(argv)), '') \
+                    ELSE '' END), lower(?)) > 0)",
+        );
+        bind.push(Param::Text(q.to_owned()));
+        bind.push(Param::Text(q.to_owned()));
+        bind.push(Param::Text(q.to_owned()));
+    }
     if let Some(agent) = &filter.agent {
         sql.push_str(" AND agent = ?");
         bind.push(Param::Text(agent.clone()));
@@ -430,9 +452,10 @@ pub fn list_sessions(
                 agent: row.get(6)?,
                 started_ns: row.get(7)?,
                 ended_ns: row.get(8)?,
-                pinned: row.get(9)?,
-                collectors: row.get(10)?,
-                argv: row.get(11)?,
+                end_reason: row.get(9)?,
+                pinned: row.get(10)?,
+                collectors: row.get(11)?,
+                argv: row.get(12)?,
                 counts: SessionCounts::default(),
             })
         })
@@ -455,7 +478,7 @@ pub fn session_summary(
     }
     let head = conn
         .query_row(
-            "SELECT s.id, s.public_id, s.name, s.agent, s.started_ns, s.ended_ns, \
+            "SELECT s.id, s.public_id, s.name, s.agent, s.started_ns, s.ended_ns, s.end_reason, \
                     s.exit_code, s.mode, s.platform, s.os_version, s.collectors, s.argv \
              FROM sessions s WHERE s.id = ? AND s.user_id = ?",
             rusqlite::params![session_id, user_id],
@@ -467,12 +490,13 @@ pub fn session_summary(
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, String>(8)?,
                     row.get::<_, Option<String>>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<String>>(12)?,
                 ))
             },
         )
@@ -485,6 +509,7 @@ pub fn session_summary(
         agent,
         started_ns,
         ended_ns,
+        end_reason,
         exit_code,
         mode,
         platform,
@@ -504,6 +529,7 @@ pub fn session_summary(
         agent,
         started_ns,
         ended_ns,
+        end_reason,
         exit_code,
         process_count: counts.process_count,
         flow_count: counts.flow_count,
@@ -2372,6 +2398,71 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(gaps(&conn, "user-a", 2).unwrap().is_none());
+    }
+
+    #[test]
+    fn session_search_matches_name_argv_and_public_id_without_crossing_users() {
+        let conn = conn();
+        session(&conn, 1, "alice", 10);
+        session(&conn, 2, "alice", 20);
+        session(&conn, 3, "alice", 30);
+        session(&conn, 4, "alice", 40);
+        session(&conn, 5, "alice", 50);
+        session(&conn, 6, "bob", 60);
+        conn.execute(
+            "UPDATE sessions SET name = 'Quarterly Review' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET argv = '[\"sh\",\"-c\",\"exit 3\"]' WHERE id = 2",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET public_id = 'public-fragment-cue' WHERE id = 3",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET name = 'literal %_ marker' WHERE id = 4",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET name = 'literal xx marker' WHERE id = 5",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET name = 'private needle' WHERE id = 6",
+            [],
+        )
+        .unwrap();
+
+        let ids = |q: &str| {
+            list_sessions(
+                &conn,
+                "alice",
+                &SessionFilter {
+                    q: Some(q.to_owned()),
+                    ..SessionFilter::default()
+                },
+            )
+            .unwrap()
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids("quarterly"), vec![1]);
+        assert_eq!(ids("C EXIT 3"), vec![2]);
+        assert_eq!(ids("sh -c"), vec![2]);
+        assert_eq!(ids("FRAGMENT"), vec![3]);
+        assert_eq!(ids("%_"), vec![4]);
+        assert!(ids("absent").is_empty());
+        assert!(ids("private needle").is_empty());
+        assert_eq!(ids(" \t ").len(), 5);
     }
 
     #[test]

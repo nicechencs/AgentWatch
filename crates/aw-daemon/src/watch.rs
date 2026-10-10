@@ -11,7 +11,7 @@
 //! asks (`stopped`; the target keeps running), when an adopt does not arrive
 //! in time (`adopt_timeout`), or when the daemon stops (`daemon_shutdown`).
 //! On start, sessions a previous run left open are closed as
-//! `daemon_shutdown`: nothing is watching them any more.
+//! `daemon_restart`: nothing is watching them any more.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -66,7 +66,7 @@ impl Watches {
     pub(crate) fn recover(&self) {
         if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
             let _ = conn.execute(
-                "UPDATE sessions SET ended_ns = ?1, end_reason = 'daemon_shutdown' \
+                "UPDATE sessions SET ended_ns = ?1, end_reason = 'daemon_restart' \
                  WHERE ended_ns IS NULL AND id <> 1",
                 [now_ns()],
             );
@@ -188,10 +188,16 @@ impl Watches {
             // snapshot row was persisted with evidence S and NA fields rather
             // than silently reporting zero processes.
             self.end(db_id, "exited", None);
+            if let Some(child) = child {
+                reap_launched_child(child);
+            }
         } else {
             // The root could not be identified (gone already, or a platform
             // the poll sampler does not read). Not left open as "recording".
             self.end(db_id, "attach_failed", None);
+            if let Some(child) = child {
+                reap_launched_child(child);
+            }
         }
     }
 
@@ -202,8 +208,13 @@ impl Watches {
                 let mut running = self.running.remove(index);
                 running.sampler.flush();
                 running.sampler.stop();
-                // `stop` does not kill. A spawned child keeps running; it is
-                // no longer reaped by the daemon.
+                // `stop` does not kill. The session must not receive any later
+                // status updates, but its daemon-launched child remains ours
+                // to reap. Move just that handle to a waiter independent of
+                // the recording lifecycle.
+                if let Some(child) = running.child.take() {
+                    reap_launched_child(child);
+                }
             } else {
                 index += 1;
             }
@@ -220,6 +231,20 @@ impl Watches {
             rusqlite::params![now_ns(), reason, exit_code, db_id],
         );
     }
+}
+
+/// Reap exactly one daemon-launched child after its recording has stopped.
+///
+/// The waiter owns the [`Child`] handle, so `wait` can only reap this child;
+/// it neither changes SIGCHLD handling nor observes unrelated children. It
+/// deliberately has no database access: a user stop is final for recording
+/// purposes even if the target exits later.
+fn reap_launched_child(mut child: Child) {
+    let _ = std::thread::Builder::new()
+        .name("aw-launch-reaper".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 /// Write `code` onto the root's `processes` row, and its `exit_ns` when that
@@ -281,3 +306,66 @@ pub(crate) fn now_ns() -> i64 {
 
 /// Pending launches keyed by public id.
 pub(crate) type PendingLaunches = BTreeMap<String, PendingLaunch>;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::Watches;
+
+    #[test]
+    fn startup_recovery_marks_open_sessions_as_daemon_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "aw-watch-recover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp directory");
+        let db = dir.join("agentwatch.db");
+        let store = aw_store::Store::open(&db).expect("store");
+        store
+            .connection()
+            .execute_batch(
+                "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors) VALUES \
+                     (1, 'daemon-sample', 'launch', '0', 1, 'linux', '[]'), \
+                     (2, 'interrupted', 'launch', 'u', 2, 'linux', '[]'); \
+                 INSERT INTO sessions (id, public_id, mode, user_id, started_ns, ended_ns, end_reason, platform, collectors) VALUES \
+                     (3, 'already-ended', 'launch', 'u', 3, 4, 'stopped', 'linux', '[]');",
+            )
+            .expect("seed sessions");
+
+        Watches::new(db.clone()).recover();
+
+        let recovered: (Option<i64>, Option<String>) = store
+            .connection()
+            .query_row(
+                "SELECT ended_ns, end_reason FROM sessions WHERE id = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("recovered session");
+        assert!(recovered.0.is_some());
+        assert_eq!(recovered.1.as_deref(), Some("daemon_restart"));
+        let daemon_sample: Option<i64> = store
+            .connection()
+            .query_row("SELECT ended_ns FROM sessions WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("daemon sample");
+        assert_eq!(daemon_sample, None);
+        let ended: (Option<i64>, Option<String>) = store
+            .connection()
+            .query_row(
+                "SELECT ended_ns, end_reason FROM sessions WHERE id = 3",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("already ended session");
+        assert_eq!(ended, (Some(4), Some("stopped".to_owned())));
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

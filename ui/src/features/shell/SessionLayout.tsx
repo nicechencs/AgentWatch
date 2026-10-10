@@ -12,6 +12,7 @@ import { composedFilter, useSessionQuery } from "@/lib/session-query";
 import { useExport } from "@/lib/use-export";
 import { sessionQueryOptions } from "@/lib/live-session";
 import { sessionTitle } from "@/lib/session-title";
+import { sessionStatus } from "@/lib/session-status";
 import { useI18n } from "@/lib/i18n";
 
 const TABS = [
@@ -33,6 +34,7 @@ export function SessionLayout() {
   const { query, patch } = useSessionQuery();
   const [stopping, setStopping] = useState(false);
   const [stopError, setStopError] = useState<unknown>(null);
+  const [stopNotice, setStopNotice] = useState(false);
   const client = useQueryClient();
   const session = useQuery(sessionQueryOptions(sid));
   const ended = session.data ? session.data.ended_ns !== null || Boolean(session.data.purged) : null;
@@ -71,7 +73,8 @@ export function SessionLayout() {
     );
   }
   const data = session.data;
-  const active = data.ended_ns === null && !data.purged;
+  const status = sessionStatus(data, t);
+  const active = status.kind === "recording";
 
   const stop = async () => {
     setStopping(true);
@@ -79,6 +82,7 @@ export function SessionLayout() {
     try {
       await api.stopSession(sid);
       await session.refetch();
+      setStopNotice(true);
       // Counts on the other tabs were read while recording.
       void client.invalidateQueries({ queryKey: ["summary", sid] });
       void client.invalidateQueries({ queryKey: ["processes", sid] });
@@ -104,8 +108,12 @@ export function SessionLayout() {
           <span className="truncate">{sessionTitle(data)}</span>
         </nav>
         <span className="font-mono text-xs">{data.public_id}</span>
-        <span className={`text-xs ${active ? "text-accent" : "text-ink-faint"}`}>
-          {active ? `● ${t("session.recording")}` : `○ ${t("session.stopped")}`}
+        <span
+          className={`text-xs ${active ? "text-accent" : "text-ink-faint"}`}
+          title={status.explanation ?? status.label}
+        >
+          {active ? "●" : "○"} {status.label}
+          {status.explanation ? ` · ${status.explanation}` : ""}
         </span>
         <span className="text-xs text-ink-faint">
           {isWallTime(data.started_ns) ? <RelTime ns={data.started_ns} /> : "–"}
@@ -147,6 +155,7 @@ export function SessionLayout() {
           ) : null}
         </div>
       </header>
+      {stopNotice ? <p role="status" className="px-3 py-1 text-xs text-ink-soft">{t("session.stopNotice")}</p> : null}
       {stopError ? <ErrorNote error={stopError} /> : null}
       <nav className="flex gap-1 border-b border-line px-3">
         {TABS.map((tab) => (

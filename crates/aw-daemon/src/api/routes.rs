@@ -1188,6 +1188,7 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                             "agent": row.agent,
                             "started_ns": row.started_ns,
                             "ended_ns": row.ended_ns,
+                            "end_reason": row.end_reason,
                             "pinned": row.pinned != 0,
                             "collectors": stored_collectors_json(&row.collectors),
                             "argv": super::query::argv_value(row.argv.as_deref()),
@@ -1603,6 +1604,7 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
                 "agent": summary.agent,
                 "started_ns": summary.started_ns,
                 "ended_ns": summary.ended_ns,
+                "end_reason": summary.end_reason,
                 "exit_code": summary.exit_code,
                 "mode": summary.mode,
                 "platform": platform_or_host(summary.platform.as_deref()),
@@ -2766,6 +2768,23 @@ mod tests {
             .unwrap_or(-1)
     }
 
+    fn process_exit_fields(
+        db: &std::path::Path,
+        sid: &str,
+        pid: u32,
+    ) -> Option<(Option<i64>, Option<i64>)> {
+        rusqlite::Connection::open(db)
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT p.exit_ns, p.exit_code FROM processes p JOIN sessions s ON s.id = p.session_id \
+                     WHERE s.public_id = ?1 AND p.pid = ?2",
+                    rusqlite::params![sid, pid],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+            })
+            .ok()
+    }
+
     fn post(state: &mut ApiState, token: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
         let response = dispatch(
             state,
@@ -2851,6 +2870,120 @@ mod tests {
         assert_eq!(status, 404, "{body}");
         assert_eq!(body["error"]["code"], "no_sessions");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_last_export_uses_the_caller_scoped_resolver() {
+        let (dir, db) = seeded_db("at-last-export", LAST_SESSIONS_SQL);
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+        let token = token_for(&mut state, "1000", false);
+        let export = |state: &mut ApiState, token: &str, sid: &str| {
+            let mut request = req(
+                "GET",
+                &format!("/api/v1/sessions/{sid}/export"),
+                Some("127.0.0.1:7456"),
+                Some(token),
+                b"",
+            );
+            request.query = "format=jsonl".to_owned();
+            dispatch(state, &request)
+        };
+
+        let response = export(&mut state, &token, "@last");
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        assert_eq!(
+            response.header("content-type"),
+            Some("application/x-ndjson")
+        );
+        assert!(!response.body.is_empty());
+
+        let hidden = export(&mut state, &token, "s-root-new");
+        assert_eq!(hidden.status, 404);
+
+        let no_sessions = token_for(&mut state, "1001", false);
+        let missing = export(&mut state, &no_sessions, "@last");
+        assert_eq!(missing.status, 404);
+        assert_eq!(json_body(&missing)["error"]["code"], "no_sessions");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_list_search_paginates_only_matching_rows() {
+        let (dir, db) = seeded_db(
+            "session-search-pages",
+            "
+            INSERT INTO sessions (id, public_id, name, mode, user_id, started_ns, platform, collectors)
+            VALUES
+                (1, 's-1', 'needle 1', 'launch', 'alice', 1, 'linux', '[]'),
+                (2, 's-2', 'needle 2', 'launch', 'alice', 2, 'linux', '[]'),
+                (3, 's-3', 'other 3', 'launch', 'alice', 3, 'linux', '[]'),
+                (4, 's-4', 'needle 4', 'launch', 'alice', 4, 'linux', '[]'),
+                (5, 's-5', 'other 5', 'launch', 'alice', 5, 'linux', '[]'),
+                (6, 's-6', 'needle 6', 'launch', 'alice', 6, 'linux', '[]'),
+                (7, 's-7', 'other 7', 'launch', 'alice', 7, 'linux', '[]'),
+                (8, 's-8', 'needle 8', 'launch', 'alice', 8, 'linux', '[]'),
+                (9, 's-9', 'needle 9', 'launch', 'alice', 9, 'linux', '[]'),
+                (10, 's-10', 'other 10', 'launch', 'alice', 10, 'linux', '[]'),
+                (11, 's-11', 'needle 11', 'launch', 'alice', 11, 'linux', '[]');
+            ",
+        );
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+        let token = token_for(&mut state, "alice", false);
+        let page = |state: &mut ApiState, query: &str| {
+            let mut request = req(
+                "GET",
+                "/api/v1/sessions",
+                Some("127.0.0.1:7456"),
+                Some(&token),
+                b"",
+            );
+            request.query = query.to_owned();
+            let response = dispatch(state, &request);
+            assert_eq!(
+                response.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&response.body)
+            );
+            json_body(&response)
+        };
+        let ids = |body: &Value| {
+            body["sessions"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .filter_map(|row| row["id"].as_str())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+
+        let first = page(&mut state, "q=NEEDLE&limit=3");
+        assert_eq!(ids(&first), ["s-11", "s-9", "s-8"]);
+        let first_cursor = first["next_cursor"].as_str().unwrap_or_default();
+        assert!(!first_cursor.is_empty());
+
+        let second = page(
+            &mut state,
+            &format!("q=NEEDLE&limit=3&cursor={first_cursor}"),
+        );
+        assert_eq!(ids(&second), ["s-6", "s-4", "s-2"]);
+        let second_cursor = second["next_cursor"].as_str().unwrap_or_default();
+        assert!(!second_cursor.is_empty());
+
+        let third = page(
+            &mut state,
+            &format!("q=NEEDLE&limit=3&cursor={second_cursor}"),
+        );
+        assert_eq!(ids(&third), ["s-1"]);
+        assert!(third["next_cursor"].is_null());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3690,6 +3823,111 @@ mod tests {
             Some("exited")
         );
         assert_eq!(end.and_then(|r| r.3), Some(7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stopping a launch stops recording, not ownership of the child. The
+    /// child must still be reaped, but that wait must not revise the stopped
+    /// session or its process row.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn stopped_launch_is_reaped_without_rewriting_stopped_session() {
+        let (dir, db) = seeded_db("stop-reaps-launch", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &crate::sample::current_user_id(), false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["sh","-c","sleep 1"]}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        let pid = body["root_pid"].as_u64().expect("root pid") as u32;
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut watches = crate::watch::Watches::new(db.clone());
+        watches.tick(&shared);
+        assert_eq!(watches.len(), 1);
+        assert_eq!(proc_rows(&db, &sid, pid), 1, "root process row");
+
+        {
+            let mut state = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (status, stopped) = post(
+                &mut state,
+                &token,
+                &format!("/api/v1/sessions/{sid}/stop"),
+                "{}",
+            );
+            assert_eq!(status, 200, "{stopped}");
+
+            let list = dispatch(
+                &mut state,
+                &req(
+                    "GET",
+                    "/api/v1/sessions",
+                    Some("127.0.0.1:7456"),
+                    Some(&token),
+                    b"",
+                ),
+            );
+            assert_eq!(list.status, 200);
+            assert_eq!(json_body(&list)["sessions"][0]["end_reason"], "stopped");
+            let detail = dispatch(
+                &mut state,
+                &req(
+                    "GET",
+                    &format!("/api/v1/sessions/{sid}"),
+                    Some("127.0.0.1:7456"),
+                    Some(&token),
+                    b"",
+                ),
+            );
+            assert_eq!(detail.status, 200);
+            assert_eq!(json_body(&detail)["end_reason"], "stopped");
+        }
+
+        let session_before = session_end(&db, &sid).expect("stopped session");
+        assert_eq!(session_before.2.as_deref(), Some("stopped"));
+        assert_eq!(session_before.3, None);
+        let process_before = process_exit_fields(&db, &sid, pid).expect("root process row");
+        assert_eq!(process_before, (None, None));
+
+        // The stop endpoint queued the removal; this moves only its `Child`
+        // handle to the dedicated waiter. The launched program keeps running.
+        watches.tick(&shared);
+        assert_eq!(watches.len(), 0);
+
+        // Let `sleep 1` finish, then give the reaper up to ten seconds. Before
+        // the per-child waiter this remains `State: Z` until the test daemon
+        // process itself exits.
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        let started = std::time::Instant::now();
+        let reaped = loop {
+            match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => break true,
+                Ok(status) => {
+                    let zombie = status
+                        .lines()
+                        .any(|line| line.starts_with("State:") && line.contains('Z'));
+                    if !zombie {
+                        break true;
+                    }
+                }
+                Err(_) => break false,
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(10) {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert!(reaped, "launched child {pid} stayed zombie after stop");
+
+        assert_eq!(session_end(&db, &sid), Some(session_before));
+        assert_eq!(process_exit_fields(&db, &sid, pid), Some(process_before));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

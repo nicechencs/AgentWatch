@@ -387,6 +387,20 @@ impl Spawner for CommandSpawner {
         };
         #[cfg(unix)]
         {
+            // The gate shell's own `exec` would report a missing program in
+            // English (`exec: not found`) after the session was adopted. Resolve
+            // it here, the way exec would, and fail with the Chinese message
+            // before anything runs; the caller then discards the session.
+            let path_env = spec
+                .env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value.clone())
+                .or_else(|| std::env::var("PATH").ok());
+            let resolved = resolve_program(program, path_env.as_deref(), spec.cwd.as_deref())
+                .map_err(|error| spawn_error_text(&error))?;
+            let program = &resolved;
             let (read_fd, write_fd) = pipe().map_err(nix_spawn_error_text)?;
             let flags = fcntl(&write_fd, FcntlArg::F_GETFD).map_err(nix_spawn_error_text)?;
             let flags = FdFlag::from_bits_truncate(flags) | FdFlag::FD_CLOEXEC;
@@ -420,6 +434,63 @@ impl Spawner for CommandSpawner {
                 .map_err(|error| spawn_error_text(&error))
         }
     }
+}
+
+/// Absolute path of `program` the way `execvp` would pick it: a name with a
+/// `/` is taken relative to `cwd`; a bare name is searched in `path`. The hit
+/// must be a regular file with an execute bit. `NotFound` when nothing
+/// matches, `PermissionDenied` when only non-executable files match.
+#[cfg(unix)]
+pub(crate) fn resolve_program(
+    program: &str,
+    path: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<String, std::io::Error> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    let base = match cwd {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::current_dir()?,
+    };
+    let executable = |candidate: &Path| -> Option<bool> {
+        let meta = std::fs::metadata(candidate).ok()?;
+        Some(meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    };
+    let absolute = |candidate: PathBuf| -> String {
+        let full = if candidate.is_absolute() {
+            candidate
+        } else {
+            base.join(candidate)
+        };
+        full.to_string_lossy().into_owned()
+    };
+    if program.is_empty() {
+        return Err(Error::from(ErrorKind::NotFound));
+    }
+    if program.contains('/') {
+        let candidate = base.join(program);
+        return match executable(&candidate) {
+            Some(true) => Ok(absolute(PathBuf::from(program))),
+            Some(false) => Err(Error::from(ErrorKind::PermissionDenied)),
+            None => Err(Error::from(ErrorKind::NotFound)),
+        };
+    }
+    let mut denied = false;
+    for dir in path.unwrap_or("/usr/local/bin:/usr/bin:/bin").split(':') {
+        let dir = if dir.is_empty() { "." } else { dir };
+        let candidate = Path::new(dir).join(program);
+        match executable(&base.join(&candidate)) {
+            Some(true) => return Ok(absolute(candidate)),
+            Some(false) => denied = true,
+            None => {}
+        }
+    }
+    Err(Error::from(if denied {
+        ErrorKind::PermissionDenied
+    } else {
+        ErrorKind::NotFound
+    }))
 }
 
 fn configure_command(command: &mut Command, spec: &RunSpec) {
@@ -2243,6 +2314,60 @@ mod tests {
         assert_eq!(outcome.code, exit::GENERAL);
         assert_eq!(spawner.spawned, 0);
         assert!(text(&outcome.stderr).contains("请在此平台使用 --no-daemon"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_or_non_executable_program_fails_in_chinese_before_spawn() {
+        use super::{resolve_program, spawn_error_text, CommandSpawner, Spawner};
+        use crate::launch::RunSpec;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aw-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "x").expect("write");
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let path = format!("{}:/usr/bin:/bin", dir.display());
+        assert_eq!(
+            resolve_program("sh", Some(&path), None).expect("sh"),
+            if std::path::Path::new("/usr/bin/sh").exists() {
+                "/usr/bin/sh"
+            } else {
+                "/bin/sh"
+            }
+        );
+        assert_eq!(
+            resolve_program("aw-no-such-prog-xyz", Some(&path), None).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::NotFound)
+        );
+        assert_eq!(
+            resolve_program("plain", Some(&path), None).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(
+            resolve_program("./plain", None, dir.to_str()).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::PermissionDenied)
+        );
+
+        // Through the real spawner: no child, a Chinese sentence, no English.
+        let spec = RunSpec {
+            command: vec!["aw-no-such-prog-xyz".to_owned()],
+            cwd: None,
+            env: Vec::new(),
+            no_follow_children: false,
+            allow_breakaway: false,
+            no_daemon: false,
+        };
+        let error = match CommandSpawner.spawn(&spec) {
+            Ok(_) => panic!("a missing program must not spawn"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            spawn_error_text(&std::io::Error::from(std::io::ErrorKind::NotFound))
+        );
+        assert!(!error.contains("not found"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

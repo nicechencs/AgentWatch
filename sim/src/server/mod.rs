@@ -106,6 +106,10 @@ pub fn serve(args: Vec<String>) -> Result<(), String> {
         .local_addr()
         .map_err(|err| format!("https local address: {err}"))?;
 
+    // The truth log exists before the banner: a client that reads the banner
+    // may read the log at once.
+    let log = Arc::new(TruthLog::create(&opts.truth).map_err(|err| format!("truth log: {err}"))?);
+
     // One line each, no per-request URLs. Tests read these to learn port 0.
     println!("http://{http_addr}");
     println!("https://{https_addr}");
@@ -135,7 +139,6 @@ pub fn serve(args: Vec<String>) -> Result<(), String> {
     }
     let _ = std::io::stdout().flush();
 
-    let log = Arc::new(TruthLog::create(&opts.truth).map_err(|err| format!("truth log: {err}"))?);
     let tls = server_config(&material)?;
     let next_id = Arc::new(AtomicU64::new(1));
 

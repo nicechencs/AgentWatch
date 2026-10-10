@@ -40,8 +40,15 @@ impl Drop for Server {
 }
 
 fn spawn_server() -> Server {
+    // The tests in this file run in parallel in one process. On macOS
+    // `SystemTime` has microsecond resolution, so pid + nanos alone gave two
+    // servers the same scratch dir: one overwrote the other's cert.pem
+    // (BadSignature) and its Drop deleted the other's truth log (NotFound).
+    // The per-process sequence number makes every dir distinct.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scratch = std::env::temp_dir().join(format!(
-        "sim-serve-test-{}-{}",
+        "sim-serve-test-{}-{seq}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

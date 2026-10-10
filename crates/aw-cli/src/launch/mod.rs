@@ -38,10 +38,6 @@ pub use windows::{
     ADOPT_TIMEOUT, BREAKAWAY_INCOMPLETE_NOTE,
 };
 
-/// Present only on Windows. The stub refuses every step; it does not call Win32.
-#[cfg(target_os = "windows")]
-pub use windows::UnverifiedJobApi;
-
 /// Present only on Windows. [`windows::production`] is the `Command` launcher.
 /// Job assignment is unavailable; see that function.
 #[cfg(target_os = "windows")]
@@ -199,7 +195,7 @@ impl UnixLauncher for UnsupportedUnixLauncher {
 ///
 /// Uses `api` for every Win32 step. The production caller passes
 /// [`windows::production`], which refuses before `CreateProcess` because Job
-/// assignment is unavailable. [`UnverifiedJobApi`] remains the test stub.
+/// assignment is unavailable. [`windows::UnverifiedJobApi`] remains the test stub.
 /// The target identity is always [`windows::LaunchIdentity::CallingUser`].
 ///
 /// # Errors

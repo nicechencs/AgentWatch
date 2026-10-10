@@ -23,6 +23,7 @@
 //! or no start time without a gap. `start_at` plus `poll_once` keep both.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::io;
 use std::net::IpAddr;
@@ -60,6 +61,7 @@ const SINK_CAPACITY: usize = 8_192;
 /// hash a different uid; the attach would then not resolve and the collector
 /// would not keep scanning. That failure is visible (no process rows), not a
 /// guessed pid.
+#[cfg(target_os = "linux")]
 const LINUX_CLK_TCK: u64 = 100;
 
 /// `snapshot` walks this pid and its descendants. Pid 1 is init.

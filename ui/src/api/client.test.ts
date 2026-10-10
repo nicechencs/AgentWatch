@@ -46,3 +46,16 @@ describe("daemon shape adapters", () => {
     expect(gap).toMatchObject({ affected: ["store"], reason: "store_failure", kinds: ["store"], count: 0 });
   });
 });
+
+import { toConfigView } from "./client";
+
+describe("config adapter", () => {
+  it("unwraps the daemon config body", () => {
+    const view = toConfigView({ config: { retention: { max_age_days: 30, max_db_size_mb: 2048 }, proxy: { on_tls_reject: "fail" }, collectors: { linux: {} } } });
+    expect(view.retention.max_age_days).toBe(30);
+    expect(view.retention.max_db_bytes).toBe(2048 * 1024 * 1024);
+    expect(view.redaction.rules).toEqual([]);
+    expect(view.collectors).toEqual([]);
+    expect(view.rules).toEqual([]);
+  });
+});

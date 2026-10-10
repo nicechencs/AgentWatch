@@ -208,6 +208,31 @@ export function toGap(raw: unknown): Gap {
   } as Gap;
 }
 
+/**
+ * `GET /config` answers `{config: {retention: {max_db_size_mb, …}, proxy, …}}`.
+ * Keys the daemon does not send stay undefined (the page shows 不可得), and
+ * object-shaped sections it does not list as arrays become empty lists.
+ */
+export function toConfigView(raw: unknown): ConfigView {
+  const outer = isObj(raw) ? raw : {};
+  const r = isObj(outer.config) ? outer.config : outer;
+  const retention = isObj(r.retention) ? r.retention : {};
+  const mb = numOrNull(retention.max_db_size_mb);
+  const redaction = isObj(r.redaction) ? r.redaction : {};
+  const proxy = isObj(r.proxy) ? r.proxy : {};
+  return {
+    ...(r as object),
+    retention: {
+      ...(retention as object),
+      max_db_bytes: numOrNull(retention.max_db_bytes) ?? (mb === null ? undefined : mb * 1024 * 1024),
+    },
+    redaction: { ...(redaction as object), rules: arr(redaction.rules) },
+    collectors: arr(r.collectors),
+    proxy: { ca_fingerprint: null, ca_created_ns: null, ...(proxy as object) },
+    rules: arr(r.rules),
+  } as unknown as ConfigView;
+}
+
 function toProcessNode(raw: unknown): ProcessNode {
   const r = isObj(raw) ? raw : {};
   return {
@@ -279,7 +304,7 @@ export const api = {
   systemProcesses: (query: { agents_only?: boolean; q?: string }) =>
     get<{ roots: SystemProcess[] }>(`/processes${qs({ ...query })}`),
 
-  config: () => get<ConfigView>("/config"),
+  config: async () => toConfigView(await get<unknown>("/config")),
   putConfig: (body: unknown) => send<ConfigView>("PUT", "/config", body),
   dbStats: () => get<DbStats>("/db/stats"),
   purge: (body: { older_than?: string; all?: boolean }) => send<void>("POST", "/db/purge", body),

@@ -404,6 +404,7 @@ CREATE VIEW timeline AS
   ```
   `refs` 最多保留 50 条。
 - `net_flow_buckets` 的写入也是 UPSERT，把新增字节累加到同一个桶。
+- `processes` 按主键 `(session_id, proc_uid)` UPSERT。同一个进程常被写两次：启动在一批，退出在后面一批（轮询下基线进程的退出没有对应的启动）。第二次只补第一次未知的列：`exit_ns` / `exit_code` / `exit_signal` 取新值（新值未知时保留旧值），`parent_uid` / `ppid` / `user_id` / `signer` / `agent` 保留首次写入的值，`start_ns`、`how`、`depth`、`evidence`、`source` 不变。重复写入不再因主键冲突让整批回滚。
 - 读写量估算：一次典型 Agent 会话 1 小时产生约 5 万条 file_access、5 千条 net_flows、2 万个桶。按每行约 300 B（含索引）计算约 25 MB，满足 NFR-03。【待验证】
 
 ## 5. 保留与轮转

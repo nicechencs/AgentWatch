@@ -292,6 +292,7 @@
   "settings.used": "当前占用",
   "settings.purgeCount": "将删除 {count} 个超过 {days} 天的已结束会话。",
   "settings.purged": "已删除 {count} 个会话。",
+  "settings.purgeNeedsAdmin": "「立即清理」需要管理员权限：它会删除所有用户的旧会话。请让管理员操作，或用管理员账户打开。",
   "settings.purgeNow": "立即清理",
   "settings.purgeConfirm": "按当前保留策略清理已结束的会话？固定的会话不会被删除。",
   "settings.builtinReadonly": "内置规则只读",

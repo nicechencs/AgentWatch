@@ -55,7 +55,7 @@ function Locked({ admin }: { admin: boolean }) {
   return <p className="text-ink-faint">{t("common.adminOnly")}</p>;
 }
 
-function Storage({ config, used, usedNa, admin }: { config: ConfigView; used: number | null; usedNa: string; admin: boolean }) {
+export function Storage({ config, used, usedNa, admin }: { config: ConfigView; used: number | null; usedNa: string; admin: boolean }) {
   const { t } = useI18n();
   const client = useQueryClient();
   const [days, setDays] = useState(String(config.retention.max_age_days));
@@ -78,8 +78,15 @@ function Storage({ config, used, usedNa, admin }: { config: ConfigView; used: nu
   const [candidates, setCandidates] = useState<number | null>(null);
   const failed = (caught: Error) =>
     setNotice(isApiError(caught) && caught.status === 403 ? t("settings.forbidden") : caught.message);
+  // Purging deletes every user's old sessions: administrators only. For anyone
+  // else the button is disabled (attribute, not just styling) and no request
+  // is ever sent, even if a click gets through.
+  const canPurge = admin && scope !== null;
   const preview = useMutation({
-    mutationFn: () => api.purgePreview(scope ?? {}),
+    mutationFn: () => {
+      if (!canPurge || !scope) return Promise.reject(new Error(t("settings.purgeNeedsAdmin")));
+      return api.purgePreview(scope);
+    },
     onSuccess: (result) => {
       setCandidates(result.would_purge.length);
       setConfirm(true);
@@ -87,7 +94,10 @@ function Storage({ config, used, usedNa, admin }: { config: ConfigView; used: nu
     onError: failed,
   });
   const purge = useMutation({
-    mutationFn: () => api.purge(scope ?? {}),
+    mutationFn: () => {
+      if (!canPurge || !scope) return Promise.reject(new Error(t("settings.purgeNeedsAdmin")));
+      return api.purge(scope);
+    },
     onSuccess: (result) => {
       setNotice(t("settings.purged", { count: result?.purged?.length ?? 0 }));
       void client.invalidateQueries({ queryKey: ["db-stats"] });
@@ -121,16 +131,27 @@ function Storage({ config, used, usedNa, admin }: { config: ConfigView; used: nu
         </button>
         <button
           type="button"
-          disabled={!admin || !scope || preview.isPending || purge.isPending}
-          onClick={() => preview.mutate()}
-          className="rounded border border-line px-2 py-1 disabled:text-ink-faint"
+          data-purge=""
+          disabled={!canPurge || preview.isPending || purge.isPending}
+          aria-disabled={!canPurge || preview.isPending || purge.isPending}
+          aria-describedby={admin ? undefined : "purge-needs-admin"}
+          title={admin ? undefined : t("settings.purgeNeedsAdmin")}
+          onClick={() => {
+            if (canPurge) preview.mutate();
+          }}
+          className="rounded border border-line px-2 py-1 disabled:cursor-not-allowed disabled:text-ink-faint disabled:opacity-60"
         >
           {t("settings.purgeNow")}
         </button>
       </div>
+      {admin ? null : (
+        <p id="purge-needs-admin" className="text-ink-faint" data-purge-locked="">
+          {t("settings.purgeNeedsAdmin")}
+        </p>
+      )}
       {notice ? <p className="text-ink-soft">{notice}</p> : null}
       <ConfirmDialog
-        open={confirm}
+        open={confirm && canPurge}
         title={t("settings.purgeNow")}
         body={`${t("settings.purgeConfirm")} ${t("settings.purgeCount", { count: candidates ?? 0, days: maxAge ?? "" })}`}
         onCancel={() => setConfirm(false)}

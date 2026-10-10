@@ -137,6 +137,7 @@
   "sessions.compareDisabled": "Comparison comes in a later phase",
   "sessions.compareNeedTwo": "Select two sessions",
   "sessions.empty": "No sessions yet",
+  "sessions.noMatch": "No session matches \"{q}\"",
   "new.title": "New session",
   "new.launch": "Launch a program",
   "new.attach": "Attach to a process",

@@ -1,7 +1,7 @@
 import { isWallTime } from "@/lib/format";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { api } from "@/api/client";
 import { refreshListWhileRecording } from "@/lib/live-session";
 import type { DbStats, Session } from "@/api/types";
@@ -14,6 +14,7 @@ import { formatDuration } from "@/lib/format";
 import { NotCollected } from "@/components/NotCollected";
 import { coverage } from "@/lib/capabilities";
 import { diskUnavailableText, diskUsed } from "@/lib/disk";
+import { sessionMatchesQuery } from "@/lib/session-match";
 import { sessionTitle } from "@/lib/session-title";
 import { useI18n } from "@/lib/i18n";
 import { useExport } from "@/lib/use-export";
@@ -24,6 +25,8 @@ export function SessionsPage() {
   const { t } = useI18n();
   const navigate = useNavigate();
   const client = useQueryClient();
+  // The search box is uncontrolled (see SearchBox): this state is only what the
+  // list filters on, and React never writes it back into the field.
   const [q, setQ] = useState("");
   const [agent, setAgent] = useState("");
   const [range, setRange] = useState<(typeof RANGES)[number]>("7d");
@@ -34,8 +37,10 @@ export function SessionsPage() {
 
   const since = range === "all" ? undefined : range === "7d" ? "-7d" : "-30d";
   const sessions = useQuery({
-    queryKey: ["sessions", q, agent, range, activeOnly],
-    queryFn: () => api.sessions({ q, agent: agent || undefined, since, active: activeOnly || undefined, limit: 200 }),
+    // `q` is not part of the key: the daemon list ignores it, so typing must
+    // not refetch (that flashed 「加载中」 and returned the same unfiltered rows).
+    queryKey: ["sessions", agent, range, activeOnly],
+    queryFn: () => api.sessions({ agent: agent || undefined, since, active: activeOnly || undefined, limit: 200 }),
     // A program that exits on its own ends its session: the row must turn
     // 「已停止」 without reopening the page.
     refetchInterval: refreshListWhileRecording,
@@ -47,6 +52,12 @@ export function SessionsPage() {
     for (const session of sessions.data?.items ?? []) if (session.agent) names.add(session.agent);
     return [...names].sort();
   }, [sessions.data]);
+
+  // The daemon list ignores `q`, so the fetched rows are filtered here.
+  const items = useMemo(
+    () => (sessions.data?.items ?? []).filter((session) => sessionMatchesQuery(session, q)),
+    [sessions.data, q],
+  );
 
   const mutate = useMutation({
     mutationFn: async (action: { kind: "pin" | "delete" | "rename"; session: Session; name?: string }) => {
@@ -79,12 +90,7 @@ export function SessionsPage() {
       </div>
 
       <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
-        <input
-          value={q}
-          onChange={(event) => setQ(event.target.value)}
-          placeholder={t("sessions.search")}
-          className="rounded border border-line bg-paper px-2 py-1"
-        />
+        <SearchBox onQuery={setQ} />
         <select value={agent} onChange={(event) => setAgent(event.target.value)} className="rounded border border-line bg-paper px-2 py-1">
           <option value="">{t("sessions.agentAll")}</option>
           {agents.map((name) => (
@@ -120,9 +126,13 @@ export function SessionsPage() {
 
       {sessions.isLoading ? <Loading /> : null}
       {sessions.isError ? <ErrorNote error={sessions.error} onRetry={() => void sessions.refetch()} /> : null}
-      {sessions.data && sessions.data.items.length === 0 ? <EmptyNote>{t("sessions.empty")}</EmptyNote> : null}
+      {sessions.data && items.length === 0 ? (
+        <EmptyNote>
+          {(sessions.data.items.length > 0 ? t("sessions.noMatch", { q: q.trim() }) : t("sessions.empty"))}
+        </EmptyNote>
+      ) : null}
 
-      {sessions.data && sessions.data.items.length > 0 ? (
+      {sessions.data && items.length > 0 ? (
         <table className="mt-3 w-full border-collapse text-xs">
           <thead>
             <tr className="border-b border-line text-left text-ink-faint">
@@ -136,7 +146,7 @@ export function SessionsPage() {
             </tr>
           </thead>
           <tbody>
-            {sessions.data.items.map((session) => (
+            {items.map((session) => (
               <SessionRow
                 key={session.public_id}
                 session={session}
@@ -169,6 +179,46 @@ export function SessionsPage() {
         }}
       />
     </main>
+  );
+}
+
+/**
+ * Uncontrolled, like the launch command box: React never writes the value
+ * after the first render. A controlled input re-rendered between a keystroke
+ * and its change handler (the desktop window re-renders on channel replies;
+ * an input method's pending text is not yet an input event) wrote the old
+ * state back, dropping characters, and select-all then delete did not clear.
+ * The text is read on input only to filter the list already fetched.
+ */
+function SearchBox({ onQuery }: { onQuery: (query: string) => void }) {
+  const { t } = useI18n();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const read = () => onQuery(inputRef.current?.value ?? "");
+  return (
+    <form
+      role="search"
+      onSubmit={(event) => {
+        // Enter keeps the filter; it must not reload the page or refetch.
+        event.preventDefault();
+        read();
+      }}
+    >
+      <input
+        ref={inputRef}
+        name="q"
+        type="search"
+        defaultValue=""
+        autoComplete="off"
+        autoCapitalize="off"
+        autoCorrect="off"
+        spellCheck={false}
+        onInput={read}
+        onChange={read}
+        placeholder={t("sessions.search")}
+        aria-label={t("sessions.search")}
+        className="rounded border border-line bg-paper px-2 py-1"
+      />
+    </form>
   );
 }
 

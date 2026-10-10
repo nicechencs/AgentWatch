@@ -137,6 +137,7 @@
   "sessions.compareDisabled": "对比在后续阶段提供",
   "sessions.compareNeedTwo": "选择两个会话",
   "sessions.empty": "还没有会话",
+  "sessions.noMatch": "没有匹配「{q}」的会话",
   "new.title": "新建会话",
   "new.launch": "启动程序",
   "new.attach": "附着到进程",

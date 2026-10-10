@@ -21,6 +21,16 @@ tauri = { version = "2", features = [] }
 # serde / serde_json: MIT OR Apache-2.0.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Shared internal-channel client (same as `aw`): path order, error classes,
+# pipe-busy retry, timeouts. std only.
+aw-channel = { path = "../../crates/aw-channel" }
+
+[features]
+# On by default so `cargo run` / `cargo build --release` / `tauri build`
+# always serve the bundled ui/dist through tauri's asset protocol. A dev run
+# against Vite on localhost:5173 turns it off: `cargo run --no-default-features`.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -13,8 +13,12 @@
 //! - macOS: `LOCAL_PEERCRED` is not exposed by a safe API this crate links.
 //!   The socket mode (0660) is the only gate, and the caller is recorded as
 //!   [`UNVERIFIED_PEER`], never as an administrator.
-//! - Windows: the named pipe listener is not built yet; [`IpcServer::bind`]
-//!   returns `Unsupported` and the daemon logs that the channel is closed.
+//! - Windows: named pipe `\\.\pipe\agentwatch-api` (tokio). The pipe keeps the
+//!   default DACL, so only LocalSystem, Administrators, and the daemon's own
+//!   account can open it for writing; a client is recorded as an
+//!   administrator. The `AgentWatch Users` DACL and the client SID
+//!   (`GetNamedPipeClientProcessId`) are not applied yet, so an ordinary
+//!   Windows user cannot open the pipe.
 //!
 //! The socket path comes from [`AW_SOCKET`] when set (tests and unprivileged
 //! development runs), otherwise the documented platform path. A stale socket
@@ -34,6 +38,9 @@ pub const LINUX_SOCKET: &str = "/run/agentwatch/api.sock";
 
 /// macOS socket (api-and-cli §1).
 pub const MACOS_SOCKET: &str = "/var/run/agentwatch/api.sock";
+
+/// Windows named pipe (api-and-cli §1).
+pub const WINDOWS_PIPE: &str = r"\\.\pipe\agentwatch-api";
 
 /// `user_id` given to a peer whose uid could not be read. Not an administrator.
 pub const UNVERIFIED_PEER: &str = "unverified-peer";
@@ -56,6 +63,8 @@ fn socket_path_from(env: Option<String>) -> Option<PathBuf> {
         Some(PathBuf::from(LINUX_SOCKET))
     } else if cfg!(target_os = "macos") {
         Some(PathBuf::from(MACOS_SOCKET))
+    } else if cfg!(windows) {
+        Some(PathBuf::from(WINDOWS_PIPE))
     } else {
         None
     }
@@ -67,9 +76,6 @@ pub type SharedState = Arc<Mutex<ApiState>>;
 
 #[cfg(unix)]
 pub use unix::IpcServer;
-
-#[cfg(not(unix))]
-pub use other::IpcServer;
 
 #[cfg(unix)]
 mod unix {
@@ -251,14 +257,178 @@ mod unix {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod pipe {
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+
+    use super::super::auth::Caller;
+    use super::super::http::{parse_request, response_bytes};
+    use super::super::routes::{dispatch_peer, error_response};
+    use super::SharedState;
+
+    const MAX_REQUEST: usize = 80 * 1024;
+
+    /// `user_id` for a pipe client. The pipe keeps the default DACL, which
+    /// lets only LocalSystem, Administrators, and the daemon's own account
+    /// open it for writing, so a connected client is an administrator. The
+    /// client SID is not read yet.
+    pub const PIPE_ADMIN: &str = "pipe-admin";
+
+    /// A running named-pipe listener.
+    pub struct IpcServer {
+        /// Pipe path actually created.
+        pub path: PathBuf,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl IpcServer {
+        /// Create the first pipe instance on `path` and serve `state`.
+        ///
+        /// # Errors
+        ///
+        /// Runtime creation or pipe creation failure (another daemon holding
+        /// the first instance is `PermissionDenied` / `AccessDenied`).
+        pub fn bind(path: &Path, state: SharedState) -> io::Result<Self> {
+            let name = path.as_os_str().to_owned();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let first = runtime
+                .block_on(async { ServerOptions::new().first_pipe_instance(true).create(&name) })?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let thread = thread::Builder::new()
+                .name("aw-ipc".to_owned())
+                .spawn(move || runtime.block_on(accept_loop(name, first, state, flag)))?;
+            Ok(Self {
+                path: path.to_path_buf(),
+                stop,
+                thread: Some(thread),
+            })
+        }
+
+        /// Stop the accept loop and join it.
+        pub fn shutdown(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    impl Drop for IpcServer {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    async fn accept_loop(
+        name: std::ffi::OsString,
+        mut server: NamedPipeServer,
+        state: SharedState,
+        stop: Arc<AtomicBool>,
+    ) {
+        while !stop.load(Ordering::Relaxed) {
+            let connected = tokio::select! {
+                result = server.connect() => result,
+                () = tokio::time::sleep(Duration::from_millis(100)) => continue,
+            };
+            if let Err(err) = connected {
+                tracing::warn!(target: "aw_daemon::ipc", error = %err, "pipe connect failed");
+                continue;
+            }
+            let next = match ServerOptions::new().create(&name) {
+                Ok(next) => next,
+                Err(err) => {
+                    tracing::warn!(target: "aw_daemon::ipc", error = %err, "next pipe instance not created");
+                    return;
+                }
+            };
+            let client = std::mem::replace(&mut server, next);
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                if let Err(err) = serve(client, &state).await {
+                    tracing::debug!(target: "aw_daemon::ipc", error = %err, "pipe connection closed");
+                }
+            });
+        }
+    }
+
+    async fn serve(pipe: NamedPipeServer, state: &SharedState) -> io::Result<()> {
+        let caller = Caller {
+            user_id: PIPE_ADMIN.to_owned(),
+            admin: true,
+        };
+        let mut collected = Vec::new();
+        let mut buf = vec![0_u8; 8 * 1024];
+        let request = loop {
+            pipe.readable().await?;
+            match pipe.try_read(&mut buf) {
+                Ok(0) => match parse_request(&collected, 0) {
+                    Some(req) => break req,
+                    None => return Ok(()),
+                },
+                Ok(n) => {
+                    collected.extend_from_slice(&buf[..n]);
+                    if collected.len() > MAX_REQUEST {
+                        let response =
+                            error_response(413, "payload_too_large", "request body exceeds 64 KiB");
+                        return write_all(&pipe, &response_bytes(&response)).await;
+                    }
+                    if let Some(req) = parse_request(&collected, 0) {
+                        break req;
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                Err(err) => return Err(err),
+            }
+        };
+        let response = {
+            let mut guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            dispatch_peer(&mut guard, &request, &caller)
+        };
+        write_all(&pipe, &response_bytes(&response)).await?;
+        pipe.disconnect()
+    }
+
+    async fn write_all(pipe: &NamedPipeServer, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            pipe.writable().await?;
+            match pipe.try_write(bytes) {
+                Ok(n) => bytes = &bytes[n..],
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub use pipe::IpcServer;
+
+#[cfg(not(any(unix, windows)))]
+pub use other::IpcServer;
+
+#[cfg(not(any(unix, windows)))]
 mod other {
     use std::io;
     use std::path::{Path, PathBuf};
 
     use super::SharedState;
 
-    /// Placeholder until the named pipe listener lands. Never constructed.
+    /// No internal channel on this platform. Never constructed.
     pub struct IpcServer {
         /// Never set.
         pub path: PathBuf,
@@ -273,7 +443,7 @@ mod other {
         pub fn bind(_path: &Path, _state: SharedState) -> io::Result<Self> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "named pipe listener is not built yet",
+                "no internal channel on this platform",
             ))
         }
 

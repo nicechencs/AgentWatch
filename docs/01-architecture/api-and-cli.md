@@ -15,7 +15,7 @@
 内部通道的实现状态（2026-10-10）：
 - Linux / macOS：`agentwatchd` 前台运行时监听 Unix socket（`crates/aw-daemon/src/api/ipc.rs`），权限 0660；报文与 HTTP 相同（HTTP/1.1 请求和响应），不带 `Authorization`，也不做 `Host` 校验。只提供 `/health` 和 `/api/v1/*`，不提供页面资源。socket 与 HTTP 共用同一份状态，所以在 socket 上签的 ticket 可以在 HTTP 上兑换。
 - Linux 用 `SO_PEERCRED` 取对端 uid，uid 0 为管理员。macOS 暂未取到 `LOCAL_PEERCRED`，对端记为 `unverified-peer`、非管理员，只靠 socket 权限把关。属组 `agentwatch` 尚未设置。
-- Windows 命名管道监听尚未实现，CLI 一侧已能按文件方式打开管道。
+- Windows：`agentwatchd` 在 `\\.\pipe\agentwatch-api` 上监听（tokio 命名管道），报文同上。管道沿用系统默认 DACL，只有 LocalSystem、Administrators 和 daemon 自己的账户能以读写方式打开，所以连上的客户端记为管理员 `pipe-admin`。`AgentWatch Users` 组的 DACL 和按 `GetNamedPipeClientProcessId` 取客户端 SID 尚未实现：普通 Windows 用户暂时打不开管道。只做了交叉编译检查，没有在 Windows 上实跑。
 - `AW_SOCKET` 环境变量同时覆盖 daemon 的监听路径和 `aw` 的默认连接路径，用于测试和非 root 开发运行。`aw daemon start` 在通道无响应时拉起 `agentwatchd --foreground`（`AW_DAEMON_CONFIG` 作为 `--config` 传入）并等待 `/health`，不注册系统服务。
 
 CLI 和 UI 请求到达后走同一套 axum 路由。传输层不同，但请求体和响应体完全一致。

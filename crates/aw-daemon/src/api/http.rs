@@ -326,6 +326,15 @@ const DEFAULT_HEADERS: &[(&str, &str)] = &[
     ("cache-control", "no-store"),
 ];
 
+/// The full response as bytes, for transports that write asynchronously
+/// (the Windows named pipe in `api/ipc.rs`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn response_bytes(response: &ApiResponse) -> Vec<u8> {
+    let mut out = Vec::new();
+    let _ = write_response(&mut out, response);
+    out
+}
+
 pub(crate) fn write_response<W: Write>(
     stream: &mut W,
     response: &ApiResponse,

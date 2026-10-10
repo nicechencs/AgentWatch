@@ -38,6 +38,7 @@ AW_SOCKET=/tmp/aw/api.sock agentwatchd --foreground --config <dev config>
 AW_SOCKET=/tmp/aw/api.sock cargo run
 ```
 
-Not in this package: installers, signing, auto-update (P4). The Windows named
-pipe listener in `agentwatchd` is not built yet, so on Windows the app reports
-`daemon_unreachable` until it is.
+Not in this package: installers, signing, auto-update (P4). On Windows the
+daemon's pipe keeps the default DACL, so only an elevated (administrator) app
+can open it today; an ordinary user sees `daemon_unreachable` until the
+`AgentWatch Users` DACL lands.

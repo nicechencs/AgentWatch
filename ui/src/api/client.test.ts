@@ -131,7 +131,7 @@ describe("export and live go through the request layer", () => {
 
   it("parses the daemon's SSE frames and filename headers", () => {
     const frames = parseSse('retry: 1000\nid: 7\nevent: record\ndata: {"a":1}\n\n: keepalive\n\n');
-    expect(frames).toEqual([{ event: "record", data: '{"a":1}', id: "7" }]);
+    expect(frames).toEqual([{ event: "record", data: '{"a":1}', id: 7 }]);
     expect(dispositionName('attachment; filename="x.md"')).toBe("x.md");
   });
 
@@ -165,13 +165,16 @@ describe("export and live go through the request layer", () => {
     };
     const fetchMock = vi.spyOn(globalThis, "fetch");
     const records: unknown[] = [];
-    const errors: number[] = [];
-    const close = subscribeLive("s1", "", { onRecord: (r) => records.push(r), onLagged: () => {}, onError: () => errors.push(1) });
+    const errors: unknown[] = [];
+    const close = subscribeLive("s1", "", { onRecord: (r) => records.push(r), onLagged: () => {}, onError: (e) => errors.push(e) });
     await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith("aw_stream_open", expect.objectContaining({ target: "/api/v1/sessions/s1/live" })));
     deliver!({ index: 0, message: { kind: "event", id: "4", event: "record", data: '{"cat":"net"}' } });
     deliver!({ index: 1, message: { kind: "error", code: "daemon_unreachable", message: "x", status: null } });
-    expect(records).toEqual([{ cat: "net" }]);
-    expect(errors).toEqual([1]);
+    expect(records).toHaveLength(1);
+    expect((records[0] as { cat: string }).cat).toBe("net");
+    // The page shows the channel's own code next to the checkbox.
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as { code: string }).code).toBe("daemon_unreachable");
     close();
     expect(invoke).toHaveBeenCalledWith("aw_stream_close", { id: 9 });
     expect(fetchMock).not.toHaveBeenCalled();

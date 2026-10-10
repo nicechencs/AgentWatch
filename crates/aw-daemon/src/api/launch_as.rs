@@ -8,8 +8,10 @@
 //! - Caller is the daemon's own account: started as is.
 //! - Daemon runs as root, caller is another account: the child drops to the
 //!   caller before `exec`. std does it in this order in the child:
-//!   `setgroups(0)` (no supplementary groups), `setgid(gid)`, `setuid(uid)`,
-//!   then `chdir(cwd)` (so the directory is checked as the caller). The parent
+//!   `setgid(gid)`, `setgroups(0)` (no supplementary groups; std ignores a
+//!   failure here, so the parent check below also requires no foreign
+//!   groups), `setuid(uid)`, then `chdir(cwd)` (so the directory is checked
+//!   as the caller). Both group changes happen while still root. The parent
 //!   then reads `/proc/<pid>/status` and kills the child unless real,
 //!   effective, saved and filesystem ids are all the caller's: with all four
 //!   non-root the child cannot become root again.
@@ -174,6 +176,47 @@ mod tests {
     fn ordinary_daemon_does_not_start_programs_for_others() {
         assert_eq!(code(identity_for("1001", 1000)), "launch_other_user");
         assert_eq!(code(identity_for("0", 1000)), "launch_other_user");
+    }
+
+    /// `verify_dropped` reads a real process: a child of this account passes
+    /// for this account and fails for any other uid or gid, so a child that
+    /// kept root (or any other id) is caught.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_dropped_checks_all_ids_of_a_real_process() {
+        let me = nix::unistd::getuid().as_raw();
+        let gid = nix::unistd::getgid().as_raw();
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep");
+        let who = super::Identity {
+            uid: me,
+            gid,
+            name: "t".to_owned(),
+            home: "/".into(),
+            shell: "/bin/sh".into(),
+        };
+        let status = std::fs::read_to_string(format!("/proc/{}/status", child.id())).unwrap();
+        let groups_line = status.lines().find(|l| l.starts_with("Groups:")).unwrap();
+        let only_primary = groups_line[7..]
+            .split_whitespace()
+            .all(|g| g == gid.to_string());
+        // The test runner may carry supplementary groups; the check must then refuse.
+        assert_eq!(super::verify_dropped(child.id(), &who), only_primary);
+        let other_uid = super::Identity {
+            uid: me.wrapping_add(1),
+            ..who.clone()
+        };
+        assert!(!super::verify_dropped(child.id(), &other_uid));
+        let other_gid = super::Identity {
+            gid: gid.wrapping_add(1),
+            ..who.clone()
+        };
+        assert!(!super::verify_dropped(child.id(), &other_gid));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!super::verify_dropped(u32::MAX, &who), "no such pid");
     }
 
     /// Root daemon, caller is this test's account: the drop target is that

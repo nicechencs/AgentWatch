@@ -164,7 +164,8 @@ impl Stage for DedupStage {
     }
 }
 
-/// Enrich placeholder. Real lookups are P1-PIPE-03.
+/// Enrich forwarding stage. DNS lookups use AggregateStage's private cache
+/// after Redact (P1-PIPE-06), because RawEvent has no connection domain field.
 #[derive(Debug, Default)]
 pub struct EnrichStage {
     inner: Forward,
@@ -240,6 +241,8 @@ impl Stage for RedactStage {
 /// not raised. The event is still forwarded. File aggregation is not this card.
 pub struct AggregateStage {
     net: crate::aggregate::NetAggregator,
+    /// DNS mapping lives here so merged rows and flow metadata follow Redact.
+    dns: crate::enrich::DnsCache,
     /// File open→close rows (P2-PIPE-01). Independent of the network table.
     file: crate::aggregate::FileAggregator,
     /// Sensitive-path labels (P2-PIPE-02). Applied to rows as they are emitted.
@@ -272,6 +275,7 @@ impl AggregateStage {
     ) -> Self {
         Self {
             net: crate::aggregate::NetAggregator::new(cfg.bucket_secs),
+            dns: crate::enrich::DnsCache::new(),
             file: crate::aggregate::FileAggregator::new(&cfg),
             sensitive: crate::sensitive::Rules::load(&sensitive),
             agent: None,
@@ -318,6 +322,8 @@ impl AggregateStage {
 
     /// Emit file rows a close finished but the coalesce window was still holding.
     pub fn finish(&mut self, out: &mut Output) {
+        self.dns.finish_queries();
+        out.dns.extend(self.dns.take_records());
         let before = out.file_access.len();
         self.file.finish(out);
         self.label_and_thin(before, out);
@@ -341,7 +347,39 @@ impl Stage for AggregateStage {
             out.gaps
                 .push(crate::output::GapRec::from_event(&event, gap));
         }
-        self.net.observe(&event, out);
+        self.dns.expire(event.ts_mono_ns);
+        let ctx = crate::enrich::DnsObs {
+            ts_ns: event.ts_mono_ns,
+            session_id: event.session_id,
+            proc_uid: event.proc.as_ref().map(|proc| proc.uid),
+            evidence: event.evidence.clone(),
+            source: event.source.clone(),
+        };
+        match &event.kind {
+            aw_core::EventKind::DnsQuery(query) => self.dns.observe_query(query, &ctx),
+            aw_core::EventKind::DnsAnswer(answer) => {
+                let grade = dns_domain_evidence(&event);
+                self.dns.observe_answer_with_evidence(answer, &ctx, &grade);
+            }
+            _ => {}
+        }
+        out.dns.extend(self.dns.take_records());
+        let domain = match &event.kind {
+            aw_core::EventKind::NetConnect(connect) => {
+                let ip = match connect.flow.remote {
+                    aw_core::SocketAddr::Ip(ip) => ip,
+                    aw_core::SocketAddr::Socket(addr) => addr.ip(),
+                };
+                Some(self.dns.resolve_with_source(
+                    ip,
+                    event.ts_mono_ns,
+                    ctx.proc_uid,
+                    ctx.session_id,
+                ))
+            }
+            _ => None,
+        };
+        self.net.observe_with_domain(&event, out, domain);
         let before = out.file_access.len();
         self.file.observe(&event, out);
         self.label_and_thin(before, out);
@@ -349,6 +387,7 @@ impl Stage for AggregateStage {
     }
 
     fn tick(&mut self, now_ns: u64, out: &mut Output) {
+        self.dns.expire(now_ns);
         self.net.tick(now_ns, out);
         let before = out.file_access.len();
         self.file.tick(now_ns, out);
@@ -366,6 +405,32 @@ impl AggregateStage {
             self.sensitive.label(row, agent);
         }
         self.degrade.retain_new_files(&mut out.file_access, before);
+    }
+}
+
+/// Domain mapping depends on both the name and the answer addresses. Preserve
+/// the weakest contributing grade, including field overrides; the DNS row
+/// itself keeps the source event's record evidence.
+fn dns_domain_evidence(event: &RawEvent) -> aw_core::Evidence {
+    let mut grade = event.evidence.clone();
+    for field in ["qname", "answers"] {
+        if let Some(evidence) = event.field_evidence.get(field) {
+            if dns_evidence_rank(evidence) < dns_evidence_rank(&grade) {
+                grade = evidence.clone();
+            }
+        }
+    }
+    grade
+}
+
+fn dns_evidence_rank(evidence: &aw_core::Evidence) -> u8 {
+    match evidence {
+        aw_core::Evidence::E1 => 5,
+        aw_core::Evidence::E2 => 4,
+        aw_core::Evidence::S => 3,
+        aw_core::Evidence::E3 => 2,
+        aw_core::Evidence::I => 1,
+        aw_core::Evidence::NA(_) => 0,
     }
 }
 

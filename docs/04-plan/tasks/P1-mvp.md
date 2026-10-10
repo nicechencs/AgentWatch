@@ -1,7 +1,7 @@
 # P1 MVP 任务清单
 
 > 状态：草案
-> 最后更新：2026-10-06
+> 最后更新：2026-10-10
 > 关联：[roadmap](../roadmap.md#p1-mvp)、[任务卡规范](README.md)、[P0 任务](P0-foundation.md)
 > 里程碑：P1 MVP
 > 截止：2026-11-29
@@ -48,6 +48,7 @@
 | P1-MAC-02 | nettop 采样与 pktap DNS | MAC | M | P1-MAC-01 | B |
 | P1-CLI-01 | CLI 骨架与 daemon 客户端 | CLI | S | P1-DAEMON-03 | C |
 | P1-PIPE-03 | DNS 映射与 IP→域名回填 | PIPE | M | P1-PIPE-02 | C |
+| P1-PIPE-06 | DNS 丰富逻辑接入默认管道与流量聚合 | PIPE | M | P1-PIPE-03, P1-PIPE-04 | G |
 | P1-STORE-03 | 导出 JSONL / CSV | STORE | S | P1-STORE-02 | C |
 | P1-DAEMON-04 | 会话管理：run/attach/stop 编排，附着先采集后快照 | DAEMON | M | P1-DAEMON-02, P1-DAEMON-03, P1-PIPE-02 | C |
 | P1-SIM-02 | 评估器 `sim eval`：召回率与字节误差报告 | SIM | M | P1-SIM-01, P1-STORE-02 | C |
@@ -61,7 +62,7 @@
 | P1-CI-01 | Linux / Windows 托管 runner 特权端到端测试 | CI | M | P1-SIM-02, P1-WIN-04, P1-LNX-04, P1-CLI-02 | E |
 | P1-DOC-01 | P1 阶段验收：性能基准、macOS 手动端到端、文档回填 | DOC | M | P1-CI-01, P1-MAC-03, P1-POLL-01, P1-CLI-04 | F |
 
-共 35 项。并行组：同组任务的文件范围不重叠，可以同时分给多个 subagent；组 A → F 大致顺序推进。同一平台内按 Windows → Linux → macOS 安排真机验证时间。
+共 36 项。并行组：同组任务的文件范围不重叠，可以同时分给多个 subagent；组 A → F 大致顺序推进。同一平台内按 Windows → Linux → macOS 安排真机验证时间。
 
 **建议周计划**（1 人 + AI，5 周）：
 
@@ -94,6 +95,7 @@ flowchart LR
     PIPE01 --> PIPE02[PIPE-02 Scope+进程缓存]
     PIPE02 --> PIPE03[PIPE-03 DNS 映射]
     PIPE03 --> PIPE04[PIPE-04 网络聚合]
+    PIPE03 & PIPE04 --> PIPE06[PIPE-06 DNS 接线]
     PIPE01 --> PIPE05[PIPE-05 Batcher/缺口/限流]
     STORE01 --> PIPE05
     STORE01 --> STORE02[STORE-02 查询]
@@ -1236,3 +1238,34 @@ flowchart LR
 - [ ] 未达标的项都有对应的 Issue 编号。
 
 **参考文档**：[roadmap](../roadmap.md)、[capability-matrix](../../02-platforms/capability-matrix.md)、[performance-budget](../../01-architecture/performance-budget.md)、[risks](../risks.md)
+
+### P1-PIPE-06 DNS 丰富逻辑接入默认管道与流量聚合
+
+- **AREA**: PIPE
+- **平台**: all
+- **类型**: feature
+- **优先级**: M
+- **规模**: M
+- **依赖**: P1-PIPE-03, P1-PIPE-04
+- **关联**: REQ-04.3, CAP-DNS-01, CAP-DNS-02, CAP-DNS-04, ADR-0004
+- **文件范围**: `crates/aw-pipeline/src/stage.rs`, `crates/aw-pipeline/src/pipeline.rs`, `crates/aw-pipeline/src/enrich/dns.rs`, `crates/aw-pipeline/src/aggregate/net.rs`, `crates/aw-pipeline/tests/dns_replay.rs`, `docs/01-architecture/pipeline.md`, `docs/04-plan/tasks/P1-mvp.md`
+
+**背景**：DNS 缓存与网络聚合已分别实现，但默认 EnrichStage 仍透传，最终流量没有 DNS 域名归属。RawEvent 的 NetConnect 没有 domain 字段，接线应使用已有管道记录与阶段内部状态，不修改事件模型。
+
+**实现要点**：
+- 消费查询与应答，输出 DnsRec；对连接使用事件时间按同进程、同会话其他进程、全局缓存的顺序选择域名。
+- 通过内部阶段接口把域名与字段证据带到最终 NetFlowRec，记录级证据不变；SNI 继续按已有规则处理，不能丢失其观测值。
+- 有限 TTL 的缓存按事件时间淘汰，消耗已输出的 DNS 行，避免持续运行时无界积累；未知 TTL 不冒充新鲜 E1。
+
+**限制**：
+- 不发起任何网络请求，不读取系统 DNS 缓存或平台 API。
+- 不修改 aw-core 类型、数据库 schema、HTTP API、证据规则或依赖；不同时接入代理、规则引擎或内容哈希。
+- 不把 E3、S 或 I 的来源提升为 E1；未命中域名保持 None 并标 NA(no_dns_observed)。当前输出没有候选域名字段，保留缓存接口的候选结果，不为此扩展公共记录类型。
+
+**验收标准**：
+- [ ] 默认 Pipeline 回放覆盖同进程 E1、全局缓存 I、其他进程 I、TTL 过期 NA、无记录 NA；最终 flow 的 domain 字段证据正确且记录证据不变。
+- [ ] DNS 查询与应答只输出一次合并行；采样或自报告来源不被升级，已有 SNI 仍可见。
+- [ ] 相同输入重复回放输出一致；连续输入缓存清理可验证，不引入按主机时间计算的 TTL。
+- [ ] cargo test -p aw-pipeline、相关严格 Clippy、cargo fmt 检查通过；文档说明本轮接线和仍未接入部分。
+
+**参考文档**：[pipeline](../../01-architecture/pipeline.md)、[network-attribution](../../01-architecture/network-attribution.md)、[evidence-model](../../01-architecture/evidence-model.md)、[testing](../../05-dev/testing.md)

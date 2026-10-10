@@ -20,10 +20,10 @@
 //!
 //! Every timestamp is an argument. This module does not read a clock.
 //!
-//! [`crate::output::DnsRec`] is the merged query+answer row. [`NetFlowRec`] has
-//! no `field_evidence` and no `domain_alts`, and this card may not change that
-//! type, so the back-fill result is [`ConnectDomain`] here. A later aggregate
-//! card copies `domain` onto the flow.
+//! [`crate::output::DnsRec`] is the merged query+answer row. The default pipeline
+//! drains these rows after redaction and passes [`ConnectDomain`] to the network
+//! aggregator (P1-PIPE-06). Candidate names remain on this cache interface;
+//! public flow records have no candidate field.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -113,6 +113,7 @@ struct PendingQuery {
     server: Option<SocketAddr>,
     evidence: Evidence,
     source: Source,
+    session_id: Option<SessionId>,
 }
 
 impl DnsCache {
@@ -126,12 +127,55 @@ impl DnsCache {
         &self.records
     }
 
+    /// Move emitted rows to the pipeline so they are not retained twice.
+    pub(crate) fn take_records(&mut self) -> Vec<DnsRec> {
+        std::mem::take(&mut self.records)
+    }
+
+    /// Remove finite-TTL entries whose window ended on the event clock.
+    /// Unknown TTLs have no expiry to compare; pending queries remain until
+    /// answered or finished. This does not impose a capacity bound on either.
+    pub(crate) fn expire(&mut self, at_ns: u64) {
+        self.by_ip.retain(|_, rows| {
+            rows.retain(|row| row.ts_ns > at_ns || row.live_at(at_ns));
+            !rows.is_empty()
+        });
+    }
+
+    /// Preserve unanswered queries at the end of a replay, in deterministic
+    /// observation order. Answered queries were already consumed and are absent.
+    pub(crate) fn finish_queries(&mut self) {
+        let mut pending: Vec<_> = self.pending.drain().collect();
+        pending.sort_by(|(a, left), (b, right)| {
+            left.ts_ns
+                .cmp(&right.ts_ns)
+                .then(a.qname.cmp(&b.qname))
+                .then(a.qtype.cmp(&b.qtype))
+                .then(
+                    a.proc_uid
+                        .map(|uid| uid.0)
+                        .cmp(&b.proc_uid.map(|uid| uid.0)),
+                )
+                .then(
+                    left.session_id
+                        .map(|id| id.0)
+                        .cmp(&right.session_id.map(|id| id.0)),
+                )
+        });
+        for (key, query) in pending {
+            self.records.push(query_record(&key, query));
+        }
+    }
+
     /// Note a query. It is not indexed by IP: a query has no address yet.
     ///
     /// A later [`Self::observe_answer`] with the same session, process, qname,
     /// and qtype consumes it. Time is `ts_ns`, not the host clock.
     pub fn observe_query(&mut self, query: &DnsQuery, ctx: &DnsObs) {
         let key = pending_key(ctx, &query.qname, query.qtype);
+        if let Some(previous) = self.pending.remove(&key) {
+            self.records.push(query_record(&key, previous));
+        }
         self.pending.insert(
             key,
             PendingQuery {
@@ -140,6 +184,7 @@ impl DnsCache {
                 server: query.server,
                 evidence: ctx.evidence.clone(),
                 source: ctx.source.clone(),
+                session_id: ctx.session_id,
             },
         );
     }
@@ -151,8 +196,26 @@ impl DnsCache {
     /// the addresses. A query that never arrives still produces a record; its
     /// server stays `None`.
     pub fn observe_answer(&mut self, answer: &DnsAnswer, ctx: &DnsObs) {
+        self.observe_answer_with_evidence(answer, ctx, &ctx.evidence);
+    }
+
+    /// Keep DNS row evidence separate from the grade of the mapped fields.
+    pub(crate) fn observe_answer_with_evidence(
+        &mut self,
+        answer: &DnsAnswer,
+        ctx: &DnsObs,
+        domain_evidence: &Evidence,
+    ) {
         let key = pending_key(ctx, &answer.qname, answer.qtype);
-        let pending = self.pending.remove(&key);
+        let pending = if self
+            .pending
+            .get(&key)
+            .is_some_and(|query| query.ts_ns <= ctx.ts_ns)
+        {
+            self.pending.remove(&key)
+        } else {
+            None
+        };
         let ts_ns = pending.as_ref().map(|row| row.ts_ns).unwrap_or(ctx.ts_ns);
         let server = pending.as_ref().and_then(|row| row.server);
         let evidence = ctx.evidence.clone();
@@ -166,7 +229,7 @@ impl DnsCache {
                 qname: answer.qname.clone(),
                 ts_ns: ctx.ts_ns,
                 ttl_secs: answer.ttl_min,
-                source_evidence: evidence.clone(),
+                source_evidence: domain_evidence.clone(),
                 proc_uid: ctx.proc_uid,
                 session_id: ctx.session_id,
             });
@@ -207,7 +270,17 @@ impl DnsCache {
         proxy_connect: Option<&str>,
     ) -> ConnectDomain {
         let _ = (sni_step(sni), proxy_step(proxy_connect));
+        self.resolve_with_source(ip, at_ns, proc_uid, session_id).0
+    }
 
+    /// Internal pipeline path also needs the attribution step for domain_source.
+    pub(crate) fn resolve_with_source(
+        &self,
+        ip: IpAddr,
+        at_ns: u64,
+        proc_uid: Option<ProcUid>,
+        session_id: Option<SessionId>,
+    ) -> (ConnectDomain, Option<super::DomainSource>) {
         if proc_uid.is_some() {
             // Same process, this session first. A row stored before scope assigned
             // a session is still this process's own answer.
@@ -219,7 +292,10 @@ impl DnsCache {
             ];
             for scope in own_scopes {
                 if let Some(found) = self.pick(scope, ip, at_ns, |row| row.proc_uid == proc_uid) {
-                    return found.into_domain(Evidence::E1);
+                    return (
+                        found.into_domain(true),
+                        Some(super::DomainSource::DnsSameProcess),
+                    );
                 }
             }
         }
@@ -233,15 +309,21 @@ impl DnsCache {
                 at_ns,
                 |row| row.proc_uid.is_some() && row.proc_uid != proc_uid,
             ) {
-                return found.into_domain(Evidence::I);
+                return (
+                    found.into_domain(false),
+                    Some(super::DomainSource::DnsSessionPeer),
+                );
             }
         }
 
         if let Some(found) = self.pick(CacheScope::Global, ip, at_ns, |_| true) {
-            return found.into_domain(Evidence::I);
+            return (
+                found.into_domain(false),
+                Some(super::DomainSource::DnsGlobal),
+            );
         }
 
-        ConnectDomain::not_observed()
+        (ConnectDomain::not_observed(), None)
     }
 
     /// Live answers for `(scope, ip)` matching `pred`, newest `ts_ns` first.
@@ -255,7 +337,11 @@ impl DnsCache {
         let mut hits: Vec<&CacheEntry> = Vec::new();
         if let Some(rows) = self.by_ip.get(&(scope, ip)) {
             for row in rows {
-                if row.live_at(at_ns) && pred(row) {
+                if !row.qname.is_empty()
+                    && !row.source_evidence.is_na()
+                    && row.live_at(at_ns)
+                    && pred(row)
+                {
                     hits.push(row);
                 }
             }
@@ -276,6 +362,8 @@ impl DnsCache {
         Some(Picked {
             qname: primary.qname.clone(),
             alt_domains: alt,
+            source_evidence: primary.source_evidence.clone(),
+            known_ttl: primary.ttl_secs.is_some(),
         })
     }
 }
@@ -283,10 +371,24 @@ impl DnsCache {
 struct Picked {
     qname: String,
     alt_domains: Vec<String>,
+    source_evidence: Evidence,
+    known_ttl: bool,
 }
 
 impl Picked {
-    fn into_domain(self, evidence: Evidence) -> ConnectDomain {
+    fn into_domain(self, same_process: bool) -> ConnectDomain {
+        // Own, fresh observations retain the source grade. A peer/global
+        // association or an unknown TTL cannot establish a fresh E1 window.
+        let evidence = if same_process
+            && (self.known_ttl
+                || matches!(
+                    self.source_evidence,
+                    Evidence::S | Evidence::E3 | Evidence::I
+                )) {
+            self.source_evidence
+        } else {
+            Evidence::I
+        };
         ConnectDomain {
             domain: Some(self.qname),
             alt_domains: self.alt_domains,
@@ -313,6 +415,22 @@ pub struct DnsObs {
     pub evidence: Evidence,
     /// Collector source copied onto the [`DnsRec`].
     pub source: Source,
+}
+
+fn query_record(key: &PendingKey, query: PendingQuery) -> DnsRec {
+    DnsRec {
+        session_id: query.session_id,
+        proc_uid: key.proc_uid,
+        ts_ns: query.ts_ns,
+        qname: key.qname.clone(),
+        qtype: key.qtype,
+        rcode: None,
+        answers: Vec::new(),
+        ttl_min: None,
+        server: query.server.map(|addr| addr.to_string()),
+        evidence: query.evidence,
+        source: query.source,
+    }
 }
 
 fn pending_key(ctx: &DnsObs, qname: &str, qtype: u16) -> PendingKey {
@@ -563,6 +681,51 @@ mod tests {
         );
         assert_eq!(found.domain.as_deref(), Some("peer.example"));
         assert_eq!(domain_ev(&found), &Evidence::I);
+    }
+
+    #[test]
+    fn finite_ttl_cleanup_and_record_drain_do_not_retain_history() {
+        let mut cache = DnsCache::new();
+        for index in 0..100u64 {
+            let at = index * 2_000_000_000;
+            cache.expire(at);
+            assert!(cache.by_ip.is_empty());
+            let ctx = obs(at, Some(1), Some(10), Evidence::E1);
+            cache.observe_query(&DnsQuery::new("api.example", RTYPE_A, None, None), &ctx);
+            cache.observe_answer(&answer("api.example", "1.2.3.4", Some(1)), &ctx);
+            assert!(cache.pending.is_empty());
+            assert_eq!(cache.by_ip.values().map(Vec::len).sum::<usize>(), 1);
+            assert_eq!(cache.take_records().len(), 1);
+            assert!(cache.records().is_empty());
+            cache.expire(at + 1_000_000_000);
+            assert!(cache.by_ip.is_empty());
+        }
+    }
+
+    #[test]
+    fn cleanup_keeps_future_and_unknown_ttl_observations() {
+        let mut cache = DnsCache::new();
+        cache.observe_answer(
+            &answer("future.example", "1.2.3.4", Some(1)),
+            &obs(10_000_000_000, Some(1), Some(10), Evidence::E1),
+        );
+        cache.observe_answer(
+            &answer("unknown.example", "9.9.9.9", None),
+            &obs(0, Some(1), Some(10), Evidence::E1),
+        );
+        cache.expire(5_000_000_000);
+        assert_eq!(cache.by_ip.len(), 2);
+        let unknown = cache.resolve(
+            "9.9.9.9".parse().unwrap(),
+            5_000_000_000,
+            Some(ProcUid(10)),
+            Some(SessionId(1)),
+            None,
+            None,
+        );
+        assert_eq!(domain_ev(&unknown), &Evidence::I);
+        cache.expire(11_000_000_000);
+        assert_eq!(cache.by_ip.len(), 1);
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! Replay driver. Runs the seven stages in order on a virtual clock.
 //!
 //! [`Pipeline::replay`] does not read [`std::time::Instant`] or the wall clock. The
-//! virtual position is each event's `ts_mono_ns`. Passthrough stages emit no business
-//! records; see [`crate::output::Output`].
+//! virtual position is each event's `ts_mono_ns`. DNS rows and flow domain metadata
+//! are produced after Redact by Aggregate's private DNS cache (P1-PIPE-06).
 
 use aw_core::RawEvent;
 
@@ -16,7 +16,7 @@ use crate::stage::{
 
 /// The seven stages, in pipeline.md order, with the config they will eventually read.
 ///
-/// [`Pipeline::replay`] runs the stock passthrough chain. Each stage is its own type
+/// [`Pipeline::replay`] runs the default chain. Each stage is its own type
 /// that implements [`Stage`], so a test can put a different impl in front of the
 /// remaining stock stages without editing this crate.
 pub struct Pipeline {
@@ -31,8 +31,9 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    /// Pipeline with the stages that read `cfg`: redact, aggregate, and the
-    /// degrade ladder. Scope, dedup, enrich, and correlate stay passthrough.
+    /// Pipeline with configured redaction, aggregation, and degrade handling.
+    /// Scope starts without sessions; dedup, enrich, and correlate forward.
+    /// DNS is wired inside aggregate, after redaction.
     pub fn new(cfg: PipelineConfig) -> Self {
         let redact = RedactStage::new(&cfg.redaction);
         let aggregate = AggregateStage::with_degrade(

@@ -1,7 +1,7 @@
 # 事件处理管道
 
 > 状态：草案
-> 最后更新：2026-10-07
+> 最后更新：2026-10-10
 > 关联：REQ-03~07、REQ-11、NFR-01~06、[ADR-0011](../03-adr/0011-aggregate-first.md)、[ADR-0012](../03-adr/0012-no-content-redact-before-write.md)、[ADR-0013](../03-adr/0013-inter-agent-observation.md)、[event-schema](event-schema.md)、[storage](storage.md)、[inter-agent-communication](inter-agent-communication.md)
 
 `aw-pipeline` 把 `RawEvent` 流变成可存储的 `Record` 和 `Finding`。它不依赖任何平台 crate，所有逻辑都可以通过回放 JSONL 测试。
@@ -70,6 +70,10 @@ flowchart LR
 | 代理归属 | `HttpRequest.client`（代理看到的客户端端口）→ 查本地连接表，得到发起进程 |
 | 敏感路径标记 | 路径匹配 `sensitive_paths` 规则后打标签 `sensitive:<rule_id>` |
 | 路径归一化 | Windows 设备路径 `\Device\HarddiskVolume3\...` 转为 `C:\...`；`~` 展开；符号链接保持原样，另存 `resolved_path`【待验证】 |
+
+**P1-PIPE-06 默认管道接线**：当前 `RawEvent::NetConnect` 没有域名字段，`EnrichStage` 仍转发原事件。默认管道在 **Redact 之后的 `AggregateStage` 私有状态** 中复用 `DnsCache`，合并 DNS 查询/应答并直接输出一条 `DnsRec`；只在 `NetConnect` 时查缓存，通过内部接口把域名、`domain_source` 与字段证据传给网络聚合器，不改变公共事件或输出类型、连接记录级证据。未命中为 `domain = None`、`NA(no_dns_observed)`；同进程已知 TTL 的映射保留来源等级，`qname` / `answers` 字段降级也参与约束；其他进程或全局映射为 I，同进程未知 TTL 的 E1 来源也只记为 I。
+
+已输出 DNS 行立即从缓存取走；有限 TTL 按应答的事件时间淘汰，回放结束输出未应答查询，均不读取主机时间。未知 TTL 和未应答查询尚无容量淘汰策略，不能据此宣称全部缓存有界。候选域名保留在缓存接口中，当前公开流记录无候选字段。实际 `TlsSni` 继续沿用现有聚合器更新行为，保留独立 `sni` 值与字段证据；DNS 映射不会生成 SNI。`enrich::attribute_domain` 对同进程 DNS / SNI 的排序与 [network-attribution §4.2](network-attribution.md#42-匹配规则) 存在既有差异，本轮不接入该 helper，也不裁决该设计差异。代理归属、规则引擎和内容哈希未在本轮接入。
 
 ### 3.4 Redact（脱敏）
 - 输入输出都是 `RawEvent`。

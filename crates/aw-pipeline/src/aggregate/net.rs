@@ -27,6 +27,7 @@ use aw_core::{
     Source,
 };
 
+use crate::enrich::{ConnectDomain, DomainSource, DOMAIN_FIELD};
 use crate::output::{FlowBucketRec, NetFlowRec, Output};
 
 /// UDP with no packet for this long is closed. pipeline.md §3.5.
@@ -87,10 +88,14 @@ pub struct FlowAcc {
     pub bytes_up: Option<u64>,
     /// Sum of `NetRecv.bytes`. `None` until a recv is seen.
     pub bytes_down: Option<u64>,
-    /// SNI, when a `TlsSni` named this flow. Not a URL.
+    /// DNS mapping or SNI chosen for this flow. Not a URL.
     pub domain: Option<String>,
-    /// How `domain` was chosen. `Some("sni")` or `None`.
+    /// How `domain` was chosen: DNS attribution step, SNI, or None.
     pub domain_source: Option<String>,
+    /// Kept separately so a DNS association never becomes a TLS observation.
+    sni: Option<String>,
+    domain_evidence: Evidence,
+    sni_evidence: Option<Evidence>,
     /// Record-level evidence of the opening event. Not raised later.
     pub evidence: Evidence,
     /// Evidence of the byte observations. `S` only when every byte event was `S`.
@@ -135,12 +140,33 @@ impl NetAggregator {
 
     /// Apply one event. Non-network events are ignored. The event is not stored.
     pub fn observe(&mut self, event: &RawEvent, out: &mut Output) {
+        self.observe_with_domain(event, out, None);
+    }
+
+    /// Private stage path: apply a DNS result on NetConnect without changing
+    /// RawEvent or manufacturing a TlsSni event. Record evidence stays untouched.
+    pub(crate) fn observe_with_domain(
+        &mut self,
+        event: &RawEvent,
+        out: &mut Output,
+        domain: Option<(ConnectDomain, Option<DomainSource>)>,
+    ) {
         self.advance(event.ts_mono_ns, out);
         match &event.kind {
             EventKind::NetConnect(connect) => {
                 let acc = self.ensure(&connect.flow, event);
                 if acc.direction.is_none() {
                     acc.direction = Some(connect.direction);
+                }
+                if acc.sni.is_none() {
+                    if let Some((found, source)) = domain {
+                        acc.domain_evidence = found
+                            .domain_evidence()
+                            .cloned()
+                            .unwrap_or(Evidence::NA(aw_core::NaReason::NoDnsObserved));
+                        acc.domain = found.domain;
+                        acc.domain_source = source.map(|source| source.as_str().to_owned());
+                    }
                 }
             }
             EventKind::NetSend(send) => {
@@ -158,8 +184,19 @@ impl NetAggregator {
                     return;
                 }
                 let acc = self.ensure(&sni.flow, event);
+                let grade = event
+                    .field_evidence
+                    .get("sni")
+                    .unwrap_or(&event.evidence)
+                    .clone();
+                if grade.is_na() {
+                    return;
+                }
+                acc.sni = Some(sni.sni.clone());
+                acc.sni_evidence = Some(grade.clone());
                 acc.domain = Some(sni.sni.clone());
                 acc.domain_source = Some("sni".to_owned());
+                acc.domain_evidence = grade;
             }
             _ => {}
         }
@@ -246,6 +283,9 @@ impl NetAggregator {
                     bytes_down: None,
                     domain: None,
                     domain_source: None,
+                    sni: None,
+                    domain_evidence: Evidence::NA(aw_core::NaReason::NoDnsObserved),
+                    sni_evidence: None,
                     evidence: event.evidence.clone(),
                     byte_evidence: None,
                     saw_nonsampled_bytes: false,
@@ -346,6 +386,14 @@ impl FlowAcc {
         let (remote_ip, remote_port) = split_addr(self.flow.remote);
         let byte_ev = self.byte_evidence.clone();
         let mut field_evidence = BTreeMap::new();
+        if self.domain_evidence != self.evidence {
+            field_evidence.insert(DOMAIN_FIELD.to_owned(), self.domain_evidence.clone());
+        }
+        if let Some(grade) = &self.sni_evidence {
+            if grade != &self.evidence {
+                field_evidence.insert("sni".to_owned(), grade.clone());
+            }
+        }
         if let Some(ev) = byte_ev {
             if ev != self.evidence {
                 if self.bytes_up.is_some() {
@@ -367,7 +415,7 @@ impl FlowAcc {
             remote_port,
             domain: self.domain.clone(),
             domain_source: self.domain_source.clone(),
-            sni: self.domain.clone(),
+            sni: self.sni.clone(),
             bytes_up: self.bytes_up,
             bytes_down: self.bytes_down,
             start_ns: self.first,

@@ -11,7 +11,12 @@ export function SignIn() {
     return (
       <main className="mx-auto mt-24 max-w-md px-4">
         <h1 className="text-lg font-semibold">{t("app.name")}</h1>
-        {status === "unreachable" || status === "forbidden" || status === "failed" ? (
+        {status === "unreachable" ||
+        status === "forbidden" ||
+        status === "busy" ||
+        status === "timeout" ||
+        status === "broken" ||
+        status === "failed" ? (
           <>
             {status === "unreachable" ? (
               <>
@@ -23,6 +28,12 @@ export function SignIn() {
                 <p className="mt-3 text-sm">{t("auth.forbidden")}</p>
                 <p className="mt-1 text-xs text-ink-soft">{t("auth.forbiddenBody")}</p>
               </>
+            ) : status === "busy" ? (
+              <p className="mt-3 text-sm">{t("auth.busy")}</p>
+            ) : status === "timeout" ? (
+              <p className="mt-3 text-sm">{t("auth.timeout")}</p>
+            ) : status === "broken" ? (
+              <p className="mt-3 text-sm">{t("auth.broken", { reason: error ?? "" })}</p>
             ) : (
               <p className="mt-3 text-sm">{t("auth.daemonError", { reason: error ?? "" })}</p>
             )}

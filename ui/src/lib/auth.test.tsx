@@ -79,7 +79,7 @@ describe("desktop app entry", () => {
   it("a stopped daemon is 'service not running', with retry", async () => {
     const invoke = vi.fn().mockRejectedValue({ code: "daemon_unreachable", message: "connect failed" });
     (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = { invoke };
-    render(
+    return render(
       <I18nProvider lang="en">
         <AuthProvider>
           <Status />
@@ -97,7 +97,7 @@ describe("desktop app entry", () => {
 
   const renderDesktop = (invoke: ReturnType<typeof vi.fn>) => {
     (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = { invoke };
-    render(
+    return render(
       <I18nProvider lang="en">
         <AuthProvider>
           <Status />
@@ -116,10 +116,18 @@ describe("desktop app entry", () => {
   });
 
   it("busy / timeout / broken channel are errors, not 'not running'", async () => {
-    const invoke = vi.fn().mockRejectedValue({ code: "daemon_busy", message: "every pipe instance is busy" });
-    renderDesktop(invoke);
-    await waitFor(() => expect(screen.getByText("failed")).toBeInTheDocument());
-    expect(screen.queryByText("The AgentWatch service is not running")).toBeNull();
+    for (const [code, status] of [
+      ["daemon_busy", "busy"],
+      ["daemon_timeout", "timeout"],
+      ["channel_broken", "broken"],
+    ]) {
+      const invoke = vi.fn().mockRejectedValue({ code, message: "x" });
+      const view = renderDesktop(invoke);
+      await waitFor(() => expect(screen.getByText(status)).toBeInTheDocument());
+      expect(screen.queryByText("The AgentWatch service is not running")).toBeNull();
+      if (status === "busy") expect(screen.getByText("The AgentWatch service is busy. Retry in a moment.")).toBeInTheDocument();
+      view.unmount();
+    }
   });
 
   it("a daemon that answers with an error says so, and retry asks again", async () => {

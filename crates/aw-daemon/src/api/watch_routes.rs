@@ -229,7 +229,7 @@ fn create_inner(
             insert_session(&path, &mut target)?;
             let response = created(&target, json!({}));
             state.watch_requests.push(WatchRequest::Start {
-                target,
+                target: Box::new(target),
                 child: None,
             });
             Ok(response)
@@ -272,7 +272,7 @@ fn create_inner(
             insert_session(&path, &mut target)?;
             let response = created(&target, json!({}));
             state.watch_requests.push(WatchRequest::Start {
-                target,
+                target: Box::new(target),
                 child: Some(child),
             });
             Ok(response)
@@ -349,7 +349,7 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
         pending.target.root_pid = pid;
         let response = ApiResponse::json(200, &json!({ "id": sid, "root_pid": pid }));
         state.watch_requests.push(WatchRequest::Start {
-            target: pending.target,
+            target: Box::new(pending.target),
             child: None,
         });
         Ok(response)
@@ -421,7 +421,7 @@ pub(super) fn attach(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u
             write_session_row: false,
         };
         state.watch_requests.push(WatchRequest::Start {
-            target,
+            target: Box::new(target),
             child: None,
         });
         Ok(ApiResponse::json(

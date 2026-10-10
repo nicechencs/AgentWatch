@@ -28,7 +28,7 @@ pub(crate) const ADOPT_TIMEOUT_NS: i64 = 5_000_000_000;
 pub(crate) enum WatchRequest {
     /// Watch `target.root_pid`. `child` is set when the daemon spawned it.
     Start {
-        target: SampleTarget,
+        target: Box<SampleTarget>,
         child: Option<Child>,
     },
     /// Stop watching every root of this `sessions.id`. The row was already
@@ -97,7 +97,7 @@ impl Watches {
         }
         for request in requests {
             match request {
-                WatchRequest::Start { target, child } => self.start(target, child),
+                WatchRequest::Start { target, child } => self.start(*target, child),
                 WatchRequest::Stop { db_id } => self.stop_session(db_id),
             }
         }
@@ -145,8 +145,8 @@ impl Watches {
         }
     }
 
-    /// Number of roots being watched.
-    #[cfg(test)]
+    /// Number of roots being watched. The tests that read it are Linux-only.
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn len(&self) -> usize {
         self.running.len()
     }

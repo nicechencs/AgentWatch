@@ -1615,8 +1615,8 @@ fn list_query(raw: &str) -> Result<ListQuery, ApiResponse> {
         cursor: pairs.get("cursor").cloned(),
         q: pairs.get("q").cloned(),
         kind: pairs.get("kind").cloned(),
-        since_ns: optional_i64(&pairs, "since")?,
-        until_ns: optional_i64(&pairs, "until")?,
+        since_ns: optional_time_ns(&pairs, "since")?,
+        until_ns: optional_time_ns(&pairs, "until")?,
         agent: pairs.get("agent").cloned(),
         active_only: pairs
             .get("active")
@@ -1640,6 +1640,46 @@ fn optional_i64(
             error_response(400, "bad_argument", &format!("{key}: expected an integer"))
         }),
     }
+}
+
+/// `since` / `until`: Unix nanoseconds, or a relative `-<n><s|m|h|d>` such as
+/// `-7d` (what the UI and `aw … --since` send), measured back from now.
+fn optional_time_ns(
+    pairs: &std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> Result<Option<i64>, ApiResponse> {
+    let Some(text) = pairs.get(key).map(String::as_str).filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    if let Ok(value) = text.parse::<i64>() {
+        return Ok(Some(value));
+    }
+    let bad = || {
+        error_response(
+            400,
+            "bad_argument",
+            &format!("{key}: expected Unix nanoseconds or -<n><s|m|h|d>"),
+        )
+    };
+    let rest = text.strip_prefix('-').ok_or_else(bad)?;
+    let unit_ns: i64 = match rest.chars().last() {
+        Some('s') => 1_000_000_000,
+        Some('m') => 60_000_000_000,
+        Some('h') => 3_600_000_000_000,
+        Some('d') => 86_400_000_000_000,
+        _ => return Err(bad()),
+    };
+    let count = rest[..rest.len() - 1]
+        .parse::<i64>()
+        .ok()
+        .filter(|n| *n >= 0)
+        .ok_or_else(bad)?;
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
+        .unwrap_or(0);
+    Ok(Some(now_ns.saturating_sub(count.saturating_mul(unit_ns))))
 }
 
 fn query_pairs(raw: &str) -> std::collections::BTreeMap<String, String> {
@@ -2409,6 +2449,29 @@ mod tests {
         let other = get("/api/v1/sessions/nope/export", "format=jsonl");
         assert_eq!(other.status, 404);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn since_accepts_relative_durations() {
+        let mut pairs = std::collections::BTreeMap::new();
+        pairs.insert("since".to_owned(), "-7d".to_owned());
+        let got = super::optional_time_ns(&pairs, "since").ok().flatten();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_nanos()).ok())
+            .unwrap_or(0);
+        let week = 7 * 86_400_000_000_000_i64;
+        assert!(got.is_some_and(|v| (now - week - v).abs() < 60_000_000_000));
+        pairs.insert("since".to_owned(), "123".to_owned());
+        assert_eq!(
+            super::optional_time_ns(&pairs, "since").ok().flatten(),
+            Some(123)
+        );
+        for bad in ["7d", "-7w", "-d", "--1d", "abc"] {
+            pairs.insert("since".to_owned(), bad.to_owned());
+            assert!(super::optional_time_ns(&pairs, "since").is_err(), "{bad}");
+        }
     }
 
     #[test]

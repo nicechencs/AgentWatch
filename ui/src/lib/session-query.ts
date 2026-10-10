@@ -42,7 +42,13 @@ export function useSessionQuery(): {
 } {
   const search = useSearch({ strict: false }) as Partial<SessionQuery>;
   const router = useRouter();
-  const query: SessionQuery = { ...EMPTY_QUERY, ...search };
+  // validateSearch returns every key, unset ones as `undefined`; a plain spread
+  // would overwrite the "" defaults with undefined and crash `.trim()`.
+  const query: SessionQuery = { ...EMPTY_QUERY };
+  for (const key of Object.keys(EMPTY_QUERY) as (keyof SessionQuery)[]) {
+    const value = search[key];
+    if (typeof value === "string") query[key] = value;
+  }
   const patch = (next: Partial<SessionQuery>) => {
     const merged: Partial<SessionQuery> = { ...query, ...next };
     for (const key of Object.keys(merged) as (keyof SessionQuery)[]) {

@@ -167,7 +167,9 @@ function Disk({ stats }: { stats: { db_bytes: number; wal_bytes: number; max_db_
   return (
     <span>
       {t("sessions.diskLabel")} <Bytes value={stats.db_bytes + stats.wal_bytes} /> /{" "}
-      <Bytes value={stats.max_db_bytes} /> · {t("sessions.diskKeep", { days: stats.max_age_days })}
+      <Bytes value={stats.max_db_bytes} />
+      {/* db/stats can answer `available: false` with no numbers: never print a raw `{days}`. */}
+      {typeof stats.max_age_days === "number" ? <> · {t("sessions.diskKeep", { days: stats.max_age_days })}</> : null}
     </span>
   );
 }

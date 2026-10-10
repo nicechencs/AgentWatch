@@ -261,12 +261,37 @@ impl<C: Supervised> Supervisor<C> {
             });
         }
 
-        Ok(Self {
+        let supervisor = Self {
             slots,
             report,
             gaps: Vec::new(),
             scope: None,
-        })
+        };
+        supervisor.log_selection();
+        Ok(supervisor)
+    }
+
+    /// One line per class: which tier won, or that nobody offered it.
+    ///
+    /// The collector name and the evidence level only. A probe answer can carry
+    /// an `NA` reason string; that string is not logged, because a collector is
+    /// free to put anything in it.
+    fn log_selection(&self) {
+        for class in CapabilityClass::ALL {
+            let choice = self.report.get(class);
+            match choice.source_name() {
+                Some(source) => tracing::info!(
+                    class = class.as_str(),
+                    source,
+                    evidence = evidence_label(&choice.evidence),
+                    "collector selected"
+                ),
+                None => tracing::warn!(
+                    class = class.as_str(),
+                    "no collector offered this class"
+                ),
+            }
+        }
     }
 
     /// Report the caller stores on the session. Not written by this module.
@@ -352,6 +377,15 @@ impl<C: Supervised> Supervisor<C> {
             at_ms: now_ms,
             detail: format!("{name}: {detail}"),
         });
+        // `detail` is the collector's own message. `TickError` documents it as a
+        // redacted diagnostic, so it is safe to log; the panic path passes a
+        // fixed string instead of the panic payload.
+        tracing::warn!(
+            collector = %name,
+            failures,
+            detail,
+            "collector failed; restart gap recorded"
+        );
 
         if failures >= DEMOTE_AFTER {
             self.demote(index, now_ms);
@@ -397,7 +431,13 @@ impl<C: Supervised> Supervisor<C> {
         } else {
             format!("demoted to {}", landed.join(","))
         };
-        self.push_unsupported(name, classes, now_ms, &detail);
+        self.push_unsupported(name.clone(), classes, now_ms, &detail);
+        tracing::warn!(
+            collector = %name,
+            failures = DEMOTE_AFTER,
+            detail = %detail,
+            "collector demoted after repeated failures"
+        );
     }
 
     /// First supervised tier after `from` whose probe offers `class`.
@@ -466,6 +506,19 @@ fn class_names(classes: &[CapabilityClass]) -> Vec<String> {
 
 fn missing_row() -> SupervisorError {
     SupervisorError::Report(ReportError::SourceWithoutEvidence)
+}
+
+/// Short evidence label for a log line. `NA` is not given its reason: the reason
+/// enum's `Debug` form is stable, but logging only the level keeps the line short.
+fn evidence_label(evidence: &Evidence) -> &'static str {
+    match evidence {
+        Evidence::E1 => "E1",
+        Evidence::E2 => "E2",
+        Evidence::E3 => "E3",
+        Evidence::S => "S",
+        Evidence::I => "I",
+        Evidence::NA(_) => "NA",
+    }
 }
 
 #[cfg(test)]

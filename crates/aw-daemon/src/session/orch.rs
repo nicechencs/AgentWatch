@@ -78,6 +78,19 @@ pub enum SessionStatus {
     Failed,
 }
 
+impl SessionStatus {
+    /// Storage-style label. Not a sentence.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AwaitingAdopt => "awaiting_adopt",
+            Self::Running => "running",
+            Self::Ended => "ended",
+            Self::Interrupted => "interrupted",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// Counts written when a session ends. Absence is `None`, never `0`-as-unknown:
 /// these counters are observations this process made, so zero is a real zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +354,8 @@ impl<S: ScopeProvider, K: SessionSink> SessionOrchestrator<S, K> {
             other_events: 0,
         };
         self.sessions.insert(id.0, live);
+        // The ticket is the credential the CLI uses to adopt. It is not logged.
+        tracing::info!(session = id.0, mode = "run", "session prepared");
         Ok(StartedRun {
             session: id,
             ticket: prepared.ticket,
@@ -413,6 +428,7 @@ impl<S: ScopeProvider, K: SessionSink> SessionOrchestrator<S, K> {
             });
         }
         self.watch(id, req.pid);
+        tracing::info!(session = id.0, pid = req.pid, "session adopted");
         Ok(Adopted {
             uid,
             pid: adopted.pid,
@@ -460,6 +476,7 @@ impl<S: ScopeProvider, K: SessionSink> SessionOrchestrator<S, K> {
         self.ingest_snapshot(id, &attached.members, follow)?;
         let again = self.provider.rescan(id, root_pid)?;
         self.ingest_snapshot(id, &again, follow)?;
+        tracing::info!(session = id.0, pid = root_pid, mode = "attach", "session attached");
         Ok(self.live(id)?.record.clone())
     }
 
@@ -663,6 +680,15 @@ impl<S: ScopeProvider, K: SessionSink> SessionOrchestrator<S, K> {
         live.record.status = status;
         live.record.ended_ns = Some(ended_ns);
         live.record.end_reason = Some(reason);
+        // Counts only. The summary has no paths, argv, or event content.
+        tracing::info!(
+            session = id.0,
+            reason = reason.as_str(),
+            status = status.as_str(),
+            process_starts = summary.process_starts,
+            other_events = summary.other_events,
+            "session ended"
+        );
         live.record.summary = Some(summary);
         Ok(live.record.clone())
     }

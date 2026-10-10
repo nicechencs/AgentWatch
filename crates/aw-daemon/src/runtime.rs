@@ -282,13 +282,28 @@ impl RollingFile {
 }
 
 /// tracing subscriber that writes one sanitized line per event.
+///
+/// `max_level` is inclusive. The default is [`Level::DEBUG`]: coding-conventions
+/// §2 assigns queue depth and batch timing to `debug`, and those lines are only
+/// useful if they reach the file. `trace` stays off unless a caller asks for it,
+/// matching the "trace is compiled out of release" rule.
 struct FileSubscriber {
     writer: Mutex<RollingFile>,
+    max_level: Level,
+}
+
+impl FileSubscriber {
+    fn new(writer: RollingFile) -> Self {
+        Self {
+            writer: Mutex::new(writer),
+            max_level: Level::DEBUG,
+        }
+    }
 }
 
 impl Subscriber for FileSubscriber {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.level() <= &Level::INFO
+        metadata.level() <= &self.max_level
     }
 
     fn new_span(&self, _span: &Attributes<'_>) -> Id {
@@ -387,6 +402,20 @@ fn is_sensitive_field(name: &str) -> bool {
         || lower.contains("header")
         || lower.contains("authorization")
         || lower.contains("cookie")
+        // A raw event, a request or response body, or a file path can carry the
+        // content ADR-0012 forbids persisting. Match the field name so a future
+        // `tracing::debug!(event = ?raw, ...)` cannot render it.
+        || lower == "body"
+        || lower.contains("payload")
+        || lower.contains("content")
+        || lower == "event"
+        || lower == "raw_event"
+        || lower == "cmdline"
+        || lower == "command"
+        || lower == "path"
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
 }
 
 /// Shared stop flag. The stop file and a test can both set it.
@@ -459,6 +488,8 @@ pub fn run_foreground(
     let lock = InstanceLock::acquire(&data_dir)?;
     init_logging(&data_dir)?;
 
+    // The directory is recorded, but not as a field named `path`: the subscriber
+    // redacts that name because file paths in events can be sensitive.
     tracing::info!(
         data_dir = %data_dir.display(),
         "agentwatchd foreground started"
@@ -587,9 +618,7 @@ fn config_snapshot(config: &DaemonConfig) -> serde_json::Value {
 /// already has a global subscriber.
 pub fn init_logging(data_dir: &Path) -> Result<(), RuntimeError> {
     let rolling = RollingFile::open(data_dir, LOG_MAX_BYTES, LOG_KEEP)?;
-    let subscriber = FileSubscriber {
-        writer: Mutex::new(rolling),
-    };
+    let subscriber = FileSubscriber::new(rolling);
     tracing::subscriber::set_global_default(subscriber).map_err(|err| RuntimeError::Log {
         path: data_dir.join(LOG_FILE_NAME),
         source: io::Error::other(err.to_string()),
@@ -629,7 +658,39 @@ pub fn signal_stop(data_dir: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{core_dump_guard_status, InstanceLock, RollingFile, RuntimeError, LOG_MAX_BYTES};
+    use super::{
+        core_dump_guard_status, is_sensitive_field, InstanceLock, RollingFile, RuntimeError,
+        LOG_MAX_BYTES,
+    };
+
+    #[test]
+    fn sensitive_names_cover_content_and_credentials() {
+        for name in [
+            "argv",
+            "env",
+            "url",
+            "headers",
+            "authorization",
+            "cookie",
+            "body",
+            "payload",
+            "content",
+            "event",
+            "raw_event",
+            "cmdline",
+            "command",
+            "path",
+            "token",
+            "secret",
+            "password",
+        ] {
+            assert!(is_sensitive_field(name), "{name} must be redacted");
+        }
+        // Names the lifecycle logs actually use must survive.
+        for name in ["session", "pid", "status", "reason", "collector", "detail", "route"] {
+            assert!(!is_sensitive_field(name), "{name} must stay visible");
+        }
+    }
 
     #[test]
     fn core_dump_status_admits_it_is_not_implemented() {

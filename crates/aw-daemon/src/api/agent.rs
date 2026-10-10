@@ -357,16 +357,23 @@ fn accept_loop(listener: TcpListener, shared: Arc<Mutex<OtlpShared>>, stop: Arc<
         match listener.accept() {
             Ok((stream, peer)) => {
                 if !peer.ip().is_loopback() {
+                    tracing::warn!(target: "aw_daemon::otlp", "rejected non-loopback peer");
                     drop(stream);
                     continue;
                 }
                 let shared = Arc::clone(&shared);
-                let _ = thread::Builder::new().name("aw-otlp-conn".to_owned()).spawn(move || {
-                    if let Err(err) = serve_conn(stream, &shared) {
-                        // Status only. The error is an I/O kind, not a body.
-                        tracing::debug!(target: "aw_daemon::otlp", error = %err, "connection closed");
-                    }
-                });
+                if thread::Builder::new()
+                    .name("aw-otlp-conn".to_owned())
+                    .spawn(move || {
+                        if let Err(err) = serve_conn(stream, &shared) {
+                            // Status only. The error is an I/O kind, not a body.
+                            tracing::debug!(target: "aw_daemon::otlp", error = %err, "connection closed");
+                        }
+                    })
+                    .is_err()
+                {
+                    tracing::warn!(target: "aw_daemon::otlp", "connection thread not started");
+                }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
@@ -395,14 +402,27 @@ fn serve_conn(mut stream: TcpStream, shared: &Mutex<OtlpShared>) -> std::io::Res
         }
     };
     let status = handle(&request, shared);
-    // Method, path, status. Never the body: an OTLP log can carry a prompt.
-    tracing::debug!(
-        target: "aw_daemon::otlp",
-        method = %request.method,
-        path = %request.path,
-        status = status,
-        "otlp"
-    );
+    // Method, route, status. Never the body: an OTLP log can carry a prompt.
+    // The path is collapsed the same way as the HTTP API so a token in a segment
+    // does not reach the file.
+    let route = crate::api::http::log_route(&request.path);
+    if status >= 400 {
+        tracing::warn!(
+            target: "aw_daemon::otlp",
+            method = %request.method,
+            route = %route,
+            status = status,
+            "otlp rejected"
+        );
+    } else {
+        tracing::debug!(
+            target: "aw_daemon::otlp",
+            method = %request.method,
+            route = %route,
+            status = status,
+            "otlp"
+        );
+    }
     write_status(&mut stream, status, reason(status))
 }
 

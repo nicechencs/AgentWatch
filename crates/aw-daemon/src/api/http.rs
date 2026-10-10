@@ -90,18 +90,24 @@ fn accept_loop(listener: TcpListener, state: ApiState, stop: Arc<AtomicBool>, po
         match listener.accept() {
             Ok((stream, peer)) => {
                 if !peer.ip().is_loopback() {
-                    // Bound to localhost, so this is unexpected. Drop it.
+                    // Bound to localhost, so this is unexpected. Drop it and say
+                    // so: a non-loopback peer means the bind guarantee failed.
+                    tracing::warn!(target: "aw_daemon::http", "rejected non-loopback peer");
                     drop(stream);
                     continue;
                 }
                 let state = Arc::clone(&state);
-                let _ = thread::Builder::new().name("aw-http-conn".to_owned()).spawn(
-                    move || {
+                if thread::Builder::new()
+                    .name("aw-http-conn".to_owned())
+                    .spawn(move || {
                         if let Err(err) = serve_conn(stream, &state, port) {
                             tracing::debug!(target: "aw_daemon::http", error = %err, "connection closed");
                         }
-                    },
-                );
+                    })
+                    .is_err()
+                {
+                    tracing::warn!(target: "aw_daemon::http", "connection thread not started");
+                }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
@@ -160,15 +166,55 @@ fn serve_conn(
         };
         dispatch(&mut guard, &request)
     };
-    // Method + path + status only. Never the Authorization header or the body.
-    tracing::debug!(
-        target: "aw_daemon::http",
-        method = %request.method,
-        path = %request.path,
-        status = response.status,
-        "request"
-    );
+    // Method + route + status only. The raw path is not logged: a query string
+    // was split off, but a path segment can still carry a token or a ticket.
+    // 4xx/5xx are a degradation the operator should see without debug logging;
+    // successful requests stay at debug so the file is not one line per poll.
+    let route = log_route(&request.path);
+    if response.status >= 400 {
+        tracing::warn!(
+            target: "aw_daemon::http",
+            method = %request.method,
+            route = %route,
+            status = response.status,
+            "request rejected"
+        );
+    } else {
+        tracing::debug!(
+            target: "aw_daemon::http",
+            method = %request.method,
+            route = %route,
+            status = response.status,
+            "request"
+        );
+    }
     write_response(&mut stream, &response)
+}
+
+/// Collapse a request path to its route shape.
+///
+/// Numeric segments and long opaque segments become `*`, so a session id or a
+/// ticket in the path is not written to the log. The query string never reaches
+/// here.
+pub(crate) fn log_route(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            out.push('/');
+        }
+        if segment.is_empty() {
+            continue;
+        }
+        let opaque = segment.chars().all(|ch| ch.is_ascii_digit())
+            || segment.len() > 16
+            || segment.chars().any(|ch| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
+        if opaque {
+            out.push('*');
+        } else {
+            out.push_str(segment);
+        }
+    }
+    if out.is_empty() { "/".to_owned() } else { out }
 }
 
 fn content_length(buf: &[u8]) -> Option<usize> {

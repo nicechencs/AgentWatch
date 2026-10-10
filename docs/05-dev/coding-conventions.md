@@ -1,7 +1,7 @@
 # 编码规范与 AI 协作约定
 
 > 状态：草案
-> 最后更新：2026-10-06
+> 最后更新：2026-10-10
 > 关联：NFR-07、REQ-06、REQ-07、[ADR-0004](../03-adr/0004-evidence-levels.md)、[ADR-0012](../03-adr/0012-no-content-redact-before-write.md)、[evidence-model](../01-architecture/evidence-model.md)、[AGENTS.md](../../AGENTS.md)
 
 ## 1. 错误处理
@@ -27,6 +27,16 @@
 - **禁止在任何级别的日志中输出未脱敏数据**：命令行、环境变量、URL、HTTP 头、文件内容。需要打印事件时只打印已通过 Redact 阶段的记录，或只打印 `seq`、`kind`、`proc.uid`。
 - 用于日志的类型实现 `Debug` 时，含敏感字段的结构体要手写 `Debug`（或用 `#[debug(skip)]` 类宏），避免 `{:?}` 泄露原始值。
 - daemon 日志轮转：单文件 10 MB、保留 5 个。
+
+### 2.1 daemon 日志的落地
+
+`aw-daemon` 自己实现 `tracing` 订阅器（`runtime.rs`），不引入 `tracing-subscriber`。约定：
+
+- 写入门槛是 `debug`（含）。`trace` 仍然默认不落盘，与上面“默认编译移除”一致。
+- 脱敏按**字段名**拦截，不靠事后扫描文本。命中的字段只记录长度（`Debug` 格式化的值连长度都不取，避免渲染原始值）：`argv`、`env`、`url`、`header`、`authorization`、`cookie`、`body`、`payload`、`content`、`event`、`raw_event`、`cmdline`、`command`、`path`、`token`、`secret`、`password`。因此日志字段不要用这些名字承载需要可见的值。
+- HTTP 与 OTLP 访问日志只记录方法、折叠后的路由和状态码。路径中的数字段、超过 16 字符的段和非字母数字段折叠为 `*`，查询串不记录。4xx/5xx 记 `warn`，成功请求记 `debug`。
+- 必须有日志的生命周期点：daemon 启动与三步关闭、采集器选型结果、采集器失败与降级、会话的准备 / 收养 / 附着 / 结束。会话日志只含会话号、pid、结束原因和计数，不含 ticket。
+- 非回环对端的连接、以及无法创建的连接线程，记 `warn` 后丢弃，不静默。
 
 ## 3. unsafe 与 FFI
 

@@ -12,8 +12,15 @@
 //!   `LOCAL_PEERCRED` uid) through `nix`. No `unsafe` in this crate. uid 0 is
 //!   an administrator. A peer whose uid cannot be read is [`UNVERIFIED_PEER`],
 //!   never an administrator.
-//! - The socket is mode 0660. When a group named [`SOCKET_GROUP`] exists, the
-//!   socket's group is set to it, so members can connect without root.
+//! - When a group named [`SOCKET_GROUP`] exists, the socket is
+//!   `root:agentwatch 0660`: members connect without root. Without the group
+//!   it is 0666: any local account may connect and is identified by uid (an
+//!   ordinary user sees only their own sessions; control needs root or the
+//!   daemon's uid). A root daemon is therefore always reachable by the
+//!   unprivileged desktop app.
+//! - A daemon that may not create the system socket (not root) binds the
+//!   per-user socket instead (`aw_channel::user_path`); `aw` and the app look
+//!   there second.
 //! - Windows: named pipe `\\.\pipe\agentwatch-api` (tokio). The pipe carries an
 //!   explicit DACL (`aw_collector_windows::pipe`): LocalSystem and
 //!   Administrators full control; `AgentWatch Users` when that group exists,
@@ -35,27 +42,44 @@ use std::sync::{Arc, Mutex};
 use super::control::Control;
 use super::routes::ApiState;
 
-/// Environment variable that overrides the socket path for both `agentwatchd`
-/// and `aw`. Empty is the same as unset.
-pub const AW_SOCKET: &str = "AW_SOCKET";
+/// Environment variable that overrides the socket path for `agentwatchd`,
+/// `aw`, and the desktop app. Empty is the same as unset.
+pub const AW_SOCKET: &str = aw_channel::AW_SOCKET;
 
 /// Linux socket (api-and-cli §1).
-pub const LINUX_SOCKET: &str = "/run/agentwatch/api.sock";
+pub const LINUX_SOCKET: &str = aw_channel::LINUX_SOCKET;
 
 /// macOS socket (api-and-cli §1).
-pub const MACOS_SOCKET: &str = "/var/run/agentwatch/api.sock";
+pub const MACOS_SOCKET: &str = aw_channel::MACOS_SOCKET;
 
 /// Windows named pipe (api-and-cli §1).
-pub const WINDOWS_PIPE: &str = r"\\.\pipe\agentwatch-api";
+pub const WINDOWS_PIPE: &str = aw_channel::WINDOWS_PIPE;
 
 /// `user_id` given to a peer whose uid could not be read. Not an administrator.
 pub const UNVERIFIED_PEER: &str = "unverified-peer";
 
-/// Socket mode. Owner and the `agentwatch` group may connect.
+/// Socket mode when the [`SOCKET_GROUP`] group exists: owner and members.
 pub const SOCKET_MODE: u32 = 0o660;
 
+/// Socket mode without that group. Any local account may connect; the peer
+/// uid is still read on every request, an ordinary user sees only their own
+/// sessions, and daemon control needs root or the daemon's own uid. Without
+/// this a root daemon's socket (root:root 0660) would shut out the
+/// unprivileged desktop app entirely.
+pub const OPEN_SOCKET_MODE: u32 = 0o666;
+
+/// Mode for the socket given whether the group was applied. Pure.
+#[must_use]
+pub fn socket_mode(grouped: bool) -> u32 {
+    if grouped {
+        SOCKET_MODE
+    } else {
+        OPEN_SOCKET_MODE
+    }
+}
+
 /// Where the daemon listens: [`AW_SOCKET`] when set, else the platform path.
-/// `None` on a platform with no Unix socket channel.
+/// `None` on a platform with no channel.
 #[must_use]
 pub fn socket_path() -> Option<PathBuf> {
     socket_path_from(std::env::var(AW_SOCKET).ok())
@@ -65,15 +89,32 @@ fn socket_path_from(env: Option<String>) -> Option<PathBuf> {
     if let Some(value) = env.filter(|value| !value.trim().is_empty()) {
         return Some(PathBuf::from(value.trim()));
     }
-    if cfg!(target_os = "linux") {
-        Some(PathBuf::from(LINUX_SOCKET))
-    } else if cfg!(target_os = "macos") {
-        Some(PathBuf::from(MACOS_SOCKET))
-    } else if cfg!(windows) {
-        Some(PathBuf::from(WINDOWS_PIPE))
-    } else {
-        None
+    aw_channel::system_path()
+}
+
+/// Per-user socket an unprivileged daemon binds when it may not create the
+/// system one. `None` with [`AW_SOCKET`] set (that path is final), on
+/// Windows, and without `HOME` / `XDG_RUNTIME_DIR`. Clients look here second
+/// (aw-channel), so `aw` and the app find it without configuration.
+#[must_use]
+pub fn fallback_socket_path() -> Option<PathBuf> {
+    if std::env::var(AW_SOCKET).is_ok_and(|v| !v.trim().is_empty()) {
+        return None;
     }
+    aw_channel::user_path(&|key| std::env::var(key).ok())
+}
+
+/// Whether a bind error on the system path should fall back to the per-user
+/// path: the daemon may not create the directory or file. A live daemon
+/// (`AddrInUse`) is not a reason to fall back.
+#[must_use]
+pub fn should_fall_back(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::ReadOnlyFilesystem
+    )
 }
 
 /// Shared API state. The loopback HTTP listener holds the same handle, so a
@@ -93,11 +134,14 @@ fn answer(
     if let Some(reply) = super::control::handle(control, request, caller) {
         return reply;
     }
-    let mut guard = match state.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let reply = {
+        let mut guard = match state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        super::routes::dispatch_peer(&mut guard, request, caller)
     };
-    super::routes::dispatch_peer(&mut guard, request, caller)
+    super::control::decorate(control, request, reply)
 }
 
 #[cfg(unix)]
@@ -118,7 +162,7 @@ mod unix {
     use super::super::auth::Caller;
     use super::super::http::{parse_request, write_response};
     use super::super::routes::error_response;
-    use super::{answer, Control, SharedState, SOCKET_GROUP, SOCKET_MODE, UNVERIFIED_PEER};
+    use super::{answer, socket_mode, Control, SharedState, SOCKET_GROUP, UNVERIFIED_PEER};
 
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const MAX_REQUEST: usize = 80 * 1024;
@@ -141,8 +185,14 @@ mod unix {
         /// (`AddrInUse`), bind, or chmod failure.
         pub fn bind(path: &Path, state: SharedState, control: Arc<Control>) -> io::Result<Self> {
             if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
+                if !parent.as_os_str().is_empty() && !parent.exists() {
                     fs::create_dir_all(parent)?;
+                    // A directory this daemon created is its own and not
+                    // writable by others, so nobody can swap the socket.
+                    // 0750 with the `agentwatch` group, else 0755.
+                    let grouped = set_group(parent);
+                    let dir_mode = if grouped { 0o750 } else { 0o755 };
+                    let _ = fs::set_permissions(parent, fs::Permissions::from_mode(dir_mode));
                 }
             }
             if path.exists() {
@@ -155,8 +205,8 @@ mod unix {
                 fs::remove_file(path)?;
             }
             let listener = UnixListener::bind(path)?;
-            fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))?;
-            set_group(path);
+            let grouped = set_group(path);
+            fs::set_permissions(path, fs::Permissions::from_mode(socket_mode(grouped)))?;
             listener.set_nonblocking(true)?;
             let stop = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&stop);
@@ -188,18 +238,23 @@ mod unix {
 
     /// Give the socket to [`SOCKET_GROUP`] when that group exists. Failure
     /// (an unprivileged daemon cannot chown to a group it is not in) is logged;
-    /// the socket stays usable by its owner.
-    fn set_group(path: &Path) {
+    /// the socket is then opened to every local account instead (see
+    /// [`super::OPEN_SOCKET_MODE`]). `true` when the group was applied.
+    fn set_group(path: &Path) -> bool {
         let gid = match nix::unistd::Group::from_name(SOCKET_GROUP) {
             Ok(Some(group)) => group.gid.as_raw(),
-            Ok(None) => return,
+            Ok(None) => return false,
             Err(err) => {
                 tracing::debug!(target: "aw_daemon::ipc", error = %err, "group lookup failed");
-                return;
+                return false;
             }
         };
-        if let Err(err) = std::os::unix::fs::chown(path, None, Some(gid)) {
-            tracing::warn!(target: "aw_daemon::ipc", error = %err, gid, "socket group not set");
+        match std::os::unix::fs::chown(path, None, Some(gid)) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(target: "aw_daemon::ipc", error = %err, gid, "socket group not set");
+                false
+            }
         }
     }
 
@@ -296,15 +351,19 @@ mod unix {
             }
         };
         let response = answer(state, control, &request, &caller);
-        let route = super::super::http::log_route(&request.path);
-        tracing::debug!(
-            target: "aw_daemon::ipc",
-            method = %request.method,
-            route = %route,
-            status = response.status,
-            admin = caller.admin,
-            "request"
-        );
+        // `aw daemon logs -f` polls twice a second; logging those reads
+        // would feed the log it is following.
+        if request.path != super::super::control::LOGS_PATH {
+            let route = super::super::http::log_route(&request.path);
+            tracing::debug!(
+                target: "aw_daemon::ipc",
+                method = %request.method,
+                route = %route,
+                status = response.status,
+                admin = caller.admin,
+                "request"
+            );
+        }
         write_response(&mut stream, &response)
     }
 }
@@ -328,6 +387,8 @@ mod pipe {
     use super::{answer, Control, SharedState};
 
     const MAX_REQUEST: usize = 80 * 1024;
+    /// A client that has not finished its exchange in this time is dropped.
+    const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// A running named-pipe listener.
     pub struct IpcServer {
@@ -399,18 +460,26 @@ mod pipe {
                 tracing::warn!(target: "aw_daemon::ipc", error = %err, "pipe connect failed");
                 continue;
             }
-            let next = match create_server(&name, false, &sddl) {
-                Ok(next) => next,
-                Err(err) => {
-                    tracing::warn!(target: "aw_daemon::ipc", error = %err, "next pipe instance not created");
-                    return;
+            // A failed instance create is retried, never the end of the
+            // listener: the connected client is still served below.
+            let next = loop {
+                match create_server(&name, false, &sddl) {
+                    Ok(next) => break next,
+                    Err(err) => {
+                        tracing::warn!(target: "aw_daemon::ipc", error = %err, "next pipe instance not created; retrying");
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
                 }
             };
             let client = std::mem::replace(&mut server, next);
             let state = Arc::clone(&state);
             let control = Arc::clone(&control);
             tokio::spawn(async move {
-                if let Err(err) = serve(client, &state, &control).await {
+                let served = tokio::time::timeout(IO_TIMEOUT, serve(client, state, control)).await;
+                if let Ok(Err(err)) = served {
                     tracing::debug!(target: "aw_daemon::ipc", error = %err, "pipe connection closed");
                 }
             });
@@ -419,8 +488,8 @@ mod pipe {
 
     async fn serve(
         pipe: NamedPipeServer,
-        state: &SharedState,
-        control: &Control,
+        state: SharedState,
+        control: Arc<Control>,
     ) -> io::Result<()> {
         let caller = match client_identity(&pipe) {
             Ok(client) => Caller {
@@ -462,7 +531,12 @@ mod pipe {
                 Err(err) => return Err(err),
             }
         };
-        let response = answer(state, control, &request, &caller);
+        // Routes are synchronous (SQLite); off the runtime thread so one slow
+        // request (a large export) does not stall every other pipe client.
+        let response =
+            tokio::task::spawn_blocking(move || answer(&state, &control, &request, &caller))
+                .await
+                .unwrap_or_else(|_| error_response(500, "internal", "request handler failed"));
         write_all(&pipe, &response_bytes(&response)).await?;
         pipe.disconnect()
     }
@@ -531,7 +605,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::super::routes::{dispatch, ApiState, HttpRequest};
-    use super::{socket_path_from, Control, IpcServer, SOCKET_MODE};
+    use super::{socket_path_from, Control, IpcServer, OPEN_SOCKET_MODE, SOCKET_MODE};
 
     fn temp_socket(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("aw-ipc-{}-{name}", std::process::id()));
@@ -558,6 +632,12 @@ mod tests {
 
     #[test]
     fn env_override_wins_and_blank_is_unset() {
+        assert!(super::should_fall_back(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!super::should_fall_back(&std::io::Error::from(
+            std::io::ErrorKind::AddrInUse
+        )));
         assert_eq!(
             socket_path_from(Some("/tmp/x.sock".to_owned())),
             Some(PathBuf::from("/tmp/x.sock"))
@@ -569,12 +649,28 @@ mod tests {
     }
 
     #[test]
-    fn socket_serves_health_and_mode_is_0660() {
+    fn socket_serves_health_and_mode_follows_the_group() {
         let path = temp_socket("health");
         let state = Arc::new(Mutex::new(ApiState::default()));
         let mut server = IpcServer::bind(&path, state, Control::new(None)).expect("bind");
         let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
-        assert_eq!(mode, SOCKET_MODE);
+        // No `agentwatch` group on a test machine: open to local accounts.
+        // With the group it is 0660 and the group is `agentwatch`.
+        let grouped = nix::unistd::Group::from_name(super::SOCKET_GROUP)
+            .ok()
+            .flatten()
+            .is_some_and(|g| {
+                std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(&path).expect("meta"))
+                    == g.gid.as_raw()
+            });
+        assert_eq!(
+            mode,
+            if grouped {
+                SOCKET_MODE
+            } else {
+                OPEN_SOCKET_MODE
+            }
+        );
         let (status, body) = exchange(&path, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
         assert_eq!(status, 200);
         assert_eq!(body["status"], "ok");
@@ -658,5 +754,86 @@ mod tests {
         );
         assert_eq!(status, 202, "{body}");
         assert!(control.stop_requested());
+    }
+}
+
+/// Real named-pipe runs (R1). They create a private pipe name, start the
+/// listener with the AgentWatch DACL, and dial it with `aw_channel` — the
+/// client `aw` (cmd → client.rs → aw_channel) and the desktop app
+/// (app/src-tauri → aw_channel) both use.
+#[cfg(all(test, windows))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod pipe_tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use super::super::routes::ApiState;
+    use super::{Control, IpcServer};
+
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn pipe_name() -> PathBuf {
+        PathBuf::from(format!(
+            r"\\.\pipe\agentwatch-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+
+    fn call(path: &std::path::Path, method: &str, target: &str) -> (u16, serde_json::Value) {
+        let body: &[u8] = if method == "POST" { b"{}" } else { b"" };
+        let request = aw_channel::encode_request(method, target, "application/json", body);
+        let reply = aw_channel::exchange(path, &request, aw_channel::TIMEOUT).expect("exchange");
+        let json = serde_json::from_slice(&reply.body).unwrap_or(serde_json::Value::Null);
+        (reply.status, json)
+    }
+
+    #[test]
+    fn pipe_serves_health_and_a_ticket_to_the_shared_client() {
+        let path = pipe_name();
+        let state = Arc::new(Mutex::new(ApiState::default()));
+        let control = Control::new(None);
+        control.set_http_port(7456);
+        let mut server = IpcServer::bind(&path, state, Arc::clone(&control)).expect("bind pipe");
+
+        let (status, body) = call(&path, "GET", "/health");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["status"], "ok");
+
+        // Several in a row: each connection needs a fresh instance.
+        for _ in 0..3 {
+            let (status, body) = call(&path, "POST", "/api/v1/auth/ui-ticket");
+            assert_eq!(status, 200, "{body}");
+            assert!(!body["ticket"].as_str().unwrap_or("").is_empty(), "{body}");
+            assert_eq!(body["http_port"], 7456);
+        }
+
+        // The caller is identified from its token, not assumed.
+        let (status, me) = call(&path, "GET", "/api/v1/me");
+        assert_eq!(status, 200, "{me}");
+        let sid = me["user_id"].as_str().unwrap_or("");
+        assert!(sid.starts_with("S-1-"), "{me}");
+        assert_eq!(
+            me["admin"].as_bool(),
+            Some(aw_collector_windows::privilege::is_privileged().unwrap_or(false)),
+            "admin follows the caller's elevation: {me}"
+        );
+        server.shutdown();
+    }
+
+    #[test]
+    fn missing_pipe_is_unreachable() {
+        let request = aw_channel::encode_request("GET", "/health", "*/*", b"");
+        let err = aw_channel::exchange(&pipe_name(), &request, aw_channel::TIMEOUT).unwrap_err();
+        assert_eq!(err.code(), "daemon_unreachable", "{err}");
+    }
+
+    #[test]
+    fn second_daemon_cannot_take_the_pipe() {
+        let path = pipe_name();
+        let state = Arc::new(Mutex::new(ApiState::default()));
+        let _first = IpcServer::bind(&path, Arc::clone(&state), Control::new(None)).expect("bind");
+        assert!(IpcServer::bind(&path, state, Control::new(None)).is_err());
     }
 }

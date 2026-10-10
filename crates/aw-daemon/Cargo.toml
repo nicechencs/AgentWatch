@@ -17,6 +17,8 @@ aw-store = { workspace = true }
 aw-proxy = { workspace = true }
 aw-agent-adapters = { workspace = true }
 aw-collector-poll = { workspace = true }
+# Socket path order shared with aw and the desktop app (std only).
+aw-channel = { workspace = true }
 aw-collector-linux = { workspace = true }
 aw-collector-windows = { workspace = true }
 aw-collector-macos = { workspace = true }

@@ -35,7 +35,10 @@ use tracing::{Event, Level, Subscriber};
 use tracing_core::span::{Attributes, Id, Record};
 use tracing_core::Metadata;
 
-use crate::api::{socket_path, ApiState, Control, HttpServer, IpcServer, OtlpRegistry, StoreQuery};
+use crate::api::{
+    fallback_socket_path, should_fall_back, socket_path, ApiState, Control, HttpServer, IpcServer,
+    OtlpRegistry, StoreQuery,
+};
 use crate::config::{resolve_data_dir, ConfigWarning, DaemonConfig};
 use crate::paths::ensure_data_dir;
 use crate::sample::HostSampler;
@@ -556,7 +559,8 @@ pub fn run_foreground(
     let shared = Arc::new(Mutex::new(foreground_api(config, &data_dir)));
     // `aw daemon stop` / `logs` arrive on the internal channel (api/control.rs).
     let control = Control::new(Some(data_dir.join(LOG_FILE_NAME)));
-    let mut ipc = start_ipc(&shared, &control);
+    // HTTP first, so the port it really bound is known before the channel
+    // hands out the first UI ticket.
     let mut http = if http_port == 0 {
         tracing::info!("http listener disabled (api.http_port = 0)");
         None
@@ -564,6 +568,7 @@ pub fn run_foreground(
         match HttpServer::bind_shared(http_port, Arc::clone(&shared)) {
             Ok(server) => {
                 tracing::info!(port = server.addr.port(), "http listener started");
+                control.set_http_port(server.addr.port());
                 Some(server)
             }
             Err(err) => {
@@ -572,6 +577,7 @@ pub fn run_foreground(
             }
         }
     };
+    let mut ipc = start_ipc(&shared, &control);
 
     // Poll only. No ETW, eBPF, or eslogger. The sampler attaches to pid 1 so
     // the host source refreshes the process table; launch scope would not.
@@ -627,16 +633,30 @@ fn start_ipc(state: &Arc<Mutex<ApiState>>, control: &Arc<Control>) -> Option<Ipc
         tracing::warn!("internal channel not started: no socket path on this platform");
         return None;
     };
-    match IpcServer::bind(&path, Arc::clone(state), Arc::clone(control)) {
+    let err = match IpcServer::bind(&path, Arc::clone(state), Arc::clone(control)) {
         Ok(server) => {
             tracing::info!(socket = %server.path.display(), "internal channel started");
-            Some(server)
+            return Some(server);
         }
-        Err(err) => {
-            tracing::warn!(error = %err, "internal channel not started");
-            None
+        Err(err) => err,
+    };
+    // An unprivileged daemon cannot create /run/agentwatch: use the per-user
+    // socket, which aw and the desktop app look at second.
+    if let Some(fallback) = fallback_socket_path().filter(|_| should_fall_back(&err)) {
+        tracing::info!(system = %path.display(), error = %err, "system socket not available; using the per-user socket");
+        match IpcServer::bind(&fallback, Arc::clone(state), Arc::clone(control)) {
+            Ok(server) => {
+                tracing::info!(socket = %server.path.display(), "internal channel started (per-user)");
+                return Some(server);
+            }
+            Err(err) => {
+                tracing::warn!(socket = %fallback.display(), error = %err, "internal channel not started");
+                return None;
+            }
         }
     }
+    tracing::warn!(socket = %path.display(), error = %err, "internal channel not started");
+    None
 }
 
 /// API state for the foreground listener: the data-dir database, the loaded

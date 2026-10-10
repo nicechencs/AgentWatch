@@ -5,7 +5,8 @@
 //! explicit DACL instead of the default one (which only lets LocalSystem,
 //! Administrators, and the creator write):
 //!
-//! - LocalSystem and Administrators: full control.
+//! - LocalSystem and Administrators: full control; the pipe's owner (the
+//!   daemon's own account) too, through `OW`.
 //! - `AgentWatch Users` (when that local group exists), otherwise the
 //!   interactive users (`IU`): read and write, but **not**
 //!   `FILE_CREATE_PIPE_INSTANCE`, so an ordinary user cannot add a rogue
@@ -37,7 +38,10 @@ pub const CLIENT_RIGHTS: u32 = 0x0012_019B;
 #[must_use]
 pub fn sddl_for(group_sid: Option<&str>) -> String {
     let clients = group_sid.filter(|sid| is_sid_text(sid)).unwrap_or("IU");
-    format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x{CLIENT_RIGHTS:x};;;{clients})")
+    // OW (owner rights): the account that created the pipe keeps full
+    // control, so an unprivileged development daemon can still add the next
+    // instance even though `clients` may not.
+    format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x{CLIENT_RIGHTS:x};;;{clients})")
 }
 
 /// `S-1-…` with digits and dashes only, so a SID cannot inject SDDL.
@@ -274,7 +278,10 @@ mod tests {
     #[test]
     fn fallback_grants_interactive_users_without_create_instance() {
         let sddl = sddl_for(None);
-        assert_eq!(sddl, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019b;;;IU)");
+        assert_eq!(
+            sddl,
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x12019b;;;IU)"
+        );
         // FILE_APPEND_DATA (= FILE_CREATE_PIPE_INSTANCE) is not granted.
         assert_eq!(CLIENT_RIGHTS & 0x4, 0);
         // Read and write data are.

@@ -15,6 +15,7 @@ import { NotCollected } from "@/components/NotCollected";
 import { coverage } from "@/lib/capabilities";
 import { diskUnavailableText, diskUsed } from "@/lib/disk";
 import { sessionTitle } from "@/lib/session-title";
+import { sessionStatus } from "@/lib/session-status";
 import { useI18n } from "@/lib/i18n";
 import { useExport } from "@/lib/use-export";
 
@@ -36,6 +37,7 @@ export function SessionsPage() {
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [pendingDelete, setPendingDelete] = useState<Session | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
+  const [stopNotice, setStopNotice] = useState<string | null>(null);
 
   const since = range === "all" ? undefined : range === "7d" ? "-7d" : "-30d";
   const searched = query.trim();
@@ -73,12 +75,16 @@ export function SessionsPage() {
   const settled = !sessions.isPlaceholderData;
 
   const mutate = useMutation({
-    mutationFn: async (action: { kind: "pin" | "delete" | "rename"; session: Session; name?: string }) => {
+    mutationFn: async (action: { kind: "pin" | "delete" | "rename" | "stop"; session: Session; name?: string }) => {
       if (action.kind === "delete") return api.deleteSession(action.session.public_id);
       if (action.kind === "pin") return api.patchSession(action.session.public_id, { pinned: !action.session.pinned });
+      if (action.kind === "stop") return api.stopSession(action.session.public_id);
       return api.patchSession(action.session.public_id, { name: action.name });
     },
-    onSuccess: () => void client.invalidateQueries({ queryKey: ["sessions"] }),
+    onSuccess: (_data, action) => {
+      if (action.kind === "stop") setStopNotice(action.session.public_id);
+      void client.invalidateQueries({ queryKey: ["sessions"] });
+    },
   });
 
   const toggle = (id: string) => {
@@ -173,6 +179,9 @@ export function SessionsPage() {
                   mutate.mutate({ kind: "rename", session, name });
                 }}
                 onPin={() => mutate.mutate({ kind: "pin", session })}
+                onStop={() => mutate.mutate({ kind: "stop", session })}
+                stopping={mutate.isPending && mutate.variables?.kind === "stop" && mutate.variables.session.public_id === session.public_id}
+                stopNotice={stopNotice === session.public_id}
                 onDelete={() => setPendingDelete(session)}
               />
             ))}
@@ -266,7 +275,7 @@ function Disk({ stats }: { stats: DbStats }) {
 }
 
 function SessionRow({
-  session, checked, renaming, onToggle, onOpen, onRenameStart, onRename, onPin, onDelete,
+  session, checked, renaming, onToggle, onOpen, onRenameStart, onRename, onPin, onStop, stopping, stopNotice, onDelete,
 }: {
   session: Session;
   checked: boolean;
@@ -276,12 +285,16 @@ function SessionRow({
   onRenameStart: () => void;
   onRename: (name: string) => void;
   onPin: () => void;
+  onStop: () => void;
+  stopping: boolean;
+  stopNotice: boolean;
   onDelete: () => void;
 }) {
   const { t } = useI18n();
   const exporter = useExport();
   const [draft, setDraft] = useState(session.name ?? "");
-  const active = session.ended_ns === null && !session.purged;
+  const status = sessionStatus(session, t);
+  const active = status.kind === "recording";
   const duration = session.ended_ns ? formatDuration((session.ended_ns - session.started_ns) / 1_000_000) : active ? "…" : "–";
   const purged = Boolean(session.purged);
 
@@ -291,7 +304,7 @@ function SessionRow({
         <input type="checkbox" checked={checked} disabled={purged} onChange={onToggle} aria-label={session.public_id} />
       </td>
       <td className="px-2 py-1">
-        <StatusCell purged={purged} pinned={session.pinned} active={active} />
+        <StatusCell status={status} purged={purged} pinned={session.pinned} />
       </td>
       <td className="px-2 py-1">
         {purged ? (
@@ -342,6 +355,7 @@ function SessionRow({
           <span className="inline-flex gap-2 text-ink-faint">
             <button type="button" onClick={onRenameStart}>{t("sessions.rename")}</button>
             <button type="button" onClick={onPin}>{session.pinned ? t("sessions.unpin") : t("sessions.pin")}</button>
+            {active ? <button type="button" disabled={stopping} onClick={onStop}>{stopping ? t("session.stopping") : t("session.stop")}</button> : null}
             <button type="button" onClick={onDelete}>{t("sessions.delete")}</button>
             <button
               type="button"
@@ -352,6 +366,7 @@ function SessionRow({
             </button>
             {exporter.error ? <span role="alert" className="text-gap">{exporter.error}</span> : null}
             {exporter.notice ? <span role="status" className="text-ink-soft">{exporter.notice}</span> : null}
+            {stopNotice ? <span role="status" className="text-ink-soft">{t("session.stopNotice")}</span> : null}
           </span>
         )}
       </td>
@@ -363,13 +378,14 @@ function SessionRow({
  * Status as text, not only a glyph: 「● 录制中」「○ 已停止」. A pinned session
  * keeps its recording state and adds the pin.
  */
-function StatusCell({ purged, pinned, active }: { purged: boolean; pinned: boolean; active: boolean }) {
+function StatusCell({ status, purged, pinned }: { status: ReturnType<typeof sessionStatus>; purged: boolean; pinned: boolean }) {
   const { t } = useI18n();
   if (purged) return <span className="whitespace-nowrap text-ink-faint" title={t("sessions.purgedTip")}>◌ {t("sessions.purged")}</span>;
-  const label = active ? t("session.recording") : t("session.stopped");
+  const active = status.kind === "recording";
+  const title = status.explanation ?? status.label;
   return (
-    <span className={`whitespace-nowrap ${active ? "text-accent" : "text-ink-faint"}`} title={pinned ? `${label} · ${t("sessions.pinned")}` : label}>
-      {active ? "●" : "○"} {label}
+    <span className={`whitespace-nowrap ${active ? "text-accent" : "text-ink-faint"}`} title={pinned ? `${title} · ${t("sessions.pinned")}` : title}>
+      {active ? "●" : "○"} {status.label}
       {pinned ? <span aria-label={t("sessions.pinned")}> 📌</span> : null}
     </span>
   );

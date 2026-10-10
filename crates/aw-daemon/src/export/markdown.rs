@@ -83,11 +83,22 @@ fn build_report(
         .map_err(|err| ReportError::Store(err.to_string()))?
         .ok_or_else(|| ReportError::Store("session not found".to_owned()))?;
     let header = load_header(conn, session_id, user_id)?;
-    let findings =
-        findings_for_report(conn, session_id, user_id, lang).map_err(ReportError::Store)?;
+    // A database whose http/findings migration never ran has no `findings`
+    // table: no rule has written anything, so the section is empty. Any other
+    // error is still a 500.
+    let findings = if table_exists(conn, "findings") {
+        findings_for_report(conn, session_id, user_id, lang).map_err(ReportError::Store)?
+    } else {
+        Vec::new()
+    };
     let gaps = load_gaps(conn, session_id, user_id)?;
     let domains = load_domains(conn, session_id, user_id, redact_hosts)?;
-    let files = load_files(conn, session_id, user_id, redact_paths)?;
+    // Same for `file_access` (migration 0003): absent means no file rows.
+    let files = if table_exists(conn, "file_access") {
+        load_files(conn, session_id, user_id, redact_paths)?
+    } else {
+        Vec::new()
+    };
 
     let mut prose = String::new();
     push_overview(&mut prose, &summary, &header, lang);
@@ -153,6 +164,15 @@ fn load_header(
         },
     )
     .map_err(|err| ReportError::Store(err.to_string()))
+}
+
+fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [name],
+        |row| row.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
 }
 
 struct GapLine {

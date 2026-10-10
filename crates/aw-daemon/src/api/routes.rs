@@ -2577,6 +2577,9 @@ mod tests {
         let csv = get("/api/v1/sessions/sx/export", "format=csv");
         assert_eq!(csv.status, 200);
         assert!(csv.body.starts_with(b"PK"));
+        // This database has no `findings` table (no http/findings migration).
+        let md = get("/api/v1/sessions/sx/export", "format=md");
+        assert_eq!(md.status, 200, "{}", String::from_utf8_lossy(&md.body));
         let events = get("/api/v1/sessions/sx/agent-events", "");
         assert_eq!(events.status, 200);
         assert!(json_body(&events)["events"].is_array());

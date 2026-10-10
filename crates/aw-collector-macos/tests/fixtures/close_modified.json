@@ -1,0 +1,1 @@
+{"version":8,"seq_num":3,"global_seq_num":13,"event_type":"close","process":{"audit_token":{"pid":200}},"event":{"close":{"target":{"path":"/opt/fixture/out.txt"},"modified":true}}}

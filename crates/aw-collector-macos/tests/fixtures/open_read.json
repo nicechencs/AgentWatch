@@ -1,0 +1,1 @@
+{"version":8,"seq_num":1,"global_seq_num":11,"event_type":"open","process":{"audit_token":{"pid":200}},"event":{"open":{"file":{"path":"/opt/fixture/notes.txt"},"fflag":0},"extra_unknown":true}}

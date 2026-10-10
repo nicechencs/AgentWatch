@@ -1,0 +1,1 @@
+{"version":8,"seq_num":5,"global_seq_num":15,"event_type":"unlink","process":{"audit_token":{"pid":200}},"event":{"unlink":{"target":{"path":"/opt/fixture/old.txt"}}}}

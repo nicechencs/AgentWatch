@@ -1,0 +1,1 @@
+{"version":8,"seq_num":4,"global_seq_num":14,"event_type":"create","process":{"audit_token":{"pid":200}},"event":{"create":{"destination":{"path":"/opt/fixture/new.txt","destination_type":"file"}}}}

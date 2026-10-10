@@ -1,0 +1,1 @@
+{"version":8,"seq_num":6,"global_seq_num":16,"event_type":"rename","process":{"audit_token":{"pid":200}},"event":{"rename":{"source":{"path":"/opt/fixture/a.txt"},"destination":"/opt/fixture/b.txt"}}}

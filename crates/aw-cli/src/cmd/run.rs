@@ -252,6 +252,34 @@ pub(crate) trait Spawner {
 
 /// Production caller-side spawner. It never creates a cgroup: the daemon
 /// records the adopted root pid and performs its own scope handling.
+/// Plain Chinese sentence for a failed spawn, by error kind, with the same
+/// codes the daemon uses (`program_not_found`, `program_not_permitted`,
+/// `spawn_failed`). The program and its arguments are not repeated (they can
+/// carry secrets).
+pub(crate) fn spawn_error_text(error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            "无法启动程序：找不到这个程序或工作目录（program_not_found）".to_owned()
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            "无法启动程序：没有权限运行它或进入工作目录（program_not_permitted）".to_owned()
+        }
+        _ => format!("无法启动程序（spawn_failed，{}）", os_code(error)),
+    }
+}
+
+/// Plain Chinese sentence when waiting for the started program failed.
+pub(crate) fn wait_error_text(error: &std::io::Error) -> String {
+    format!("等待程序结束失败（{}）", os_code(error))
+}
+
+fn os_code(error: &std::io::Error) -> String {
+    error.raw_os_error().map_or_else(
+        || "系统没有给出错误码".to_owned(),
+        |code| format!("系统错误码 {code}"),
+    )
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct CommandSpawner;
 
@@ -266,7 +294,7 @@ impl SpawnedChild for ProcessChild {
         self.0
             .wait()
             .map(|status| status.code().unwrap_or(exit::GENERAL))
-            .map_err(|error| format!("could not wait for program: {}", error.kind()))
+            .map_err(|error| wait_error_text(&error))
     }
 
     fn kill_and_reap(&mut self) {
@@ -291,7 +319,7 @@ impl Spawner for CommandSpawner {
         command
             .spawn()
             .map(|child| Box::new(ProcessChild(child)) as Box<dyn SpawnedChild>)
-            .map_err(|error| format!("could not start program: {}", error.kind()))
+            .map_err(|error| spawn_error_text(&error))
     }
 }
 
@@ -414,15 +442,15 @@ fn launch_linux(
                     .spawn()
                     .map_err(|error| LaunchDispatchError::NotImplemented {
                         detail: format!(
-                            "无法启动程序：{}（cgroup 不可用，按进程树跟踪也没能启动）",
-                            error.kind()
+                            "{}；cgroup 不可用，已改按进程树跟踪，仍没能启动",
+                            spawn_error_text(&error)
                         ),
                     })?;
             let pid = spawned.id();
             let status = spawned
                 .wait()
                 .map_err(|error| LaunchDispatchError::NotImplemented {
-                    detail: format!("等待程序结束失败：{}", error.kind()),
+                    detail: wait_error_text(&error),
                 })?;
             Ok(Launched {
                 code: status.code().unwrap_or(exit::GENERAL),
@@ -1969,6 +1997,28 @@ mod tests {
     }
 
     #[test]
+    fn spawn_errors_are_plain_chinese_by_kind() {
+        use std::io::{Error, ErrorKind};
+        let not_found = super::spawn_error_text(&Error::from(ErrorKind::NotFound));
+        assert!(not_found.contains("找不到") && not_found.contains("program_not_found"));
+        let denied = super::spawn_error_text(&Error::from(ErrorKind::PermissionDenied));
+        assert!(denied.contains("没有权限") && denied.contains("program_not_permitted"));
+        let other = super::spawn_error_text(&Error::from_raw_os_error(7));
+        assert!(
+            other.contains("spawn_failed") && other.contains("系统错误码 7"),
+            "{other}"
+        );
+        let wait = super::wait_error_text(&Error::from(ErrorKind::Other));
+        assert!(wait.starts_with("等待程序结束失败"), "{wait}");
+        for text in [not_found, denied, other, wait] {
+            assert!(
+                !text.contains("entity") && !text.contains("could not"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn spawn_failure_stops_the_pending_session_without_printing_argv() {
         let command = vec!["private-tool".to_owned(), "--secret".to_owned()];
         let log = Rc::new(RefCell::new(Vec::new()));
@@ -1977,7 +2027,9 @@ mod tests {
             log: Rc::clone(&log),
             spawned: 0,
             code: 0,
-            fail: Some("could not start program: entity not found".to_owned()),
+            fail: Some(super::spawn_error_text(&std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            ))),
         };
         let mut parsed = args(&command);
         parsed.json = true;

@@ -4,8 +4,9 @@
 //! Business commands are stubs: they probe the daemon and then report that
 //! they are not implemented.
 
-// `cmd::run` has one documented `pre_exec` exception to keep the pipe gate out
-// of the target process. All other unsafe code remains denied.
+// Unsafe code is denied. `cmd::run` has two documented exceptions: the Unix
+// `pre_exec` that keeps the pipe gate out of the target, and the Windows FFI
+// that resumes a CREATE_SUSPENDED child after daemon adoption.
 #![deny(unsafe_code)]
 
 mod client;

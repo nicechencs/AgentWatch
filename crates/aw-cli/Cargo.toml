@@ -50,14 +50,24 @@ serde_json = { version = "1.0.151", default-features = false, features = ["std"]
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", default-features = false, features = ["fs"] }
 
+[target.'cfg(windows)'.dependencies]
+# P1-CLI-02 / P1-WIN-04. Used only to hold a caller-created target at
+# CREATE_SUSPENDED until the daemon accepts `/adopt`, then resume its primary
+# thread. This pin matches aw-collector-windows and the existing lockfile.
+windows = { version = "=0.57.0", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 # insta is MIT OR Apache-2.0. Same pin as aw-core. Snapshots record `aw --help`.
 insta = { version = "1.49.0", default-features = false }
 
-[lints]
+# Unsafe code is denied crate-wide. Two scoped, documented exceptions in
+# `cmd::run`: the Unix `pre_exec` that keeps the pipe gate out of the target,
+# and the Windows FFI that resumes a CREATE_SUSPENDED child after `/adopt`.
 [lints.rust]
-# `cmd::run` has one scoped, documented `pre_exec` exception. Keep the rest of
-# this crate under the same prohibition as the workspace.
 unsafe_code = "deny"
 
 [lints.clippy]

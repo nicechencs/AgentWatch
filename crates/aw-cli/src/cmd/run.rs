@@ -2,9 +2,9 @@
 //!
 //! `--no-daemon` starts the target as the calling user through an injected
 //! [`Launcher`], then prints a session summary. The default daemon path first
-//! records `/sessions/run`, starts the child as the caller behind a Unix pipe
-//! gate, and hands it over through `/adopt` before releasing it to exec. On
-//! Windows the local production launcher is
+//! records `/sessions/run`, starts the child held (at a Unix pipe gate or with
+//! Windows `CREATE_SUSPENDED`), and hands it over through `/adopt` before
+//! releasing it. On Windows the local `--no-daemon` production launcher is
 //! [`launch::production`]: Job assignment is unavailable, so no process is
 //! created. On macOS it spawns with `Command` and says suspension was not
 //! applied. On Linux [`launch::LocalCgroupHost`] places the child in a delegated
@@ -31,6 +31,8 @@ use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::process::{Child, Command};
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -252,12 +254,12 @@ pub(crate) trait SpawnedChild {
     /// general CLI failure because it has no numeric exit code to forward.
     fn wait(&mut self) -> Result<i32, String>;
 
-    /// Let a held Unix child exec its target after the daemon accepted
-    /// `/adopt`. Direct-spawn platforms have no gate, so this is a no-op.
+    /// Release a child held until the daemon accepted `/adopt`: the Unix pipe
+    /// gate lets it `exec`, while Windows resumes its primary thread.
     ///
     /// # Errors
     ///
-    /// The pipe gate could not be released. The caller must reap the child.
+    /// The launch gate could not be released. The caller must reap the child.
     fn release(&mut self) -> Result<(), String>;
 
     /// Stop and reap a child that the daemon refused to adopt.
@@ -308,28 +310,137 @@ fn os_code(error: &std::io::Error) -> String {
 pub(crate) struct CommandSpawner;
 
 #[cfg(not(unix))]
-struct ProcessChild(Child);
+struct ProcessChild {
+    child: Child,
+    #[cfg(windows)]
+    suspended: bool,
+}
 
 #[cfg(not(unix))]
 impl SpawnedChild for ProcessChild {
     fn pid(&self) -> u32 {
-        self.0.id()
+        self.child.id()
     }
 
     fn wait(&mut self) -> Result<i32, String> {
-        self.0
+        self.child
             .wait()
             .map(|status| status.code().unwrap_or(exit::GENERAL))
             .map_err(|error| wait_error_text(&error))
     }
 
     fn release(&mut self) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            if !self.suspended {
+                return Ok(());
+            }
+            windows_release::resume_primary_thread(self.child.id())
+                .map_err(|code| format!("无法放行被挂起的程序（系统错误码 {code}）"))?;
+            // Only clear this after ResumeThread succeeds, so repeated calls
+            // are harmless and never raise the thread's suspend count again.
+            self.suspended = false;
+        }
         Ok(())
     }
 
     fn kill_and_reap(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Windows-specific FFI for releasing exactly one `CREATE_SUSPENDED` child.
+///
+/// `std::process::Child` exposes the PID but not the primary-thread handle, so
+/// locate that thread in a Toolhelp snapshot. A just-created suspended process
+/// has not executed target code, therefore its sole process-owned thread is
+/// the primary thread to resume.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_release {
+    use std::mem::size_of;
+
+    use windows::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_NOT_FOUND, ERROR_NO_MORE_FILES, HANDLE,
+    };
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    /// Resume the single primary thread which `CREATE_SUSPENDED` stopped.
+    ///
+    /// The returned number is a Win32 system error code suitable for the
+    /// user-facing Chinese error at the caller.
+    pub(super) fn resume_primary_thread(pid: u32) -> Result<(), u32> {
+        // SAFETY: the requested snapshot flag and PID are plain values; the
+        // returned handle is closed exactly once below on every result path.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
+            .map_err(|error| error_code(&error))?;
+        let result = resume_from_snapshot(snapshot, pid);
+        close_handle(snapshot);
+        result
+    }
+
+    fn resume_from_snapshot(snapshot: HANDLE, pid: u32) -> Result<(), u32> {
+        let mut entry = THREADENTRY32 {
+            dwSize: size_of::<THREADENTRY32>() as u32,
+            ..THREADENTRY32::default()
+        };
+        // SAFETY: `entry` is initialized with the ABI-required `dwSize` and
+        // remains valid for the synchronous Toolhelp call.
+        unsafe { Thread32First(snapshot, &mut entry) }.map_err(|error| error_code(&error))?;
+
+        loop {
+            if entry.th32OwnerProcessID == pid {
+                return resume_thread(entry.th32ThreadID);
+            }
+
+            entry.dwSize = size_of::<THREADENTRY32>() as u32;
+            // SAFETY: as above, `snapshot` remains open and `entry` points to
+            // writable initialized storage with the ABI-required size.
+            match unsafe { Thread32Next(snapshot, &mut entry) } {
+                Ok(()) => {}
+                Err(error) if error_code(&error) == ERROR_NO_MORE_FILES.0 => {
+                    return Err(ERROR_NOT_FOUND.0);
+                }
+                Err(error) => return Err(error_code(&error)),
+            }
+        }
+    }
+
+    fn resume_thread(thread_id: u32) -> Result<(), u32> {
+        // SAFETY: `thread_id` came from the current Toolhelp snapshot. The
+        // returned handle is closed exactly once before this function returns.
+        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, thread_id) }
+            .map_err(|error| error_code(&error))?;
+        // SAFETY: `thread` is a valid handle opened with THREAD_SUSPEND_RESUME.
+        let prior_suspend_count = unsafe { ResumeThread(thread) };
+        // ResumeThread reports failure only with u32::MAX. Read the thread's
+        // last-error value before CloseHandle can alter it.
+        let resume_error = (prior_suspend_count == u32::MAX).then(last_error);
+        close_handle(thread);
+        resume_error.map_or(Ok(()), Err)
+    }
+
+    fn error_code(error: &windows::core::Error) -> u32 {
+        // Win32 APIs above create HRESULT_FROM_WIN32 values. Their low word is
+        // the original system error code shown to the user.
+        error.code().0 as u32 & 0xffff
+    }
+
+    fn last_error() -> u32 {
+        // SAFETY: GetLastError reads the calling thread's error state only.
+        unsafe { GetLastError().0 }
+    }
+
+    fn close_handle(handle: HANDLE) {
+        // SAFETY: every caller passes one handle returned by the corresponding
+        // successful Win32 open/create call, and calls this helper once.
+        let _ = unsafe { CloseHandle(handle) };
+        // A close failure cannot reverse a successful ResumeThread. Retrying
+        // `release` to report it would resume the target more than once.
     }
 }
 
@@ -482,9 +593,17 @@ impl Spawner for CommandSpawner {
             let mut command = Command::new(program);
             command.args(args);
             configure_command(&mut command, spec);
+            #[cfg(windows)]
+            command.creation_flags(0x0000_0004); // CREATE_SUSPENDED
             command
                 .spawn()
-                .map(|child| Box::new(ProcessChild(child)) as Box<dyn SpawnedChild>)
+                .map(|child| {
+                    Box::new(ProcessChild {
+                        child,
+                        #[cfg(windows)]
+                        suspended: true,
+                    }) as Box<dyn SpawnedChild>
+                })
                 .map_err(|error| spawn_error_text(&error))
         }
     }

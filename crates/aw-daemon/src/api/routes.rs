@@ -3239,6 +3239,40 @@ mod tests {
         );
         assert_eq!(status, 200, "{body}");
 
+        // A pid can be reused. Seed another depth-0 row with this pid but a
+        // different identity; `/exit` must only update the adopted root row.
+        let (db_id, root_proc_uid, start_ns): (i64, i64, i64) = rusqlite::Connection::open(&db)
+            .and_then(|conn| {
+                let db_id: i64 = conn.query_row(
+                    "SELECT id FROM sessions WHERE public_id = ?1",
+                    [&sid],
+                    |row| row.get(0),
+                )?;
+                let root_proc_uid: i64 = conn.query_row(
+                    "SELECT root_proc_uid FROM sessions WHERE id = ?1",
+                    [db_id],
+                    |row| row.get(0),
+                )?;
+                let start_ns: i64 = conn.query_row(
+                    "SELECT start_ns FROM processes WHERE session_id = ?1 AND proc_uid = ?2",
+                    rusqlite::params![db_id, root_proc_uid],
+                    |row| row.get(0),
+                )?;
+                Ok((db_id, root_proc_uid, start_ns))
+            })
+            .expect("adopted root row");
+        let reused_proc_uid = root_proc_uid.wrapping_add(1);
+        rusqlite::Connection::open(&db)
+            .and_then(|conn| {
+                conn.execute(
+                    "INSERT INTO processes \
+                     (session_id, proc_uid, pid, depth, start_ns, how, evidence, source) \
+                     VALUES (?1, ?2, ?3, 0, ?4, 'snapshot', 'S', 'fixture')",
+                    rusqlite::params![db_id, reused_proc_uid, pid, start_ns.saturating_add(1)],
+                )
+            })
+            .expect("reused pid row");
+
         nix::unistd::write(&write_fd, b"1\n").expect("release gate");
         drop(write_fd);
         assert_eq!(child.wait().expect("reap child").code(), Some(7));
@@ -3255,15 +3289,25 @@ mod tests {
             let mut stmt = conn
                 .prepare(
                     "SELECT p.exit_code FROM processes p JOIN sessions s ON s.id = p.session_id \
-                     WHERE s.public_id = ?1 AND p.pid = ?2",
+                     WHERE s.public_id = ?1 AND p.proc_uid = ?2",
                 )
                 .expect("prepare");
-            stmt.query_map(rusqlite::params![sid, pid], |r| r.get(0))
+            stmt.query_map(rusqlite::params![sid, root_proc_uid], |r| r.get(0))
                 .expect("query")
                 .map(|r| r.expect("row"))
                 .collect()
         };
         assert_eq!(root_code(&db), vec![Some(7)], "before any poll");
+        let reused_code: Option<i64> = rusqlite::Connection::open(&db)
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT exit_code FROM processes WHERE session_id = ?1 AND proc_uid = ?2",
+                    rusqlite::params![db_id, reused_proc_uid],
+                    |row| row.get(0),
+                )
+            })
+            .expect("reused pid row");
+        assert_eq!(reused_code, None, "reused pid did not receive root status");
         let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
         let mut watches = crate::watch::Watches::new(db.clone());
         watches.tick(&shared);

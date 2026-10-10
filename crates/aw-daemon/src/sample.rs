@@ -11,8 +11,8 @@
 //! the [`ProcUid`] into a pid, then keeps that pid and its children. This
 //! sampler attaches to pid 1. Pid 1 is init; the children are the processes
 //! the host source returns. The [`ProcUid`] is `ProcessIdentity::from_parts`
-//! over the same boot id and the same start-time seconds `sysinfo` reports
-//! (`btime + starttime/clk_tck`), so the collector's own lookup matches.
+//! over the boot id, pid, and the precise `/proc` start time
+//! (`btime_ns + starttime * 1e9 / clk_tck`).
 //!
 //! The first `start_at` is a baseline and emits nothing for processes already
 //! running. Later `poll_once` calls emit starts and exits that appeared between
@@ -73,8 +73,8 @@ const PROC_SOURCE: &str = "poll/sysinfo";
 struct ProcFact {
     pid: u32,
     ppid: u32,
-    /// Unix start seconds, the same unit `ProcessStart.start_time_ns` is built from.
-    start_secs: u64,
+    /// Unix start time in nanoseconds, as reported by `/proc`.
+    start_ns: u64,
     uid: ProcUid,
 }
 
@@ -87,12 +87,12 @@ pub(crate) struct RootHint {
     pub(crate) pid: u32,
     /// Parent pid read from `/proc/<pid>/stat`.
     pub(crate) ppid: u32,
-    /// Unix start time in seconds, matching the poll collector's identity.
-    pub(crate) start_secs: u64,
+    /// Unix start time in nanoseconds, captured together with the adopted pid.
+    pub(crate) start_ns: u64,
     /// Stable process identity for this boot / pid / start time.
     pub(crate) uid: ProcUid,
     /// Basename of the session argv[0], not a sampled executable path.
-    pub(crate) name: String,
+    pub(crate) name: Option<String>,
 }
 
 /// Which session a sampler writes and which process subtree it watches.
@@ -151,6 +151,10 @@ impl SampleTarget {
         row.name.clone_from(&self.name);
         row.mode = self.mode.to_owned();
         row.user_id.clone_from(&self.user_id);
+        row.root_proc_uid = self
+            .root_hint
+            .as_ref()
+            .map(|hint| i64::from_ne_bytes(hint.uid.0.to_ne_bytes()));
         row.argv.clone_from(&self.argv_json);
         row.agent.clone_from(&self.agent);
         row
@@ -239,8 +243,27 @@ impl HostSampler {
             );
             return false;
         };
+        if self
+            .target
+            .root_hint
+            .as_ref()
+            .is_some_and(|hint| hint.uid != uid)
+        {
+            tracing::warn!(
+                pid = self.target.root_pid,
+                "poll sampler not started: root process identity changed"
+            );
+            return false;
+        }
+        let Some(scope_uid) = proc_scope_uid_of(self.target.root_pid) else {
+            tracing::warn!(
+                pid = self.target.root_pid,
+                "poll sampler not started: root process scope identity unavailable"
+            );
+            return false;
+        };
         self.root_uid = Some(uid);
-        let Ok(scope) = Scope::attach([uid]) else {
+        let Ok(scope) = Scope::attach([scope_uid]) else {
             tracing::warn!("poll sampler not started: attach scope rejected");
             return false;
         };
@@ -306,11 +329,7 @@ impl HostSampler {
         if sample_session_state(&self.db_path, self.target.db_id) == SampleSessionState::Ended {
             return false;
         }
-        let Some(start_ns) = hint
-            .start_secs
-            .checked_mul(1_000_000_000)
-            .and_then(|ns| i64::try_from(ns).ok())
-        else {
+        let Some(start_ns) = i64::try_from(hint.start_ns).ok() else {
             return false;
         };
         let wall_ns = wall_now_ns();
@@ -318,7 +337,7 @@ impl HostSampler {
             hint.ppid,
             None,
             start_ns,
-            Some(hint.name),
+            hint.name,
             None,
             None,
             None,
@@ -329,7 +348,7 @@ impl HostSampler {
         let fact = ProcFact {
             pid: hint.pid,
             ppid: hint.ppid,
-            start_secs: hint.start_secs,
+            start_ns: hint.start_ns,
             uid: hint.uid,
         };
         let Some(event) = self.start_event(&start, &fact, wall_ns) else {
@@ -480,7 +499,7 @@ impl HostSampler {
     /// Pid 1, which `snapshot` cannot return. Fields that were not read stay
     /// `None` and are marked NA. Argv is not read.
     fn init_event(&mut self, row: &ProcFact, wall_ns: i64) -> Option<RawEvent> {
-        let start_ns = i64::try_from(row.start_secs.saturating_mul(1_000_000_000)).ok()?;
+        let start_ns = i64::try_from(row.start_ns).ok()?;
         let start = ProcessStart::new(
             row.ppid,
             None,
@@ -503,6 +522,8 @@ impl HostSampler {
         wall_ns: i64,
     ) -> Option<RawEvent> {
         let seq = self.next_seq();
+        let mut start = start.clone();
+        start.start_time_ns = i64::try_from(row.start_ns).ok()?;
         let mut event = RawEvent::try_new(RawEventParts {
             seq,
             ts_mono_ns: self.mono_ns,
@@ -802,21 +823,21 @@ fn proc_table() -> Vec<ProcFact> {
             let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
                 continue;
             };
-            let Some(start_secs) = read_pid_start_secs(pid) else {
+            let Some(start_ns) = read_pid_start_ns(pid) else {
                 continue;
             };
             let Some(ppid) = read_ppid(pid) else {
                 continue;
             };
             let Some(identity) =
-                ProcessIdentity::from_parts(&boot, pid, start_secs, StartTimeUnit::Seconds)
+                ProcessIdentity::from_parts(&boot, pid, start_ns, StartTimeUnit::Nanoseconds)
             else {
                 continue;
             };
             rows.push(ProcFact {
                 pid,
                 ppid,
-                start_secs,
+                start_ns,
                 uid: identity.uid,
             });
         }
@@ -856,7 +877,9 @@ fn find_proc<'a>(
 ) -> Option<&'a ProcFact> {
     let start_secs = u64::try_from(start.start_time_ns).ok()? / 1_000_000_000;
     table.iter().find(|row| {
-        !used.contains(&row.pid) && row.ppid == start.ppid && row.start_secs == start_secs
+        !used.contains(&row.pid)
+            && row.ppid == start.ppid
+            && row.start_ns / 1_000_000_000 == start_secs
     })
 }
 
@@ -877,18 +900,26 @@ fn read_ppid(_pid: u32) -> Option<u32> {
 /// `None` when the process is gone or its identity cannot be read.
 pub(crate) fn proc_uid_of(pid: u32) -> Option<ProcUid> {
     let boot = read_boot_id()?;
-    let start_secs = read_pid_start_secs(pid)?;
+    let start_ns = read_pid_start_ns(pid)?;
+    ProcessIdentity::from_parts(&boot, pid, start_ns, StartTimeUnit::Nanoseconds).map(|id| id.uid)
+}
+
+/// Identity used by the generic poll collector, which only exposes start time
+/// in seconds. Storage and adopted-root checks use [`proc_uid_of`] instead.
+fn proc_scope_uid_of(pid: u32) -> Option<ProcUid> {
+    let boot = read_boot_id()?;
+    let start_secs = read_pid_start_ns(pid)? / 1_000_000_000;
     ProcessIdentity::from_parts(&boot, pid, start_secs, StartTimeUnit::Seconds).map(|id| id.uid)
 }
 
 /// Capture the adopted root while the caller still holds it behind the pipe
 /// gate. `None` means one required `/proc` fact was unavailable; callers keep
 /// the adoption valid, but cannot later claim a root snapshot they lack.
-pub(crate) fn root_hint(pid: u32, name: String) -> Option<RootHint> {
+pub(crate) fn root_hint(pid: u32, name: Option<String>) -> Option<RootHint> {
     Some(RootHint {
         pid,
         ppid: read_ppid(pid)?,
-        start_secs: read_pid_start_secs(pid)?,
+        start_ns: read_pid_start_ns(pid)?,
         uid: proc_uid_of(pid)?,
         name,
     })
@@ -915,24 +946,28 @@ fn read_boot_id() -> Option<Vec<u8>> {
     }
 }
 
-/// Unix start seconds of `pid`, matching `sysinfo`'s Linux process start:
-/// `/proc/stat` `btime` plus `/proc/<pid>/stat` field 22 divided by the tick.
-fn read_pid_start_secs(pid: u32) -> Option<u64> {
+/// Unix start nanoseconds of `pid`: `/proc/stat` `btime` plus
+/// `/proc/<pid>/stat` field 22 converted from ticks without first truncating
+/// to seconds.
+fn read_pid_start_ns(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let ticks = stat_start_ticks(&stat)?;
-        let btime = read_btime()?;
-        if LINUX_CLK_TCK == 0 {
-            return None;
-        }
-        Some(btime.saturating_add(ticks / LINUX_CLK_TCK))
+        start_ns_from_ticks(read_btime()?, ticks)
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = pid;
         None
     }
+}
+
+#[cfg(target_os = "linux")]
+fn start_ns_from_ticks(btime_secs: u64, ticks: u64) -> Option<u64> {
+    let btime_ns = btime_secs.checked_mul(1_000_000_000)?;
+    let elapsed_ns = ticks.checked_mul(1_000_000_000)? / LINUX_CLK_TCK;
+    btime_ns.checked_add(elapsed_ns)
 }
 
 /// Field 22 (`starttime`) of `/proc/pid/stat`.
@@ -1562,6 +1597,16 @@ mod depth_tests {
             kind,
         })
         .expect("event")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_start_time_keeps_tick_precision() {
+        let btime = 1_700_000_000;
+        let first = super::start_ns_from_ticks(btime, 42_000).expect("first tick");
+        let second = super::start_ns_from_ticks(btime, 42_001).expect("second tick");
+        assert_eq!(second - first, 1_000_000_000 / super::LINUX_CLK_TCK);
+        assert_ne!(first, second);
     }
 
     /// Gap rows were stored with the collector's monotonic tick, which the

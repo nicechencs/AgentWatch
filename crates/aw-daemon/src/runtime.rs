@@ -567,6 +567,11 @@ pub fn run_foreground(
     // One state for both listeners: a ticket issued on the internal channel
     // (`aw ui`, the desktop app) must be redeemable on loopback HTTP.
     let shared = Arc::new(Mutex::new(foreground_api(config, &data_dir)));
+    // Sessions started from the API (`crate::watch`): one sampler per root.
+    // Close the last run's unfinished sessions before any listener opens, so
+    // a session created by the first request is never swept up as stale.
+    let mut watches = crate::watch::Watches::new(data_dir.join("agentwatch.db"));
+    watches.recover();
     // `aw daemon stop` / `logs` arrive on the internal channel (api/control.rs).
     let control = Control::new(Some(data_dir.join(LOG_FILE_NAME)));
     // HTTP first, so the port it really bound is known before the channel
@@ -595,9 +600,6 @@ pub fn run_foreground(
     // not start sampling — that is logged, and the stop loop still runs.
     let mut sampler = HostSampler::new(data_dir.join("agentwatch.db"));
     sampler.start();
-    // Sessions started from the API (`crate::watch`): one sampler per root.
-    let mut watches = crate::watch::Watches::new(data_dir.join("agentwatch.db"));
-    watches.recover();
     report_collectors(&shared, &sampler, &watches);
     let mut polls_until_sample: u32 = SAMPLE_EVERY_POLLS;
 

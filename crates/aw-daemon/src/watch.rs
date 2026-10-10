@@ -174,10 +174,12 @@ impl Watches {
         let db_id = target.db_id;
         let pid = target.root_pid;
         let mut sampler = HostSampler::for_target(self.db_path.clone(), target);
+        // Adopted root: its row first (from the `/adopt` identity), then poll.
+        let hinted = sampler.persist_root_hint();
         if sampler.start() {
             tracing::info!(session = db_id, pid, "watching process");
             self.running.push(Running { sampler, child });
-        } else if sampler.persist_gone_root_hint() {
+        } else if hinted || sampler.persist_gone_root_hint() {
             // `/adopt` captured this identity while the CLI's pipe gate held
             // it. The target has already gone before the first poll, but the
             // snapshot row was persisted with evidence S and NA fields rather

@@ -279,7 +279,13 @@ fn aw_run_attach_stop_against_a_real_daemon() {
         .find(|s| s["mode"] == "launch")
         .expect("aw run session listed");
     let sid = launch["id"].as_str().unwrap().to_owned();
-    daemon.wait_ended(&sid, Duration::from_secs(10));
+    let ended = daemon.wait_ended(&sid, Duration::from_secs(10));
+    assert_eq!(
+        ended["stats"]["process_count"].as_u64(),
+        Some(1),
+        "the root process is recorded once: {ended}"
+    );
+    assert_eq!(ended["exit_code"], 7, "exit code recorded: {ended}");
 
     let mut sleeper = Command::new("sleep").arg("30").spawn().expect("sleep");
     let pid = sleeper.id().to_string();
@@ -335,7 +341,28 @@ fn daemon_launch_starts_and_tracks_without_cgroup() {
         vec![my_uid(); 4],
         "runs as the caller"
     );
+    // Recording while the program runs: not ended before it exits.
+    let (_, live) = daemon.http("GET", &format!("/api/v1/sessions/{sid}"), "");
+    assert!(
+        live["ended_ns"].is_null(),
+        "ended while the program runs: {live}"
+    );
+    assert!(
+        Path::new(&format!("/proc/{pid}")).exists(),
+        "program still running"
+    );
+    let alive_ns = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    )
+    .unwrap();
     let ended = daemon.wait_ended(&sid, Duration::from_secs(15));
+    assert!(
+        ended["ended_ns"].as_i64().unwrap_or(0) > alive_ns,
+        "ended only after the program was seen running: {ended}"
+    );
     let modes: Vec<&str> = ended["collectors"]
         .as_array()
         .map(|c| c.iter().filter_map(|c| c["mode"].as_str()).collect())
@@ -344,9 +371,31 @@ fn daemon_launch_starts_and_tracks_without_cgroup() {
         modes.contains(&"poll"),
         "tracked by the poll sampler: {ended}"
     );
-    if let Some(code) = ended.get("exit_code").filter(|c| !c.is_null()) {
-        assert_eq!(code, 7, "{ended}");
-    }
+    assert!(
+        ended["stats"]["process_count"].as_u64().unwrap_or(0) >= 1,
+        "the root process is recorded: {ended}"
+    );
+    assert_eq!(ended["exit_code"], 7, "exit code recorded: {ended}");
+}
+
+/// A session created by the very first request after the daemon starts is
+/// not swept up by the startup recovery of the last run's open sessions.
+#[test]
+fn a_session_created_right_after_start_stays_recording() {
+    let mut sleeper = Command::new("sleep").arg("30").spawn().expect("sleep");
+    let daemon = Daemon::start(As::Me);
+    let (status, body) = daemon.http(
+        "POST",
+        "/api/v1/sessions",
+        &format!(r#"{{"mode":"attach","pid":{}}}"#, sleeper.id()),
+    );
+    assert_eq!(status, 201, "{body} / {}", daemon.log());
+    let sid = body["id"].as_str().expect("id").to_owned();
+    sleep(Duration::from_millis(1_500));
+    let (_, now) = daemon.http("GET", &format!("/api/v1/sessions/{sid}"), "");
+    assert!(now["ended_ns"].is_null(), "still recording: {now}");
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
 }
 
 /// Root daemon (via `sudo -n`), this test's account as the caller: the

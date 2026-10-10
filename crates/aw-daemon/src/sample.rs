@@ -280,16 +280,30 @@ impl HostSampler {
     /// event-to-batch path as an ordinary snapshot, so its evidence and NA
     /// fields remain honest.
     pub fn persist_gone_root_hint(&mut self) -> bool {
+        // A live process with this identity failed for some other reason;
+        // do not replace a real sampler with a synthetic snapshot in that
+        // case. A reused pid is also not the adopted root.
+        if self
+            .target
+            .root_hint
+            .as_ref()
+            .is_some_and(|hint| proc_uid_of(hint.pid) == Some(hint.uid))
+        {
+            return false;
+        }
+        self.persist_root_hint()
+    }
+
+    /// Write the adopted root's row from the identity `/adopt` captured,
+    /// before the first poll: a root that exits before (or between) polls is
+    /// still one process with its exit code, never zero processes. The
+    /// sampler's own row for the same process is the same id (same pid and
+    /// start), so a later poll updates it rather than adding a second.
+    pub fn persist_root_hint(&mut self) -> bool {
         let Some(hint) = self.target.root_hint.clone() else {
             return false;
         };
         if sample_session_state(&self.db_path, self.target.db_id) == SampleSessionState::Ended {
-            return false;
-        }
-        // A live process with this identity failed for some other reason;
-        // do not replace a real sampler with a synthetic snapshot in that
-        // case. A reused pid is also not the adopted root.
-        if proc_uid_of(hint.pid) == Some(hint.uid) {
             return false;
         }
         let Some(start_ns) = hint

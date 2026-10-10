@@ -14,7 +14,9 @@
 
 内部通道的实现状态（2026-10-10）：
 - Linux / macOS：`agentwatchd` 前台运行时监听 Unix socket（`crates/aw-daemon/src/api/ipc.rs`）；报文与 HTTP 相同（HTTP/1.1 请求和响应），不带 `Authorization`，也不做 `Host` 校验。只提供 `/health` 和 `/api/v1/*`，不提供页面资源。socket 与 HTTP 共用同一份状态，所以在 socket 上签的 ticket 可以在 HTTP 上兑换。
-- 路径顺序由 `crates/aw-channel` 统一，daemon、`aw`、桌面 App 一致：先系统路径（Linux `/run/agentwatch/api.sock`，macOS `/var/run/agentwatch/api.sock`），再按用户路径（Linux `$XDG_RUNTIME_DIR/agentwatch/api.sock`，无则 `$HOME/.local/state/agentwatch/api.sock`；macOS `$HOME/Library/Application Support/AgentWatch/api.sock`）。daemon 建不了系统路径（非 root 运行）时自动改绑按用户路径；客户端取第一个存在的。`AW_SOCKET` 覆盖全部。
+- 路径顺序由 `crates/aw-channel` 统一，daemon、`aw`、桌面 App 一致：先系统路径（Linux `/run/agentwatch/api.sock`，macOS `/var/run/agentwatch/api.sock`），再按用户路径（Linux `$XDG_RUNTIME_DIR/agentwatch/api.sock`，无则 `$HOME/.local/state/agentwatch/api.sock`；macOS `$HOME/Library/Application Support/AgentWatch/api.sock`）。daemon 建不了系统路径（非 root 运行，或系统路径上是别的 uid 留下的死 socket）时自动改绑按用户路径。`AW_SOCKET` 覆盖全部（只用这一个路径，不回退）；`AW_SYSTEM_SOCKET` 仅供测试，替代系统路径。
+- 客户端（`aw`、桌面 App）按上面顺序逐个连：只有"不存在 / 连接被拒"才试下一个；权限不足、管道忙、超时、报文错误直接报出，不回退（那里有 daemon）。每次请求都重新走一遍，App 的"重试"因此能找到后来才起来的 daemon。消息里显示的路径是第一个存在且不拒连的。
+- daemon 启动时先对 `<socket>.lock` 加 `flock`（独占、非阻塞，整个运行期持有）；拿不到锁说明另一个 daemon 正在启动或运行，本进程报 `internal channel ... is in use` 退出（退出码非 0）。拿到锁后才处理已有文件：用 lstat 看，不是 socket（含符号链接）一律不动并报错；能连上 = 有活 daemon，退出；连接被拒且属主是 daemon 自己的 uid，才删掉重绑；属主是别的 uid 不删（非 root daemon 于是改用按用户路径）。
 - 权限：存在 `agentwatch` 组时 socket 为 `root:agentwatch 0660`；没有该组时为 `0666`，任何本机账户都能连，但每个请求都按对端 uid 判身份（普通用户只看自己的会话）。所以 root 跑的 daemon 普通用户的桌面 App 也连得上。
 - 对端身份：Linux 用 `SO_PEERCRED`，macOS 用 `getpeereid`（即 `LOCAL_PEERCRED` 的 uid）；uid 0 为管理员；读不到 uid 记为 `unverified-peer`、非管理员。
 - Windows：`agentwatchd` 在 `\\.\pipe\agentwatch-api` 上监听（tokio 命名管道），报文同上。管道带显式 DACL（`crates/aw-collector-windows/src/pipe.rs`）：SYSTEM、Administrators、管道属主完全控制；`AgentWatch Users` 组（不存在时退到交互用户 `IU`）可读写但不能新建管道实例。客户端身份按 `GetNamedPipeClientProcessId` → 进程令牌取 SID；令牌已提权或为 LocalSystem 才是管理员。取不到身份的连接直接 403。

@@ -111,6 +111,16 @@ pub enum RuntimeError {
         source: io::Error,
     },
 
+    /// Another daemon holds the internal channel (live socket or its start
+    /// lock). This daemon must not run beside it.
+    #[error("internal channel `{}` is in use by another agentwatchd: {detail}", path.display())]
+    ChannelInUse {
+        /// Socket or pipe path.
+        path: PathBuf,
+        /// What was found.
+        detail: String,
+    },
+
     /// Logging could not be started.
     #[error("failed to open log `{}`: {source}", path.display())]
     Log {
@@ -577,7 +587,7 @@ pub fn run_foreground(
             }
         }
     };
-    let mut ipc = start_ipc(&shared, &control);
+    let mut ipc = start_ipc(&shared, &control)?;
 
     // Poll only. No ETW, eBPF, or eslogger. The sampler attaches to pid 1 so
     // the host source refreshes the process table; launch scope would not.
@@ -654,35 +664,51 @@ fn report_collectors(
 
 /// Open the internal channel. A failure is a warning, not an exit: the daemon
 /// keeps collecting, and `aw` reports the socket as unreachable (exit 3).
-fn start_ipc(state: &Arc<Mutex<ApiState>>, control: &Arc<Control>) -> Option<IpcServer> {
+fn start_ipc(
+    state: &Arc<Mutex<ApiState>>,
+    control: &Arc<Control>,
+) -> Result<Option<IpcServer>, RuntimeError> {
     let Some(path) = socket_path() else {
         tracing::warn!("internal channel not started: no socket path on this platform");
-        return None;
+        return Ok(None);
     };
     let err = match IpcServer::bind(&path, Arc::clone(state), Arc::clone(control)) {
         Ok(server) => {
             tracing::info!(socket = %server.path.display(), "internal channel started");
-            return Some(server);
+            return Ok(Some(server));
         }
         Err(err) => err,
     };
-    // An unprivileged daemon cannot create /run/agentwatch: use the per-user
-    // socket, which aw and the desktop app look at second.
+    if err.kind() == io::ErrorKind::AddrInUse {
+        // A live daemon answers there (or is starting): refuse to run a
+        // second one that nobody could reach.
+        return Err(RuntimeError::ChannelInUse {
+            path,
+            detail: err.to_string(),
+        });
+    }
+    // An unprivileged daemon cannot create /run/agentwatch (or remove a root
+    // daemon's stale socket there): use the per-user socket, which aw and
+    // the desktop app look at second.
     if let Some(fallback) = fallback_socket_path().filter(|_| should_fall_back(&err)) {
         tracing::info!(system = %path.display(), error = %err, "system socket not available; using the per-user socket");
-        match IpcServer::bind(&fallback, Arc::clone(state), Arc::clone(control)) {
+        return match IpcServer::bind(&fallback, Arc::clone(state), Arc::clone(control)) {
             Ok(server) => {
                 tracing::info!(socket = %server.path.display(), "internal channel started (per-user)");
-                return Some(server);
+                Ok(Some(server))
             }
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => Err(RuntimeError::ChannelInUse {
+                path: fallback,
+                detail: err.to_string(),
+            }),
             Err(err) => {
                 tracing::warn!(socket = %fallback.display(), error = %err, "internal channel not started");
-                return None;
+                Ok(None)
             }
-        }
+        };
     }
     tracing::warn!(socket = %path.display(), error = %err, "internal channel not started");
-    None
+    Ok(None)
 }
 
 /// API state for the foreground listener: the data-dir database, the loaded

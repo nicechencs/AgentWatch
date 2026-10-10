@@ -89,7 +89,8 @@ fn socket_path_from(env: Option<String>) -> Option<PathBuf> {
     if let Some(value) = env.filter(|value| !value.trim().is_empty()) {
         return Some(PathBuf::from(value.trim()));
     }
-    aw_channel::system_path()
+    // `AW_SYSTEM_SOCKET` stands in for the system path in tests only.
+    aw_channel::system_path_from(&|key| std::env::var(key).ok())
 }
 
 /// Per-user socket an unprivileged daemon binds when it may not create the
@@ -173,6 +174,8 @@ mod unix {
 
     use super::super::auth::Caller;
     use super::super::http::{parse_request, write_response};
+    use nix::fcntl::{Flock, FlockArg};
+
     use super::super::routes::error_response;
     use super::{answer, socket_mode, Control, SharedState, SOCKET_GROUP, UNVERIFIED_PEER};
 
@@ -185,6 +188,83 @@ mod unix {
         pub path: PathBuf,
         stop: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
+        /// `flock` on `<socket>.lock`, held for the server's life. Declared
+        /// last: released only after `Drop` has removed the socket file.
+        _lock: Flock<fs::File>,
+    }
+
+    /// `<socket>.lock` next to the socket.
+    #[must_use]
+    pub fn lock_path(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_owned();
+        name.push(".lock");
+        PathBuf::from(name)
+    }
+
+    /// Take the exclusive start lock for `path`. Contention means another
+    /// daemon is starting or running on this socket: `AddrInUse`.
+    fn take_lock(path: &Path) -> io::Result<Flock<fs::File>> {
+        let lock = lock_path(path);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock)?;
+        Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, errno)| {
+            if errno == nix::errno::Errno::EWOULDBLOCK {
+                io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("another agentwatchd holds {}", lock.display()),
+                )
+            } else {
+                io::Error::from(errno)
+            }
+        })
+    }
+
+    /// Remove a stale socket at `path`, under the start lock. Removes only
+    /// when all hold: it is a socket (lstat, so not a symlink), connecting
+    /// is refused (nobody listens), and it belongs to this daemon's uid.
+    /// A live socket is `AddrInUse`; anything else is left alone and is an
+    /// error.
+    pub(super) fn clear_stale(path: &Path) -> io::Result<()> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let meta = match fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        if !meta.file_type().is_socket() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} exists and is not a socket; not removing it",
+                    path.display()
+                ),
+            ));
+        }
+        match UnixStream::connect(path) {
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "another daemon is answering on the socket",
+            )),
+            Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => {
+                let me = nix::unistd::geteuid().as_raw();
+                if meta.uid() != me {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "stale socket {} belongs to uid {}, not {me}; not removing it",
+                            path.display(),
+                            meta.uid()
+                        ),
+                    ));
+                }
+                tracing::info!(target: "aw_daemon::ipc", socket = %path.display(), "removing stale socket (connection refused)");
+                fs::remove_file(path)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     impl IpcServer {
@@ -207,15 +287,10 @@ mod unix {
                     let _ = fs::set_permissions(parent, fs::Permissions::from_mode(dir_mode));
                 }
             }
-            if path.exists() {
-                if UnixStream::connect(path).is_ok() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AddrInUse,
-                        "another daemon is answering on the socket",
-                    ));
-                }
-                fs::remove_file(path)?;
-            }
+            // Lock first, so two daemons starting at once cannot each see
+            // the other's fresh socket as stale and delete it.
+            let lock = take_lock(path)?;
+            clear_stale(path)?;
             let listener = UnixListener::bind(path)?;
             let grouped = set_group(path);
             fs::set_permissions(path, fs::Permissions::from_mode(socket_mode(grouped)))?;
@@ -229,6 +304,7 @@ mod unix {
                 path: path.to_path_buf(),
                 stop,
                 thread: Some(thread),
+                _lock: lock,
             })
         }
 
@@ -779,6 +855,73 @@ mod tests {
             .unwrap_or_else(|| panic!("sleep {pid} listed: {seen}"));
         assert_eq!(row["name"], "sleep");
         assert_eq!(row["user_id"], uid.to_string());
+    }
+
+    #[test]
+    fn stale_socket_is_replaced() {
+        let path = temp_socket("stale");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap()); // crashed daemon
+        assert!(path.exists());
+        let state = Arc::new(Mutex::new(ApiState::default()));
+        let _server = IpcServer::bind(&path, state, Control::new(None)).expect("bind over stale");
+        let (status, _) = exchange(&path, "GET /health HTTP/1.1\r\n\r\n");
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn a_non_socket_or_symlink_at_the_path_is_not_removed() {
+        let path = temp_socket("notsock");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"keep me").unwrap();
+        let state = Arc::new(Mutex::new(ApiState::default()));
+        assert!(IpcServer::bind(&path, Arc::clone(&state), Control::new(None)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
+
+        // A symlink to a stale socket elsewhere: lstat sees a link, not a socket.
+        let target = path.with_file_name("elsewhere.sock");
+        drop(std::os::unix::net::UnixListener::bind(&target).unwrap());
+        let link = path.with_file_name("link.sock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(IpcServer::bind(&link, state, Control::new(None)).is_err());
+        assert!(std::fs::symlink_metadata(&link).is_ok(), "link kept");
+        assert!(target.exists(), "target kept");
+    }
+
+    /// Two daemons on one path: the later one fails and the first one's
+    /// socket keeps answering — whether the second arrives while the first
+    /// runs, or both race to start.
+    #[test]
+    fn racing_daemons_never_delete_the_live_socket() {
+        let path = temp_socket("race");
+        let state = Arc::new(Mutex::new(ApiState::default()));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (path, state, barrier) =
+                    (path.clone(), Arc::clone(&state), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    IpcServer::bind(&path, state, Control::new(None))
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let winners: Vec<_> = results.iter().filter(|r| r.is_ok()).collect();
+        assert_eq!(winners.len(), 1, "exactly one daemon binds");
+        for err in results.iter().filter_map(|r| r.as_ref().err()) {
+            assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+        }
+        let (status, _) = exchange(&path, "GET /health HTTP/1.1\r\n\r\n");
+        assert_eq!(status, 200, "the winner's socket survives");
+        let late = IpcServer::bind(&path, state, Control::new(None));
+        assert_eq!(
+            late.err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::AddrInUse)
+        );
+        let (status, _) = exchange(&path, "GET /health HTTP/1.1\r\n\r\n");
+        assert_eq!(status, 200);
+        drop(results);
     }
 
     #[test]

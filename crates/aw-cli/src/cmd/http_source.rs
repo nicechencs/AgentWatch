@@ -42,7 +42,7 @@ impl HttpQuerySource {
         let mut client = Client::new(self.endpoint.clone(), transport);
         let reply = client.call(request).map_err(client_to_query)?;
         reply.json().ok_or_else(|| QueryError::Unavailable {
-            detail: "daemon returned a non-JSON body".to_owned(),
+            detail: "后台返回的响应体不是 JSON".to_owned(),
         })
     }
 }
@@ -119,7 +119,7 @@ impl QuerySource for HttpQuerySource {
                 Some(Value::Bool(true)) => removed = removed.saturating_add(1),
                 _ => {
                     return Err(QueryError::Unavailable {
-                        detail: "response is missing field `deleted`".to_owned(),
+                        detail: "响应缺少字段 `deleted`".to_owned(),
                     });
                 }
             }
@@ -154,7 +154,7 @@ impl QuerySource for HttpQuerySource {
             Some(Value::String(text)) => !text.is_empty(),
             Some(_) => {
                 return Err(QueryError::Unavailable {
-                    detail: "field `next_cursor` is not a string".to_owned(),
+                    detail: "字段 `next_cursor` 不是字符串".to_owned(),
                 });
             }
         };
@@ -166,9 +166,7 @@ impl QuerySource for HttpQuerySource {
         // closes. The timeline page's cursor is `ts_ns,id`, not an `after` bound,
         // so polling it would replay the same page. Do not invent a stream.
         Err(QueryError::Unavailable {
-            detail: format!(
-                "{FOLLOW_NOTE}; real-time /sessions/{{sid}}/live is not subscribed (真实订阅未接通)"
-            ),
+            detail: format!("{FOLLOW_NOTE}；没有订阅实时 /sessions/{{sid}}/live（真实订阅未接通）"),
         })
     }
 
@@ -217,7 +215,7 @@ impl QuerySource for HttpQuerySource {
         // Mapping a root onto FileItem would invent `op` and `first_ns`.
         if body.get("files").is_none() && body.get("roots").is_some() {
             return Err(QueryError::Unavailable {
-                detail: "GET /sessions/{sid}/files group_by=dir returns directory roots, not file rows; this command does not invent a file from a directory count".to_owned(),
+                detail: "GET /sessions/{sid}/files 的 group_by=dir 返回目录根，不是文件行；此命令不会根据目录计数编造文件".to_owned(),
             });
         }
         let rows = array_field(&body, "files")?;
@@ -249,7 +247,8 @@ impl QuerySource for HttpQuerySource {
         }
         let _ = search_hit(&rows[0])?;
         Err(QueryError::Unavailable {
-            detail: "GET /search hits omit summary, ts_ns, and evidence; this command does not invent them".to_owned(),
+            detail: "GET /search 命中缺少 summary、ts_ns 和 evidence；此命令不会编造这些字段"
+                .to_owned(),
         })
     }
 
@@ -264,7 +263,7 @@ impl QuerySource for HttpQuerySource {
             Some(Value::String(text)) => Some(text.clone()),
             Some(_) => {
                 return Err(QueryError::Unavailable {
-                    detail: "field `reason` is not a string".to_owned(),
+                    detail: "字段 `reason` 不是字符串".to_owned(),
                 });
             }
         };
@@ -290,7 +289,7 @@ impl HttpQuerySource {
 }
 
 const FOLLOW_NOTE: &str =
-    "daemon timeline has no after cursor this client can poll, and GET /sessions/{sid}/live is an event stream this HTTP client does not keep open";
+    "后台时间线没有可供此客户端轮询的 after 游标，且 GET /sessions/{sid}/live 是此 HTTP 客户端不会保持打开的事件流";
 
 fn get_pairs(path: &str, pairs: &[(String, String)]) -> ApiRequest {
     let borrowed: Vec<(&str, &str)> = pairs
@@ -332,7 +331,7 @@ fn client_to_query(err: ClientError) -> QueryError {
         | ClientError::Status {
             status: 401 | 403, ..
         } => QueryError::Unavailable {
-            detail: clip(&format!("auth: {err}")),
+            detail: clip(&format!("认证失败：{err}")),
         },
         ClientError::Unreachable { .. }
         | ClientError::Transport { .. }
@@ -368,7 +367,7 @@ fn session_from_fields(
         Some(text) if !text.is_empty() => text.to_owned(),
         _ => {
             return Err(QueryError::Unavailable {
-                detail: "response is missing field `id`".to_owned(),
+                detail: "响应缺少字段 `id`".to_owned(),
             });
         }
     };
@@ -412,7 +411,7 @@ fn proc_item(value: &Value, tree: bool) -> Result<ProcItem, QueryError> {
                 .collect::<Result<Vec<_>, _>>()?,
             Some(_) => {
                 return Err(QueryError::Unavailable {
-                    detail: "field `children` is not an array".to_owned(),
+                    detail: "字段 `children` 不是数组".to_owned(),
                 });
             }
         }
@@ -470,7 +469,7 @@ fn gap_item(value: &Value) -> Result<GapItem, QueryError> {
                     Some(text) => parts.push(text.to_owned()),
                     None => {
                         return Err(QueryError::Unavailable {
-                            detail: "field `affects` has a non-string entry".to_owned(),
+                            detail: "字段 `affects` 有非字符串条目".to_owned(),
                         });
                     }
                 }
@@ -479,12 +478,12 @@ fn gap_item(value: &Value) -> Result<GapItem, QueryError> {
         }
         None | Some(Value::Null) => {
             return Err(QueryError::Unavailable {
-                detail: "response is missing field `affects`".to_owned(),
+                detail: "响应缺少字段 `affects`".to_owned(),
             });
         }
         Some(_) => {
             return Err(QueryError::Unavailable {
-                detail: "field `affects` is not a string or array".to_owned(),
+                detail: "字段 `affects` 不是字符串或数组".to_owned(),
             });
         }
     };
@@ -580,7 +579,7 @@ fn search_hit(value: &Value) -> Result<SearchHit, QueryError> {
         Some(text) if !text.is_empty() => text.to_owned(),
         _ => {
             return Err(QueryError::Unavailable {
-                detail: "response is missing field `public_id`".to_owned(),
+                detail: "响应缺少字段 `public_id`".to_owned(),
             });
         }
     };
@@ -591,7 +590,7 @@ fn search_hit(value: &Value) -> Result<SearchHit, QueryError> {
         Some(text) if !text.is_empty() => text.to_owned(),
         _ => {
             return Err(QueryError::Unavailable {
-                detail: "response is missing field `summary`".to_owned(),
+                detail: "响应缺少字段 `summary`".to_owned(),
             });
         }
     };
@@ -646,12 +645,12 @@ fn finding_item(value: &Value) -> Result<FindingItem, QueryError> {
                     Value::Bool(flag) => flag.to_string(),
                     Value::Null => {
                         return Err(QueryError::Unavailable {
-                            detail: format!("field `params.{key}` is null"),
+                            detail: format!("字段 `params.{key}` 为 null"),
                         });
                     }
                     _ => {
                         return Err(QueryError::Unavailable {
-                            detail: format!("field `params.{key}` is not a scalar"),
+                            detail: format!("字段 `params.{key}` 不是标量"),
                         });
                     }
                 };
@@ -669,14 +668,14 @@ fn finding_item(value: &Value) -> Result<FindingItem, QueryError> {
                 match (key, text) {
                     (Some(key), Some(text)) => Ok((key.to_owned(), text.to_owned())),
                     _ => Err(QueryError::Unavailable {
-                        detail: "field `params` entry is missing `key` or `value`".to_owned(),
+                        detail: "字段 `params` 的条目缺少 `key` 或 `value`".to_owned(),
                     }),
                 }
             })
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => {
             return Err(QueryError::Unavailable {
-                detail: "field `params` is not an object or array".to_owned(),
+                detail: "字段 `params` 不是对象或数组".to_owned(),
             });
         }
     };
@@ -688,7 +687,7 @@ fn finding_item(value: &Value) -> Result<FindingItem, QueryError> {
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => {
             return Err(QueryError::Unavailable {
-                detail: "field `refs` is not an array".to_owned(),
+                detail: "字段 `refs` 不是数组".to_owned(),
             });
         }
     };
@@ -733,7 +732,7 @@ fn finding_ref(value: &Value) -> Result<FindingRef, QueryError> {
         }
     }
     Err(QueryError::Unavailable {
-        detail: "field `refs` entry is missing `table` and `id`".to_owned(),
+        detail: "字段 `refs` 的条目缺少 `table` 和 `id`".to_owned(),
     })
 }
 
@@ -741,10 +740,10 @@ fn array_field<'a>(value: &'a Value, name: &str) -> Result<&'a Vec<Value>, Query
     match value.get(name) {
         Some(Value::Array(rows)) => Ok(rows),
         Some(_) => Err(QueryError::Unavailable {
-            detail: format!("field `{name}` is not an array"),
+            detail: format!("字段 `{name}` 不是数组"),
         }),
         None => Err(QueryError::Unavailable {
-            detail: format!("response is missing field `{name}`"),
+            detail: format!("响应缺少字段 `{name}`"),
         }),
     }
 }
@@ -753,13 +752,13 @@ fn required_str(value: &Value, name: &str) -> Result<String, QueryError> {
     match value.get(name) {
         Some(Value::String(text)) if !text.is_empty() => Ok(text.clone()),
         Some(Value::String(_)) => Err(QueryError::Unavailable {
-            detail: format!("field `{name}` is empty"),
+            detail: format!("字段 `{name}` 为空"),
         }),
         Some(Value::Null) | None => Err(QueryError::Unavailable {
-            detail: format!("response is missing field `{name}`"),
+            detail: format!("响应缺少字段 `{name}`"),
         }),
         Some(_) => Err(QueryError::Unavailable {
-            detail: format!("field `{name}` is not a string"),
+            detail: format!("字段 `{name}` 不是字符串"),
         }),
     }
 }
@@ -768,10 +767,10 @@ fn required_bool(value: &Value, name: &str) -> Result<bool, QueryError> {
     match value.get(name) {
         Some(Value::Bool(flag)) => Ok(*flag),
         Some(Value::Null) | None => Err(QueryError::Unavailable {
-            detail: format!("response is missing field `{name}`"),
+            detail: format!("响应缺少字段 `{name}`"),
         }),
         Some(_) => Err(QueryError::Unavailable {
-            detail: format!("field `{name}` is not a bool"),
+            detail: format!("字段 `{name}` 不是布尔值"),
         }),
     }
 }
@@ -780,7 +779,7 @@ fn required_i64(value: &Value, name: &str) -> Result<i64, QueryError> {
     match value.get(name).and_then(json_i64) {
         Some(n) => Ok(n),
         None => Err(QueryError::Unavailable {
-            detail: format!("response is missing field `{name}`"),
+            detail: format!("响应缺少字段 `{name}`"),
         }),
     }
 }
@@ -791,7 +790,7 @@ fn opt_i64_field(value: &Value, name: &str) -> Result<Option<i64>, QueryError> {
         Some(other) => json_i64(other)
             .map(Some)
             .ok_or_else(|| QueryError::Unavailable {
-                detail: format!("field `{name}` is not an integer"),
+                detail: format!("字段 `{name}` 不是整数"),
             }),
     }
 }
@@ -802,7 +801,7 @@ fn opt_string(value: &Value, name: &str) -> Result<Option<String>, QueryError> {
         Some(Value::String(text)) if text.is_empty() => Ok(None),
         Some(Value::String(text)) => Ok(Some(text.clone())),
         Some(_) => Err(QueryError::Unavailable {
-            detail: format!("field `{name}` is not a string"),
+            detail: format!("字段 `{name}` 不是字符串"),
         }),
     }
 }
@@ -822,20 +821,20 @@ fn opt_proc_uid(value: &Value, name: &str) -> Result<Option<i64>, QueryError> {
             parse_hex_i64(text)
                 .map(Some)
                 .ok_or_else(|| QueryError::Unavailable {
-                    detail: format!("field `{name}` is not a proc uid"),
+                    detail: format!("字段 `{name}` 不是进程 UID"),
                 })
         }
         Some(other) => json_i64(other)
             .map(Some)
             .ok_or_else(|| QueryError::Unavailable {
-                detail: format!("field `{name}` is not a proc uid"),
+                detail: format!("字段 `{name}` 不是进程 UID"),
             }),
     }
 }
 
 fn required_proc_uid(value: &Value) -> Result<i64, QueryError> {
     opt_proc_uid(value, "proc_uid")?.ok_or_else(|| QueryError::Unavailable {
-        detail: "response is missing field `proc_uid`".to_owned(),
+        detail: "响应缺少字段 `proc_uid`".to_owned(),
     })
 }
 
@@ -850,17 +849,17 @@ fn evidence_field(value: &Value, name: &str) -> Result<Evidence, QueryError> {
         Some(Value::Object(obj)) => return parse_evidence_object(obj),
         Some(Value::Null) | None => {
             return Err(QueryError::Unavailable {
-                detail: format!("response is missing field `{name}`"),
+                detail: format!("响应缺少字段 `{name}`"),
             });
         }
         Some(_) => {
             return Err(QueryError::Unavailable {
-                detail: format!("field `{name}` is not an evidence code"),
+                detail: format!("字段 `{name}` 不是证据代码"),
             });
         }
     };
     parse_evidence_code(text).ok_or_else(|| QueryError::Unavailable {
-        detail: format!("field `{name}` is not an evidence code"),
+        detail: format!("字段 `{name}` 不是证据代码"),
     })
 }
 
@@ -875,7 +874,7 @@ fn parse_evidence_object(value: &serde_json::Map<String, Value>) -> Result<Evide
         return Ok(Evidence::NA(reason));
     }
     parse_evidence_code(level).ok_or_else(|| QueryError::Unavailable {
-        detail: "field `evidence` is not an evidence code".to_owned(),
+        detail: "字段 `evidence` 不是证据代码".to_owned(),
     })
 }
 

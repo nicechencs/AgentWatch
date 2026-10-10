@@ -177,7 +177,7 @@ impl DaemonSummary {
 
 /// Fixed sentence for a daemon-recorded run. Not a claim about the target.
 const DAEMON_LEVEL_NOTE: &str =
-    "证据 S（daemon 轮询采样）· 数字为目标退出时 daemon 已记录的部分，会话由 daemon 在根进程退出后结束";
+    "证据 S（后台轮询采样）· 数字为目标退出时后台已记录的部分，会话由后台在根进程退出后结束";
 
 impl SessionSummary for DaemonSummary {
     fn summarize(&mut self, session_hint: Option<&str>) -> Result<Option<Summary>, String> {
@@ -193,7 +193,7 @@ impl SessionSummary for DaemonSummary {
             .map_err(|err| err.to_string())?;
         let body = reply
             .json()
-            .ok_or_else(|| "daemon returned a non-JSON body".to_owned())?;
+            .ok_or_else(|| "后台返回的响应体不是 JSON".to_owned())?;
         let stats = body.get("stats").cloned().unwrap_or(Value::Null);
         let count = |key: &str| stats.get(key).and_then(Value::as_u64);
         Ok(Some(Summary {
@@ -306,7 +306,7 @@ impl SpawnedChild for ProcessChild {
 impl Spawner for CommandSpawner {
     fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, String> {
         let Some((program, args)) = spec.command.split_first() else {
-            return Err("program is empty".to_owned());
+            return Err("程序名为空".to_owned());
         };
         let mut command = Command::new(program);
         command.args(args);
@@ -370,9 +370,7 @@ impl Launcher for PlatformLauncher {
 
     fn forward_interrupt(&mut self, _pid: u32) -> Result<(), LaunchDispatchError> {
         Err(LaunchDispatchError::NotImplemented {
-            detail:
-                "interrupt forwarding is not wired; the child is waited without a signal forwarder"
-                    .to_owned(),
+            detail: "中断转发尚未接通；将等待子进程结束，不转发信号".to_owned(),
         })
     }
 }
@@ -411,7 +409,7 @@ fn launch_linux(
 ) -> Result<Launched, LaunchDispatchError> {
     let Some((program, args)) = spec.command.split_first() else {
         return Err(LaunchDispatchError::NotImplemented {
-            detail: "launch command is empty".to_owned(),
+            detail: "启动命令为空".to_owned(),
         });
     };
     let argv: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
@@ -541,7 +539,7 @@ impl Launcher for PlatformLauncher {
         // No process group was created. A signal would need libc, which this
         // crate does not link. Do not claim the interrupt was forwarded.
         Err(LaunchDispatchError::NotImplemented {
-            detail: "interrupt forwarding is unavailable; no process group was created and libc is not linked".to_owned(),
+            detail: "中断转发不可用；没有创建进程组，且未链接 libc".to_owned(),
         })
     }
 }
@@ -624,7 +622,7 @@ fn daemon_prepare(
         return Err(super::error_outcome(
             exit::GENERAL,
             "not_available",
-            "--no-follow-children is not available when the daemon records the session (its poll sampler always follows children); drop the flag or use --no-daemon",
+            "后台记录会话时不支持 --no-follow-children（轮询采样器总是跟随子进程）；请移除此参数或使用 --no-daemon",
             args.json,
         ));
     }
@@ -767,9 +765,7 @@ pub(crate) fn daemon_run(
             Ok(()) => (PinState::Confirmed, None),
             Err(error) => (
                 PinState::Failed,
-                Some(format!(
-                    "[aw] warning: the daemon did not pin this session: {error}\n"
-                )),
+                Some(format!("[aw] 警告：后台没有保留这个会话：{error}\n")),
             ),
         }
     } else {
@@ -820,10 +816,10 @@ pub(crate) fn daemon_run(
 fn daemon_error_outcome(error: ControlError, json: bool, child_stopped: bool) -> Outcome {
     let mut message = error.to_string();
     if child_stopped {
-        message.push_str("; the program was stopped because the daemon did not take it over");
+        message.push_str("；后台没有接管程序，已将其结束");
     }
     if error.collector_unavailable() {
-        message.push_str("; use --no-daemon on this platform");
+        message.push_str("；请在此平台使用 --no-daemon");
     }
     super::error_outcome(error.exit_code(), error.machine_code(), &message, json)
 }
@@ -950,7 +946,7 @@ fn deferred_reason(flags: DeferredFlags) -> Option<String> {
     // a config and must not launch. The wrapper itself is `aw mcp-tap`.
     if flags.mcp_tap {
         return Some(
-            "--mcp-tap on `aw run` is not applied: no per-agent MCP config injection is implemented (SPIKE-09); `aw mcp-tap -- <cmd>` is the manual wrapper. nothing was launched"
+            "`aw run` 不支持 --mcp-tap：尚未实现每个 Agent 的 MCP 配置注入（SPIKE-09）；请手动使用 `aw mcp-tap -- <cmd>`。没有启动程序"
                 .to_owned(),
         );
     }
@@ -971,7 +967,7 @@ fn deferred_reason(flags: DeferredFlags) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{} is not available in this build (P3/P5 提供); nothing was launched",
+        "此构建不支持 {}（P3/P5 提供）；没有启动程序",
         which.join(", ")
     ))
 }
@@ -981,9 +977,7 @@ fn parse_summary(text: Option<&str>) -> Result<SummaryLevel, String> {
         None | Some("short") => Ok(SummaryLevel::Short),
         Some("none") => Ok(SummaryLevel::None),
         Some("full") => Ok(SummaryLevel::Full),
-        Some(other) => Err(format!(
-            "--summary `{other}` is not one of none, short, full"
-        )),
+        Some(other) => Err(format!("--summary `{other}` 不是 none、short 或 full")),
     }
 }
 
@@ -992,16 +986,14 @@ fn split_env(raw: &[String]) -> Result<Vec<(String, String)>, String> {
     let mut pairs = Vec::with_capacity(raw.len());
     for item in raw {
         let Some((key, value)) = item.split_once('=') else {
-            return Err(
-                "--env entry is missing '='; pass KEY=VALUE (the value is not shown)".to_owned(),
-            );
+            return Err("--env 条目缺少 `=`；请传入 KEY=VALUE（不会显示值）".to_owned());
         };
         if key.is_empty()
             || key
                 .bytes()
                 .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'_'))
         {
-            return Err("--env name must be ASCII letters, digits, or '_'".to_owned());
+            return Err("--env 名称只能含 ASCII 字母、数字或 `_`".to_owned());
         }
         pairs.push((key.to_owned(), value.to_owned()));
     }
@@ -1029,7 +1021,7 @@ fn write_summary(
     if args.json {
         let body = summary_json(args, launched, figures, session_id, pin_state);
         let mut bytes = serde_json::to_vec(&body)
-            .map_err(|err| io::Error::other(format!("encode summary: {err}")))?;
+            .map_err(|err| io::Error::other(format!("编码摘要失败：{err}")))?;
         bytes.push(b'\n');
         // The summary is an `[aw]` side channel. JSON still goes to stderr so the
         // target's own stdout stays untouched.
@@ -1048,7 +1040,7 @@ fn write_summary(
                 .unwrap_or("未命名");
             writeln!(
                 out,
-                "[aw] 会话 {session} 结束 · 进程 {processes} · 上传 {up} · 下载 {down} · Top 域名 {domains} · 缺口 {gaps}"
+                "[aw] 会话 {session} 结束 · 进程 {processes} · 上传 {up} · 下载 {down} · 前 5 域名 {domains} · 缺口 {gaps}"
             )?;
             // The level note is part of the summary at every level except `none`
             // (api-and-cli §2.1 asks for 等级说明).
@@ -1056,7 +1048,7 @@ fn write_summary(
             if level == SummaryLevel::Full {
                 writeln!(
                     out,
-                    "[aw] 摘要级别 full · 域名列出前 5 个 · 未知的计数显示为不可得，不显示为 0"
+                    "[aw] 摘要级别 full · 域名列出前 5 个 · 未知计数显示为不可得，不显示为 0"
                 )?;
             }
         }
@@ -1133,7 +1125,7 @@ fn summary_json(
         "pinned_reason": if pin_state == PinState::Unknown {
             Some("本构建未执行保留，保留状态不可得")
         } else if pin_state == PinState::Failed {
-            Some("daemon 未确认保留状态")
+            Some("后台未确认保留状态")
         } else {
             None
         },
@@ -1507,7 +1499,7 @@ mod tests {
         let err = text(&outcome.stderr);
         assert!(err.contains("进程 不可得"), "{err}");
         assert!(err.contains("上传 不可得"), "{err}");
-        assert!(err.contains("Top 域名 不可得"), "{err}");
+        assert!(err.contains("前 5 域名 不可得"), "{err}");
         assert!(err.contains("缺口 不可得"), "{err}");
         assert!(!err.contains("进程 0"), "{err}");
     }
@@ -1818,8 +1810,7 @@ mod tests {
         );
         assert_eq!(outcome.code, exit::USAGE);
         assert_eq!(*log.borrow(), vec!["begin", "spawn", "adopt", "kill"]);
-        assert!(text(&outcome.stderr)
-            .contains("program was stopped because the daemon did not take it over"));
+        assert!(text(&outcome.stderr).contains("后台没有接管程序，已将其结束"));
     }
 
     #[test]
@@ -1997,7 +1988,7 @@ mod tests {
         );
         assert_eq!(outcome.code, exit::GENERAL);
         assert_eq!(spawner.spawned, 0);
-        assert!(text(&outcome.stderr).contains("use --no-daemon on this platform"));
+        assert!(text(&outcome.stderr).contains("请在此平台使用 --no-daemon"));
     }
 
     #[test]

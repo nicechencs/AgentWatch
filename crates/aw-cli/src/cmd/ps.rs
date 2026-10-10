@@ -105,7 +105,7 @@ impl ProcessTable for DaemonTable {
     fn list(&mut self) -> Result<Vec<ProcessRow>, PsError> {
         let Some(transport) = self.transport.take() else {
             return Err(PsError::Unavailable {
-                detail: "process table was already read".to_owned(),
+                detail: "进程表已读取".to_owned(),
             });
         };
         let mut client = Client::new(self.endpoint.clone(), transport);
@@ -119,11 +119,11 @@ impl ProcessTable for DaemonTable {
                         }
                     }
                     other => PsError::Unavailable {
-                        detail: format!("process table request failed: {other}"),
+                        detail: format!("请求进程表失败：{other}"),
                     },
                 })?;
         let body = reply.json().ok_or_else(|| PsError::Unavailable {
-            detail: "daemon returned a non-JSON process table".to_owned(),
+            detail: "后台返回的进程表不是 JSON".to_owned(),
         })?;
         rows_from_json(&body)
     }
@@ -137,14 +137,14 @@ fn rows_from_json(body: &Value) -> Result<Vec<ProcessRow>, PsError> {
         let reason = body
             .get("reason")
             .and_then(Value::as_str)
-            .unwrap_or("the daemon did not say why");
+            .unwrap_or("后台没有说明原因");
         return Err(PsError::NotCollected {
-            detail: format!("process table not collected (没采): {reason}"),
+            detail: format!("进程表没采：{reason}"),
         });
     }
     let Some(list) = body.get("processes").and_then(Value::as_array) else {
         return Err(PsError::Unavailable {
-            detail: "daemon process table has no `processes` list".to_owned(),
+            detail: "后台进程表没有 `processes` 列表".to_owned(),
         });
     };
     list.iter()
@@ -169,7 +169,7 @@ fn rows_from_json(body: &Value) -> Result<Vec<ProcessRow>, PsError> {
                     evidence: Evidence::S,
                 }),
                 _ => Err(PsError::Unavailable {
-                    detail: "daemon process row without pid or name".to_owned(),
+                    detail: "后台进程行没有 pid 或 name".to_owned(),
                 }),
             }
         })
@@ -185,7 +185,7 @@ pub(crate) fn run(
 ) -> Outcome {
     if let Some(text) = filter {
         if text.trim().is_empty() {
-            return super::error_outcome(exit::USAGE, "usage", "--filter is empty", json);
+            return super::error_outcome(exit::USAGE, "usage", "--filter 为空", json);
         }
     }
     let rows = match table.list() {

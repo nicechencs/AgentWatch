@@ -93,7 +93,7 @@ pub fn write_table(out: &mut dyn Write, mode: OutputMode, table: &Table) -> io::
         OutputMode::Json => {
             let value = table_json(table);
             let mut bytes = serde_json::to_vec_pretty(&value)
-                .map_err(|err| io::Error::other(format!("encode table json: {err}")))?;
+                .map_err(|err| io::Error::other(format!("编码表格 JSON 失败：{err}")))?;
             bytes.push(b'\n');
             out.write_all(&bytes)
         }
@@ -258,7 +258,7 @@ fn terminal_columns() -> usize {
 pub fn parse_session(text: &str) -> Result<SessionRef, String> {
     let text = text.trim();
     if text.is_empty() {
-        return Err("session is empty; pass a public id, a session name, or @last".to_owned());
+        return Err("会话不能为空；请传入公开 ID、会话名或 @last".to_owned());
     }
     if text == "@last" {
         Ok(SessionRef::Last)
@@ -286,7 +286,7 @@ pub enum SessionRef {
 pub fn parse_time(text: &str) -> Result<TimeArg, String> {
     let text = text.trim();
     if text.is_empty() {
-        return Err("time is empty; use RFC 3339, -10m, or +30s".to_owned());
+        return Err("时间不能为空；请使用 RFC 3339、-10m 或 +30s".to_owned());
     }
     if let Some(rest) = text.strip_prefix('+') {
         let duration = parse_duration(rest)?;
@@ -311,7 +311,7 @@ pub fn parse_time(text: &str) -> Result<TimeArg, String> {
         return Ok(TimeArg::Rfc3339(text.to_owned()));
     }
     Err(format!(
-        "time `{text}` is not RFC 3339, a relative `-10m`, or a session-relative `+30s`"
+        "时间 `{text}` 不是 RFC 3339、相对当前的 `-10m` 或相对会话的 `+30s`"
     ))
 }
 
@@ -367,14 +367,14 @@ fn parse_duration(text: &str) -> Result<DurationArg, String> {
     } else if let Some(rest) = text.strip_suffix('d') {
         (rest, TimeUnit::Days)
     } else {
-        return Err(format!("duration `{text}` needs a unit: ms, s, m, h, or d"));
+        return Err(format!("时长 `{text}` 需要单位：ms、s、m、h 或 d"));
     };
     if count_text.is_empty() || !count_text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!("duration `{text}` needs an integer count"));
+        return Err(format!("时长 `{text}` 需要整数数值"));
     }
     let count: u64 = count_text
         .parse()
-        .map_err(|_| format!("duration `{text}` does not fit in u64"))?;
+        .map_err(|_| format!("时长 `{text}` 超出 u64 范围"))?;
     Ok(DurationArg { count, unit })
 }
 

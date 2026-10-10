@@ -29,7 +29,7 @@ pub(crate) fn run(session: &str, json: bool, control: &mut dyn DaemonSessions) -
         Err(error) if error.not_found() => super::error_outcome(
             error.exit_code(),
             "not_found",
-            "session not found (or not yours)",
+            "找不到会话（或它不属于当前账户）",
             json,
         ),
         Err(error) => super::attach::control_outcome(error, json),
@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(outcome.code, exit::USAGE);
         assert_eq!(
             String::from_utf8(outcome.stderr).expect("utf8"),
-            "aw: session not found (or not yours)\n"
+            "aw: 找不到会话（或它不属于当前账户）\n"
         );
     }
 }

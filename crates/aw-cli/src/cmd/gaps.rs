@@ -22,7 +22,7 @@ pub(crate) fn run(session: &str, json: bool, source: &dyn QuerySource) -> io::Re
         return Ok(super::error_outcome(
             exit::USAGE,
             "usage",
-            "session is empty",
+            "会话不能为空",
             json,
         ));
     }

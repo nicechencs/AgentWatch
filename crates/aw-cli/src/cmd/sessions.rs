@@ -78,7 +78,7 @@ fn list(
             return Ok(super::error_outcome(
                 exit::USAGE,
                 "usage",
-                "`sessions list --since` relative-to-now (-10m) needs a clock this build does not have; pass RFC 3339",
+                "`sessions list --since` 的相对当前时间（-10m）需要此构建没有的时钟；请传入 RFC 3339",
                 mode == OutputMode::Json,
             ));
         }
@@ -120,7 +120,7 @@ fn rename(
         return Ok(super::error_outcome(
             exit::USAGE,
             "usage",
-            "session name is empty",
+            "会话名为空",
             mode == OutputMode::Json,
         ));
     }
@@ -164,7 +164,7 @@ fn delete(
         return Ok(super::error_outcome(
             exit::USAGE,
             "usage",
-            "sessions delete refuses without --yes",
+            "`sessions delete` 需要 --yes，否则拒绝执行",
             mode == OutputMode::Json,
         ));
     }

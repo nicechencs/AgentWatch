@@ -50,7 +50,7 @@ pub(crate) fn run(args: FindingsArgs<'_>, source: &dyn QuerySource) -> io::Resul
         return Ok(super::error_outcome(
             exit::USAGE,
             "usage",
-            "session is empty",
+            "会话不能为空",
             args.json,
         ));
     }
@@ -59,7 +59,7 @@ pub(crate) fn run(args: FindingsArgs<'_>, source: &dyn QuerySource) -> io::Resul
             return Ok(super::error_outcome(
                 exit::USAGE,
                 "usage",
-                &format!("--min-severity `{severity}` is not info, notice, or warn"),
+                &format!("--min-severity `{severity}` 不是 info、notice 或 warn"),
                 args.json,
             ));
         }
@@ -81,7 +81,7 @@ pub(crate) fn run(args: FindingsArgs<'_>, source: &dyn QuerySource) -> io::Resul
             return Ok(super::error_outcome(
                 exit::USAGE,
                 "usage",
-                &format!("--lang `{other}` is not zh or en"),
+                &format!("--lang `{other}` 不是 zh 或 en"),
                 args.json,
             ));
         }
@@ -120,11 +120,11 @@ fn parse_evidence(text: Option<&str>) -> Result<Vec<String>, String> {
     for part in text.split(',') {
         let token = part.trim();
         if token.is_empty() {
-            return Err("--evidence has an empty item".to_owned());
+            return Err("--evidence 含有空项".to_owned());
         }
         if !EVIDENCE_TOKENS.contains(&token) {
             return Err(format!(
-                "--evidence `{token}` is not E1, E2, E3, S, I, NA, or content_match"
+                "--evidence `{token}` 不是 E1、E2、E3、S、I、NA 或 content_match"
             ));
         }
         if !tokens.iter().any(|have: &String| have == token) {

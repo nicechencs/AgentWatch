@@ -70,7 +70,7 @@ pub(crate) fn test(
         match read_expect(Path::new(expect)) {
             Ok(expected) => {
                 if canonical(&actual) != canonical(&expected) {
-                    let detail = format!("findings do not match {}", Path::new(expect).display());
+                    let detail = format!("发现结果与 {} 不匹配", Path::new(expect).display());
                     let mut outcome =
                         super::error_outcome(exit::GENERAL, "expect_mismatch", &detail, json_mode);
                     // The actual findings stay on stdout so the difference is visible
@@ -101,7 +101,7 @@ fn parse_lang(lang: Option<&str>) -> Result<Lang, String> {
     match lang {
         None | Some("zh") => Ok(Lang::Zh),
         Some("en") => Ok(Lang::En),
-        Some(other) => Err(format!("--lang `{other}` is not zh or en")),
+        Some(other) => Err(format!("--lang `{other}` 不是 zh 或 en")),
     }
 }
 
@@ -125,7 +125,7 @@ fn load_one(path: &Path) -> Result<LoadedRule, RuleError> {
         .filter(|name| !name.is_empty())
         .ok_or_else(|| RuleError::Io {
             path: path.to_path_buf(),
-            detail: "rule path has no file name".to_owned(),
+            detail: "规则路径没有文件名".to_owned(),
         })?;
     let scratch = TempDir::create().map_err(|err| RuleError::Io {
         path: path.to_path_buf(),
@@ -139,7 +139,7 @@ fn load_one(path: &Path) -> Result<LoadedRule, RuleError> {
     let set = aw_pipeline::rules::load_with_user(Some(scratch.path()))?;
     let rule_id = tested_rule_id(&set).ok_or_else(|| RuleError::Io {
         path: path.to_path_buf(),
-        detail: "the file did not load as a rule".to_owned(),
+        detail: "该文件没有加载为规则".to_owned(),
     })?;
     Ok(LoadedRule { set, rule_id })
 }
@@ -206,7 +206,7 @@ impl TempDir {
                 .map(|elapsed| elapsed.as_nanos())
                 .unwrap_or(0)
         ));
-        fs::create_dir(&path).map_err(|err| format!("create {}: {err}", path.display()))?;
+        fs::create_dir(&path).map_err(|err| format!("创建 {} 失败：{err}", path.display()))?;
         Ok(Self { path })
     }
 
@@ -229,7 +229,7 @@ struct FixtureRecord {
 
 fn read_fixture(path: &Path) -> Result<Vec<FixtureRecord>, String> {
     let text = fs::read_to_string(path)
-        .map_err(|err| format!("read fixture {}: {err}", path.display()))?;
+        .map_err(|err| format!("读取 fixture {} 失败：{err}", path.display()))?;
     let mut records = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line_no = index + 1;
@@ -238,10 +238,10 @@ fn read_fixture(path: &Path) -> Result<Vec<FixtureRecord>, String> {
             continue;
         }
         let value: Value = serde_json::from_str(trimmed)
-            .map_err(|_| format!("{}:{line_no}: fixture line is not JSON", path.display()))?;
+            .map_err(|_| format!("{}:{line_no}：fixture 行不是 JSON", path.display()))?;
         records.push(
             fixture_record(&value)
-                .map_err(|detail| format!("{}:{line_no}: {detail}", path.display()))?,
+                .map_err(|detail| format!("{}:{line_no}：{detail}", path.display()))?,
         );
     }
     Ok(records)
@@ -250,7 +250,7 @@ fn read_fixture(path: &Path) -> Result<Vec<FixtureRecord>, String> {
 fn fixture_record(value: &Value) -> Result<FixtureRecord, String> {
     let object = value
         .as_object()
-        .ok_or_else(|| "fixture line is not an object".to_owned())?;
+        .ok_or_else(|| "fixture 行不是对象".to_owned())?;
     let process = match object.get("process") {
         Some(node) => Some(proc_node(node)?),
         None => None,
@@ -260,7 +260,7 @@ fn fixture_record(value: &Value) -> Result<FixtureRecord, String> {
     } else if process.is_some() {
         None
     } else {
-        return Err("fixture line has neither record nor process".to_owned());
+        return Err("fixture 行既没有 record 也没有 process".to_owned());
     };
     Ok(FixtureRecord { process, row })
 }
@@ -268,7 +268,7 @@ fn fixture_record(value: &Value) -> Result<FixtureRecord, String> {
 fn proc_node(value: &Value) -> Result<ProcNode, String> {
     let object = value
         .as_object()
-        .ok_or_else(|| "process is not an object".to_owned())?;
+        .ok_or_else(|| "process 不是对象".to_owned())?;
     let proc_uid = required_u64(object, "proc_uid")?;
     let parent = optional_u64(object, "parent")?;
     Ok(ProcNode { proc_uid, parent })
@@ -279,7 +279,7 @@ fn rule_record(object: &Map<String, Value>) -> Result<RuleRecord, String> {
         required_str(object, "record").or_else(|_| required_str(object, "record_type"))?;
     let id =
         optional_u64(object, "id")?.or_else(|| optional_u64(object, "record_id").ok().flatten());
-    let id = id.ok_or_else(|| "record is missing id".to_owned())?;
+    let id = id.ok_or_else(|| "record 缺少 id".to_owned())?;
     let ts_ns = required_u64(object, "ts_ns")?;
     let mut record = RuleRecord::new(record_type, id, ts_ns);
     if let Some(session) = optional_u64(object, "session")? {
@@ -309,13 +309,9 @@ fn rule_record(object: &Map<String, Value>) -> Result<RuleRecord, String> {
         }
     }
     if let Some(tags) = object.get("tags") {
-        let list = tags
-            .as_array()
-            .ok_or_else(|| "tags is not a list".to_owned())?;
+        let list = tags.as_array().ok_or_else(|| "tags 不是列表".to_owned())?;
         for tag in list {
-            let tag = tag
-                .as_str()
-                .ok_or_else(|| "a tag is not a string".to_owned())?;
+            let tag = tag.as_str().ok_or_else(|| "tag 不是字符串".to_owned())?;
             record = record.tag(tag);
         }
     }
@@ -325,12 +321,12 @@ fn rule_record(object: &Map<String, Value>) -> Result<RuleRecord, String> {
 fn string_map(value: &Value, name: &str) -> Result<BTreeMap<String, String>, String> {
     let object = value
         .as_object()
-        .ok_or_else(|| format!("{name} is not an object"))?;
+        .ok_or_else(|| format!("{name} 不是对象"))?;
     let mut out = BTreeMap::new();
     for (key, entry) in object {
         let text = entry
             .as_str()
-            .ok_or_else(|| format!("{name}.{key} is not a string"))?;
+            .ok_or_else(|| format!("{name}.{key} 不是字符串"))?;
         out.insert(key.clone(), text.to_owned());
     }
     Ok(out)
@@ -339,12 +335,12 @@ fn string_map(value: &Value, name: &str) -> Result<BTreeMap<String, String>, Str
 fn number_map(value: &Value, name: &str) -> Result<BTreeMap<String, i64>, String> {
     let object = value
         .as_object()
-        .ok_or_else(|| format!("{name} is not an object"))?;
+        .ok_or_else(|| format!("{name} 不是对象"))?;
     let mut out = BTreeMap::new();
     for (key, entry) in object {
         let number = entry
             .as_i64()
-            .ok_or_else(|| format!("{name}.{key} is not an integer"))?;
+            .ok_or_else(|| format!("{name}.{key} 不是整数"))?;
         out.insert(key.clone(), number);
     }
     Ok(out)
@@ -353,12 +349,12 @@ fn number_map(value: &Value, name: &str) -> Result<BTreeMap<String, i64>, String
 fn bool_map(value: &Value, name: &str) -> Result<BTreeMap<String, bool>, String> {
     let object = value
         .as_object()
-        .ok_or_else(|| format!("{name} is not an object"))?;
+        .ok_or_else(|| format!("{name} 不是对象"))?;
     let mut out = BTreeMap::new();
     for (key, entry) in object {
         let flag = entry
             .as_bool()
-            .ok_or_else(|| format!("{name}.{key} is not a bool"))?;
+            .ok_or_else(|| format!("{name}.{key} 不是布尔值"))?;
         out.insert(key.clone(), flag);
     }
     Ok(out)
@@ -368,11 +364,11 @@ fn required_str<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str
     object
         .get(key)
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("missing {key}"))
+        .ok_or_else(|| format!("缺少 {key}"))
 }
 
 fn required_u64(object: &Map<String, Value>, key: &str) -> Result<u64, String> {
-    optional_u64(object, key)?.ok_or_else(|| format!("missing {key}"))
+    optional_u64(object, key)?.ok_or_else(|| format!("缺少 {key}"))
 }
 
 fn optional_u64(object: &Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
@@ -382,16 +378,16 @@ fn optional_u64(object: &Map<String, Value>, key: &str) -> Result<Option<u64>, S
             let number = value
                 .as_u64()
                 .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
-                .ok_or_else(|| format!("{key} is not an unsigned integer"))?;
+                .ok_or_else(|| format!("{key} 不是无符号整数"))?;
             Ok(Some(number))
         }
     }
 }
 
 fn read_expect(path: &Path) -> Result<Value, String> {
-    let text =
-        fs::read_to_string(path).map_err(|err| format!("read expect {}: {err}", path.display()))?;
-    serde_json::from_str(&text).map_err(|_| format!("{} is not JSON", path.display()))
+    let text = fs::read_to_string(path)
+        .map_err(|err| format!("读取 expect {} 失败：{err}", path.display()))?;
+    serde_json::from_str(&text).map_err(|_| format!("{} 不是 JSON", path.display()))
 }
 
 /// Compare objects independent of key order. Arrays keep their order.
@@ -515,7 +511,7 @@ fn load_outcome(err: RuleError, json_mode: bool) -> Outcome {
     let mut message = err.to_string();
     if let Some(line) = err.line() {
         if !message.contains(&format!(":{line}:")) {
-            message = format!("{message} (line {line})");
+            message = format!("{message}（第 {line} 行）");
         }
     }
     super::error_outcome(exit::GENERAL, "rule", &message, json_mode)

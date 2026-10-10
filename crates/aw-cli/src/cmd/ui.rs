@@ -53,7 +53,7 @@ impl Opener for SystemOpener {
             .stderr(Stdio::null())
             .spawn()
             .map(|_| ())
-            .map_err(|err| format!("{program}: {}", err.kind()))
+            .map_err(|err| format!("打开浏览器失败：{program}: {}", err.kind()))
     }
 }
 
@@ -70,7 +70,7 @@ pub(crate) fn ui(
         return error_outcome(
             exit::USAGE,
             "usage",
-            "aw ui asks for a ticket on the socket or named pipe; a bearer over --http cannot mint one. Drop --http",
+            "aw ui 通过 socket 或命名管道申请 ticket；--http 上的 Bearer 不能签发 ticket。请移除 --http",
             json,
         );
     }
@@ -89,7 +89,7 @@ pub(crate) fn ui(
             return error_outcome(
                 exit::GENERAL,
                 "http_off",
-                "the daemon's HTTP listener is off (api.http_port = 0), so there is no browser page to open. Use the AgentWatch desktop app, or set api.http_port in the daemon config and restart it",
+                "后台的 HTTP 监听已关闭（api.http_port = 0），没有可打开的浏览器页面。请使用 AgentWatch 桌面应用，或在后台配置中设置 api.http_port 后重启",
                 json,
             )
         }
@@ -105,12 +105,7 @@ pub(crate) fn ui(
         })
         .filter(|ticket| !ticket.is_empty())
     else {
-        return error_outcome(
-            exit::GENERAL,
-            "bad_reply",
-            "daemon answered without a ticket",
-            json,
-        );
+        return error_outcome(exit::GENERAL, "bad_reply", "后台响应没有 ticket", json);
     };
     let url = format!("http://127.0.0.1:{http_port}/#ticket={ticket}");
     let opened = if no_open {
@@ -174,7 +169,7 @@ impl Starter for ProcessStarter {
         match child.try_wait() {
             Ok(Some(status)) => {
                 self.child = None;
-                Some(format!("agentwatchd exited ({status})"))
+                Some(format!("agentwatchd 已退出（{status}）"))
             }
             _ => None,
         }
@@ -204,7 +199,7 @@ impl Starter for ProcessStarter {
                 self.child = Some(child);
                 pid
             })
-            .map_err(|err| format!("could not start agentwatchd: {}", err.kind()))
+            .map_err(|err| format!("无法启动 agentwatchd：{}", err.kind()))
     }
 }
 
@@ -257,7 +252,7 @@ pub(crate) fn daemon_start(
     json: bool,
 ) -> Outcome {
     if let Some(version) = health(endpoint, open()) {
-        return running_outcome(endpoint, &version, Some("already running"), json);
+        return running_outcome(endpoint, &version, Some("已在运行"), json);
     }
     let pid = match starter.start() {
         Ok(pid) => pid,
@@ -266,14 +261,14 @@ pub(crate) fn daemon_start(
     let mut waited = Duration::ZERO;
     loop {
         if let Some(version) = health(endpoint, open()) {
-            let note = format!("started pid {pid}");
+            let note = format!("已启动 PID {pid}");
             return running_outcome(endpoint, &version, Some(&note), json);
         }
         if let Some(reason) = starter.exited() {
             return error_outcome(
                 exit::GENERAL,
                 "daemon_exited",
-                &format!("{reason} before {endpoint} answered; see the daemon log"),
+                &format!("{endpoint} 响应前 {reason}；请查看后台日志"),
                 json,
             );
         }
@@ -285,7 +280,7 @@ pub(crate) fn daemon_start(
                 exit::UNREACHABLE,
                 "unreachable",
                 &format!(
-                    "agentwatchd pid {pid} started but {endpoint} did not answer within {} s, so it was stopped again; see the daemon log",
+                    "agentwatchd 的 PID {pid} 已启动，但 {endpoint} 在 {} 秒内没有响应，已再次停止；请查看后台日志",
                     wait.as_secs()
                 ),
                 json,
@@ -481,7 +476,7 @@ mod tests {
         assert_eq!(out.code, exit::OK);
         assert_eq!(starter.0, 1);
         let text = String::from_utf8(out.stdout).expect("utf8");
-        assert!(text.contains("started pid 4242"), "{text}");
+        assert!(text.contains("已启动 PID 4242"), "{text}");
     }
 
     #[test]
@@ -566,7 +561,7 @@ mod tests {
         assert_eq!(out.code, exit::GENERAL);
         assert!(opener.0.is_empty(), "no dead link opened");
         let text = String::from_utf8(out.stderr).unwrap();
-        assert!(text.contains("HTTP listener is off"), "{text}");
+        assert!(text.contains("HTTP 监听已关闭"), "{text}");
 
         let out = ui(
             &sock(),

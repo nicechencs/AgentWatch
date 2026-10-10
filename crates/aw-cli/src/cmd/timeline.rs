@@ -125,7 +125,7 @@ fn resolve(text: Option<&str>, started: Option<i64>, json: bool) -> Result<Optio
         return Err(super::error_outcome(
             exit::USAGE,
             "usage",
-            "`--from`/`--to` relative-to-now (-10m) needs a clock this build does not have; pass RFC 3339 or +30s",
+            "`--from`/`--to` 的相对当前时间（-10m）需要此构建没有的时钟；请传入 RFC 3339 或 +30s",
             json,
         ));
     }

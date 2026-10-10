@@ -158,10 +158,7 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
     Ok(error_outcome(
         exit::GENERAL,
         "not_implemented",
-        &format!(
-            "`{}` is not implemented yet (尚未实现)",
-            command_label(&cli.command)
-        ),
+        &format!("`{}` 尚未实现", command_label(&cli.command)),
         json,
     ))
 }
@@ -198,9 +195,7 @@ fn channel_command(cli: &Cli, env_token: Option<String>, json: bool) -> Option<O
         let current = endpoint::resolve(&input).unwrap_or_else(|_| fallback.clone());
         match LoopbackHttp::new(&current) {
             Ok(transport) => Box::new(transport),
-            Err(_) => Box::new(crate::client::MemoryTransport::failing(
-                "transport not built",
-            )),
+            Err(_) => Box::new(crate::client::MemoryTransport::failing("传输通道未建立")),
         }
     };
     Some(match &cli.command {
@@ -543,7 +538,7 @@ fn dispatch(
         Ok(()) => Ok(error_outcome(
             exit::GENERAL,
             "not_implemented",
-            &format!("`{label}` is not implemented yet (尚未实现)"),
+            &format!("`{label}` 尚未实现"),
             json,
         )),
         Err(err) => Ok(client_outcome(err, &endpoint, json)),
@@ -974,16 +969,16 @@ fn ops_command(
 fn usage_gap(command: &Command) -> Option<String> {
     match command {
         Command::Run { cmd, .. } if cmd.is_empty() => {
-            Some("`aw run` needs a command after the flags".to_owned())
+            Some("`aw run` 需要在参数后提供命令".to_owned())
         }
         Command::McpTap { cmd, .. } if cmd.is_empty() => {
-            Some("`aw mcp-tap` needs a command to wrap".to_owned())
+            Some("`aw mcp-tap` 需要提供要包装的命令".to_owned())
         }
         Command::Dev { args, .. } if args.is_empty() => {
-            Some("`aw dev` needs the arguments of the single-process mode".to_owned())
+            Some("`aw dev` 需要提供单进程模式的参数".to_owned())
         }
         Command::Attach { pid, name, .. } if pid.is_none() && name.is_none() => {
-            Some("`aw attach` needs --pid or --name".to_owned())
+            Some("`aw attach` 需要 --pid 或 --name".to_owned())
         }
         _ => None,
     }
@@ -994,7 +989,7 @@ fn version_outcome(check: bool, json: bool) -> Outcome {
         return error_outcome(
             exit::GENERAL,
             "not_implemented",
-            "`aw version --check` does not contact the network and is not implemented yet (尚未实现)",
+            "`aw version --check` 不会访问网络，尚未实现",
             json,
         );
     }
@@ -1186,7 +1181,7 @@ mod tests {
         );
         assert_eq!(outcome.code, exit::GENERAL);
         let err = text(&outcome.stderr);
-        assert!(err.contains("not implemented"), "{err}");
+        assert!(err.contains("尚未实现"), "{err}");
         assert!(err.contains("尚未实现"), "{err}");
         assert!(!err.contains(TOKEN), "{err}");
         assert_eq!(http.opened, 1);
@@ -1219,7 +1214,10 @@ mod tests {
         let outcome = run(&["--http", "http://127.0.0.1:7456", "ui"], None, &mut http);
         assert_eq!(outcome.code, exit::GENERAL);
         let err = text(&outcome.stderr);
-        assert!(err.contains("AW_TOKEN") || err.contains("missing"), "{err}");
+        assert!(
+            err.contains("AW_TOKEN") || err.contains("空 token"),
+            "{err}"
+        );
         assert!(err.contains("token"), "{err}");
         assert_eq!(http.opened, 0);
         assert!(paths(&http).is_empty());
@@ -1237,10 +1235,7 @@ mod tests {
         // production source reports that the daemon query API is not connected.
         assert_eq!(outcome.code, exit::GENERAL);
         let err = text(&outcome.stderr);
-        assert!(
-            err.contains("not connected") || err.contains("stub"),
-            "{err}"
-        );
+        assert!(err.contains("未接通") || err.contains("占位实现"), "{err}");
         assert!(!err.contains(TOKEN), "{err}");
         assert_eq!(http.opened, 0);
     }
@@ -1275,7 +1270,7 @@ mod tests {
         let check = run(&["version", "--check"], None, &mut http);
         assert_eq!(check.code, exit::GENERAL);
         let err = text(&check.stderr);
-        assert!(err.contains("does not contact the network"), "{err}");
+        assert!(err.contains("不会访问网络"), "{err}");
         assert!(err.contains("尚未实现"), "{err}");
         assert_eq!(http.opened, 0);
     }
@@ -1301,7 +1296,7 @@ mod tests {
         );
         assert_eq!(outcome.code, exit::USAGE);
         assert!(
-            text(&outcome.stderr).contains("port 0"),
+            text(&outcome.stderr).contains("端口 0"),
             "{}",
             text(&outcome.stderr)
         );
@@ -1376,7 +1371,7 @@ mod tests {
         let attach = run(&["attach", "--pid", "100"], None, &mut http);
         assert_eq!(attach.code, exit::UNREACHABLE, "{}", text(&attach.stderr));
         let err = text(&attach.stderr);
-        assert!(err.contains("not connected"), "{err}");
+        assert!(err.contains("连不上后台"), "{err}");
         assert!(
             err.contains("aw daemon start") || err.contains("--no-daemon"),
             "{err}"

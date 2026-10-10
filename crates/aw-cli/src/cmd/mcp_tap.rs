@@ -58,7 +58,7 @@ pub(crate) fn run(cmd: &[String]) -> Outcome {
         return super::error_outcome(
             exit::USAGE,
             "usage",
-            "`aw mcp-tap` needs a command to wrap",
+            "`aw mcp-tap` 需要提供要包装的命令",
             false,
         );
     };
@@ -67,7 +67,7 @@ pub(crate) fn run(cmd: &[String]) -> Outcome {
         Err(err) => super::error_outcome(
             exit::GENERAL,
             "spawn",
-            &format!("mcp-tap: spawn failed: {err}"),
+            &format!("mcp-tap：启动失败：{err}"),
             false,
         ),
     }
@@ -85,15 +85,15 @@ fn spawn_and_copy(program: &str, args: &[String]) -> io::Result<Outcome> {
     let child_stdin = child
         .stdin
         .take()
-        .ok_or_else(|| io::Error::other("child stdin was not piped"))?;
+        .ok_or_else(|| io::Error::other("子进程 stdin 未设为管道"))?;
     let child_stdout = child
         .stdout
         .take()
-        .ok_or_else(|| io::Error::other("child stdout was not piped"))?;
+        .ok_or_else(|| io::Error::other("子进程 stdout 未设为管道"))?;
     let child_stderr = child
         .stderr
         .take()
-        .ok_or_else(|| io::Error::other("child stderr was not piped"))?;
+        .ok_or_else(|| io::Error::other("子进程 stderr 未设为管道"))?;
 
     // Bounded so a slow printer cannot pin every forwarded byte as a notice.
     // `Done` still fits: the copy thread waits only for that one message.
@@ -145,14 +145,11 @@ fn spawn_and_copy(program: &str, args: &[String]) -> io::Result<Outcome> {
             CopyNote::Extract(extracted) => {
                 if !write_extract(&mut stderr_notes, &extracted) {
                     // Encoding failed. There is no daemon route to retry against.
-                    let _ = writeln!(
-                        stderr_notes,
-                        "mcp-tap: frame not parsed (daemon_unreachable)"
-                    );
+                    let _ = writeln!(stderr_notes, "mcp-tap：未解析帧（daemon_unreachable）");
                 }
             }
             CopyNote::Gap { reason } => {
-                let _ = writeln!(stderr_notes, "mcp-tap: frame not parsed ({reason})");
+                let _ = writeln!(stderr_notes, "mcp-tap：未解析帧（{reason}）");
             }
             CopyNote::Done(result) => {
                 finished = finished.saturating_add(1);

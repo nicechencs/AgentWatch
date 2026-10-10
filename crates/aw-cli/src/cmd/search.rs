@@ -40,7 +40,7 @@ pub(crate) fn run(args: SearchArgs<'_>, source: &dyn QuerySource) -> io::Result<
         return Ok(super::error_outcome(
             exit::USAGE,
             "usage",
-            "search text is empty",
+            "搜索文本为空",
             args.json,
         ));
     }
@@ -49,7 +49,7 @@ pub(crate) fn run(args: SearchArgs<'_>, source: &dyn QuerySource) -> io::Result<
             return Ok(super::error_outcome(
                 exit::USAGE,
                 "usage",
-                &format!("--kind `{kind}` is not file, proc, or url"),
+                &format!("--kind `{kind}` 不是 file、proc 或 url"),
                 args.json,
             ));
         }
@@ -89,7 +89,7 @@ pub(crate) fn run(args: SearchArgs<'_>, source: &dyn QuerySource) -> io::Result<
 fn resolve_since(text: &str) -> Result<i64, String> {
     if text.trim().starts_with('-') || looks_bare_duration(text) {
         return Err(
-            "`search --since` relative-to-now (-10m) needs a clock this build does not have; pass RFC 3339"
+            "`search --since` 的相对当前时间（-10m）需要此构建没有的时钟；请传入 RFC 3339"
                 .to_owned(),
         );
     }

@@ -106,14 +106,14 @@ impl DbStore for EmptyDb {
     }
 
     fn vacuum(&mut self) -> Result<String, String> {
-        Ok("vacuum recorded; no database is open".to_owned())
+        Ok("已记录 vacuum；未打开数据库".to_owned())
     }
 
     fn migrate(&mut self, dry_run: bool) -> Result<String, String> {
         if dry_run {
-            Ok("migrate --dry-run: no pending migration".to_owned())
+            Ok("migrate --dry-run：没有待执行的迁移".to_owned())
         } else {
-            Ok("migrate recorded; no database is open".to_owned())
+            Ok("已记录 migrate；未打开数据库".to_owned())
         }
     }
 
@@ -313,7 +313,7 @@ pub(crate) struct PurgeBody {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct UnwiredApi;
 
-const UNWIRED: &str = "daemon db API is not connected; GET /api/v1/db/stats is still a stub, so this command does not open the database. Start it with `aw daemon start`, or pass --no-daemon (polling collectors, all evidence S)";
+const UNWIRED: &str = "后台数据库 API 未接通；GET /api/v1/db/stats 仍是占位实现，所以此命令不会打开数据库。请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）";
 
 impl DbApi for UnwiredApi {
     fn stats(&mut self) -> Result<DbStatsView, DbApiError> {
@@ -361,7 +361,7 @@ impl HttpDbApi {
         let mut client = crate::client::Client::new(self.endpoint.clone(), transport);
         let reply = client.call(request).map_err(client_to_db)?;
         reply.json().ok_or_else(|| DbApiError::Failed {
-            detail: "daemon returned a non-JSON body".to_owned(),
+            detail: "后台返回的响应体不是 JSON".to_owned(),
         })
     }
 }
@@ -373,7 +373,7 @@ impl DbApi for HttpDbApi {
             let reason = body
                 .get("reason")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("db stats are not available for this caller");
+                .unwrap_or("此调用者无法取得数据库统计");
             return Err(DbApiError::Failed {
                 detail: clip_db(reason),
             });
@@ -386,7 +386,7 @@ impl DbApi for HttpDbApi {
                 .collect::<Result<Vec<_>, _>>()?,
             Some(_) => {
                 return Err(DbApiError::Failed {
-                    detail: "field `tables` is not an array".to_owned(),
+                    detail: "字段 `tables` 不是数组".to_owned(),
                 });
             }
         };
@@ -430,8 +430,8 @@ impl DbApi for HttpDbApi {
         ))?;
         Ok(body
             .get("ok")
-            .map(|_| "vacuum recorded".to_owned())
-            .unwrap_or_else(|| "vacuum returned no ok field".to_owned()))
+            .map(|_| "已记录 vacuum".to_owned())
+            .unwrap_or_else(|| "vacuum 响应没有字段 `ok`".to_owned()))
     }
 
     fn migrate(&mut self, dry_run: bool) -> Result<MigrateReport, DbApiError> {
@@ -454,7 +454,7 @@ impl DbApi for HttpDbApi {
                     serde_json::Value::String(text) => text.clone(),
                     _ => {
                         return Err(DbApiError::Failed {
-                            detail: format!("field `{key}` is not a version"),
+                            detail: format!("字段 `{key}` 不是版本号"),
                         });
                     }
                 };
@@ -467,7 +467,7 @@ impl DbApi for HttpDbApi {
         }
         if steps.is_empty() && body.get("steps").is_none() {
             return Err(DbApiError::Failed {
-                detail: "response is missing schema version fields".to_owned(),
+                detail: "响应缺少 schema 版本字段".to_owned(),
             });
         }
         Ok(MigrateReport {
@@ -492,12 +492,12 @@ impl DbApi for HttpDbApi {
             Some(serde_json::Value::Array(rows)) => rows,
             Some(_) => {
                 return Err(DbApiError::Failed {
-                    detail: "field `purged` is not an array".to_owned(),
+                    detail: "字段 `purged` 不是数组".to_owned(),
                 });
             }
             None => {
                 return Err(DbApiError::Failed {
-                    detail: "response is missing field `purged`".to_owned(),
+                    detail: "响应缺少字段 `purged`".to_owned(),
                 });
             }
         };
@@ -507,7 +507,7 @@ impl DbApi for HttpDbApi {
                 Some(text) if !text.is_empty() => removed.push(text.to_owned()),
                 _ => {
                     return Err(DbApiError::Failed {
-                        detail: "field `purged` entry is missing `public_id`".to_owned(),
+                        detail: "字段 `purged` 的条目缺少 `public_id`".to_owned(),
                     });
                 }
             }
@@ -526,10 +526,10 @@ fn table_count(value: &serde_json::Value) -> Result<(String, u64), DbApiError> {
         .and_then(serde_json::Value::as_str)
         .filter(|text| !text.is_empty())
         .ok_or_else(|| DbApiError::Failed {
-            detail: "field `tables` entry is missing `table`".to_owned(),
+            detail: "字段 `tables` 的条目缺少 `table`".to_owned(),
         })?;
     let rows = opt_db_u64(value, "rows")?.ok_or_else(|| DbApiError::Failed {
-        detail: "field `tables` entry is missing `rows`".to_owned(),
+        detail: "字段 `tables` 的条目缺少 `rows`".to_owned(),
     })?;
     Ok((name.to_owned(), rows))
 }
@@ -540,7 +540,7 @@ fn opt_db_string(value: &serde_json::Value, name: &str) -> Result<Option<String>
         Some(serde_json::Value::String(text)) if text.is_empty() => Ok(None),
         Some(serde_json::Value::String(text)) => Ok(Some(text.clone())),
         Some(_) => Err(DbApiError::Failed {
-            detail: format!("field `{name}` is not a string"),
+            detail: format!("字段 `{name}` 不是字符串"),
         }),
     }
 }
@@ -549,7 +549,7 @@ fn opt_db_i64(value: &serde_json::Value, name: &str) -> Result<Option<i64>, DbAp
     match value.get(name) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(other) => other.as_i64().map(Some).ok_or_else(|| DbApiError::Failed {
-            detail: format!("field `{name}` is not an integer"),
+            detail: format!("字段 `{name}` 不是整数"),
         }),
     }
 }
@@ -558,7 +558,7 @@ fn opt_db_u64(value: &serde_json::Value, name: &str) -> Result<Option<u64>, DbAp
     match value.get(name) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(other) => other.as_u64().map(Some).ok_or_else(|| DbApiError::Failed {
-            detail: format!("field `{name}` is not an integer"),
+            detail: format!("字段 `{name}` 不是整数"),
         }),
     }
 }
@@ -604,12 +604,12 @@ pub(crate) fn run(
             Err(err) => api_error(err, json),
         },
         DbOp::Vacuum => {
-            if !confirm.confirm("VACUUM rewrites the database and can take a long time. Continue?")
+            if !confirm.confirm("VACUUM 会重写数据库，可能耗时很久。是否继续？")
             {
                 return super::error_outcome(
                     exit::USAGE,
                     "usage",
-                    "`db vacuum` rewrites the database; confirm on a terminal, or this non-interactive call is refused",
+                    "`db vacuum` 会重写数据库；请在终端确认，否则拒绝这个非交互调用",
                     json,
                 );
             }
@@ -663,7 +663,7 @@ fn purge_api(args: PurgeArgs<'_>, api: &mut dyn DbApi, confirm: &mut dyn Confirm
         return super::error_outcome(
             exit::USAGE,
             "usage",
-            "`db purge` takes either --older-than or --all, not both",
+            "`db purge` 只能传入 --older-than 或 --all，不能同时传入",
             json,
         );
     }
@@ -671,7 +671,7 @@ fn purge_api(args: PurgeArgs<'_>, api: &mut dyn DbApi, confirm: &mut dyn Confirm
         return super::error_outcome(
             exit::USAGE,
             "usage",
-            "`db purge` needs --older-than <dur> or --all",
+            "`db purge` 需要 --older-than <dur> 或 --all",
             json,
         );
     }
@@ -685,18 +685,17 @@ fn purge_api(args: PurgeArgs<'_>, api: &mut dyn DbApi, confirm: &mut dyn Confirm
         return super::error_outcome(
             exit::PERMISSION,
             "permission",
-            "administrator required for `db purge --all`; re-run in an administrator terminal or with sudo",
+            "`db purge --all` 需要管理员权限；请在管理员终端或使用 sudo 重新运行",
             json,
         );
     }
-    let confirmed = yes
-        || confirm
-            .confirm("purge deletes ended sessions. Pinned and active sessions stay. Continue?");
+    let confirmed =
+        yes || confirm.confirm("purge 会删除已结束的会话。保留和活动会话会留下。是否继续？");
     if !confirmed {
         return super::error_outcome(
             exit::USAGE,
             "usage",
-            "`db purge` deletes sessions; pass --yes, or confirm on a terminal. A non-interactive call without --yes is refused",
+            "`db purge` 会删除会话；请传入 --yes 或在终端确认。没有 --yes 的非交互调用会被拒绝",
             json,
         );
     }
@@ -791,7 +790,7 @@ fn migrate_outcome(report: &MigrateReport, json: bool) -> Outcome {
             })
         )
     } else if report.steps.is_empty() {
-        let detail = report.detail.as_deref().unwrap_or("no pending migration");
+        let detail = report.detail.as_deref().unwrap_or("没有待执行的迁移");
         format!("{detail}\n")
     } else {
         let mut lines = String::new();
@@ -860,7 +859,7 @@ fn purge(
         return super::error_outcome(
             exit::USAGE,
             "usage",
-            "`db purge` takes either --older-than or --all, not both",
+            "`db purge` 只能传入 --older-than 或 --all，不能同时传入",
             json,
         );
     }
@@ -868,18 +867,18 @@ fn purge(
         return super::error_outcome(
             exit::USAGE,
             "usage",
-            "`db purge` needs --older-than <dur> or --all",
+            "`db purge` 需要 --older-than <dur> 或 --all",
             json,
         );
     }
     if !yes {
-        return super::error_outcome(exit::USAGE, "usage", "`db purge` needs --yes", json);
+        return super::error_outcome(exit::USAGE, "usage", "`db purge` 需要 --yes", json);
     }
     if all && !privilege.is_admin() {
         return super::error_outcome(
             exit::PERMISSION,
             "permission",
-            "administrator required for `db purge --all`; re-run in an administrator terminal or with sudo",
+            "`db purge --all` 需要管理员权限；请在管理员终端或使用 sudo 重新运行",
             json,
         );
     }
@@ -890,7 +889,7 @@ fn purge(
             return super::error_outcome(
                 exit::USAGE,
                 "usage",
-                "`db purge` needs --older-than <dur> or --all",
+                "`db purge` 需要 --older-than <dur> 或 --all",
                 json,
             );
         };
@@ -922,15 +921,14 @@ pub(crate) fn older_than_cutoff(text: &str, now_ns: i64) -> Result<i64, String> 
             let delta = duration_ns(duration)?;
             Ok(now_ns.saturating_sub(delta).saturating_add(1))
         }
-        TimeArg::Rfc3339(_) => Err(
-            "`--older-than` needs a duration such as 0s or 30d, not an absolute time".to_owned(),
-        ),
+        TimeArg::Rfc3339(_) => {
+            Err("`--older-than` 需要 0s 或 30d 这样的时长，不能是绝对时间".to_owned())
+        }
     }
 }
 
 fn duration_ns(duration: DurationArg) -> Result<i64, String> {
-    let count =
-        i64::try_from(duration.count).map_err(|_| "duration does not fit in i64".to_owned())?;
+    let count = i64::try_from(duration.count).map_err(|_| "时长超出 i64 范围".to_owned())?;
     let unit: i64 = match duration.unit {
         TimeUnit::Millis => 1_000_000,
         TimeUnit::Seconds => 1_000_000_000,
@@ -940,7 +938,7 @@ fn duration_ns(duration: DurationArg) -> Result<i64, String> {
     };
     count
         .checked_mul(unit)
-        .ok_or_else(|| "duration overflowed nanoseconds".to_owned())
+        .ok_or_else(|| "时长换算为纳秒时溢出".to_owned())
 }
 
 #[allow(dead_code)]
@@ -957,7 +955,7 @@ fn stats_outcome(stats: &DbStats, json: bool) -> Outcome {
     } else {
         let bytes = match stats.db_bytes {
             Some(bytes) => bytes.to_string(),
-            None => "unknown".to_owned(),
+            None => "不可得".to_owned(),
         };
         format!(
             "db_bytes {bytes}\nsessions {}\npinned_sessions {}\n",

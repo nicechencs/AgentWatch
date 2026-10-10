@@ -319,27 +319,22 @@ pub enum LaunchError {
 impl std::fmt::Display for LaunchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyCommand => f.write_str("launch command is empty"),
-            Self::ForkFailed { detail } => write!(f, "fork failed: {detail}"),
+            Self::EmptyCommand => f.write_str("启动命令为空"),
+            Self::ForkFailed { detail } => write!(f, "fork 失败：{detail}"),
             Self::CgroupV1NoLaunch => f.write_str(V1_DOCTOR_HINT),
-            Self::CreateFailed { detail } => write!(f, "session cgroup was not created: {detail}"),
+            Self::CreateFailed { detail } => write!(f, "未创建会话 cgroup：{detail}"),
             Self::WriteProcsFailed { detail } => {
-                write!(f, "writing cgroup.procs failed: {detail}")
+                write!(f, "写入 cgroup.procs 失败：{detail}")
             }
             Self::CgroupIdUnavailable { detail } => {
-                write!(f, "cgroup id is unavailable: {detail}")
+                write!(f, "cgroup ID 不可得：{detail}")
             }
-            Self::MapUpdateFailed { detail } => write!(f, "scope_cgroups update failed: {detail}"),
-            Self::AdoptTimeout => {
-                f.write_str("adopt timed out; the child was terminated and did not exec")
-            }
-            Self::AdoptFailed { detail } => write!(f, "adopt failed: {detail}"),
-            Self::ExecFailed { detail } => write!(f, "exec was not released: {detail}"),
-            Self::WaitFailed { detail } => write!(f, "waiting for the child failed: {detail}"),
-            Self::NotVerified { step } => write!(
-                f,
-                "{step} is not verified in this environment; no process was created"
-            ),
+            Self::MapUpdateFailed { detail } => write!(f, "更新 scope_cgroups 失败：{detail}"),
+            Self::AdoptTimeout => f.write_str("adopt 超时；子进程已结束，未执行 exec"),
+            Self::AdoptFailed { detail } => write!(f, "adopt 失败：{detail}"),
+            Self::ExecFailed { detail } => write!(f, "未放行 exec：{detail}"),
+            Self::WaitFailed { detail } => write!(f, "等待子进程失败：{detail}"),
+            Self::NotVerified { step } => write!(f, "步骤 {step} 未在此环境验证；没有创建进程"),
         }
     }
 }
@@ -456,7 +451,7 @@ pub fn run_launch<L: CgroupLaunch>(
         // The enum has one variant today. This guard stays so a future variant
         // cannot silently become a root launch.
         return Err(LaunchError::ForkFailed {
-            detail: "only the calling user may launch; root is not a path".to_owned(),
+            detail: "只能以调用用户身份启动；root 不是路径".to_owned(),
         });
     }
     if request.command.is_empty() {
@@ -487,38 +482,37 @@ pub fn run_launch<L: CgroupLaunch>(
 
     let session_dir = format!("{SLICE_NAME}/session-{}", request.session_id);
     let systemd = launch.systemd();
-    let (created_via, transient_unit_error) = if systemd == SystemdPresence::System
-        || request.systemd == SystemdPresence::System
-    {
-        steps.push(LaunchStep::StartTransientUnit);
-        match launch.start_transient_unit(&session_dir) {
-            Ok(()) => (CgroupCreatePath::TransientUnit, None),
-            Err(err) => {
-                let detail = err.to_string();
-                steps.push(LaunchStep::TransientUnitFellBack);
-                if let Err(mkdir_err) = launch.mkdir_session(&session_dir) {
-                    steps.push(LaunchStep::Terminate);
-                    let _ = launch.terminate(pid);
-                    return Err(LaunchError::CreateFailed {
-                        detail: format!(
-                            "StartTransientUnit failed ({detail}); mkdir fallback failed: {mkdir_err}"
+    let (created_via, transient_unit_error) =
+        if systemd == SystemdPresence::System || request.systemd == SystemdPresence::System {
+            steps.push(LaunchStep::StartTransientUnit);
+            match launch.start_transient_unit(&session_dir) {
+                Ok(()) => (CgroupCreatePath::TransientUnit, None),
+                Err(err) => {
+                    let detail = err.to_string();
+                    steps.push(LaunchStep::TransientUnitFellBack);
+                    if let Err(mkdir_err) = launch.mkdir_session(&session_dir) {
+                        steps.push(LaunchStep::Terminate);
+                        let _ = launch.terminate(pid);
+                        return Err(LaunchError::CreateFailed {
+                            detail: format!(
+                            "StartTransientUnit 失败（{detail}）；mkdir 回退也失败：{mkdir_err}"
                         ),
-                    });
+                        });
+                    }
+                    (
+                        CgroupCreatePath::MkdirAfterTransientUnitFailed,
+                        Some(detail),
+                    )
                 }
-                (
-                    CgroupCreatePath::MkdirAfterTransientUnitFailed,
-                    Some(detail),
-                )
             }
-        }
-    } else {
-        if let Err(err) = launch.mkdir_session(&session_dir) {
-            steps.push(LaunchStep::Terminate);
-            let _ = launch.terminate(pid);
-            return Err(err);
-        }
-        (CgroupCreatePath::Mkdir, None)
-    };
+        } else {
+            if let Err(err) = launch.mkdir_session(&session_dir) {
+                steps.push(LaunchStep::Terminate);
+                let _ = launch.terminate(pid);
+                return Err(err);
+            }
+            (CgroupCreatePath::Mkdir, None)
+        };
     steps.push(LaunchStep::CreateSessionCgroup);
 
     steps.push(LaunchStep::WriteCgroupProcs);
@@ -738,7 +732,7 @@ impl LocalCgroupHost {
         let session = parent.join(format!("agentwatch-{session_id}"));
         if let Err(err) = std::fs::create_dir(&session) {
             return Err(LaunchError::CreateFailed {
-                detail: format!("cgroup mkdir {}: {err}", session.display()),
+                detail: format!("创建 cgroup 目录 {} 失败：{err}", session.display()),
             });
         }
         let mut child = std::process::Command::new(program);
@@ -754,7 +748,7 @@ impl LocalCgroupHost {
             Err(err) => {
                 let _ = std::fs::remove_dir(&session);
                 return Err(LaunchError::ForkFailed {
-                    detail: format!("spawn failed before cgroup move: {err}"),
+                    detail: format!("移入 cgroup 前启动失败：{err}"),
                 });
             }
         };
@@ -772,15 +766,12 @@ fn delegated_parent() -> Result<std::path::PathBuf, LaunchError> {
         return Err(LaunchError::CgroupV1NoLaunch);
     }
     let relative = self_cgroup_relative().map_err(|detail| LaunchError::CreateFailed {
-        detail: format!("cgroup mkdir: parent cgroup is not readable: {detail}"),
+        detail: format!("创建 cgroup 目录失败：父 cgroup 不可读：{detail}"),
     })?;
     let parent = std::path::Path::new("/sys/fs/cgroup").join(relative);
     if !parent.is_dir() {
         return Err(LaunchError::CreateFailed {
-            detail: format!(
-                "cgroup mkdir: parent {} is not a directory",
-                parent.display()
-            ),
+            detail: format!("创建 cgroup 目录失败：父路径 {} 不是目录", parent.display()),
         });
     }
     // subtree_control must be enabled by an ancestor (delegation). An empty
@@ -789,14 +780,14 @@ fn delegated_parent() -> Result<std::path::PathBuf, LaunchError> {
     let subtree = parent.join("cgroup.subtree_control");
     let enabled = std::fs::read_to_string(&subtree).map_err(|err| LaunchError::CreateFailed {
         detail: format!(
-            "cgroup mkdir: {} is not delegated ({err})",
+            "创建 cgroup 目录失败：{} 未委派（{err}）",
             subtree.display()
         ),
     })?;
     if enabled.split_whitespace().next().is_none() {
         return Err(LaunchError::CreateFailed {
             detail: format!(
-                "cgroup mkdir: {} has no delegated controllers",
+                "创建 cgroup 目录失败：{} 没有已委派的控制器",
                 subtree.display()
             ),
         });
@@ -806,7 +797,7 @@ fn delegated_parent() -> Result<std::path::PathBuf, LaunchError> {
     if !dir_writable(&parent) {
         return Err(LaunchError::CreateFailed {
             detail: format!(
-                "cgroup mkdir: {} is not writable by this user",
+                "创建 cgroup 目录失败：当前用户不能写入 {}",
                 parent.display()
             ),
         });
@@ -882,20 +873,20 @@ fn read_cgroup_version() -> CgroupVersion {
 #[allow(dead_code)]
 fn self_cgroup_relative() -> Result<std::path::PathBuf, String> {
     let text = std::fs::read_to_string("/proc/self/cgroup")
-        .map_err(|err| format!("read /proc/self/cgroup: {err}"))?;
+        .map_err(|err| format!("读取 /proc/self/cgroup 失败：{err}"))?;
     let line = text
         .lines()
         .find(|line| line.starts_with("0::"))
-        .ok_or_else(|| "no unified hierarchy line".to_owned())?;
+        .ok_or_else(|| "没有统一层级行".to_owned())?;
     let rest = line
         .strip_prefix("0::")
-        .ok_or_else(|| "unified line has no path".to_owned())?;
+        .ok_or_else(|| "统一层级行没有路径".to_owned())?;
     let trimmed = rest.trim_start_matches('/');
     if trimmed.is_empty() {
-        return Err("process is in the cgroup root, which is not a user delegation".to_owned());
+        return Err("进程位于 cgroup 根目录，不是用户委派目录".to_owned());
     }
     if trimmed.contains("..") {
-        return Err("cgroup path contains '..'".to_owned());
+        return Err("cgroup 路径包含 `..`".to_owned());
     }
     Ok(std::path::PathBuf::from(trimmed))
 }
@@ -915,21 +906,21 @@ fn move_and_wait(
         // twice. Keep it, drop the unused cgroup, track by process tree.
         let _ = std::fs::remove_dir(session);
         let status = spawned.wait().map_err(|err| LaunchError::WaitFailed {
-            detail: format!("wait failed: {err}"),
+            detail: format!("等待失败：{err}"),
         })?;
         return Ok(LaunchResult {
             code: status.code(),
             pid,
             cgroup_path: String::new(),
             detail: format!(
-                "cgroup.procs {} refused the pid ({err}); tracked by process tree",
+                "cgroup.procs {} 拒绝 PID（{err}）；已改按进程树跟踪",
                 procs.display()
             ),
             scoped: false,
         });
     }
     let status = spawned.wait().map_err(|err| LaunchError::WaitFailed {
-        detail: format!("wait failed: {err}"),
+        detail: format!("等待失败：{err}"),
     })?;
     let code = status.code();
     let _ = std::fs::remove_dir(session);
@@ -938,7 +929,7 @@ fn move_and_wait(
         pid,
         cgroup_path: session.display().to_string(),
         detail: format!(
-            "pid written to {} after spawn; the move is not atomic with exec (gap)",
+            "启动后才把 PID 写入 {}；与 exec 的移动不是原子的（缺口）",
             procs.display()
         ),
         scoped: true,
@@ -965,7 +956,7 @@ mod launch_tests {
         assert_eq!(result.code, Some(5), "the program ran to its own end");
         assert!(!result.scoped);
         assert!(result.cgroup_path.is_empty());
-        assert!(result.detail.contains("process tree"), "{}", result.detail);
+        assert!(result.detail.contains("进程树"), "{}", result.detail);
     }
 
     #[derive(Debug)]
@@ -1215,7 +1206,7 @@ mod launch_tests {
         );
         assert_eq!(
             done.transient_unit_error.as_deref(),
-            Some("session cgroup was not created: scripted dbus refusal")
+            Some("未创建会话 cgroup：scripted dbus refusal")
         );
         assert!(done.steps.contains(&LaunchStep::TransientUnitFellBack));
         assert!(done.steps.contains(&LaunchStep::Exec));

@@ -116,31 +116,19 @@ impl DaemonControl for PlannedControl {
                 if *confirm {
                     (
                         "planned",
-                        "install was confirmed; command text is for an administrator to run, nothing was registered",
+                        "已确认 install；命令文本供管理员运行，尚未注册任何内容",
                     )
                 } else {
-                    (
-                        "planned",
-                        "install plan was rendered; nothing was registered",
-                    )
+                    ("planned", "已生成 install 计划；尚未注册任何内容")
                 }
             }
             DaemonOp::Uninstall { purge, check } => {
                 if *check {
-                    (
-                        "checked",
-                        "uninstall --check found nothing to remove in this build",
-                    )
+                    ("checked", "此构建的 uninstall --check 没有发现可移除内容")
                 } else if *purge {
-                    (
-                        "planned",
-                        "uninstall --purge was recorded; the database was not deleted",
-                    )
+                    ("planned", "已记录 uninstall --purge；没有删除数据库")
                 } else {
-                    (
-                        "planned",
-                        "uninstall was recorded; the service was not removed",
-                    )
+                    ("planned", "已记录 uninstall；没有移除服务")
                 }
             }
         };
@@ -179,7 +167,7 @@ pub(crate) fn run(
         return super::error_outcome(
             exit::PERMISSION,
             "permission",
-            "administrator required; re-run in an administrator terminal or with sudo",
+            "需要管理员权限；请在管理员终端或使用 sudo 重新运行",
             json,
         );
     }
@@ -211,7 +199,7 @@ fn unconfirmed_install(json: bool) -> Outcome {
                 },
             },
             "acls": acls,
-            "hint": "re-run `aw daemon install --yes` to print sc.exe text; this process does not run it",
+            "hint": "请重新运行 `aw daemon install --yes` 以打印 sc.exe 文本；此进程不会执行它",
         });
         return Outcome {
             code: exit::USAGE,
@@ -443,7 +431,7 @@ mod tests {
         assert_eq!(outcome.code, exit::OK);
         let text = String::from_utf8(outcome.stdout).expect("utf8");
         assert!(text.contains("planned"), "{text}");
-        assert!(text.contains("not deleted"), "{text}");
+        assert!(text.contains("没有删除数据库"), "{text}");
         assert_eq!(
             control.seen,
             vec![DaemonOp::Uninstall {

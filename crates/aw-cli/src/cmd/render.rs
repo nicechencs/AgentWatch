@@ -31,7 +31,7 @@ pub(crate) fn write_out(
     match mode {
         OutputMode::Json => {
             let mut bytes = serde_json::to_vec_pretty(json_doc)
-                .map_err(|err| io::Error::other(format!("encode json: {err}")))?;
+                .map_err(|err| io::Error::other(format!("编码 JSON 失败：{err}")))?;
             bytes.push(b'\n');
             out.write_all(&bytes)
         }
@@ -317,7 +317,7 @@ pub(crate) fn timeline_json(rows: &[TimelineItem], live_connected: bool) -> Valu
         "note": if live_connected {
             Value::Null
         } else {
-            json!("real-time /sessions/{sid}/live is not subscribed (真实订阅未接通); rows are the injected source")
+            json!("没有订阅实时 /sessions/{sid}/live（真实订阅未接通）；这些行来自注入的数据源")
         },
         "events": rows.iter().map(|row| json!({
             "ts_ns": row.ts_ns,

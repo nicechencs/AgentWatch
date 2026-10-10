@@ -115,7 +115,7 @@ pub(crate) struct RuleInfo {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct UnwiredConfig;
 
-const UNWIRED: &str = "daemon config API is not connected; GET /api/v1/config is still a stub, so this command does not read the config file. Start it with `aw daemon start`, or pass --no-daemon (polling collectors, all evidence S)";
+const UNWIRED: &str = "后台配置 API 未接通；GET /api/v1/config 仍是占位实现，所以此命令不会读取配置文件。请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）";
 
 impl ConfigApi for UnwiredConfig {
     fn show(&mut self, _: bool) -> Result<ConfigDoc, ConfigError> {
@@ -171,7 +171,7 @@ impl HttpConfigApi {
         let mut client = crate::client::Client::new(self.endpoint.clone(), transport);
         let reply = client.call(request).map_err(client_to_config)?;
         reply.json().ok_or_else(|| ConfigError::Failed {
-            detail: "daemon returned a non-JSON body".to_owned(),
+            detail: "后台返回的响应体不是 JSON".to_owned(),
         })
     }
 }
@@ -205,9 +205,7 @@ impl ConfigApi for HttpConfigApi {
     fn schema(&mut self) -> Result<Value, ConfigError> {
         // `GET /api/v1/config/schema` is not a route. Do not print `{}`.
         Err(ConfigError::Failed {
-            detail:
-                "GET /api/v1/config/schema is not served; this command does not invent a schema"
-                    .to_owned(),
+            detail: "未提供 GET /api/v1/config/schema；此命令不会编造 schema".to_owned(),
         })
     }
 
@@ -216,9 +214,7 @@ impl ConfigApi for HttpConfigApi {
         // client (it loads files offline). A call that does reach here must
         // not claim there are no rules.
         Err(ConfigError::Failed {
-            detail:
-                "GET /api/v1/rules is not served; this command does not invent an empty rule list"
-                    .to_owned(),
+            detail: "未提供 GET /api/v1/rules；此命令不会编造空规则列表".to_owned(),
         })
     }
 }
@@ -230,7 +226,7 @@ fn lookup_key(root: &Value, key: &str) -> Result<Value, ConfigError> {
             Some(child) => current = child,
             None => {
                 return Err(ConfigError::Invalid {
-                    detail: format!("config has no key `{key}`"),
+                    detail: format!("配置没有键 `{key}`"),
                 });
             }
         }
@@ -363,7 +359,7 @@ pub(crate) fn run(cmd: &ConfigCmd, json: bool, api: &mut dyn ConfigApi) -> Outco
         ConfigCmd::Edit => super::error_outcome(
             exit::GENERAL,
             "not_implemented",
-            "`config edit` does not spawn an editor in this build; use `aw config set <key> <value>` (尚未实现)",
+            "此构建的 `config edit` 不会启动编辑器；请使用 `aw config set <key> <value>`（尚未实现）",
             json,
         ),
         ConfigCmd::Schema => {
@@ -383,7 +379,7 @@ pub(crate) fn run(cmd: &ConfigCmd, json: bool, api: &mut dyn ConfigApi) -> Outco
         ConfigCmd::Rules(RulesCmd::Test { .. }) => super::error_outcome(
             exit::GENERAL,
             "not_implemented",
-            "`config rules test` is not implemented yet (尚未实现); it belongs to P3",
+            "`config rules test` 尚未实现；由 P3 提供",
             json,
         ),
     }
@@ -393,7 +389,7 @@ pub(crate) fn run(cmd: &ConfigCmd, json: bool, api: &mut dyn ConfigApi) -> Outco
 /// the schema's ident set are refused before the request is built.
 fn bad_key(key: &str) -> Option<String> {
     if key.is_empty() {
-        return Some("config key is empty".to_owned());
+        return Some("配置键为空".to_owned());
     }
     let ok = key.split('.').all(|part| {
         !part.is_empty()
@@ -405,7 +401,7 @@ fn bad_key(key: &str) -> Option<String> {
         None
     } else {
         Some(format!(
-            "`{key}` is not a dotted config key (letters, digits, underscore)"
+            "`{key}` 不是点分配置键（只能含字母、数字和下划线）"
         ))
     }
 }
@@ -416,7 +412,7 @@ fn bad_key(key: &str) -> Option<String> {
 fn parse_set_value(text: &str) -> Result<Value, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err("config value is empty".to_owned());
+        return Err("配置值为空".to_owned());
     }
     if trimmed == "true" || trimmed == "false" || trimmed == "null" {
         return serde_json::from_str(trimmed).map_err(|err| err.to_string());
@@ -430,7 +426,7 @@ fn parse_set_value(text: &str) -> Result<Value, String> {
             .is_some_and(|ch| ch.is_ascii_digit() || ch == '-')
     {
         return serde_json::from_str(trimmed)
-            .map_err(|err| format!("`{trimmed}` is not valid JSON for a config value ({err})"));
+            .map_err(|err| format!("`{trimmed}` 不是有效的 JSON 配置值（{err}）"));
     }
     Ok(Value::String(trimmed.to_owned()))
 }
@@ -476,11 +472,11 @@ fn rules_outcome(rules: &[RuleInfo], json_mode: bool) -> Outcome {
             })
         )
     } else if rules.is_empty() {
-        "no rules loaded\n".to_owned()
+        "没有已加载的规则\n".to_owned()
     } else {
         let mut lines = String::new();
         for rule in rules {
-            let kind = if rule.builtin { "builtin" } else { "custom" };
+            let kind = if rule.builtin { "内置" } else { "自定义" };
             lines.push_str(&format!("{kind} {}\n", rule.id));
         }
         lines

@@ -59,7 +59,7 @@ pub(crate) fn daemon_stop(
     json: bool,
 ) -> Outcome {
     if health(endpoint, open()).is_none() {
-        return ok(state_line("stopped", "not running", endpoint, json));
+        return ok(state_line("stopped", "没有运行", endpoint, json));
     }
     let mut client = Client::new(endpoint.clone(), open());
     if let Err(err) = client.call(&ApiRequest::post_json("/api/v1/daemon/stop", &json!({}))) {
@@ -68,14 +68,14 @@ pub(crate) fn daemon_stop(
     let mut waited = Duration::ZERO;
     loop {
         if health(endpoint, open()).is_none() {
-            return ok(state_line("stopped", "daemon shut down", endpoint, json));
+            return ok(state_line("stopped", "后台已停止", endpoint, json));
         }
         if waited >= wait {
             return error_outcome(
                 exit::GENERAL,
                 "still_running",
                 &format!(
-                    "agentwatchd accepted stop but still answers after {} s [{endpoint}]",
+                    "agentwatchd 已接受停止请求，但 {} 秒后仍在响应 [{endpoint}]",
                     wait.as_secs()
                 ),
                 json,
@@ -259,9 +259,7 @@ mod tests {
         let mut open = down;
         let out = daemon_stop(&sock(), &mut open, Duration::ZERO, false);
         assert_eq!(out.code, exit::OK);
-        assert!(String::from_utf8(out.stdout)
-            .unwrap()
-            .contains("not running"));
+        assert!(String::from_utf8(out.stdout).unwrap().contains("没有运行"));
     }
 
     #[test]
@@ -342,7 +340,7 @@ mod tests {
         assert_eq!(starter.1, 1);
         let text = String::from_utf8(out.stdout).unwrap();
         assert!(text.contains("stopped"), "{text}");
-        assert!(text.contains("started pid 77"), "{text}");
+        assert!(text.contains("已启动 PID 77"), "{text}");
     }
 
     #[test]

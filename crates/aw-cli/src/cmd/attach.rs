@@ -114,19 +114,19 @@ impl std::fmt::Display for ControlError {
         match self {
             Self::Unreachable { detail } => write!(
                 f,
-                "daemon unreachable ({detail}). Start it with `aw daemon start`, or pass --no-daemon (polling collectors, all evidence S)"
+                "连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：{detail}"
             ),
             Self::Forbidden { detail } => write!(
                 f,
-                "the daemon is running, but this account may not open its channel ({detail}). Ask an administrator to add you to the agentwatch group (Windows: AgentWatch Users)"
+                "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。详情：{detail}"
             ),
-            Self::Transport { detail } => write!(f, "daemon request failed: {detail}"),
+            Self::Transport { detail } => write!(f, "向后台发请求失败：{detail}"),
             Self::Status {
                 status, message, ..
             } => {
-                write!(f, "daemon returned HTTP {status}: {message}")
+                write!(f, "后台返回 HTTP {status}：{message}")
             }
-            Self::BadReply { detail } => write!(f, "daemon returned an invalid session response: {detail}"),
+            Self::BadReply { detail } => write!(f, "后台返回的会话数据不完整：{detail}"),
         }
     }
 }
@@ -233,7 +233,7 @@ impl HttpDaemonSessions {
         let mut client = Client::new(self.endpoint.clone(), transport);
         let reply = client.call(request).map_err(ControlError::from)?;
         reply.json().ok_or_else(|| ControlError::BadReply {
-            detail: "response body is not JSON".to_owned(),
+            detail: "响应体不是 JSON".to_owned(),
         })
     }
 }
@@ -257,14 +257,14 @@ impl HttpDaemonSessions {
             .get("sessions")
             .and_then(Value::as_array)
             .ok_or_else(|| ControlError::BadReply {
-                detail: "field `sessions` is missing".to_owned(),
+                detail: "缺少字段 `sessions`".to_owned(),
             })?;
         let ids = |row: &Value| row.get("id").and_then(Value::as_str).map(str::to_owned);
         if last {
             return rows.first().and_then(ids).ok_or(ControlError::Status {
                 status: 404,
                 code: Some("not_found".to_owned()),
-                message: "no session to stop for @last".to_owned(),
+                message: "@last 没有可停止的会话".to_owned(),
             });
         }
         let matches: Vec<String> = rows
@@ -279,7 +279,7 @@ impl HttpDaemonSessions {
                 status: 400,
                 code: Some("ambiguous".to_owned()),
                 message: format!(
-                    "{} sessions are named `{key}`; pass the public id from `aw sessions list`",
+                    "有 {} 个会话名为 `{key}`；请传入 `aw sessions list` 中的公开 ID",
                     many.len()
                 ),
             }),
@@ -379,7 +379,7 @@ impl DaemonSessions for UnwiredControl {
 
 fn unwired() -> ControlError {
     ControlError::Unreachable {
-        detail: "daemon session API is not connected in this test dispatch".to_owned(),
+        detail: "此测试分发没有接通后台会话 API".to_owned(),
     }
 }
 
@@ -395,7 +395,7 @@ fn required_text(body: &Value, key: &str) -> Result<String, ControlError> {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| ControlError::BadReply {
-            detail: format!("field `{key}` is missing or empty"),
+            detail: format!("字段 `{key}` 缺失或为空"),
         })
 }
 
@@ -469,7 +469,7 @@ fn prepare(args: &AttachArgs<'_>) -> Result<AttachRequest, Outcome> {
         return Err(super::error_outcome(
             exit::GENERAL,
             "not_available",
-            "--name is not available for attach in this build; find the process with `aw ps` and pass --pid",
+            "此构建的 attach 不支持 --name；请用 `aw ps` 找到进程后传入 --pid",
             args.json,
         ));
     }
@@ -486,7 +486,7 @@ fn prepare(args: &AttachArgs<'_>) -> Result<AttachRequest, Outcome> {
         return Err(super::error_outcome(
             exit::USAGE,
             "usage",
-            "`aw attach` needs --pid",
+            "`aw attach` 需要 --pid",
             args.json,
         ));
     };
@@ -494,7 +494,7 @@ fn prepare(args: &AttachArgs<'_>) -> Result<AttachRequest, Outcome> {
         return Err(super::error_outcome(
             exit::GENERAL,
             "not_available",
-            "--group is not available on attach in this build (P3/P5 提供)",
+            "此构建的 attach 不支持 --group（P3/P5 提供）",
             args.json,
         ));
     }
@@ -502,7 +502,7 @@ fn prepare(args: &AttachArgs<'_>) -> Result<AttachRequest, Outcome> {
         return Err(super::error_outcome(
             exit::USAGE,
             "usage",
-            "--until-exit and --duration are alternative end conditions",
+            "--until-exit 和 --duration 只能二选一",
             args.json,
         ));
     }
@@ -529,9 +529,7 @@ fn unavailable_switch(name: &str, json: bool) -> Outcome {
     super::error_outcome(
         exit::GENERAL,
         "not_available",
-        &format!(
-            "{name} is not available for attach in this build; the daemon poll sampler has no such switch"
-        ),
+        &format!("此构建的 attach 不支持 {name}；后台轮询采样器没有这个参数"),
         json,
     )
 }
@@ -542,12 +540,12 @@ fn parse_attach_duration(text: &str) -> Result<Duration, String> {
     let text = text.trim();
     if text.starts_with('+') || text.starts_with('-') {
         return Err(format!(
-            "--duration `{text}` must be a length such as 10s, not a relative time"
+            "--duration `{text}` 必须是 10s 这样的时长，不能是相对时间"
         ));
     }
     match crate::output::parse_time(text) {
         Ok(crate::output::TimeArg::BeforeNow(span)) => span_to_duration(span.count, span.unit),
-        Ok(_) => Err(format!("--duration `{text}` must be a length such as 10s")),
+        Ok(_) => Err(format!("--duration `{text}` 必须是 10s 这样的时长")),
         Err(detail) => Err(detail),
     }
 }
@@ -575,7 +573,7 @@ pub(crate) fn control_outcome(error: ControlError, json: bool) -> Outcome {
 }
 
 fn pin_warning(error: &ControlError) -> String {
-    format!("[aw] warning: the daemon did not pin this session: {error}\n")
+    format!("[aw] 警告：后台没有保留这个会话：{error}\n")
 }
 
 fn attached_outcome(
@@ -588,7 +586,7 @@ fn attached_outcome(
     let note = if stopped_on_duration {
         "监控已按 --duration 结束；目标进程未被结束"
     } else if until_exit {
-        "监控已附着；daemon 会在根进程退出时结束会话；停止监控不会结束目标进程"
+        "监控已附着；后台会在根进程退出时结束会话；停止监控不会结束目标进程"
     } else {
         "监控已附着；停止监控不会结束目标进程"
     };

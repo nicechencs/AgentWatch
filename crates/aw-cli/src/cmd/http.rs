@@ -42,7 +42,7 @@ pub(crate) fn run(args: HttpArgs<'_>, source: &dyn QuerySource) -> io::Result<Ou
         return Ok(super::error_outcome(
             exit::USAGE,
             "usage",
-            "session is empty",
+            "会话不能为空",
             args.json,
         ));
     }

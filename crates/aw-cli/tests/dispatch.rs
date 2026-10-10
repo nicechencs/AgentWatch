@@ -52,7 +52,7 @@ fn version_check_exits_1_and_does_not_claim_a_network_call() {
     let out = output(&["version", "--check"]);
     assert_eq!(out.status.code(), Some(1));
     let err = String::from_utf8(out.stderr).expect("utf8");
-    assert!(err.contains("does not contact the network"), "{err}");
+    assert!(err.contains("不会访问网络"), "{err}");
 }
 
 #[test]
@@ -61,8 +61,7 @@ fn ps_without_a_daemon_exits_3() {
     // or per-user socket) cannot answer for the missing one.
     let missing = std::env::temp_dir().join(format!("aw-cli-nodaemon-{}.sock", std::process::id()));
     let out = aw()
-        .env("AW_SOCKET", &missing)
-        .arg("ps")
+        .args(["--socket", missing.to_str().expect("socket path"), "ps"])
         .output()
         .expect("spawn aw");
     assert_eq!(
@@ -72,7 +71,10 @@ fn ps_without_a_daemon_exits_3() {
         String::from_utf8_lossy(&out.stderr)
     );
     let err = String::from_utf8(out.stderr).expect("utf8");
-    assert!(err.contains("aw daemon start"), "{err}");
+    assert!(
+        err.starts_with("aw: 连不上后台，请先运行 `aw daemon start`"),
+        "{err}"
+    );
     assert!(err.contains("--no-daemon"), "{err}");
 }
 

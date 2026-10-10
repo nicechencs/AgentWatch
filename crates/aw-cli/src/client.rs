@@ -151,17 +151,17 @@ impl fmt::Display for ClientError {
         match self {
             Self::Unreachable { detail } => write!(
                 f,
-                "daemon unreachable ({detail}). Start it with `aw daemon start`, or pass --no-daemon (polling collectors, all evidence S)"
+                "连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：{detail}"
             ),
             Self::Forbidden { detail } => write!(
                 f,
-                "the daemon is running, but this account may not open its channel ({detail}). Ask an administrator to add you to the agentwatch group (Windows: AgentWatch Users)"
+                "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。详情：{detail}"
             ),
-            Self::Transport { detail } => write!(f, "daemon request failed: {detail}"),
+            Self::Transport { detail } => write!(f, "向后台发请求失败：{detail}"),
             Self::Status {
                 status, message, ..
             } => {
-                write!(f, "daemon returned HTTP {status}: {message}")
+                write!(f, "后台返回 HTTP {status}：{message}")
             }
         }
     }
@@ -229,7 +229,7 @@ impl<T: Transport> Client<T> {
 
 fn status_message(reply: &ApiReply) -> String {
     let Some(value) = reply.json() else {
-        return format!("non-JSON body, {} bytes", reply.body.len());
+        return format!("非 JSON 响应体，{} 字节", reply.body.len());
     };
     if let Some(message) = value
         .get("error")
@@ -317,7 +317,7 @@ fn http_exchange(
     let mut stream =
         TcpStream::connect_timeout(&addr, timeout).map_err(|_| ClientError::Unreachable {
             detail: format!(
-                "tcp connect to {} timed out or was refused (token {})",
+                "连接 {} 超时或被拒绝（token {}）",
                 base.origin(),
                 token_hint(token)
             ),
@@ -325,12 +325,12 @@ fn http_exchange(
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|err| ClientError::Transport {
-            detail: format!("set read timeout: {err}"),
+            detail: format!("设置读取超时失败：{err}"),
         })?;
     stream
         .set_write_timeout(Some(timeout))
         .map_err(|err| ClientError::Transport {
-            detail: format!("set write timeout: {err}"),
+            detail: format!("设置写入超时失败：{err}"),
         })?;
     let bytes = encode_request(base, token, request);
     roundtrip(&mut stream, &bytes)
@@ -377,13 +377,13 @@ fn roundtrip<S: Read + Write>(stream: &mut S, bytes: &[u8]) -> Result<ApiReply, 
     stream
         .write_all(bytes)
         .map_err(|err| ClientError::Transport {
-            detail: format!("write request: {err}"),
+            detail: format!("写入请求失败：{err}"),
         })?;
     let mut buf = Vec::new();
     stream
         .read_to_end(&mut buf)
         .map_err(|err| ClientError::Transport {
-            detail: format!("read response: {err}"),
+            detail: format!("读取响应失败：{err}"),
         })?;
     parse_response(&buf).map_err(|detail| ClientError::Transport { detail })
 }
@@ -438,21 +438,21 @@ fn parse_response(bytes: &[u8]) -> Result<ApiReply, String> {
     let split = bytes
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| "HTTP response has no header terminator".to_owned())?;
-    let head = std::str::from_utf8(&bytes[..split])
-        .map_err(|_| "HTTP response headers are not UTF-8".to_owned())?;
+        .ok_or_else(|| "HTTP 响应没有头部结束符".to_owned())?;
+    let head =
+        std::str::from_utf8(&bytes[..split]).map_err(|_| "HTTP 响应头不是 UTF-8".to_owned())?;
     let body = bytes[split + 4..].to_vec();
     let status_line = head.lines().next().unwrap_or("");
     let mut parts = status_line.split_whitespace();
     let version = parts.next().unwrap_or("");
     if !version.starts_with("HTTP/") {
-        return Err(format!("not an HTTP status line: `{status_line}`"));
+        return Err(format!("不是 HTTP 状态行：`{status_line}`"));
     }
     let code = parts
         .next()
         .unwrap_or("")
         .parse::<u16>()
-        .map_err(|_| format!("HTTP status is not a number in `{status_line}`"))?;
+        .map_err(|_| format!("HTTP 状态行中的状态码不是数字：`{status_line}`"))?;
     Ok(ApiReply { status: code, body })
 }
 
@@ -515,7 +515,10 @@ impl Transport for MemoryTransport {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{encode_request, parse_response, token_hint, ApiRequest, Client, MemoryTransport};
+    use super::{
+        encode_request, parse_response, token_hint, ApiRequest, Client, ClientError,
+        MemoryTransport,
+    };
     use crate::endpoint::{resolve, EndpointInput};
     use crate::exit;
 
@@ -580,6 +583,20 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("aw daemon start"), "{text}");
         assert!(text.contains("--no-daemon"), "{text}");
+    }
+
+    #[test]
+    fn unreachable_message_starts_with_the_daemon_instruction_and_keeps_detail() {
+        let detail = "x.sock: connection refused";
+        let text = ClientError::Unreachable {
+            detail: detail.to_owned(),
+        }
+        .to_string();
+        assert!(
+            text.starts_with("连不上后台，请先运行 `aw daemon start`"),
+            "{text}"
+        );
+        assert!(text.contains(detail), "{text}");
     }
 
     /// The bug: socket endpoints were refused before any dial, so `aw` could

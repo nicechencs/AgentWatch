@@ -144,6 +144,7 @@ dependencies = [
  "getrandom 0.3.4",
  "rusqlite",
  "rust-embed",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror",

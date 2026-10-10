@@ -35,7 +35,7 @@ use tracing::{Event, Level, Subscriber};
 use tracing_core::span::{Attributes, Id, Record};
 use tracing_core::Metadata;
 
-use crate::api::{ApiState, HttpServer, OtlpRegistry, StoreQuery};
+use crate::api::{socket_path, ApiState, HttpServer, IpcServer, OtlpRegistry, StoreQuery};
 use crate::config::{resolve_data_dir, ConfigWarning, DaemonConfig};
 use crate::paths::ensure_data_dir;
 use crate::sample::HostSampler;
@@ -551,11 +551,15 @@ pub fn run_foreground(
     // already taken is a warning: the daemon keeps running without HTTP.
     // `api.http_port` picks the port; 0 turns the listener off.
     let http_port = config.api.http_port;
+    // One state for both listeners: a ticket issued on the internal channel
+    // (`aw ui`, the desktop app) must be redeemable on loopback HTTP.
+    let shared = Arc::new(Mutex::new(foreground_api(config, &data_dir)));
+    let mut ipc = start_ipc(&shared);
     let mut http = if http_port == 0 {
         tracing::info!("http listener disabled (api.http_port = 0)");
         None
     } else {
-        match HttpServer::bind(http_port, foreground_api(config, &data_dir)) {
+        match HttpServer::bind_shared(http_port, Arc::clone(&shared)) {
             Ok(server) => {
                 tracing::info!(port = server.addr.port(), "http listener started");
                 Some(server)
@@ -592,6 +596,9 @@ pub fn run_foreground(
     if let Some(server) = http.as_mut() {
         server.shutdown();
     }
+    if let Some(server) = ipc.as_mut() {
+        server.shutdown();
+    }
 
     // The sampler is stopped before the shutdown lines. One last tick flushes
     // the delta, then the collector is stopped. The three lines below stay in
@@ -609,6 +616,25 @@ pub fn run_foreground(
     drop(otlp);
     drop(lock);
     Ok(())
+}
+
+/// Open the internal channel. A failure is a warning, not an exit: the daemon
+/// keeps collecting, and `aw` reports the socket as unreachable (exit 3).
+fn start_ipc(state: &Arc<Mutex<ApiState>>) -> Option<IpcServer> {
+    let Some(path) = socket_path() else {
+        tracing::warn!("internal channel not started: no socket path on this platform");
+        return None;
+    };
+    match IpcServer::bind(&path, Arc::clone(state)) {
+        Ok(server) => {
+            tracing::info!(socket = %server.path.display(), "internal channel started");
+            Some(server)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "internal channel not started");
+            None
+        }
+    }
 }
 
 /// API state for the foreground listener: the data-dir database, the loaded

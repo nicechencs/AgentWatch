@@ -729,6 +729,38 @@ pub fn dispatch(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     route_authed(state, req, &caller)
 }
 
+/// Dispatch one request that arrived on the internal channel (Unix socket or
+/// named pipe, see `api/ipc.rs`).
+///
+/// The transport already identified the peer by its operating-system
+/// credential, so there is no bearer and no `Host` check. Only the API and
+/// `/health` are served here: the UI is not an asset site on this channel. Any
+/// `Authorization` header is dropped so `POST /api/v1/auth/ui-ticket` is
+/// issued to the peer, as api-and-cli §1 requires.
+pub(crate) fn dispatch_peer(
+    state: &mut ApiState,
+    req: &HttpRequest,
+    caller: &Caller,
+) -> ApiResponse {
+    if req.body_too_large {
+        return error_response(413, "payload_too_large", "request body exceeds 64 KiB");
+    }
+    let get = req.method.eq_ignore_ascii_case("GET");
+    if get && (req.path == "/health" || req.path == "/api/v1/health") {
+        return health(state);
+    }
+    if !req.path.starts_with("/api/") {
+        return error_response(
+            404,
+            "not_found",
+            "the internal channel serves /health and /api/v1 only",
+        );
+    }
+    let mut peer_req = req.clone();
+    peer_req.headers.remove("authorization");
+    route_authed(state, &peer_req, caller)
+}
+
 /// `POST /api/v1/agent/hook`. Loopback only. No bearer: the hook process has no ticket.
 ///
 /// `dropped: true` records a `self_report_dropped` gap and does not insert a

@@ -49,6 +49,17 @@ impl HttpServer {
     ///
     /// I/O failure from `TcpListener::bind`.
     pub fn bind(port: u16, state: ApiState) -> std::io::Result<Self> {
+        Self::bind_shared(port, Arc::new(std::sync::Mutex::new(state)))
+    }
+
+    /// Same as [`HttpServer::bind`], serving a state shared with the internal
+    /// channel (`api/ipc.rs`), so a ticket issued on the socket or pipe is
+    /// redeemable here.
+    ///
+    /// # Errors
+    ///
+    /// I/O failure from `TcpListener::bind`.
+    pub fn bind_shared(port: u16, state: Arc<std::sync::Mutex<ApiState>>) -> std::io::Result<Self> {
         let addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
         // Defense in depth: `loopback_only` is the same check config uses.
         let _ = HttpBind::loopback_only(addr).map_err(|err| {
@@ -84,8 +95,12 @@ impl Drop for HttpServer {
     }
 }
 
-fn accept_loop(listener: TcpListener, state: ApiState, stop: Arc<AtomicBool>, port: u16) {
-    let state = Arc::new(std::sync::Mutex::new(state));
+fn accept_loop(
+    listener: TcpListener,
+    state: Arc<std::sync::Mutex<ApiState>>,
+    stop: Arc<AtomicBool>,
+    port: u16,
+) {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, peer)) => {
@@ -240,7 +255,7 @@ fn header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
 }
 
-fn parse_request(buf: &[u8], listen_port: u16) -> Option<HttpRequest> {
+pub(crate) fn parse_request(buf: &[u8], listen_port: u16) -> Option<HttpRequest> {
     let header_end = header_end(buf)?;
     let head = std::str::from_utf8(&buf[..header_end]).ok()?;
     let mut lines = head.split("\r\n");
@@ -311,7 +326,10 @@ const DEFAULT_HEADERS: &[(&str, &str)] = &[
     ("cache-control", "no-store"),
 ];
 
-fn write_response(stream: &mut TcpStream, response: &ApiResponse) -> std::io::Result<()> {
+pub(crate) fn write_response<W: Write>(
+    stream: &mut W,
+    response: &ApiResponse,
+) -> std::io::Result<()> {
     let body = maybe_gzip(&response.headers, &response.body);
     let gzipped = body.len() != response.body.len();
     let head = response_head(response, body.len(), gzipped);

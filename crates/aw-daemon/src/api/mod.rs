@@ -16,6 +16,7 @@ mod auth;
 mod findings;
 mod http;
 mod http_events;
+mod ipc;
 mod openapi;
 mod proxy;
 mod query;
@@ -25,6 +26,7 @@ pub(crate) use agent::OtlpRegistry;
 pub(crate) use findings::share;
 
 pub(crate) use http::HttpServer;
+pub(crate) use ipc::{socket_path, IpcServer};
 pub(crate) use query::StoreQuery;
 pub(crate) use routes::ApiState;
 

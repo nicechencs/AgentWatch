@@ -10,6 +10,7 @@ function Root() {
   const { status } = useAuth();
   const path = useRouterState({ select: (state) => state.location.pathname });
   // In the desktop app nothing works without the daemon, settings included.
-  if (status === "unreachable" || (status !== "signed-in" && path !== "/settings")) return <SignIn />;
+  const desktopBlocked = status === "unreachable" || status === "forbidden" || status === "failed";
+  if (desktopBlocked || (status !== "signed-in" && path !== "/settings")) return <SignIn />;
   return <Outlet />;
 }

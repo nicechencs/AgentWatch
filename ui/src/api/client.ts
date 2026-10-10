@@ -5,7 +5,7 @@
  * a later browser start does not inherit the token.
  */
 import { ApiError } from "./errors";
-import { send as transportSend } from "./transport";
+import { send as transportSend, sendBytes as transportSendBytes } from "./transport";
 import type {
   ApiErrorBody,
   ConfigView,
@@ -349,8 +349,8 @@ export const api = {
   stopSession: (sid: string) => send<Session>("POST", `/sessions/${sid}/stop`),
   deleteSession: (sid: string) => send<void>("DELETE", `/sessions/${sid}`),
   summary: async (sid: string) => toSummary(await get<unknown>(`/sessions/${sid}/summary`)),
-  exportUrl: (sid: string, format: "jsonl" | "csv" | "md") =>
-    `${API}/sessions/${sid}/export?format=${format}`,
+  /** Raw bytes of an export, through the same request layer as every call. */
+  exportFile: (sid: string, format: ExportFormat) => fetchExport(sid, format),
 
   timeline: async (sid: string, query: Record<string, unknown>) =>
     toPage(await get<unknown>(`/sessions/${sid}/timeline${qs(query)}`), ["rows"], toTimelineItem),
@@ -405,25 +405,135 @@ export const api = {
   purge: (body: { older_than?: string; all?: boolean }) => send<void>("POST", "/db/purge", { ...body, confirm: true }),
 };
 
+export type ExportFormat = "jsonl" | "csv" | "md";
+
+const EXPORT_EXT: Record<ExportFormat, string> = { jsonl: "jsonl", csv: "zip", md: "md" };
+
+export interface ExportFile {
+  name: string;
+  blob: Blob;
+}
+
+/** `filename="…"` from a content-disposition header, or null. */
+export function dispositionName(header: string | null): string | null {
+  const match = header ? /filename="?([^";]+)"?/iu.exec(header) : null;
+  return match ? match[1] : null;
+}
+
+/**
+ * `GET /sessions/{sid}/export?format=` with the token (browser) or over the
+ * internal channel (app), read as bytes so the CSV zip is not mangled as text.
+ * A daemon error is thrown as {@link ApiError}; the page shows it in place.
+ */
+export async function fetchExport(sid: string, format: ExportFormat): Promise<ExportFile> {
+  const headers = new Headers();
+  if (token) headers.set("authorization", `Bearer ${token}`);
+  const response = await transportSendBytes(`${API}/sessions/${encodeURIComponent(sid)}/export?format=${format}`, {
+    method: "GET",
+    headers,
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    let body: ApiErrorBody | null = null;
+    try {
+      body = text ? (JSON.parse(text) as ApiErrorBody) : null;
+    } catch {
+      body = null;
+    }
+    throw new ApiError(response.status, body, response.statusText);
+  }
+  const blob = await response.blob();
+  const name = dispositionName(response.headers.get("content-disposition")) ?? `${sid}.${EXPORT_EXT[format]}`;
+  return { name, blob };
+}
+
+/** Hand a file to the user as a download without leaving the page. */
+export function saveFile(file: ExportFile): void {
+  const url = URL.createObjectURL(file.blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = file.name;
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+/** One `event:`/`data:`/`id:` frame of a `text/event-stream` body. */
+export interface SseFrame {
+  event: string;
+  data: string;
+  id: string | null;
+}
+
+export function parseSse(text: string): SseFrame[] {
+  const frames: SseFrame[] = [];
+  for (const block of text.split(/\r?\n\r?\n/u)) {
+    let event = "message";
+    let id: string | null = null;
+    const data: string[] = [];
+    for (const line of block.split(/\r?\n/u)) {
+      if (line.startsWith(":") || line === "") continue;
+      const colon = line.indexOf(":");
+      const field = colon === -1 ? line : line.slice(0, colon);
+      const value = colon === -1 ? "" : line.slice(colon + 1).replace(/^ /u, "");
+      if (field === "event") event = value;
+      else if (field === "data") data.push(value);
+      else if (field === "id") id = value;
+    }
+    if (data.length || id !== null) frames.push({ event, data: data.join("\n"), id });
+  }
+  return frames;
+}
+
 export interface LiveHandlers {
   onRecord: (item: TimelineItem) => void;
   onLagged: (dropped: number) => void;
   onError: () => void;
 }
 
-/** SSE subscription to /live. Returns a close function. */
+/** How often `/live` is asked for new records. The daemon answers each
+ * request with what arrived since `cursor` and closes (`retry: 1000`). */
+export const LIVE_POLL_MS = 1000;
+
+/**
+ * Follow `/live` through the same request layer as every other call: the
+ * token goes in the Authorization header (browser) and the app uses the
+ * internal channel. `EventSource` is not used: it cannot send that header and
+ * does not exist on the internal channel. Returns a close function.
+ */
 export function subscribeLive(sid: string, filter: string, handlers: LiveHandlers): () => void {
-  const params = new URLSearchParams();
-  if (filter) params.set("filter", filter);
-  if (token) params.set("access_token", token);
-  const source = new EventSource(`${API}/sessions/${sid}/live?${params.toString()}`);
-  source.addEventListener("record", (event) => {
-    handlers.onRecord(JSON.parse((event as MessageEvent).data) as TimelineItem);
-  });
-  source.addEventListener("lagged", (event) => {
-    const data = JSON.parse((event as MessageEvent).data) as { dropped?: number };
-    handlers.onLagged(data.dropped ?? 0);
-  });
-  source.onerror = () => handlers.onError();
-  return () => source.close();
+  let closed = false;
+  let cursor = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const poll = async () => {
+    if (closed) return;
+    try {
+      const headers = new Headers();
+      if (token) headers.set("authorization", `Bearer ${token}`);
+      const response = await transportSend(
+        `${API}/sessions/${encodeURIComponent(sid)}/live${qs({ filter, cursor: cursor || undefined })}`,
+        { method: "GET", headers },
+      );
+      if (!response.ok) throw new Error(String(response.status));
+      for (const frame of parseSse(await response.text())) {
+        if (frame.id !== null && Number.isFinite(Number(frame.id))) cursor = Math.max(cursor, Number(frame.id));
+        if (frame.event === "record") handlers.onRecord(JSON.parse(frame.data) as TimelineItem);
+        if (frame.event === "lagged") {
+          const data = JSON.parse(frame.data) as { dropped?: number | boolean };
+          handlers.onLagged(typeof data.dropped === "number" ? data.dropped : 0);
+        }
+      }
+    } catch {
+      if (!closed) handlers.onError();
+      return;
+    }
+    if (!closed) timer = setTimeout(() => void poll(), LIVE_POLL_MS);
+  };
+  void poll();
+  return () => {
+    closed = true;
+    if (timer) clearTimeout(timer);
+  };
 }

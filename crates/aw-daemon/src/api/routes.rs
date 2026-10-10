@@ -2855,6 +2855,120 @@ mod tests {
     }
 
     #[test]
+    fn at_last_export_uses_the_caller_scoped_resolver() {
+        let (dir, db) = seeded_db("at-last-export", LAST_SESSIONS_SQL);
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+        let token = token_for(&mut state, "1000", false);
+        let export = |state: &mut ApiState, token: &str, sid: &str| {
+            let mut request = req(
+                "GET",
+                &format!("/api/v1/sessions/{sid}/export"),
+                Some("127.0.0.1:7456"),
+                Some(token),
+                b"",
+            );
+            request.query = "format=jsonl".to_owned();
+            dispatch(state, &request)
+        };
+
+        let response = export(&mut state, &token, "@last");
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        assert_eq!(
+            response.header("content-type"),
+            Some("application/x-ndjson")
+        );
+        assert!(!response.body.is_empty());
+
+        let hidden = export(&mut state, &token, "s-root-new");
+        assert_eq!(hidden.status, 404);
+
+        let no_sessions = token_for(&mut state, "1001", false);
+        let missing = export(&mut state, &no_sessions, "@last");
+        assert_eq!(missing.status, 404);
+        assert_eq!(json_body(&missing)["error"]["code"], "no_sessions");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_list_search_paginates_only_matching_rows() {
+        let (dir, db) = seeded_db(
+            "session-search-pages",
+            "
+            INSERT INTO sessions (id, public_id, name, mode, user_id, started_ns, platform, collectors)
+            VALUES
+                (1, 's-1', 'needle 1', 'launch', 'alice', 1, 'linux', '[]'),
+                (2, 's-2', 'needle 2', 'launch', 'alice', 2, 'linux', '[]'),
+                (3, 's-3', 'other 3', 'launch', 'alice', 3, 'linux', '[]'),
+                (4, 's-4', 'needle 4', 'launch', 'alice', 4, 'linux', '[]'),
+                (5, 's-5', 'other 5', 'launch', 'alice', 5, 'linux', '[]'),
+                (6, 's-6', 'needle 6', 'launch', 'alice', 6, 'linux', '[]'),
+                (7, 's-7', 'other 7', 'launch', 'alice', 7, 'linux', '[]'),
+                (8, 's-8', 'needle 8', 'launch', 'alice', 8, 'linux', '[]'),
+                (9, 's-9', 'needle 9', 'launch', 'alice', 9, 'linux', '[]'),
+                (10, 's-10', 'other 10', 'launch', 'alice', 10, 'linux', '[]'),
+                (11, 's-11', 'needle 11', 'launch', 'alice', 11, 'linux', '[]');
+            ",
+        );
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+        let token = token_for(&mut state, "alice", false);
+        let page = |state: &mut ApiState, query: &str| {
+            let mut request = req(
+                "GET",
+                "/api/v1/sessions",
+                Some("127.0.0.1:7456"),
+                Some(&token),
+                b"",
+            );
+            request.query = query.to_owned();
+            let response = dispatch(state, &request);
+            assert_eq!(
+                response.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&response.body)
+            );
+            json_body(&response)
+        };
+        let ids = |body: &Value| {
+            body["sessions"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .filter_map(|row| row["id"].as_str())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+
+        let first = page(&mut state, "q=NEEDLE&limit=3");
+        assert_eq!(ids(&first), ["s-11", "s-9", "s-8"]);
+        let first_cursor = first["next_cursor"].as_str().unwrap_or_default();
+        assert!(!first_cursor.is_empty());
+
+        let second = page(
+            &mut state,
+            &format!("q=NEEDLE&limit=3&cursor={first_cursor}"),
+        );
+        assert_eq!(ids(&second), ["s-6", "s-4", "s-2"]);
+        let second_cursor = second["next_cursor"].as_str().unwrap_or_default();
+        assert!(!second_cursor.is_empty());
+
+        let third = page(
+            &mut state,
+            &format!("q=NEEDLE&limit=3&cursor={second_cursor}"),
+        );
+        assert_eq!(ids(&third), ["s-1"]);
+        assert!(third["next_cursor"].is_null());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn session_detail_and_summary_json_carry_platform_and_os_version() {
         let (dir, db) = seeded_db(
             "detail-platform",

@@ -197,6 +197,7 @@ pub(crate) enum Command {
     /// 导出
     Export {
         session: String,
+        /// 导出格式：jsonl、csv、md（markdown 也可）
         #[arg(long)]
         format: Option<String>,
         #[arg(short, long)]

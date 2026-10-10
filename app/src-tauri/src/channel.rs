@@ -275,7 +275,10 @@ mod tests {
     fn retry_falls_back_from_a_stale_system_socket_to_the_user_socket() {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixListener;
-        let dir = std::env::temp_dir().join(format!("aw-desktop-retry-{}", std::process::id()));
+        // Short base under /tmp: macOS's per-user path adds
+        // "Library/Application Support/AgentWatch/api.sock", and its temp dir
+        // is long enough to pass the 104-byte socket path limit.
+        let dir = std::path::PathBuf::from(format!("/tmp/awdr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let system = dir.join("system.sock");
@@ -294,7 +297,8 @@ mod tests {
         let first = super::exchange_in(&path, "GET", "/health", "", &env).unwrap_err();
         assert_eq!(first.code, "daemon_unreachable");
 
-        let user = dir.join("agentwatch").join("api.sock");
+        // The per-user path for this OS (XDG on Linux, Application Support on macOS).
+        let user = aw_channel::user_path(&env).expect("per-user path");
         std::fs::create_dir_all(user.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(&user).unwrap();
         let server = std::thread::spawn(move || loop {

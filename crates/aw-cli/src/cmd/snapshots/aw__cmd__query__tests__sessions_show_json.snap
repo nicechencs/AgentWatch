@@ -36,6 +36,7 @@ expression: body
     "evidence": {
       "level": "E1"
     },
+    "exit_code": null,
     "id": "s-7k2m",
     "mode": "launch",
     "name": "demo",

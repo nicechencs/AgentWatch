@@ -72,8 +72,9 @@ pub(crate) struct SessionItem {
     pub started_ns: Option<i64>,
     /// End, or still running.
     pub ended_ns: Option<i64>,
-    /// Excluded from retention.
-    pub pinned: bool,
+    /// Excluded from retention. `None` when the reply did not carry `pinned`
+    /// (the store summary omits it); printed as 没采, never as unpinned.
+    pub pinned: Option<bool>,
     /// Record evidence. A session the user created is E1 (the tool observed it).
     pub evidence: Evidence,
 }
@@ -91,6 +92,9 @@ pub(crate) struct SessionShow {
     pub dns_count: Option<i64>,
     /// Gap rows.
     pub gap_count: Option<i64>,
+    /// The watched process's exit code. `None` when the reply omitted it or
+    /// sent null — not observed, never printed as `0`.
+    pub exit_code: Option<i64>,
     /// Sum of `bytes_up`. `None` when every flow left the column unknown.
     pub bytes_up: Option<i64>,
     /// Sum of `bytes_down`.
@@ -989,6 +993,8 @@ impl QuerySource for MemorySource {
                     .count() as i64,
             ),
             gap_count: Some(i64::try_from(session.gaps.len()).unwrap_or(i64::MAX)),
+            // The in-memory fixture has no session-level exit code.
+            exit_code: None,
             bytes_up,
             bytes_down,
             capabilities: session.capabilities.clone(),
@@ -1013,7 +1019,7 @@ impl QuerySource for MemorySource {
 
     fn set_pinned(&mut self, key: &str, pinned: bool) -> Result<SessionItem, QueryError> {
         let index = self.find(key)?;
-        self.sessions[index].item.pinned = pinned;
+        self.sessions[index].item.pinned = Some(pinned);
         Ok(self.sessions[index].item.clone())
     }
 
@@ -1623,16 +1629,6 @@ pub(crate) fn opt_i64(value: Option<i64>) -> String {
     }
 }
 
-/// Bool cell.
-#[must_use]
-pub(crate) fn yes_no(value: bool) -> &'static str {
-    if value {
-        "yes"
-    } else {
-        "no"
-    }
-}
-
 /// `--from` / `--to` as an absolute nanosecond, or a session-relative `+30s`
 /// measured from `started_ns`. `-10m` is relative to `now_ns`.
 ///
@@ -1784,7 +1780,7 @@ pub(crate) fn sample_source() -> MemorySource {
             agent: Some("example-agent".to_owned()),
             started_ns: Some(1_700_000_000_000_000_000),
             ended_ns: Some(1_700_000_060_000_000_000),
-            pinned: false,
+            pinned: Some(false),
             evidence: Evidence::E1,
         },
         capabilities: vec![

@@ -137,6 +137,15 @@ fn na_code(reason: &aw_core::NaReason) -> &'static str {
     }
 }
 
+/// `pinned` as a table cell. A missing field is 没采, not "no".
+pub(crate) fn pinned_text(pinned: Option<bool>) -> String {
+    match pinned {
+        Some(true) => "yes".to_owned(),
+        Some(false) => "no".to_owned(),
+        None => "没采".to_owned(),
+    }
+}
+
 /// Record-level evidence for a row that may not have one (a mixed group).
 pub(crate) fn evidence_or_na(evidence: Option<&Evidence>) -> Evidence {
     evidence
@@ -165,7 +174,7 @@ pub(crate) fn session_table(items: &[SessionItem]) -> Table {
                     opt_text(item.agent.as_deref()),
                     opt_i64(item.started_ns),
                     opt_i64(item.ended_ns),
-                    super::query::yes_no(item.pinned).to_owned(),
+                    pinned_text(item.pinned),
                 ],
                 evidence: item.evidence.clone(),
             })
@@ -211,9 +220,11 @@ pub(crate) fn show_table(show: &SessionShow) -> Table {
             &show.item.evidence,
         ),
         stat_row("ended_ns", opt_i64(show.item.ended_ns), &show.item.evidence),
+        stat_row("pinned", pinned_text(show.item.pinned), &show.item.evidence),
         stat_row(
-            "pinned",
-            super::query::yes_no(show.item.pinned).to_owned(),
+            "exit_code",
+            show.exit_code
+                .map_or_else(|| "没采".to_owned(), |code| code.to_string()),
             &show.item.evidence,
         ),
         stat_row(
@@ -260,8 +271,13 @@ fn stat_row(field: &str, value: String, evidence: &Evidence) -> Row {
 }
 
 pub(crate) fn show_json(show: &SessionShow) -> Value {
+    let mut session = session_item_json(&show.item);
+    // JSON keeps a missing exit code as null. The table prints 没采.
+    if let Some(object) = session.as_object_mut() {
+        object.insert("exit_code".to_owned(), json!(show.exit_code));
+    }
     json!({
-        "session": session_item_json(&show.item),
+        "session": session,
         "stats": {
             "processes": show.process_count,
             "flows": show.flow_count,

@@ -146,7 +146,7 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
         || is_wired_ops(&cli.command)
         || is_live_session_command(&cli.command);
     if !needs_endpoint {
-        // Stubs that probe `/health`, and ops that stay unwired (export, daemon).
+        // Stubs that probe `/health`, and ops that stay unwired (daemon).
         let mut source = query::UnavailableSource;
         return dispatch(cli, env_token, &mut LiveHttp, &mut source, &mut LiveControl);
     }
@@ -286,7 +286,7 @@ fn is_query(command: &Command) -> bool {
 
 fn is_wired_ops(command: &Command) -> bool {
     match command {
-        Command::Doctor { .. } | Command::Db(_) => true,
+        Command::Doctor { .. } | Command::Db(_) | Command::Export { .. } => true,
         Command::Config(tree::ConfigCmd::Rules(_)) => false,
         Command::Config(_) => true,
         _ => false,
@@ -875,6 +875,21 @@ fn query_command(
     }
 }
 
+/// `aw export`. A resolved endpoint fetches `GET /sessions/{sid}/export`.
+/// Without one (the injected test dispatcher) there is still no session.
+fn export_command(args: export::ExportArgs<'_>, endpoint: Option<&Endpoint>) -> Outcome {
+    let output_file = args.output.map(std::path::Path::new);
+    let Some(endpoint) = endpoint else {
+        return export::run(args, &mut export::EmptyExport);
+    };
+    let format = match export::parse_format(args.format) {
+        Ok(format) => format,
+        Err(_) => return export::run(args, &mut export::EmptyExport),
+    };
+    let mut source = export::DaemonExport::new(export::HttpExport::new(endpoint.clone()), format);
+    export::run_to(args, &mut source, output_file)
+}
+
 /// `export`, `doctor`, `daemon`, and `db` (P1-CLI-04).
 ///
 /// These do not touch a service manager or open SQLite. Each command calls an
@@ -905,7 +920,7 @@ fn ops_command(
             redact_paths,
             redact_hosts,
             ..
-        } => Some(export::run(
+        } => Some(export_command(
             export::ExportArgs {
                 session,
                 format: format.as_deref(),
@@ -915,7 +930,7 @@ fn ops_command(
                 redact_hosts: *redact_hosts,
                 json,
             },
-            &mut export::EmptyExport,
+            endpoint,
         )),
         Command::Doctor { perf } => {
             if let Some(endpoint) = endpoint {

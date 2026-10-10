@@ -140,6 +140,8 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
             flow_count: opt_i64_field(&stats, "flow_count")?,
             dns_count: opt_i64_field(&stats, "dns_count")?,
             gap_count: opt_i64_field(&stats, "gap_count")?,
+            // The store summary sends `exit_code` (null when not observed).
+            exit_code: opt_i64_field(&body, "exit_code")?,
             bytes_up: opt_i64_field(&stats, "bytes_up")?,
             bytes_down: opt_i64_field(&stats, "bytes_down")?,
             // The session document does not carry a capability snapshot.
@@ -235,7 +237,9 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
             Vec::new()
         };
         let path = format!("/api/v1/sessions/{}/processes", encode_path_segment(key));
-        let body = self.call(&get_pairs(&path, &pairs))?;
+        // `key` is what the user typed. A 404 must name it; dropping it prints
+        // 「找不到会话 ``」.
+        let body = self.call_session(&get_pairs(&path, &pairs), Some(key))?;
         let rows = array_field(&body, "processes")?;
         rows.iter().map(|row| proc_item(row, tree)).collect()
     }
@@ -445,8 +449,8 @@ fn clip(text: &str) -> String {
 
 fn session_item(value: &Value) -> Result<SessionItem, QueryError> {
     // `GET /sessions` (store page) sends both. `GET /sessions/{id}` is the store
-    // summary, which has `mode` and omits `pinned`; an unpinned session is the
-    // store default, so a missing flag is false rather than a guessed row.
+    // summary, which has `mode` and omits `pinned`. A missing flag is not
+    // observed (None → 没采), not an unpinned session.
     // The in-memory stub answers `{ id, user_id, name }` with neither: `mode`
     // stays unknown and is printed as 不可得, not invented.
     let mode = match value.get("mode") {
@@ -458,14 +462,14 @@ fn session_item(value: &Value) -> Result<SessionItem, QueryError> {
             });
         }
     };
-    let pinned = optional_bool(value, "pinned")?.unwrap_or(false);
+    let pinned = optional_bool(value, "pinned")?;
     session_from_fields(value, mode, pinned)
 }
 
 fn session_from_fields(
     value: &Value,
     mode: String,
-    pinned: bool,
+    pinned: Option<bool>,
 ) -> Result<SessionItem, QueryError> {
     let public_id = match value.get("id").and_then(Value::as_str) {
         Some(text) if !text.is_empty() => text.to_owned(),
@@ -1086,6 +1090,7 @@ mod tests {
             flow_count: super::opt_i64_field(&stats, "flow_count").expect("count"),
             dns_count: super::opt_i64_field(&stats, "dns_count").expect("count"),
             gap_count: super::opt_i64_field(&stats, "gap_count").expect("count"),
+            exit_code: super::opt_i64_field(&value, "exit_code").expect("exit"),
             bytes_up: super::opt_i64_field(&stats, "bytes_up").expect("count"),
             bytes_down: super::opt_i64_field(&stats, "bytes_down").expect("count"),
             capabilities: Vec::new(),
@@ -1096,7 +1101,10 @@ mod tests {
     #[test]
     fn session_detail_without_pinned_parses_and_renders() {
         let shown = shown(SESSION_DETAIL);
-        assert!(!shown.item.pinned);
+        // The store summary omits `pinned`. That is not observed, not unpinned.
+        assert_eq!(shown.item.pinned, None);
+        // No `exit_code` in this fixture stays unknown; it is not printed as 0.
+        assert_eq!(shown.exit_code, None);
         assert_eq!(shown.item.public_id, "s-7k2m");
         assert_eq!(shown.item.mode, "launch");
         assert_eq!(shown.item.started_ns, Some(1_700_000_000_000_000_000));
@@ -1115,16 +1123,17 @@ mod tests {
         let text = String::from_utf8(buf).expect("utf8");
         assert!(text.contains("demo"), "{text}");
         assert!(text.contains("launch"), "{text}");
-        assert!(text.contains("no"), "{text}");
+        assert!(text.contains("没采"), "{text}");
+        assert!(!text.contains("no"), "{text}");
     }
 
     /// A list row the stub serves has no `mode` and no `pinned`. Both are
-    /// optional: pinned defaults to false, mode is reported as unknown.
+    /// optional: pinned stays unknown, mode is reported as unknown.
     #[test]
     fn session_list_row_without_mode_or_pinned_parses() {
         let value = serde_json::json!({ "id": "s-1", "user_id": "u", "name": "n" });
         let item = session_item(&value).expect("parse");
-        assert!(!item.pinned);
+        assert_eq!(item.pinned, None);
         assert_eq!(item.mode, "不可得");
         assert_eq!(item.name.as_deref(), Some("n"));
     }

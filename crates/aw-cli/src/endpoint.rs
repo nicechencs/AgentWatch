@@ -208,7 +208,15 @@ fn classify_socket_path(path: String) -> Endpoint {
     }
 }
 
+/// Overrides the platform socket or pipe path when `--socket` is absent. The
+/// daemon reads the same variable, so an unprivileged development run can put
+/// both ends in a user-writable directory.
+pub const SOCKET_ENV: &str = "AW_SOCKET";
+
 fn platform_default() -> Option<Endpoint> {
+    if let Some(path) = blank_to_none(env::var(SOCKET_ENV).ok()) {
+        return Some(classify_socket_path(path));
+    }
     #[cfg(target_os = "linux")]
     {
         Some(Endpoint::Unix {

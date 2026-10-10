@@ -1174,6 +1174,8 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                             "started_ns": row.started_ns,
                             "ended_ns": row.ended_ns,
                             "pinned": row.pinned != 0,
+                            "collectors": stored_collectors_json(&row.collectors),
+                            "stats": counts_json(&row.counts),
                         })
                     })
                     .collect();
@@ -1234,9 +1236,13 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
         ("POST", "/api/v1/db/vacuum") => db_admin(state, caller, StoreOp::Vacuum),
         ("POST", "/api/v1/db/migrate") => db_admin(state, caller, StoreOp::Migrate),
         ("PUT", "/api/v1/config") => put_config(state, caller, &req.body),
-        ("GET", "/api/v1/config") => {
-            ApiResponse::json(200, &json!({ "config": state.config_json }))
-        }
+        ("GET", "/api/v1/config") => ApiResponse::json(
+            200,
+            &json!({
+                "config": state.config_json,
+                "builtin_redaction_rules": builtin_redaction_json(),
+            }),
+        ),
         ("GET", "/api/v1/openapi.json") => {
             ApiResponse::json(200, &super::openapi::document(req.listen_port))
         }
@@ -1568,18 +1574,43 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
                 "ended_ns": summary.ended_ns,
                 "mode": summary.mode,
                 "collectors": stored_collectors_json(&summary.collectors),
-                "stats": {
-                    "process_count": summary.process_count,
-                    "flow_count": summary.flow_count,
-                    "dns_count": summary.dns_count,
-                    "gap_count": summary.gap_count,
-                    "bytes_up": summary.bytes_up,
-                    "bytes_down": summary.bytes_down,
-                }
+                "stats": counts_json(&aw_store::SessionCounts {
+                    process_count: summary.process_count,
+                    flow_count: summary.flow_count,
+                    dns_count: summary.dns_count,
+                    gap_count: summary.gap_count,
+                    bytes_up: summary.bytes_up,
+                    bytes_down: summary.bytes_down,
+                    finding_count: summary.finding_count,
+                }),
             }),
         ),
         Err(err) => from_backend(err),
     }
+}
+
+/// Built-in redaction rules (always on, read-only), so Settings can list
+/// them instead of an empty "内置规则只读" section.
+fn builtin_redaction_json() -> serde_json::Value {
+    let rules: Vec<serde_json::Value> = aw_pipeline::builtin_rules()
+        .into_iter()
+        .map(|rule| json!({ "id": rule.id, "scope": rule.scope, "pattern": rule.pattern }))
+        .collect();
+    serde_json::Value::Array(rules)
+}
+
+/// `stats` for the session list and the overview: one shape, one source
+/// (`aw_store::session_counts`), so the two pages show the same numbers.
+fn counts_json(counts: &aw_store::SessionCounts) -> serde_json::Value {
+    json!({
+        "process_count": counts.process_count,
+        "flow_count": counts.flow_count,
+        "dns_count": counts.dns_count,
+        "gap_count": counts.gap_count,
+        "bytes_up": counts.bytes_up,
+        "bytes_down": counts.bytes_down,
+        "finding_count": counts.finding_count,
+    })
 }
 
 /// What each collector named on a session row can observe in this build.
@@ -3432,6 +3463,24 @@ mod tests {
         // address was loopback and that the function returned a real port.
         assert_ne!(bound.port(), 0);
         Ok(())
+    }
+
+    /// UI review detail 9: Settings listed no built-in redaction rule.
+    #[test]
+    fn config_answer_lists_builtin_redaction_rules() {
+        let rules = super::builtin_redaction_json();
+        let list = rules.as_array().cloned().unwrap_or_default();
+        assert!(list.iter().any(|rule| rule["id"] == "tok.github"));
+        assert!(list
+            .iter()
+            .any(|rule| rule["id"] == "env.secret_name" && rule["pattern"].is_null()));
+        let counts = super::counts_json(&aw_store::SessionCounts {
+            process_count: 3,
+            finding_count: None,
+            ..Default::default()
+        });
+        assert_eq!(counts["process_count"], 3);
+        assert!(counts["finding_count"].is_null());
     }
 
     /// UI review P1-5: a poll-only session must say which categories were not

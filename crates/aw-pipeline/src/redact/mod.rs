@@ -5,4 +5,4 @@
 
 mod engine;
 
-pub use engine::{Redactor, UNSAFE_NO_REDACT_FLAG};
+pub use engine::{builtin_rules, BuiltinRule, Redactor, UNSAFE_NO_REDACT_FLAG};

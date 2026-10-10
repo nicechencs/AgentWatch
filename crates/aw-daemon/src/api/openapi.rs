@@ -57,19 +57,19 @@ fn paths() -> Value {
         "/doctor": op("get", "Collector probe and capability report.", true, "implemented"),
         "/processes": op("get", "Current system process tree for the attach picker.", true, "implemented"),
         "/sessions": {
-            "get": op_body("List sessions visible to the caller.", true, "implemented"),
+            "get": op_body("List sessions visible to the caller. Each row carries collectors (with capabilities) and stats: the same counts as /sessions/{sid}/summary (process_count, flow_count, dns_count, gap_count, bytes_up, bytes_down, finding_count; finding_count null when the findings table does not exist).", true, "implemented"),
             "post": op_body("Create a session and start watching it (poll sampler, evidence S; Linux). mode=attach {pid}: another user's process needs an administrator (403). mode=launch {argv, cwd?, env?}: the daemon starts the program as its own user, so only that user may ask; others get 403 launch_needs_cli (use aw run). Elsewhere 503 collector_unavailable.", true, "implemented")
         },
         "/sessions/run": op("post", "aw run: record a launch session {argv} and return {id, ticket, adopt_timeout_ms}. The caller starts the process itself, then posts /adopt.", true, "implemented"),
         "/sessions/{sid}/adopt": op("post", "{ticket, pid}: hand the caller's process to a /sessions/run session within 5 s. Wrong ticket 403, late 410 adopt_timeout.", true, "implemented"),
         "/sessions/{sid}/attach": op("post", "{pid}: watch one more root in an open session the caller owns. Another user's process needs an administrator.", true, "implemented"),
         "/sessions/{sid}": {
-            "get": op_body("Session detail and stats.", true, "implemented"),
+            "get": op_body("Session detail, mode, collectors [{name, mode, capabilities:[{kind, evidence, na_reason}]}] and stats (same counts as the list).", true, "implemented"),
             "patch": op_body("Rename or pin.", true, "implemented"),
             "delete": op_body("Delete. Other users' sessions are hidden as 404.", true, "implemented")
         },
-        "/sessions/{sid}/stop": op("post", "Stop observation. Does not kill the target process.", true, "implemented"),
-        "/sessions/{sid}/summary": op("get", "Overview counts.", true, "implemented"),
+        "/sessions/{sid}/stop": op("post", "Stop observation. Does not kill the target process. Sets ended_ns; nothing more is written to the session, including the daemon-sample session after a daemon restart.", true, "implemented"),
+        "/sessions/{sid}/summary": op("get", "Overview counts, mode and collectors. Counts are the same function the session list uses.", true, "implemented"),
         "/sessions/{sid}/timeline": op("get", "Cursor-paged timeline.", true, "implemented"),
         "/sessions/{sid}/timeline/histogram": op("get", "Density buckets.", true, "implemented"),
         "/sessions/{sid}/processes": op("get", "Process tree.", true, "implemented"),
@@ -86,9 +86,9 @@ fn paths() -> Value {
         "/sessions/{sid}/http": op("get", "Proxy-mode HTTP rows. A session without the proxy is 200 with reason no_proxy.", true, "implemented"),
         "/sessions/{sid}/findings": op("get", "Findings with rendered wording.", true, "implemented"),
         "/sessions/{sid}/agent-events": op("get", "E3 self-reports for the session, cursor-paged by id. No table yet is an empty page with reason no_self_reports.", true, "implemented"),
-        "/search": op("get", "Cross-session search.", true, "implemented"),
+        "/search": op("get", "Cross-session search. Hits: {src, src_id, session_id, public_id, text, ts_ns, evidence}; text is the file path or executable path (argv when unknown), null values are not guessed.", true, "implemented"),
         "/config": {
-            "get": op_body("Effective daemon config (no secrets).", true, "implemented"),
+            "get": op_body("Effective daemon config (no secrets) as config, plus builtin_redaction_rules [{id, scope, pattern}] (always on, read-only; pattern null for structural rules).", true, "implemented"),
             "put": op_body("Replace config. Administrator only.", true, "implemented")
         },
         "/db/stats": op("get", "Database size and table counts. Non-admins see only their own session count.", true, "implemented"),

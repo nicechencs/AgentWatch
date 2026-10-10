@@ -309,31 +309,78 @@ struct Patterns {
     rules: Vec<Rule>,
 }
 
+/// Token patterns, by rule id. Also listed by [`builtin_rules`].
+const TOKEN_SOURCES: &[(&str, &str)] = &[
+    ("tok.aws_akid", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    ("tok.github", r"\bgh[pousr]_[A-Za-z0-9]{36,255}\b"),
+    ("tok.github_pat", r"\bgithub_pat_[A-Za-z0-9_]{22,255}\b"),
+    ("tok.anthropic", r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b"),
+    ("tok.openai", r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}\b"),
+    ("tok.slack", r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"),
+    ("tok.google_api", r"\bAIza[0-9A-Za-z_\-]{35}\b"),
+    (
+        "tok.stripe",
+        r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b",
+    ),
+    (
+        "tok.jwt",
+        r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+    ),
+    ("tok.bearer", r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]+=*"),
+    (
+        "tok.url_userinfo",
+        r"(?i)\b([a-z][a-z0-9+.-]*://)([^/\s:@]+):([^/\s@]+)@",
+    ),
+];
+
+/// One built-in redaction rule, for display (`GET /api/v1/config`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltinRule {
+    /// Rule id, the same text that appears in `«redacted:<id>»`.
+    pub id: &'static str,
+    /// Where it applies: `text` (any captured text), `argv`, `env`, `url`, `header`.
+    pub scope: &'static str,
+    /// The regular expression, for token rules. Structural rules have none.
+    pub pattern: Option<&'static str>,
+}
+
+/// Every rule the engine applies without configuration. Token rules come
+/// from the same table the matcher compiles, so the list cannot drift from
+/// what runs; the structural rules are the `mark(...)` ids in this file.
+pub fn builtin_rules() -> Vec<BuiltinRule> {
+    let mut rules: Vec<BuiltinRule> = TOKEN_SOURCES
+        .iter()
+        .map(|(id, source)| BuiltinRule {
+            id,
+            scope: "text",
+            pattern: Some(source),
+        })
+        .collect();
+    for (id, scope) in [
+        ("argv.flag_secret", "argv"),
+        ("argv.flag_secret_eq", "argv"),
+        ("argv.header", "argv"),
+        ("argv.basic_auth", "argv"),
+        ("argv.env_assign", "argv"),
+        ("argv.mysql_p", "argv"),
+        ("env.secret_name", "env"),
+        ("url.fragment", "url"),
+        ("url.query_secret", "url"),
+        ("header.blocked", "header"),
+    ] {
+        rules.push(BuiltinRule {
+            id,
+            scope,
+            pattern: None,
+        });
+    }
+    rules
+}
+
 fn patterns() -> &'static Patterns {
     static PATTERNS: OnceLock<Patterns> = OnceLock::new();
     PATTERNS.get_or_init(|| {
-        let sources: &[(&str, &str)] = &[
-            ("tok.aws_akid", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
-            ("tok.github", r"\bgh[pousr]_[A-Za-z0-9]{36,255}\b"),
-            ("tok.github_pat", r"\bgithub_pat_[A-Za-z0-9_]{22,255}\b"),
-            ("tok.anthropic", r"\bsk-ant-[A-Za-z0-9_\-]{20,}\b"),
-            ("tok.openai", r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}\b"),
-            ("tok.slack", r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"),
-            ("tok.google_api", r"\bAIza[0-9A-Za-z_\-]{35}\b"),
-            (
-                "tok.stripe",
-                r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b",
-            ),
-            (
-                "tok.jwt",
-                r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
-            ),
-            ("tok.bearer", r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]+=*"),
-            (
-                "tok.url_userinfo",
-                r"(?i)\b([a-z][a-z0-9+.-]*://)([^/\s:@]+):([^/\s@]+)@",
-            ),
-        ];
+        let sources: &[(&str, &str)] = TOKEN_SOURCES;
         let set = RegexSet::new(sources.iter().map(|(_, source)| *source))
             .unwrap_or_else(|_| panic!("redaction RegexSet failed to compile"));
         let rules = sources
@@ -537,4 +584,38 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{builtin_rules, patterns};
+
+    /// The Settings page listed no built-in rule (UI review #143, detail 9).
+    /// The list must name every token rule the matcher runs, with no repeats.
+    #[test]
+    fn builtin_rules_cover_the_compiled_token_rules() {
+        let listed = builtin_rules();
+        let ids: Vec<&str> = listed.iter().map(|rule| rule.id).collect();
+        for rule in &patterns().rules {
+            assert!(ids.contains(&rule.id), "{} not listed", rule.id);
+        }
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len());
+        assert!(ids.contains(&"env.secret_name"));
+        assert!(listed
+            .iter()
+            .all(|rule| (rule.scope == "text") == rule.pattern.is_some()));
+        // Every structural id is a marker this file actually writes.
+        let source = include_str!("engine.rs");
+        for rule in listed.iter().filter(|rule| rule.pattern.is_none()) {
+            assert!(
+                source.contains(&format!("\"{}\"", rule.id))
+                    || source.contains(&format!("redacted:{}", rule.id)),
+                "{}",
+                rule.id
+            );
+        }
+    }
 }

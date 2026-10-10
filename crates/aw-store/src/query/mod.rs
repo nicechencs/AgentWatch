@@ -106,6 +106,75 @@ pub struct SessionListItem {
     pub ended_ns: Option<i64>,
     /// `1` when excluded from retention.
     pub pinned: i64,
+    /// `sessions.collectors`: JSON array of collector names, as stored.
+    pub collectors: String,
+    /// The same counts the overview reads ([`session_counts`]), so the list
+    /// and the overview never disagree.
+    pub counts: SessionCounts,
+}
+
+/// Row counts for one session, shared by the session list and the overview.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionCounts {
+    /// Process rows.
+    pub process_count: i64,
+    /// Flow rows.
+    pub flow_count: i64,
+    /// DNS rows.
+    pub dns_count: i64,
+    /// Gap rows.
+    pub gap_count: i64,
+    /// Sum of `bytes_up`. `None` when every flow left the column NULL.
+    pub bytes_up: Option<i64>,
+    /// Sum of `bytes_down`. `None` when every flow left the column NULL.
+    pub bytes_down: Option<i64>,
+    /// Finding rows. `None` when the database has no `findings` table yet
+    /// (unknown, not zero).
+    pub finding_count: Option<i64>,
+}
+
+/// Counts for `session_id`. The caller has already checked visibility.
+pub fn session_counts(conn: &Connection, session_id: i64) -> Result<SessionCounts, QueryError> {
+    let mut counts = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM processes p WHERE p.session_id = ?1), \
+                    (SELECT COUNT(*) FROM net_flows f WHERE f.session_id = ?1), \
+                    (SELECT COUNT(*) FROM dns d WHERE d.session_id = ?1), \
+                    (SELECT COUNT(*) FROM gaps g WHERE g.session_id = ?1), \
+                    (SELECT SUM(bytes_up) FROM net_flows f WHERE f.session_id = ?1), \
+                    (SELECT SUM(bytes_down) FROM net_flows f WHERE f.session_id = ?1)",
+            rusqlite::params![session_id],
+            |row| {
+                Ok(SessionCounts {
+                    process_count: row.get(0)?,
+                    flow_count: row.get(1)?,
+                    dns_count: row.get(2)?,
+                    gap_count: row.get(3)?,
+                    bytes_up: row.get(4)?,
+                    bytes_down: row.get(5)?,
+                    finding_count: None,
+                })
+            },
+        )
+        .map_err(|err| QueryError::sqlite("session_counts", err))?;
+    let findings_table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'findings'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| QueryError::sqlite("session_counts", err))?;
+    if findings_table > 0 {
+        counts.finding_count = Some(
+            conn.query_row(
+                "SELECT COUNT(*) FROM findings WHERE session_id = ?",
+                rusqlite::params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|err| QueryError::sqlite("session_counts", err))?,
+        );
+    }
+    Ok(counts)
 }
 
 /// Counts for one session. Missing counts stay `None` only when the session
@@ -140,6 +209,8 @@ pub struct SessionSummary {
     pub mode: String,
     /// `sessions.collectors`: JSON array of collector names, as stored.
     pub collectors: String,
+    /// Finding rows; see [`SessionCounts::finding_count`].
+    pub finding_count: Option<i64>,
 }
 
 /// One process in a session tree.
@@ -285,7 +356,7 @@ pub fn list_sessions(
 ) -> Result<Vec<SessionListItem>, QueryError> {
     let pred = compile_optional(filter.expr.as_deref(), Target::Sessions, None, None)?;
     let mut sql = String::from(
-        "SELECT id, public_id, name, mode, agent, started_ns, ended_ns, pinned \
+        "SELECT id, public_id, name, mode, agent, started_ns, ended_ns, pinned, collectors \
          FROM sessions WHERE user_id = ?",
     );
     let mut bind: Vec<Param> = vec![Param::Text(user_id.to_string())];
@@ -334,10 +405,16 @@ pub fn list_sessions(
                 started_ns: row.get(5)?,
                 ended_ns: row.get(6)?,
                 pinned: row.get(7)?,
+                collectors: row.get(8)?,
+                counts: SessionCounts::default(),
             })
         })
         .map_err(|err| QueryError::sqlite("list_sessions", err))?;
-    collect_rows(rows)
+    let mut items: Vec<SessionListItem> = collect_rows(rows)?;
+    for item in &mut items {
+        item.counts = session_counts(conn, item.id)?;
+    }
+    Ok(items)
 }
 
 /// Overview counts for one session. `None` when it is not owned by `user_id`.
@@ -349,39 +426,49 @@ pub fn session_summary(
     if !session_visible(conn, user_id, session_id)? {
         return Ok(None);
     }
-    let summary = conn
+    let head = conn
         .query_row(
             "SELECT s.id, s.public_id, s.name, s.agent, s.started_ns, s.ended_ns, \
-                    (SELECT COUNT(*) FROM processes p WHERE p.session_id = s.id), \
-                    (SELECT COUNT(*) FROM net_flows f WHERE f.session_id = s.id), \
-                    (SELECT COUNT(*) FROM dns d WHERE d.session_id = s.id), \
-                    (SELECT COUNT(*) FROM gaps g WHERE g.session_id = s.id), \
-                    (SELECT SUM(bytes_up) FROM net_flows f WHERE f.session_id = s.id), \
-                    (SELECT SUM(bytes_down) FROM net_flows f WHERE f.session_id = s.id), \
                     s.mode, s.collectors \
              FROM sessions s WHERE s.id = ? AND s.user_id = ?",
             rusqlite::params![session_id, user_id],
             |row| {
-                Ok(SessionSummary {
-                    id: row.get(0)?,
-                    public_id: row.get(1)?,
-                    name: row.get(2)?,
-                    agent: row.get(3)?,
-                    started_ns: row.get(4)?,
-                    ended_ns: row.get(5)?,
-                    process_count: row.get(6)?,
-                    flow_count: row.get(7)?,
-                    dns_count: row.get(8)?,
-                    gap_count: row.get(9)?,
-                    bytes_up: row.get(10)?,
-                    bytes_down: row.get(11)?,
-                    mode: row.get(12)?,
-                    collectors: row.get(13)?,
-                })
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
             },
         )
         .optional()
         .map_err(|err| QueryError::sqlite("session_summary", err))?;
+    let Some((id, public_id, name, agent, started_ns, ended_ns, mode, collectors)) = head else {
+        return Ok(None);
+    };
+    // Same function as the session list: one source for both pages.
+    let counts = session_counts(conn, id)?;
+    let summary = Some(SessionSummary {
+        id,
+        public_id,
+        name,
+        agent,
+        started_ns,
+        ended_ns,
+        process_count: counts.process_count,
+        flow_count: counts.flow_count,
+        dns_count: counts.dns_count,
+        gap_count: counts.gap_count,
+        bytes_up: counts.bytes_up,
+        bytes_down: counts.bytes_down,
+        mode,
+        collectors,
+        finding_count: counts.finding_count,
+    });
     Ok(summary)
 }
 
@@ -2531,5 +2618,26 @@ mod tests {
         assert!(search(&conn, "other", "node", false, None, None)
             .unwrap()
             .is_empty());
+    }
+
+    /// UI review of #143, detail 7: the list said 「不可得」 where the
+    /// overview had numbers. Both now read [`session_counts`].
+    #[test]
+    fn session_list_carries_the_overview_counts() {
+        let conn = conn();
+        session(&conn, 1, "u", 10);
+        proc_row(&conn, 1, 7, 70, None, 11);
+        proc_row(&conn, 1, 8, 80, Some(7), 12);
+        let items = list_sessions(&conn, "u", &SessionFilter::default()).unwrap();
+        assert_eq!(items.len(), 1);
+        let summary = session_summary(&conn, "u", 1).unwrap().unwrap();
+        assert_eq!(items[0].counts.process_count, 2);
+        assert_eq!(items[0].counts.process_count, summary.process_count);
+        assert_eq!(items[0].counts.gap_count, summary.gap_count);
+        assert_eq!(items[0].counts.bytes_up, summary.bytes_up);
+        // No findings table in this schema: unknown, not zero.
+        assert_eq!(items[0].counts.finding_count, None);
+        assert_eq!(summary.finding_count, None);
+        assert_eq!(items[0].collectors, "[]");
     }
 }

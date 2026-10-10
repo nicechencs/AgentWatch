@@ -79,7 +79,7 @@ pub use ipc::{
 pub use limits::Limiter;
 pub use output::{DnsRec, FileAccessRec, FlowBucketRec, GapRec, NetFlowRec, Output, ProcessRec};
 pub use pipeline::Pipeline;
-pub use redact::{Redactor, UNSAFE_NO_REDACT_FLAG};
+pub use redact::{builtin_rules, BuiltinRule, Redactor, UNSAFE_NO_REDACT_FLAG};
 pub use scope::{ScopeConfig, ScopeFilter, ScopeSet, ScopeUpdate, DEFAULT_PENDING_MS};
 pub use sensitive::{PathGlob, Rules as SensitiveRules};
 pub use stage::{

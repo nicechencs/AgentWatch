@@ -84,6 +84,12 @@ mod tests {
             })
         }
 
+        fn record_exit(&mut self, _: &LaunchSession, _: i32) -> Result<(), ControlError> {
+            Err(ControlError::BadReply {
+                detail: "stop must not record an exit".to_owned(),
+            })
+        }
+
         fn attach(&mut self, _request: &AttachRequest) -> Result<SessionHandle, ControlError> {
             self.attached += 1;
             Err(ControlError::BadReply {
@@ -127,6 +133,12 @@ mod tests {
             }
 
             fn adopt(&mut self, _: &LaunchSession, _: u32) -> Result<(), ControlError> {
+                Err(ControlError::BadReply {
+                    detail: "not called".to_owned(),
+                })
+            }
+
+            fn record_exit(&mut self, _: &LaunchSession, _: i32) -> Result<(), ControlError> {
                 Err(ControlError::BadReply {
                     detail: "not called".to_owned(),
                 })

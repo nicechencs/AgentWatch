@@ -79,6 +79,19 @@ fn redacted_argv_json(argv: &[String]) -> String {
     serde_json::to_string(&scrubbed).unwrap_or_else(|_| "[]".to_owned())
 }
 
+/// The one executable label the pipe-gated `/adopt` path can retain when its
+/// root exits before the first poll. It comes from the session argv already
+/// accepted for storage, not a post-exit `/proc` read.
+fn argv0_basename(argv_json: Option<&str>) -> Option<String> {
+    let argv: Vec<String> = serde_json::from_str(argv_json?).ok()?;
+    let argv0 = argv.first()?;
+    std::path::Path::new(argv0)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
 /// The daemon's effective uid (0 when it runs as root).
 fn daemon_uid() -> u32 {
     #[cfg(unix)]
@@ -232,6 +245,7 @@ fn target_for(
         argv_json: argv.map(redacted_argv_json),
         agent: opt_text(body, "agent"),
         write_session_row: true,
+        root_hint: None,
     })
 }
 
@@ -417,10 +431,13 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
         let pid = pid_field(&value)?;
         // Never `allow_admin`: an administrator cannot adopt another account's pid.
         check_pid_owner(caller, pid, false)?;
+        let root_hint = argv0_basename(pending.target.argv_json.as_deref())
+            .and_then(|name| crate::sample::root_hint(pid, name));
         let Some(mut pending) = state.pending_launches.remove(sid) else {
             return Err(not_found());
         };
         pending.target.root_pid = pid;
+        pending.target.root_hint = root_hint;
         let response = ApiResponse::json(200, &json!({ "id": sid, "root_pid": pid }));
         state.watch_requests.push(WatchRequest::Start {
             target: Box::new(pending.target),
@@ -429,6 +446,65 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
         Ok(response)
     };
     match inner(state) {
+        Ok(response) | Err(response) => response,
+    }
+}
+
+/// `POST /sessions/{sid}/exit` with `{exit_code}`. The caller-created child is
+/// reaped by `aw run`, so it reports its numeric status separately. A code the
+/// daemon already recorded is authoritative and is never replaced.
+pub(super) fn record_exit(
+    state: &mut ApiState,
+    caller: &Caller,
+    sid: &str,
+    body: &[u8],
+) -> ApiResponse {
+    let inner = || -> Result<ApiResponse, ApiResponse> {
+        let value = parse(body)?;
+        let exit_code = value
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok())
+            .ok_or_else(|| {
+                error_response(400, "bad_argument", "exit_code: expected a signed integer")
+            })?;
+        let path = db_path(state)?;
+        let conn = rusqlite::Connection::open(&path)
+            .map_err(|_| error_response(500, "store", "cannot open the database"))?;
+        let row: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT id, user_id FROM sessions WHERE public_id = ?1",
+                [sid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+        let Some((db_id, owner)) = row else {
+            return Err(error_response(404, "not_found", "session not found"));
+        };
+        // This status comes from the unprivileged caller that created the
+        // child. Do not allow another caller, including an administrator, to
+        // write it for a session it did not launch.
+        if owner != caller.user_id {
+            return Err(error_response(404, "not_found", "session not found"));
+        }
+        conn.execute(
+            "UPDATE sessions SET exit_code = COALESCE(exit_code, ?1) WHERE id = ?2",
+            rusqlite::params![exit_code, db_id],
+        )
+        .map_err(|_| error_response(500, "store", "cannot update the session"))?;
+        let stored: i32 = conn
+            .query_row(
+                "SELECT exit_code FROM sessions WHERE id = ?1",
+                [db_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| error_response(500, "store", "cannot read the session exit code"))?;
+        Ok(ApiResponse::json(
+            200,
+            &json!({ "id": sid, "exit_code": stored }),
+        ))
+    };
+    match inner() {
         Ok(response) | Err(response) => response,
     }
 }
@@ -493,6 +569,7 @@ pub(super) fn attach(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u
             argv_json: None,
             agent,
             write_session_row: false,
+            root_hint: None,
         };
         state.watch_requests.push(WatchRequest::Start {
             target: Box::new(target),

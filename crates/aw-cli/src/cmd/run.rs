@@ -2,8 +2,9 @@
 //!
 //! `--no-daemon` starts the target as the calling user through an injected
 //! [`Launcher`], then prints a session summary. The default daemon path first
-//! records `/sessions/run`, starts the child as the caller, and hands it over
-//! through `/adopt`. On Windows the local production launcher is
+//! records `/sessions/run`, starts the child as the caller behind a Unix pipe
+//! gate, and hands it over through `/adopt` before releasing it to exec. On
+//! Windows the local production launcher is
 //! [`launch::production`]: Job assignment is unavailable, so no process is
 //! created. On macOS it spawns with `Command` and says suspension was not
 //! applied. On Linux [`launch::LocalCgroupHost`] places the child in a delegated
@@ -26,7 +27,14 @@
 //! the launcher. They are not written to stdout, stderr, or an error string.
 
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::process::{Child, Command};
+
+#[cfg(unix)]
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+#[cfg(unix)]
+use nix::unistd::{pipe, write};
 
 use aw_proxy::{plan_injection, Injection, ProxyOnReject};
 
@@ -236,6 +244,14 @@ pub(crate) trait SpawnedChild {
     /// general CLI failure because it has no numeric exit code to forward.
     fn wait(&mut self) -> Result<i32, String>;
 
+    /// Let a held Unix child exec its target after the daemon accepted
+    /// `/adopt`. Direct-spawn platforms have no gate, so this is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// The pipe gate could not be released. The caller must reap the child.
+    fn release(&mut self) -> Result<(), String>;
+
     /// Stop and reap a child that the daemon refused to adopt.
     fn kill_and_reap(&mut self);
 }
@@ -283,8 +299,10 @@ fn os_code(error: &std::io::Error) -> String {
 #[derive(Debug, Default)]
 pub(crate) struct CommandSpawner;
 
+#[cfg(not(unix))]
 struct ProcessChild(Child);
 
+#[cfg(not(unix))]
 impl SpawnedChild for ProcessChild {
     fn pid(&self) -> u32 {
         self.0.id()
@@ -297,9 +315,68 @@ impl SpawnedChild for ProcessChild {
             .map_err(|error| wait_error_text(&error))
     }
 
+    fn release(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn kill_and_reap(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+/// The shell runs with the pipe read end open, and cannot reach the target
+/// `exec` until the parent writes to the other end. The write end is
+/// close-on-exec, so an eventual target cannot accidentally keep the gate open.
+/// `dash` accepts dynamic redirections only for one-digit descriptors, so the
+/// read uses the portable `/dev/fd/N` alias. A higher-numbered read end is
+/// harmless after EOF and is left for target exit rather than turning a valid
+/// launch into shell exit 125.
+#[cfg(unix)]
+const GATE_SHELL: &str = r#"fd=$1; shift; IFS= read -r _ < "/dev/fd/$fd" || exit 125; case "$fd" in [0-9]) eval "exec $fd<&-" ;; esac; exec "$@""#;
+
+#[cfg(unix)]
+struct GatedChild {
+    child: Child,
+    release_fd: Option<OwnedFd>,
+}
+
+#[cfg(unix)]
+impl SpawnedChild for GatedChild {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn wait(&mut self) -> Result<i32, String> {
+        self.child
+            .wait()
+            .map(|status| status.code().unwrap_or(exit::GENERAL))
+            .map_err(|error| wait_error_text(&error))
+    }
+
+    fn release(&mut self) -> Result<(), String> {
+        let Some(fd) = self.release_fd.take() else {
+            return Ok(());
+        };
+        let mut remaining = &b"1\n"[..];
+        while !remaining.is_empty() {
+            match write(&fd, remaining) {
+                Ok(0) => return Err("启动闸门未写入任何数据".to_owned()),
+                Ok(written) => remaining = &remaining[written..],
+                Err(error) => {
+                    return Err(format!("无法释放启动闸门（系统错误码 {}）", error as i32));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn kill_and_reap(&mut self) {
+        // Drop the write end before reaping. If a signal races with the shell,
+        // EOF makes it choose exit 125 rather than reaching the target exec.
+        self.release_fd.take();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -308,19 +385,55 @@ impl Spawner for CommandSpawner {
         let Some((program, args)) = spec.command.split_first() else {
             return Err("程序名为空".to_owned());
         };
-        let mut command = Command::new(program);
-        command.args(args);
-        if let Some(cwd) = spec.cwd.as_deref() {
-            command.current_dir(cwd);
+        #[cfg(unix)]
+        {
+            let (read_fd, write_fd) = pipe().map_err(nix_spawn_error_text)?;
+            let flags = fcntl(&write_fd, FcntlArg::F_GETFD).map_err(nix_spawn_error_text)?;
+            let flags = FdFlag::from_bits_truncate(flags) | FdFlag::FD_CLOEXEC;
+            fcntl(&write_fd, FcntlArg::F_SETFD(flags)).map_err(nix_spawn_error_text)?;
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(GATE_SHELL)
+                .arg("aw-run")
+                .arg(read_fd.as_raw_fd().to_string())
+                .arg(program)
+                .args(args);
+            configure_command(&mut command, spec);
+            let child = command.spawn().map_err(|error| spawn_error_text(&error))?;
+            // The shell owns the read end now. Once this copy is dropped, an
+            // aw crash closes the only write end and the shell exits 125.
+            drop(read_fd);
+            Ok(Box::new(GatedChild {
+                child,
+                release_fd: Some(write_fd),
+            }))
         }
-        for (key, value) in &spec.env {
-            command.env(key, value);
+        #[cfg(not(unix))]
+        {
+            let mut command = Command::new(program);
+            command.args(args);
+            configure_command(&mut command, spec);
+            command
+                .spawn()
+                .map(|child| Box::new(ProcessChild(child)) as Box<dyn SpawnedChild>)
+                .map_err(|error| spawn_error_text(&error))
         }
-        command
-            .spawn()
-            .map(|child| Box::new(ProcessChild(child)) as Box<dyn SpawnedChild>)
-            .map_err(|error| spawn_error_text(&error))
     }
+}
+
+fn configure_command(command: &mut Command, spec: &RunSpec) {
+    if let Some(cwd) = spec.cwd.as_deref() {
+        command.current_dir(cwd);
+    }
+    for (key, value) in &spec.env {
+        command.env(key, value);
+    }
+}
+
+#[cfg(unix)]
+fn nix_spawn_error_text(error: nix::errno::Errno) -> String {
+    spawn_error_text(&std::io::Error::from_raw_os_error(error as i32))
 }
 
 /// Windows production launcher.
@@ -759,6 +872,10 @@ pub(crate) fn daemon_run(
         child.kill_and_reap();
         return daemon_error_outcome(error, args.json, true);
     }
+    if let Err(detail) = child.release() {
+        child.kill_and_reap();
+        return super::error_outcome(exit::GENERAL, "gate_release_failed", &detail, args.json);
+    }
 
     let (pin_state, pin_warning) = if args.pin {
         match sessions.pin(&launch.public_id) {
@@ -777,11 +894,19 @@ pub(crate) fn daemon_run(
             return super::error_outcome(exit::GENERAL, "wait_failed", &detail, args.json)
         }
     };
+    let exit_warning = sessions
+        .record_exit(&launch, code)
+        .err()
+        .map(|error| format!("[aw] 警告：daemon 未记录程序退出码：{error}\n"));
     if level == SummaryLevel::None || args.quiet {
+        let mut stderr = pin_warning.unwrap_or_default();
+        if let Some(warning) = exit_warning {
+            stderr.push_str(&warning);
+        }
         return Outcome {
             code,
             stdout: Vec::new(),
-            stderr: pin_warning.unwrap_or_default().into_bytes(),
+            stderr: stderr.into_bytes(),
         };
     }
     let launched = Launched {
@@ -804,6 +929,9 @@ pub(crate) fn daemon_run(
         return super::error_outcome(exit::GENERAL, "summary", &error.to_string(), args.json);
     }
     if let Some(warning) = pin_warning {
+        stderr.extend_from_slice(warning.as_bytes());
+    }
+    if let Some(warning) = exit_warning {
         stderr.extend_from_slice(warning.as_bytes());
     }
     Outcome {
@@ -1029,7 +1157,11 @@ fn write_summary(
     }
     match figures {
         Ok(Some(summary)) => {
-            let processes = count_text(summary.processes);
+            let processes = if !args.no_daemon && summary.processes == Some(0) {
+                "退出太快没采到".to_owned()
+            } else {
+                count_text(summary.processes)
+            };
             let up = bytes_text(summary.bytes_up);
             let down = bytes_text(summary.bytes_down);
             let gaps = count_text(summary.gaps);
@@ -1137,6 +1269,9 @@ fn summary_json(
         Ok(Some(_)) => {}
         Ok(None) => body["reason"] = json!("摘要不可用"),
         Err(detail) => body["reason"] = json!(detail),
+    }
+    if !args.no_daemon && summary.and_then(|item| item.processes) == Some(0) {
+        body["processes_note"] = json!("exited_before_sampled");
     }
     body
 }
@@ -1254,6 +1389,11 @@ mod tests {
             Ok(self.code)
         }
 
+        fn release(&mut self) -> Result<(), String> {
+            self.log.borrow_mut().push("release");
+            Ok(())
+        }
+
         fn kill_and_reap(&mut self) {
             self.log.borrow_mut().push("kill");
         }
@@ -1285,6 +1425,7 @@ mod tests {
         log: Rc<RefCell<Vec<&'static str>>>,
         begin: Option<ControlError>,
         adopt: Option<ControlError>,
+        exit: Option<ControlError>,
         seen_begin: Option<BeginRunRequest>,
         stops: Vec<String>,
     }
@@ -1295,6 +1436,7 @@ mod tests {
                 log,
                 begin: None,
                 adopt: None,
+                exit: None,
                 seen_begin: None,
                 stops: Vec::new(),
             }
@@ -1317,6 +1459,14 @@ mod tests {
         fn adopt(&mut self, _: &LaunchSession, _: u32) -> Result<(), ControlError> {
             self.log.borrow_mut().push("adopt");
             match self.adopt.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
+        fn record_exit(&mut self, _: &LaunchSession, _: i32) -> Result<(), ControlError> {
+            self.log.borrow_mut().push("exit");
+            match self.exit.take() {
                 Some(error) => Err(error),
                 None => Ok(()),
             }
@@ -1445,6 +1595,44 @@ mod tests {
         assert!(err.contains("缺口 1"), "{err}");
         assert!(err.contains("E1 系统"), "{err}");
         assert!(!err.contains("上传了"), "{err}");
+    }
+
+    #[test]
+    fn daemon_zero_process_summary_says_it_exited_before_sampling() {
+        let command = vec!["tool".to_owned()];
+        let zero = Summary {
+            session_id: Some("s-fast".to_owned()),
+            processes: Some(0),
+            bytes_up: Some(0),
+            bytes_down: Some(0),
+            top_domains: Vec::new(),
+            gaps: Some(0),
+            level_note: "证据 S".to_owned(),
+        };
+        let mut launcher = fake_exit_7();
+        let outcome = run(
+            &args(&command),
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut FixedSummary(Some(zero.clone())),
+        );
+        let text = text(&outcome.stderr);
+        assert!(text.contains("进程 退出太快没采到"), "{text}");
+        assert!(!text.contains("进程 0"), "{text}");
+
+        let mut json_args = args(&command);
+        json_args.json = true;
+        let mut launcher = fake_exit_7();
+        let outcome = run(
+            &json_args,
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut FixedSummary(Some(zero)),
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&outcome.stderr).expect("JSON summary");
+        assert_eq!(body["processes"], 0);
+        assert_eq!(body["processes_note"], "exited_before_sampled");
     }
 
     #[test]
@@ -1744,7 +1932,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_run_orders_begin_spawn_adopt_wait_and_hides_env_from_the_request() {
+    fn daemon_run_holds_then_adopts_releases_and_waits_without_sending_env() {
         let command = vec!["tool".to_owned(), "argument".to_owned()];
         let env = vec!["TOKEN=super-secret-value".to_owned()];
         let mut parsed = args(&command);
@@ -1771,7 +1959,7 @@ mod tests {
         assert_eq!(outcome.code, 7);
         assert_eq!(
             *log.borrow(),
-            vec!["begin", "spawn", "adopt", "pin", "wait"]
+            vec!["begin", "spawn", "adopt", "release", "pin", "wait", "exit"]
         );
         let request = sessions.seen_begin.expect("begin request");
         assert_eq!(request.argv, command);
@@ -1811,6 +1999,37 @@ mod tests {
         assert_eq!(outcome.code, exit::USAGE);
         assert_eq!(*log.borrow(), vec!["begin", "spawn", "adopt", "kill"]);
         assert!(text(&outcome.stderr).contains("后台没有接管程序，已将其结束"));
+    }
+
+    #[test]
+    fn exit_code_report_failure_is_a_warning_and_keeps_the_target_status() {
+        let command = vec!["tool".to_owned()];
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sessions = FakeSessions::new(Rc::clone(&log));
+        sessions.exit = Some(ControlError::Unreachable {
+            detail: "down".to_owned(),
+        });
+        let mut spawner = FakeSpawner {
+            log: Rc::clone(&log),
+            spawned: 0,
+            code: 7,
+            fail: None,
+        };
+        let mut parsed = args(&command);
+        parsed.summary = Some("none");
+        let outcome = daemon_run(
+            &parsed,
+            none(),
+            &mut sessions,
+            &mut spawner,
+            &mut EmptySummary,
+        );
+        assert_eq!(outcome.code, 7);
+        assert!(text(&outcome.stderr).contains("未记录程序退出码"));
+        assert_eq!(
+            *log.borrow(),
+            vec!["begin", "spawn", "adopt", "release", "wait", "exit"]
+        );
     }
 
     #[test]
@@ -1957,10 +2176,45 @@ mod tests {
             &mut EmptySummary,
         );
         assert_eq!(outcome.code, 5, "{}", text(&outcome.stderr));
-        assert_eq!(*log.borrow(), vec!["begin", "adopt"]);
+        assert_eq!(*log.borrow(), vec!["begin", "adopt", "exit"]);
         let begin = sessions.seen_begin.expect("begin request");
         assert_eq!(begin.argv, command);
         assert!(text(&outcome.stderr).contains("s-daemon"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_spawner_pipe_gate_holds_the_target_until_release() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = std::env::temp_dir().join(format!(
+            "aw-cli-gate-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let marker = dir.join("target-ran");
+        let command = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf ran > \"$1\"".to_owned(),
+            "aw-gate-test".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        ];
+        let spec = RunSpec::new(command).expect("run spec");
+        let mut child = super::CommandSpawner.spawn(&spec).expect("held child");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !marker.exists(),
+            "the target ran before daemon adoption released its gate"
+        );
+        child.release().expect("release gate");
+        assert_eq!(child.wait().expect("wait target"), 0);
+        assert!(marker.is_file(), "the target did not run after release");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -78,6 +78,23 @@ struct ProcFact {
     uid: ProcUid,
 }
 
+/// Root identity captured by `/adopt` while the Unix pipe gate still holds the
+/// child before its real program can exec. It is only a sampling-level hint:
+/// executable path, argv, cwd, and OS user were not sampled and remain NA.
+#[derive(Debug, Clone)]
+pub(crate) struct RootHint {
+    /// Process id supplied to `/adopt`.
+    pub(crate) pid: u32,
+    /// Parent pid read from `/proc/<pid>/stat`.
+    pub(crate) ppid: u32,
+    /// Unix start time in seconds, matching the poll collector's identity.
+    pub(crate) start_secs: u64,
+    /// Stable process identity for this boot / pid / start time.
+    pub(crate) uid: ProcUid,
+    /// Basename of the session argv[0], not a sampled executable path.
+    pub(crate) name: String,
+}
+
 /// Which session a sampler writes and which process subtree it watches.
 ///
 /// The daemon-wide sample is [`SampleTarget::daemon`]: session 1, rooted at
@@ -104,6 +121,9 @@ pub struct SampleTarget {
     /// Write the `sessions` row on the first batch. `false` when the route
     /// already inserted it.
     pub write_session_row: bool,
+    /// Identity captured at adoption. It makes a root that exits before the
+    /// first poll recordable without pretending the missing fields were seen.
+    pub root_hint: Option<RootHint>,
 }
 
 impl SampleTarget {
@@ -119,6 +139,7 @@ impl SampleTarget {
             argv_json: None,
             agent: None,
             write_session_row: true,
+            root_hint: None,
         }
     }
 
@@ -252,6 +273,65 @@ impl HostSampler {
             }
         }
         self.started
+    }
+
+    /// Persist the adopted root from the synchronous hint if it disappeared
+    /// before this sampler could start. The process row goes through the same
+    /// event-to-batch path as an ordinary snapshot, so its evidence and NA
+    /// fields remain honest.
+    pub fn persist_gone_root_hint(&mut self) -> bool {
+        let Some(hint) = self.target.root_hint.clone() else {
+            return false;
+        };
+        if sample_session_state(&self.db_path, self.target.db_id) == SampleSessionState::Ended {
+            return false;
+        }
+        // A live process with this identity failed for some other reason;
+        // do not replace a real sampler with a synthetic snapshot in that
+        // case. A reused pid is also not the adopted root.
+        if proc_uid_of(hint.pid) == Some(hint.uid) {
+            return false;
+        }
+        let Some(start_ns) = hint
+            .start_secs
+            .checked_mul(1_000_000_000)
+            .and_then(|ns| i64::try_from(ns).ok())
+        else {
+            return false;
+        };
+        let wall_ns = wall_now_ns();
+        let start = ProcessStart::new(
+            hint.ppid,
+            None,
+            start_ns,
+            Some(hint.name),
+            None,
+            None,
+            None,
+            StartHow::Snapshot,
+            None,
+            None,
+        );
+        let fact = ProcFact {
+            pid: hint.pid,
+            ppid: hint.ppid,
+            start_secs: hint.start_secs,
+            uid: hint.uid,
+        };
+        let Some(event) = self.start_event(&start, &fact, wall_ns) else {
+            return false;
+        };
+        match self.persist(&[event], wall_ns) {
+            Ok(()) => {
+                self.last_sample_ns = Some(wall_ns);
+                true
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "poll root hint write failed");
+                self.pending_store_failure = true;
+                false
+            }
+        }
     }
 
     /// Whether the root process is still the one this sampler attached to:
@@ -774,12 +854,30 @@ fn read_ppid(pid: u32) -> Option<u32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
+#[cfg(not(target_os = "linux"))]
+fn read_ppid(_pid: u32) -> Option<u32> {
+    None
+}
+
 /// [`ProcUid`] of `pid`, hashed the way the poll collector hashes a row.
 /// `None` when the process is gone or its identity cannot be read.
 pub(crate) fn proc_uid_of(pid: u32) -> Option<ProcUid> {
     let boot = read_boot_id()?;
     let start_secs = read_pid_start_secs(pid)?;
     ProcessIdentity::from_parts(&boot, pid, start_secs, StartTimeUnit::Seconds).map(|id| id.uid)
+}
+
+/// Capture the adopted root while the caller still holds it behind the pipe
+/// gate. `None` means one required `/proc` fact was unavailable; callers keep
+/// the adoption valid, but cannot later claim a root snapshot they lack.
+pub(crate) fn root_hint(pid: u32, name: String) -> Option<RootHint> {
+    Some(RootHint {
+        pid,
+        ppid: read_ppid(pid)?,
+        start_secs: read_pid_start_secs(pid)?,
+        uid: proc_uid_of(pid)?,
+        name,
+    })
 }
 
 fn read_boot_id() -> Option<Vec<u8>> {

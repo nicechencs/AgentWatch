@@ -169,6 +169,12 @@ impl Watches {
         if sampler.start() {
             tracing::info!(session = db_id, pid, "watching process");
             self.running.push(Running { sampler, child });
+        } else if sampler.persist_gone_root_hint() {
+            // `/adopt` captured this identity while the CLI's pipe gate held
+            // it. The target has already gone before the first poll, but the
+            // snapshot row was persisted with evidence S and NA fields rather
+            // than silently reporting zero processes.
+            self.end(db_id, "exited", None);
         } else {
             // The root could not be identified (gone already, or a platform
             // the poll sampler does not read). Not left open as "recording".

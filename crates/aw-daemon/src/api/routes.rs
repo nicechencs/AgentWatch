@@ -1212,6 +1212,9 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
     }
     if method == "POST" && state.query.db_path.is_some() {
         if let Some(rest) = path.strip_prefix("/api/v1/sessions/") {
+            if let Some(sid) = rest.strip_suffix("/exit") {
+                return super::watch_routes::record_exit(state, caller, sid, &req.body);
+            }
             if let Some(sid) = rest.strip_suffix("/adopt") {
                 return super::watch_routes::adopt(state, caller, sid, &req.body);
             }
@@ -3084,6 +3087,81 @@ mod tests {
             r#"{"argv":["/usr/bin/python3","tool.py"],"name":"mine"}"#,
         );
         assert_eq!(given, "mine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn adopted_pipe_gated_root_is_snapshotted_after_an_immediate_exit_and_reports_its_code() {
+        use std::os::fd::AsRawFd;
+
+        let (dir, db) = seeded_db("gated-fast-exit", "");
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                r#"fd=$1; shift; IFS= read -r _ < "/dev/fd/$fd" || exit 125; case "$fd" in [0-9]) eval "exec $fd<&-" ;; esac; exec "$@""#,
+            )
+            .arg("aw-daemon-test-gate")
+            .arg(read_fd.as_raw_fd().to_string())
+            .arg("sh")
+            .arg("-c")
+            .arg("exit 7")
+            .spawn()
+            .expect("held child");
+        let pid = child.id();
+        drop(read_fd);
+
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &crate::sample::current_user_id(), false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions/run",
+            r#"{"argv":["sh","-c","exit 7"]}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        let ticket = body["ticket"].as_str().unwrap_or_default();
+        let (status, body) = post(
+            &mut state,
+            &token,
+            &format!("/api/v1/sessions/{sid}/adopt"),
+            &format!(r#"{{"ticket":"{ticket}","pid":{pid}}}"#),
+        );
+        assert_eq!(status, 200, "{body}");
+
+        nix::unistd::write(&write_fd, b"1\n").expect("release gate");
+        drop(write_fd);
+        assert_eq!(child.wait().expect("reap child").code(), Some(7));
+
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut watches = crate::watch::Watches::new(db.clone());
+        watches.tick(&shared);
+        assert_eq!(proc_rows(&db, &sid, pid), 1);
+        let end = session_end(&db, &sid);
+        assert_eq!(
+            end.as_ref().and_then(|row| row.2.as_deref()),
+            Some("exited")
+        );
+
+        let (status, body) = {
+            let mut guard = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            post(
+                &mut guard,
+                &token,
+                &format!("/api/v1/sessions/{sid}/exit"),
+                r#"{"exit_code":7}"#,
+            )
+        };
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["id"], sid);
+        assert_eq!(body["exit_code"], 7);
+        assert_eq!(session_end(&db, &sid).and_then(|row| row.3), Some(7));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

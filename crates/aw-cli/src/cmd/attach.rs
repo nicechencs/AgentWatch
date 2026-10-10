@@ -205,6 +205,10 @@ pub(crate) trait DaemonSessions {
     /// Give the daemon a caller-created root process.
     fn adopt(&mut self, session: &LaunchSession, pid: u32) -> Result<(), ControlError>;
 
+    /// Report the numeric target exit code after a caller-created child exits.
+    /// The daemon preserves a code it already recorded itself.
+    fn record_exit(&mut self, session: &LaunchSession, exit_code: i32) -> Result<(), ControlError>;
+
     /// Create a session for an existing root process.
     fn attach(&mut self, request: &AttachRequest) -> Result<SessionHandle, ControlError>;
 
@@ -316,6 +320,18 @@ impl DaemonSessions for HttpDaemonSessions {
         Ok(())
     }
 
+    fn record_exit(&mut self, session: &LaunchSession, exit_code: i32) -> Result<(), ControlError> {
+        let path = format!(
+            "/api/v1/sessions/{}/exit",
+            encode_path_segment(&session.public_id)
+        );
+        let _ = self.call(&ApiRequest::post_json(
+            &path,
+            &json!({ "exit_code": exit_code }),
+        ))?;
+        Ok(())
+    }
+
     fn attach(&mut self, request: &AttachRequest) -> Result<SessionHandle, ControlError> {
         let mut body = Map::new();
         body.insert("mode".to_owned(), json!("attach"));
@@ -361,6 +377,10 @@ impl DaemonSessions for UnwiredControl {
     }
 
     fn adopt(&mut self, _: &LaunchSession, _: u32) -> Result<(), ControlError> {
+        Err(unwired())
+    }
+
+    fn record_exit(&mut self, _: &LaunchSession, _: i32) -> Result<(), ControlError> {
         Err(unwired())
     }
 
@@ -639,6 +659,12 @@ mod tests {
         fn adopt(&mut self, _: &LaunchSession, _: u32) -> Result<(), ControlError> {
             Err(ControlError::BadReply {
                 detail: "attach test must not adopt".to_owned(),
+            })
+        }
+
+        fn record_exit(&mut self, _: &LaunchSession, _: i32) -> Result<(), ControlError> {
+            Err(ControlError::BadReply {
+                detail: "attach test must not record an exit".to_owned(),
             })
         }
 

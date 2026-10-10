@@ -216,6 +216,10 @@ pub struct SessionSummary {
     pub bytes_down: Option<i64>,
     /// `launch` or `attach`.
     pub mode: String,
+    /// Platform identifier, or unknown.
+    pub platform: Option<String>,
+    /// OS version, or unknown.
+    pub os_version: Option<String>,
     /// `sessions.collectors`: JSON array of collector names, as stored.
     pub collectors: String,
     /// Finding rows; see [`SessionCounts::finding_count`].
@@ -452,7 +456,7 @@ pub fn session_summary(
     let head = conn
         .query_row(
             "SELECT s.id, s.public_id, s.name, s.agent, s.started_ns, s.ended_ns, \
-                    s.exit_code, s.mode, s.collectors, s.argv \
+                    s.exit_code, s.mode, s.platform, s.os_version, s.collectors, s.argv \
              FROM sessions s WHERE s.id = ? AND s.user_id = ?",
             rusqlite::params![session_id, user_id],
             |row| {
@@ -465,15 +469,29 @@ pub fn session_summary(
                     row.get::<_, Option<i64>>(5)?,
                     row.get::<_, Option<i64>>(6)?,
                     row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(8)?,
                     row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Option<String>>(11)?,
                 ))
             },
         )
         .optional()
         .map_err(|err| QueryError::sqlite("session_summary", err))?;
-    let Some((id, public_id, name, agent, started_ns, ended_ns, exit_code, mode, collectors, argv)) =
-        head
+    let Some((
+        id,
+        public_id,
+        name,
+        agent,
+        started_ns,
+        ended_ns,
+        exit_code,
+        mode,
+        platform,
+        os_version,
+        collectors,
+        argv,
+    )) = head
     else {
         return Ok(None);
     };
@@ -494,6 +512,8 @@ pub fn session_summary(
         bytes_up: counts.bytes_up,
         bytes_down: counts.bytes_down,
         mode,
+        platform,
+        os_version,
         collectors,
         finding_count: counts.finding_count,
         argv,

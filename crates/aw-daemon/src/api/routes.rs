@@ -1183,7 +1183,7 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                             "session_id": row.id,
                             "name": row.name,
                             "mode": row.mode,
-                            "platform": row.platform,
+                            "platform": platform_or_host(row.platform.as_deref()),
                             "os_version": row.os_version,
                             "agent": row.agent,
                             "started_ns": row.started_ns,
@@ -1605,6 +1605,8 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
                 "ended_ns": summary.ended_ns,
                 "exit_code": summary.exit_code,
                 "mode": summary.mode,
+                "platform": platform_or_host(summary.platform.as_deref()),
+                "os_version": summary.os_version,
                 "collectors": stored_collectors_json(&summary.collectors),
                 "argv": super::query::argv_value(summary.argv.as_deref()),
                 "stats": counts_json(&aw_store::SessionCounts {
@@ -1620,6 +1622,16 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
         ),
         Err(err) => from_backend(err),
     }
+}
+
+/// Stored session rows use [`std::env::consts::OS`] when they are created.
+/// Older rows may have a nullable platform, so keep the API usable without
+/// changing the representation of newly-created rows.
+fn platform_or_host(stored: Option<&str>) -> String {
+    stored
+        .filter(|platform| !platform.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| std::env::consts::OS.to_owned())
 }
 
 /// Built-in redaction rules (always on, read-only), so Settings can list
@@ -2843,18 +2855,81 @@ mod tests {
     }
 
     #[test]
-    fn session_list_json_carries_platform_and_os_version() {
+    fn session_detail_and_summary_json_carry_platform_and_os_version() {
         let (dir, db) = seeded_db(
-            "list-platform",
+            "detail-platform",
             "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, os_version, collectors) VALUES (1, 's-macos', 'launch', 'alice', 1, 'macos', '14.6', '[]');",
         );
         let mut state = ApiState::new(1_000);
         state.query = super::StoreQuery::open_path(db);
 
+        let (status, body) = get_as(&mut state, "alice", "/api/v1/sessions/s-macos");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["platform"], "macos");
+        assert_eq!(body["os_version"], "14.6");
+
+        let (status, body) = get_as(&mut state, "alice", "/api/v1/sessions/s-macos/summary");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["platform"], "macos");
+        assert_eq!(body["os_version"], "14.6");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn null_session_platform_falls_back_to_the_host_in_list_and_detail() {
+        let (dir, db) = seeded_db("null-platform", "");
+        // New rows require a platform, but a query must remain useful for an
+        // imported older row whose column is nullable.
+        let legacy_schema = rusqlite::Connection::open(&db).and_then(|connection| {
+            connection.execute_batch(
+                "
+                PRAGMA foreign_keys = OFF;
+                BEGIN;
+                CREATE TABLE sessions_legacy (
+                  id INTEGER PRIMARY KEY,
+                  public_id TEXT NOT NULL UNIQUE,
+                  name TEXT,
+                  mode TEXT NOT NULL CHECK (mode IN ('launch','attach')),
+                  agent TEXT,
+                  root_proc_uid INTEGER,
+                  argv TEXT,
+                  cwd TEXT,
+                  user_id TEXT NOT NULL,
+                  started_ns INTEGER NOT NULL,
+                  ended_ns INTEGER,
+                  end_reason TEXT,
+                  exit_code INTEGER,
+                  proxy_enabled INTEGER NOT NULL DEFAULT 0,
+                  proxy_port INTEGER,
+                  platform TEXT,
+                  os_version TEXT,
+                  collectors TEXT NOT NULL,
+                  collector_profile TEXT,
+                  config_digest TEXT,
+                  pinned INTEGER NOT NULL DEFAULT 0,
+                  stats TEXT
+                );
+                DROP TABLE sessions;
+                ALTER TABLE sessions_legacy RENAME TO sessions;
+                CREATE INDEX idx_sessions_started ON sessions(started_ns);
+                INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors)
+                VALUES (1, 's-unknown-platform', 'launch', 'alice', 1, NULL, '[]');
+                COMMIT;
+                ",
+            )
+        });
+        assert!(legacy_schema.is_ok(), "{legacy_schema:?}");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+
         let (status, body) = get_as(&mut state, "alice", "/api/v1/sessions");
         assert_eq!(status, 200, "{body}");
-        assert_eq!(body["sessions"][0]["platform"], "macos");
-        assert_eq!(body["sessions"][0]["os_version"], "14.6");
+        assert_eq!(body["sessions"][0]["platform"], std::env::consts::OS);
+
+        let (status, body) = get_as(&mut state, "alice", "/api/v1/sessions/s-unknown-platform");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["platform"], std::env::consts::OS);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

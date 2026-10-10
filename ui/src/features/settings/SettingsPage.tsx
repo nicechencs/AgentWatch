@@ -67,10 +67,30 @@ function Storage({ config, used, admin }: { config: ConfigView; used: number | n
     },
     onError: (caught) => setNotice(isApiError(caught) && caught.status === 403 ? t("settings.forbidden") : caught.message),
   });
+  // "Current retention policy": sessions that ended more than max_age_days ago.
+  // The daemon deletes only after a dry run and an explicit confirm; pinned and
+  // running sessions are never deleted.
+  const maxAge = config.retention.max_age_days;
+  const scope = typeof maxAge === "number" && maxAge > 0 ? { older_than: `${maxAge}d` } : null;
+  const [candidates, setCandidates] = useState<number | null>(null);
+  const failed = (caught: Error) =>
+    setNotice(isApiError(caught) && caught.status === 403 ? t("settings.forbidden") : caught.message);
+  const preview = useMutation({
+    mutationFn: () => api.purgePreview(scope ?? {}),
+    onSuccess: (result) => {
+      setCandidates(result.would_purge.length);
+      setConfirm(true);
+    },
+    onError: failed,
+  });
   const purge = useMutation({
-    mutationFn: () => api.purge({}),
-    onSuccess: () => void client.invalidateQueries({ queryKey: ["db-stats"] }),
-    onError: (caught) => setNotice(isApiError(caught) && caught.status === 403 ? t("settings.forbidden") : caught.message),
+    mutationFn: () => api.purge(scope ?? {}),
+    onSuccess: (result) => {
+      setNotice(t("settings.purged", { count: result?.purged?.length ?? 0 }));
+      void client.invalidateQueries({ queryKey: ["db-stats"] });
+      void client.invalidateQueries({ queryKey: ["sessions"] });
+    },
+    onError: failed,
   });
 
   return (
@@ -96,7 +116,12 @@ function Storage({ config, used, admin }: { config: ConfigView; used: number | n
         <button type="button" disabled={!admin || save.isPending} onClick={() => save.mutate()} className="rounded border border-line px-2 py-1 disabled:text-ink-faint">
           {t("common.save")}
         </button>
-        <button type="button" disabled={!admin} onClick={() => setConfirm(true)} className="rounded border border-line px-2 py-1 disabled:text-ink-faint">
+        <button
+          type="button"
+          disabled={!admin || !scope || preview.isPending || purge.isPending}
+          onClick={() => preview.mutate()}
+          className="rounded border border-line px-2 py-1 disabled:text-ink-faint"
+        >
           {t("settings.purgeNow")}
         </button>
       </div>
@@ -104,7 +129,7 @@ function Storage({ config, used, admin }: { config: ConfigView; used: number | n
       <ConfirmDialog
         open={confirm}
         title={t("settings.purgeNow")}
-        body={t("settings.purgeConfirm")}
+        body={`${t("settings.purgeConfirm")} ${t("settings.purgeCount", { count: candidates ?? 0, days: maxAge ?? "" })}`}
         onCancel={() => setConfirm(false)}
         onConfirm={() => {
           setConfirm(false);

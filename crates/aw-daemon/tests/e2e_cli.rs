@@ -126,8 +126,22 @@ impl Daemon {
     }
 
     fn aw(&self, args: &[&str]) -> Output {
-        Command::new(aw_bin())
-            .envs(env_for(&self.root))
+        let mut command = if self.as_root && my_uid() == 0 {
+            let mut sudo = Command::new("sudo");
+            sudo.args(["-n", "-u"])
+                .arg(format!("#{}", caller_uid()))
+                .arg("env");
+            for (key, value) in env_for(&self.root) {
+                sudo.arg(format!("{key}={}", value.display()));
+            }
+            sudo.arg(aw_bin());
+            sudo
+        } else {
+            let mut own = Command::new(aw_bin());
+            own.envs(env_for(&self.root));
+            own
+        };
+        command
             .env_remove("AW_TOKEN")
             .args(args)
             .stdin(Stdio::null())
@@ -159,6 +173,47 @@ impl Daemon {
         (status, serde_json::from_str(body).unwrap_or(Value::Null))
     }
 
+    /// Make one request as the original non-root caller when this ignored test
+    /// is itself invoked through sudo in CI. The root daemon must not see the
+    /// test runner's root credential as the launch caller.
+    fn http_as_caller(&self, method: &str, path: &str, body: &str) -> (u16, Value) {
+        if !(self.as_root && my_uid() == 0) {
+            return self.http(method, path, body);
+        }
+        let out = Command::new("sudo")
+            .args(["-n", "-u"])
+            .arg(format!("#{}", caller_uid()))
+            .arg("curl")
+            .args([
+                "--silent",
+                "--show-error",
+                "--unix-socket",
+                self.socket().to_str().expect("utf-8 socket path"),
+                "--request",
+                method,
+                "--header",
+                "Content-Type: application/json",
+                "--data",
+                body,
+                "--write-out",
+                "\n%{http_code}",
+            ])
+            .arg(format!("http://localhost{path}"))
+            .output()
+            .expect("curl as caller");
+        assert!(
+            out.status.success(),
+            "curl as caller: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8(out.stdout).expect("curl response utf-8");
+        let (body, status) = text.rsplit_once('\n').expect("curl status line");
+        (
+            status.parse().expect("HTTP status"),
+            serde_json::from_str(body).unwrap_or(Value::Null),
+        )
+    }
+
     fn sessions(&self) -> Vec<Value> {
         let out = self.aw(&["sessions", "list", "--json"]);
         assert!(
@@ -168,6 +223,16 @@ impl Daemon {
         );
         let value: Value = serde_json::from_slice(&out.stdout).expect("sessions json");
         value["sessions"].as_array().cloned().unwrap_or_default()
+    }
+
+    fn procs(&self, sid: &str) -> Value {
+        let out = self.aw(&["procs", sid, "--tree", "--json"]);
+        assert!(
+            out.status.success(),
+            "aw procs {sid}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).expect("processes json")
     }
 
     /// Poll the API until `sid` has ended; the session object.
@@ -244,6 +309,46 @@ fn my_uid() -> u32 {
     proc_ids(u64::from(std::process::id()), "Uid:")[0]
 }
 
+/// The ordinary account that called `sudo` for the CI root-test command. When
+/// this test binary itself is not root, it is already that account.
+fn caller_uid() -> u32 {
+    if my_uid() == 0 {
+        std::env::var("SUDO_UID")
+            .expect("run root tests through sudo so SUDO_UID names the caller")
+            .parse()
+            .expect("SUDO_UID is numeric")
+    } else {
+        my_uid()
+    }
+}
+
+fn caller_name() -> String {
+    if my_uid() == 0 {
+        return std::env::var("SUDO_USER").expect("run root tests through sudo");
+    }
+    String::from_utf8(
+        Command::new("id")
+            .arg("-un")
+            .output()
+            .expect("id -un")
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned()
+}
+
+fn caller_primary_gid() -> u32 {
+    if my_uid() == 0 {
+        std::env::var("SUDO_GID")
+            .expect("run root tests through sudo so SUDO_GID names the caller")
+            .parse()
+            .expect("SUDO_GID is numeric")
+    } else {
+        proc_ids(u64::from(std::process::id()), "Gid:")[0]
+    }
+}
+
 /// `id -G <name>` as a sorted set: the account's login group list.
 fn login_groups(name: &str) -> Vec<u32> {
     let out = Command::new("id")
@@ -265,7 +370,7 @@ fn login_groups(name: &str) -> Vec<u32> {
 #[test]
 fn aw_run_attach_stop_against_a_real_daemon() {
     let daemon = Daemon::start(As::Me);
-    let out = daemon.aw(&["run", "-q", "--", "sh", "-c", "exit 7"]);
+    let out = daemon.aw(&["run", "-q", "--", "sh", "-c", "sleep 1; exit 7"]);
     assert_eq!(
         out.status.code(),
         Some(7),
@@ -280,12 +385,27 @@ fn aw_run_attach_stop_against_a_real_daemon() {
         .expect("aw run session listed");
     let sid = launch["id"].as_str().unwrap().to_owned();
     let ended = daemon.wait_ended(&sid, Duration::from_secs(10));
-    assert_eq!(
-        ended["stats"]["process_count"].as_u64(),
-        Some(1),
-        "the root process is recorded once: {ended}"
+    assert!(
+        ended["stats"]["process_count"].as_u64().unwrap_or(0) >= 1,
+        "the root process is recorded: {ended}"
     );
     assert_eq!(ended["exit_code"], 7, "exit code recorded: {ended}");
+    assert_root_exit_code(&daemon, &sid);
+
+    // A very short-lived root may be recorded from the adopt hint. When it is
+    // present, its process row must carry the caller-reaped status as well.
+    let out = daemon.aw(&["run", "-q", "--", "sh", "-c", "exit 7"]);
+    assert_eq!(out.status.code(), Some(7));
+    let fast = daemon
+        .sessions()
+        .into_iter()
+        .find(|s| s["mode"] == "launch" && s["id"] != sid)
+        .expect("fast aw run session listed");
+    let fast_id = fast["id"].as_str().unwrap().to_owned();
+    let fast_ended = daemon.wait_ended(&fast_id, Duration::from_secs(10));
+    if fast_ended["stats"]["process_count"].as_u64().unwrap_or(0) > 0 {
+        assert_root_exit_code(&daemon, &fast_id);
+    }
 
     let mut sleeper = Command::new("sleep").arg("30").spawn().expect("sleep");
     let pid = sleeper.id().to_string();
@@ -315,6 +435,21 @@ fn aw_run_attach_stop_against_a_real_daemon() {
     );
     let _ = sleeper.kill();
     let _ = sleeper.wait();
+}
+
+fn assert_root_exit_code(daemon: &Daemon, sid: &str) {
+    let procs = daemon.procs(sid);
+    let roots: Vec<&Value> = procs["processes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["depth"] == 0)
+        .collect();
+    assert_eq!(roots.len(), 1, "one depth-0 root row: {procs}");
+    assert_eq!(
+        roots[0]["exit_code"], 7,
+        "the launched root process row records its own exit code: {procs}"
+    );
 }
 
 /// A program the daemon launches (the App's `POST /sessions` launch) starts
@@ -406,29 +541,20 @@ fn a_session_created_right_after_start_stays_recording() {
 #[test]
 #[ignore = "needs passwordless sudo to start a root daemon"]
 fn root_daemon_launch_carries_the_callers_login_groups() {
-    let me = my_uid();
+    let me = caller_uid();
     assert_ne!(
         me, 0,
         "run as an ordinary account; the daemon is the root one"
     );
-    let name = String::from_utf8(
-        Command::new("id")
-            .arg("-un")
-            .output()
-            .expect("id -un")
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_owned();
+    let name = caller_name();
     let want = login_groups(&name);
-    let primary = proc_ids(u64::from(std::process::id()), "Gid:")[0];
+    let primary = caller_primary_gid();
     assert!(
         want.iter().any(|g| *g != primary),
         "the caller must be in a supplementary group: {want:?}"
     );
     let daemon = Daemon::start(As::Root);
-    let (status, body) = daemon.http(
+    let (status, body) = daemon.http_as_caller(
         "POST",
         "/api/v1/sessions",
         r#"{"mode":"launch","argv":["sleep","10"]}"#,

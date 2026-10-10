@@ -29,12 +29,20 @@
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
 
+#[cfg(all(unix, not(target_os = "macos")))]
+use nix::fcntl::OFlag;
 #[cfg(unix)]
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+#[cfg(target_os = "macos")]
+use nix::unistd::pipe;
+#[cfg(all(unix, not(target_os = "macos")))]
+use nix::unistd::pipe2;
 #[cfg(unix)]
-use nix::unistd::{pipe, write};
+use nix::unistd::write;
 
 use aw_proxy::{plan_injection, Injection, ProxyOnReject};
 
@@ -325,15 +333,67 @@ impl SpawnedChild for ProcessChild {
     }
 }
 
-/// The shell runs with the pipe read end open, and cannot reach the target
-/// `exec` until the parent writes to the other end. The write end is
-/// close-on-exec, so an eventual target cannot accidentally keep the gate open.
-/// `dash` accepts dynamic redirections only for one-digit descriptors, so the
-/// read uses the portable `/dev/fd/N` alias. A higher-numbered read end is
-/// harmless after EOF and is left for target exit rather than turning a valid
-/// launch into shell exit 125.
+/// The shell reads the gate from fd 3 and closes it before `exec`ing the
+/// target. Both pipe ends begin close-on-exec; [`keep_gate_read_fd_for_child`]
+/// creates fd 3 without that flag only in the shell child.
 #[cfg(unix)]
-const GATE_SHELL: &str = r#"fd=$1; shift; IFS= read -r _ < "/dev/fd/$fd" || exit 125; case "$fd" in [0-9]) eval "exec $fd<&-" ;; esac; exec "$@""#;
+const GATE_SHELL: &str = r#"IFS= read -r _ <&3 || exit 125; exec 3<&-; exec "$@""#;
+
+/// Descriptor reserved for the gate in the shell child. It is closed before
+/// the shell reaches the target `exec`.
+#[cfg(unix)]
+const GATE_FD: i32 = 3;
+
+/// Create a gate pipe whose descriptors are close-on-exec from birth whenever
+/// the platform supports `pipe2`. macOS has no `pipe2`, so set the flag on
+/// both descriptors before either can be handed to a child.
+#[cfg(unix)]
+fn gate_pipe() -> nix::Result<(OwnedFd, OwnedFd)> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        pipe2(OFlag::O_CLOEXEC)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (read_fd, write_fd) = pipe()?;
+        set_cloexec(&read_fd)?;
+        set_cloexec(&write_fd)?;
+        Ok((read_fd, write_fd))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_cloexec(fd: &OwnedFd) -> nix::Result<()> {
+    let flags = fcntl(fd, FcntlArg::F_GETFD)?;
+    let flags = FdFlag::from_bits_truncate(flags) | FdFlag::FD_CLOEXEC;
+    fcntl(fd, FcntlArg::F_SETFD(flags)).map(drop)
+}
+
+/// Keep the read end available to the gate shell as fd 3. The original read
+/// descriptor remains close-on-exec, so only fd 3 is inherited; the shell
+/// closes it before starting the target.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn keep_gate_read_fd_for_child(command: &mut Command, read_fd: OwnedFd) {
+    // SAFETY: The closure runs only between fork and exec. It invokes only
+    // `dup2` and, when the source is already fd 3, `fcntl(F_SETFD)`, which are
+    // async-signal-safe. The duplicated OwnedFd is intentionally forgotten so
+    // fd 3 stays open until the shell executes; no parent descriptor is
+    // changed because this runs in the child.
+    unsafe {
+        command.pre_exec(move || {
+            let duplicated =
+                nix::unistd::dup2_raw(&read_fd, GATE_FD).map_err(std::io::Error::from)?;
+            std::mem::forget(duplicated);
+            if read_fd.as_raw_fd() == GATE_FD {
+                let flags = fcntl(&read_fd, FcntlArg::F_GETFD).map_err(std::io::Error::from)?;
+                let flags = FdFlag::from_bits_truncate(flags) & !FdFlag::FD_CLOEXEC;
+                fcntl(&read_fd, FcntlArg::F_SETFD(flags)).map_err(std::io::Error::from)?;
+            }
+            Ok(())
+        });
+    }
+}
 
 #[cfg(unix)]
 struct GatedChild {
@@ -401,23 +461,17 @@ impl Spawner for CommandSpawner {
             let resolved = resolve_program(program, path_env.as_deref(), spec.cwd.as_deref())
                 .map_err(|error| spawn_error_text(&error))?;
             let program = &resolved;
-            let (read_fd, write_fd) = pipe().map_err(nix_spawn_error_text)?;
-            let flags = fcntl(&write_fd, FcntlArg::F_GETFD).map_err(nix_spawn_error_text)?;
-            let flags = FdFlag::from_bits_truncate(flags) | FdFlag::FD_CLOEXEC;
-            fcntl(&write_fd, FcntlArg::F_SETFD(flags)).map_err(nix_spawn_error_text)?;
+            let (read_fd, write_fd) = gate_pipe().map_err(nix_spawn_error_text)?;
             let mut command = Command::new("/bin/sh");
             command
                 .arg("-c")
                 .arg(GATE_SHELL)
                 .arg("aw-run")
-                .arg(read_fd.as_raw_fd().to_string())
                 .arg(program)
                 .args(args);
             configure_command(&mut command, spec);
+            keep_gate_read_fd_for_child(&mut command, read_fd);
             let child = command.spawn().map_err(|error| spawn_error_text(&error))?;
-            // The shell owns the read end now. Once this copy is dropped, an
-            // aw crash closes the only write end and the shell exits 125.
-            drop(read_fd);
             Ok(Box::new(GatedChild {
                 child,
                 release_fd: Some(write_fd),
@@ -2286,6 +2340,67 @@ mod tests {
         assert_eq!(child.wait().expect("wait target"), 0);
         assert!(marker.is_file(), "the target did not run after release");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn command_spawner_does_not_leak_the_gate_pipe_into_the_target() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = std::env::temp_dir().join(format!(
+            "aw-cli-gate-fds-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory");
+        // A plain spawn inherits whatever non-CLOEXEC descriptors this test
+        // process already holds (runners differ; fd 4 is one such extra). The
+        // gate pipe is the only descriptor the spawner may add, and the target
+        // must not keep it, so the two fd sets have to match.
+        let script = "ls /proc/self/fd > \"$1\"";
+        let baseline_path = dir.join("baseline-fds");
+        let baseline_status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg("aw-gate-fd-test")
+            .arg(&baseline_path)
+            .status()
+            .expect("baseline spawn");
+        assert!(
+            baseline_status.success(),
+            "baseline ls failed: {baseline_status}"
+        );
+        let fds = dir.join("target-fds");
+        let command = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            "aw-gate-fd-test".to_owned(),
+            fds.to_string_lossy().into_owned(),
+        ];
+        let spec = RunSpec::new(command).expect("run spec");
+        let mut child = super::CommandSpawner.spawn(&spec).expect("held child");
+        child.release().expect("release gate");
+        assert_eq!(child.wait().expect("wait target"), 0);
+        assert_eq!(
+            listed_fds(&fds),
+            listed_fds(&baseline_path),
+            "the gated target must match a plain spawn; the gate pipe must not remain"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        fn listed_fds(path: &std::path::Path) -> Vec<u32> {
+            let mut open_fds: Vec<u32> = std::fs::read_to_string(path)
+                .expect("fd list")
+                .lines()
+                .map(|fd| fd.parse().expect("numeric fd"))
+                .collect();
+            open_fds.sort_unstable();
+            open_fds
+        }
     }
 
     #[test]

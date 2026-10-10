@@ -4,7 +4,9 @@
 //! Business commands are stubs: they probe the daemon and then report that
 //! they are not implemented.
 
-#![forbid(unsafe_code)]
+// `cmd::run` has one documented `pre_exec` exception to keep the pipe gate out
+// of the target process. All other unsafe code remains denied.
+#![deny(unsafe_code)]
 
 mod client;
 mod cmd;

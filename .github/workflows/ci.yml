@@ -36,6 +36,17 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
         run: cargo test --workspace
+      - name: root daemon tests
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo_bin="$(command -v cargo)"
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+          sudo -E env "PATH=$PATH" "CARGO_HOME=$cargo_home" "RUSTUP_HOME=$rustup_home" "$cargo_bin" test -p aw-daemon --test e2e_cli -- --ignored root_daemon
+          # aw-daemon has no lib target; these ignored launch_as tests live in
+          # the agentwatchd binary's api/routes module.
+          sudo -E env "PATH=$PATH" "CARGO_HOME=$cargo_home" "RUSTUP_HOME=$rustup_home" "$cargo_bin" test -p aw-daemon --bin agentwatchd -- --ignored launch_as_root
 
   ui:
     name: ui

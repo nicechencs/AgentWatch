@@ -55,4 +55,11 @@ nix = { version = "0.30", default-features = false, features = ["fs"] }
 insta = { version = "1.49.0", default-features = false }
 
 [lints]
-workspace = true
+[lints.rust]
+# `cmd::run` has one scoped, documented `pre_exec` exception. Keep the rest of
+# this crate under the same prohibition as the workspace.
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

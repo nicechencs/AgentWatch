@@ -516,7 +516,8 @@ mod pipe {
                     "pipe client could not be identified",
                 );
                 write_all(&pipe, &response_bytes(&response)).await?;
-                return pipe.disconnect();
+                // Dropped, not disconnected: see the end of `serve`.
+                return Ok(());
             }
         };
         let mut collected = Vec::new();
@@ -550,7 +551,15 @@ mod pipe {
                 .await
                 .unwrap_or_else(|_| error_response(500, "internal", "request handler failed"));
         write_all(&pipe, &response_bytes(&response)).await?;
-        pipe.disconnect()
+        // Do not call `disconnect` (DisconnectNamedPipe) here: it throws away
+        // whatever the client has not read yet, and the client's read then
+        // fails with ERROR_PIPE_NOT_CONNECTED ("uncategorized error"), which
+        // made the pipe test fail on Windows CI. Dropping the instance closes
+        // the server handle; the client reads the buffered reply and then sees
+        // ERROR_BROKEN_PIPE, which std reports as end of file. Each instance
+        // serves one connection, so nothing reuses it.
+        drop(pipe);
+        Ok(())
     }
 
     async fn write_all(pipe: &NamedPipeServer, mut bytes: &[u8]) -> io::Result<()> {

@@ -54,11 +54,11 @@ fn paths() -> Value {
         "/health": op("get", "Daemon status. Unauthenticated. Non-sensitive fields only.", false, "implemented"),
         "/auth/ui-ticket": op("post", "Issue a one-time UI ticket. Socket/pipe callers only; HTTP bearer is refused.", true, "implemented"),
         "/auth/ui-token": op("post", "Redeem a one-time ticket for a 12h bearer token.", false, "implemented"),
-        "/doctor": op("get", "Collector probe and capability report.", true, "implemented"),
+        "/doctor": op("get", "Collector runtime state (collectors[]: name, status running|stopped|unknown|not_built, daemon_sample, watched_roots, last_sample_ns, capabilities) as reported by the sampling loop, not the config; capabilities[] is the same poll list session answers carry, plus available.", true, "implemented"),
         "/processes": op("get", "Current system process tree for the attach picker.", true, "implemented"),
         "/sessions": {
-            "get": op_body("List sessions visible to the caller. Each row carries collectors (with capabilities) and stats: the same counts as /sessions/{sid}/summary (process_count, flow_count, dns_count, gap_count, bytes_up, bytes_down, finding_count; finding_count null when the findings table does not exist).", true, "implemented"),
-            "post": op_body("Create a session and start watching it (poll sampler, evidence S; Linux). mode=attach {pid}: another user's process needs an administrator (403). mode=launch {argv, cwd?, env?}: the daemon starts the program as its own user, so only that user may ask; others get 403 launch_needs_cli (use aw run). Elsewhere 503 collector_unavailable.", true, "implemented")
+            "get": op_body("List sessions visible to the caller. Each row carries collectors (with capabilities) and stats: the same counts as /sessions/{sid}/summary (process_count, flow_count, dns_count, gap_count, bytes_up, bytes_down, finding_count; finding_count null when the findings table does not exist), and argv (redacted command, null when absent).", true, "implemented"),
+            "post": op_body("Create a session and start watching it (poll sampler, evidence S; Linux). mode=attach {pid}: another user's process needs an administrator (403). mode=launch {argv, cwd?, env?}: the daemon starts the program as its own user, so only that user may ask; others get 403 launch_needs_cli (use aw run). Elsewhere 503 collector_unavailable. A launch that cannot start is 400 program_not_found, program_not_permitted or spawn_failed.", true, "implemented")
         },
         "/sessions/run": op("post", "aw run: record a launch session {argv} and return {id, ticket, adopt_timeout_ms}. The caller starts the process itself, then posts /adopt.", true, "implemented"),
         "/sessions/{sid}/adopt": op("post", "{ticket, pid}: hand the caller's process to a /sessions/run session within 5 s. Wrong ticket 403, late 410 adopt_timeout.", true, "implemented"),
@@ -70,7 +70,7 @@ fn paths() -> Value {
         },
         "/sessions/{sid}/stop": op("post", "Stop observation. Does not kill the target process. Sets ended_ns; nothing more is written to the session, including the daemon-sample session after a daemon restart.", true, "implemented"),
         "/sessions/{sid}/summary": op("get", "Overview counts, mode and collectors. Counts are the same function the session list uses.", true, "implemented"),
-        "/sessions/{sid}/timeline": op("get", "Cursor-paged timeline.", true, "implemented"),
+        "/sessions/{sid}/timeline": op("get", "Cursor-paged timeline. proc rows carry pre_existing: true only for an attach session's baseline process that started before the session.", true, "implemented"),
         "/sessions/{sid}/timeline/histogram": op("get", "Density buckets.", true, "implemented"),
         "/sessions/{sid}/processes": op("get", "Process tree.", true, "implemented"),
         "/sessions/{sid}/processes/{proc_uid}": op("get", "One process. Unknown proc_uid is 404.", true, "implemented"),
@@ -86,7 +86,7 @@ fn paths() -> Value {
         "/sessions/{sid}/http": op("get", "Proxy-mode HTTP rows. A session without the proxy is 200 with reason no_proxy.", true, "implemented"),
         "/sessions/{sid}/findings": op("get", "Findings with rendered wording.", true, "implemented"),
         "/sessions/{sid}/agent-events": op("get", "E3 self-reports for the session, cursor-paged by id. No table yet is an empty page with reason no_self_reports.", true, "implemented"),
-        "/search": op("get", "Cross-session search. Hits: {src, src_id, session_id, public_id, text, ts_ns, evidence}; text is the file path or executable path (argv when unknown), null values are not guessed.", true, "implemented"),
+        "/search": op("get", "Cross-session search. Hits: {src, src_id, session_id, public_id, text, ts_ns, evidence}; text is the file path or executable path (argv when unknown), null values are not guessed. session_name is the session name, else its command line.", true, "implemented"),
         "/config": {
             "get": op_body("Effective daemon config (no secrets) as config, plus builtin_redaction_rules [{id, scope, pattern}] (always on, read-only; pattern null for structural rules).", true, "implemented"),
             "put": op_body("Replace config. Administrator only.", true, "implemented")

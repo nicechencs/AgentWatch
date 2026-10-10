@@ -145,6 +145,17 @@ impl Watches {
         }
     }
 
+    /// Roots being sampled now, and the newest stored sample among them.
+    pub(crate) fn runtime(&self) -> (usize, Option<i64>) {
+        let roots = self.running.iter().filter(|r| r.sampler.running()).count();
+        let last = self
+            .running
+            .iter()
+            .filter_map(|r| r.sampler.last_sample_ns())
+            .max();
+        (roots, last)
+    }
+
     /// Number of roots being watched. The tests that read it are Linux-only.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn len(&self) -> usize {

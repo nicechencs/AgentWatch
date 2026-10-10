@@ -260,13 +260,7 @@ fn create_inner(
                     }
                 }
             }
-            let child = command.spawn().map_err(|err| {
-                error_response(
-                    400,
-                    "spawn_failed",
-                    &format!("could not start the program: {}", err.kind()),
-                )
-            })?;
+            let child = command.spawn().map_err(|err| spawn_error(&err))?;
             let pid = child.id();
             let mut target = target_for(caller, &value, "launch", pid, Some(&argv))?;
             insert_session(&path, &mut target)?;
@@ -451,5 +445,53 @@ pub(super) fn stopped(state: &mut ApiState, sid: &str) {
         |row| row.get::<_, i64>(0),
     ) {
         state.watch_requests.push(WatchRequest::Stop { db_id });
+    }
+}
+
+/// A failed `spawn` as an error the UI can word. The code says what went
+/// wrong (`program_not_found` covers a missing program and a missing working
+/// directory, which the OS reports alike); the message stays plain English for
+/// API callers. It used to be `spawn_failed` with the raw `ErrorKind` text
+/// ("entity not found"), which the page printed as is.
+fn spawn_error(err: &std::io::Error) -> ApiResponse {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => error_response(
+            400,
+            "program_not_found",
+            "the program or the working directory was not found",
+        ),
+        std::io::ErrorKind::PermissionDenied => error_response(
+            400,
+            "program_not_permitted",
+            "the program is not executable by the daemon's user",
+        ),
+        _ => error_response(400, "spawn_failed", "the program could not be started"),
+    }
+}
+
+#[cfg(test)]
+mod spawn_error_tests {
+    use super::spawn_error;
+
+    fn code(kind: std::io::ErrorKind) -> String {
+        let response = spawn_error(&std::io::Error::from(kind));
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.body).unwrap_or(serde_json::Value::Null);
+        body["error"]["code"].as_str().unwrap_or("").to_owned()
+    }
+
+    /// UI re-review #144 new-1: a wrong program showed
+    /// 「could not start the program: entity not found」.
+    #[test]
+    fn spawn_failures_carry_a_code_the_ui_can_word() {
+        assert_eq!(code(std::io::ErrorKind::NotFound), "program_not_found");
+        assert_eq!(
+            code(std::io::ErrorKind::PermissionDenied),
+            "program_not_permitted"
+        );
+        assert_eq!(code(std::io::ErrorKind::Other), "spawn_failed");
+        let response = spawn_error(&std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(response.status, 400);
+        assert!(!String::from_utf8_lossy(&response.body).contains("entity"));
     }
 }

@@ -164,6 +164,8 @@ pub struct HostSampler {
     imaged: BTreeSet<u64>,
     /// Identity of the root at `start`, for [`Self::root_alive`].
     root_uid: Option<ProcUid>,
+    /// Wall time of the last sample that was taken and stored.
+    last_sample_ns: Option<i64>,
 }
 
 impl HostSampler {
@@ -187,6 +189,7 @@ impl HostSampler {
             mono_ns: 1,
             imaged: BTreeSet::new(),
             root_uid: None,
+            last_sample_ns: None,
         }
     }
 
@@ -239,6 +242,8 @@ impl HostSampler {
                 if let Err(err) = self.persist(&events, wall_ns) {
                     tracing::warn!(error = %err, "poll baseline write failed");
                     self.pending_store_failure = true;
+                } else {
+                    self.last_sample_ns = Some(wall_ns);
                 }
             }
             Err(err) => {
@@ -253,6 +258,16 @@ impl HostSampler {
     /// same pid and same start time. A reused pid is not the same process.
     pub fn root_alive(&self) -> bool {
         proc_uid_of(self.target.root_pid).is_some_and(|uid| Some(uid) == self.root_uid)
+    }
+
+    /// Whether the collector is started (sampling on each tick).
+    pub fn running(&self) -> bool {
+        self.started
+    }
+
+    /// Wall time of the last stored sample, Unix nanoseconds.
+    pub fn last_sample_ns(&self) -> Option<i64> {
+        self.last_sample_ns
     }
 
     /// The session this sampler writes.
@@ -305,6 +320,8 @@ impl HostSampler {
         if let Err(err) = self.persist(sink.events(), wall_ns) {
             tracing::warn!(error = %err, "poll sample write failed");
             self.pending_store_failure = true;
+        } else {
+            self.last_sample_ns = Some(wall_ns);
         }
     }
 

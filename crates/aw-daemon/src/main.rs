@@ -28,6 +28,7 @@ mod assets;
 // module is part of the binary and clippy sees it. The session path calls
 // `file_hasher::hash_file` once a proxied read is correlated.
 mod capabilities;
+mod collector_state;
 mod collectors;
 mod config;
 mod file_hasher;

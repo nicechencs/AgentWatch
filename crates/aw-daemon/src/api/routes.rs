@@ -198,6 +198,8 @@ pub struct ApiState {
     pub watch_requests: Vec<crate::watch::WatchRequest>,
     /// `POST /sessions/run` tickets waiting for `/adopt`, by public id.
     pub pending_launches: crate::watch::PendingLaunches,
+    /// Collector state written by the foreground loop; read by `/doctor`.
+    pub collector_runtime: crate::collector_state::CollectorRuntime,
 }
 
 impl Default for ApiState {
@@ -216,6 +218,7 @@ impl Default for ApiState {
             },
             preview_ui: false,
             watch_requests: Vec::new(),
+            collector_runtime: crate::collector_state::CollectorRuntime::default(),
             pending_launches: crate::watch::PendingLaunches::new(),
         }
     }
@@ -1184,6 +1187,7 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                             "ended_ns": row.ended_ns,
                             "pinned": row.pinned != 0,
                             "collectors": stored_collectors_json(&row.collectors),
+                            "argv": super::query::argv_value(row.argv.as_deref()),
                             "stats": counts_json(&row.counts),
                         })
                     })
@@ -1588,6 +1592,7 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
                 "ended_ns": summary.ended_ns,
                 "mode": summary.mode,
                 "collectors": stored_collectors_json(&summary.collectors),
+                "argv": super::query::argv_value(summary.argv.as_deref()),
                 "stats": counts_json(&aw_store::SessionCounts {
                     process_count: summary.process_count,
                     flow_count: summary.flow_count,
@@ -2180,6 +2185,7 @@ fn timeline_json(page: &aw_store::TimelinePage) -> serde_json::Value {
             "id": row.id,
             "proc_uid": row.proc_uid.map(|id| format!("{id:x}")),
             "evidence": row.evidence,
+            "pre_existing": row.pre_existing,
         })).collect::<Vec<_>>(),
         "next_cursor": page.next.map(|c| format!("{},{}", c.ts_ns, c.id)),
     })
@@ -2267,16 +2273,19 @@ fn filter_mentions_body(filter: &str, json_body: &str) -> bool {
 }
 
 fn doctor(state: &ApiState) -> ApiResponse {
-    let _ = state;
-    // No collector is probed on the HTTP thread. The report says so. The host
+    // Collectors: the foreground loop's runtime state, not the config names.
+    // Capabilities: the same poll list the session answers carry. The host
     // block is the daemon's own privilege, read from the OS (BUGS B5); `null`
     // means the check failed, not "not privileged".
+    let runtime = &state.collector_runtime;
+    let caps = poll_capabilities();
     ApiResponse::json(
         200,
         &json!({
-            "probed": false,
-            "reason": "collector probe is not run on the request path",
-            "collectors": [],
+            "probed": runtime.reported,
+            "reason": if runtime.reported { None } else { Some("the collector loop has not reported yet") },
+            "collectors": crate::collector_state::doctor_collectors(runtime, &caps),
+            "capabilities": crate::collector_state::doctor_capabilities(&caps),
             "host": {
                 "os": std::env::consts::OS,
                 "privileged": crate::privilege::current(),
@@ -3402,6 +3411,31 @@ mod tests {
                 .and_then(Value::as_bool),
             crate::privilege::current()
         );
+        // UI re-review #144 new-3/new-4: collectors come from the runtime
+        // state the foreground loop reports; capabilities are the poll list
+        // the session answers carry, even before the loop reports.
+        assert_eq!(json_body(&doctor)["collectors"][0]["status"], "unknown");
+        assert_eq!(json_body(&doctor)["capabilities"][0]["kind"], "proc");
+        assert_eq!(json_body(&doctor)["capabilities"][0]["available"], true);
+        state.collector_runtime = crate::collector_state::CollectorRuntime {
+            reported: true,
+            daemon_sample: true,
+            watched_roots: 0,
+            last_sample_ns: Some(7),
+        };
+        let running = dispatch(
+            &mut state,
+            &req(
+                "GET",
+                "/api/v1/doctor",
+                Some("127.0.0.1:7456"),
+                Some(&alice),
+                b"",
+            ),
+        );
+        assert_eq!(json_body(&running)["probed"], true);
+        assert_eq!(json_body(&running)["collectors"][0]["name"], "poll");
+        assert_eq!(json_body(&running)["collectors"][0]["status"], "running");
         let processes = dispatch(
             &mut state,
             &req(
@@ -3498,6 +3532,27 @@ mod tests {
         // address was loopback and that the function returned a real port.
         assert_ne!(bound.port(), 0);
         Ok(())
+    }
+
+    /// UI re-review #144 new-2: the page tags 「会话开始前已存在」 from this
+    /// field only; the store decides it (attach baseline started before the session).
+    #[test]
+    fn timeline_answer_carries_pre_existing() {
+        let row = |id: i64, pre_existing: bool| aw_store::TimelineRow {
+            session_id: 1,
+            ts_ns: 5,
+            cat: "proc".to_owned(),
+            id,
+            proc_uid: Some(id),
+            evidence: "S".to_owned(),
+            pre_existing,
+        };
+        let body = super::timeline_json(&aw_store::TimelinePage {
+            rows: vec![row(1, true), row(2, false)],
+            next: None,
+        });
+        assert_eq!(body["rows"][0]["pre_existing"], true);
+        assert_eq!(body["rows"][1]["pre_existing"], false);
     }
 
     /// UI review detail 9: Settings listed no built-in redaction rule.

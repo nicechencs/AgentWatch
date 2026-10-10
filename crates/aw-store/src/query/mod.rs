@@ -108,6 +108,9 @@ pub struct SessionListItem {
     pub pinned: i64,
     /// `sessions.collectors`: JSON array of collector names, as stored.
     pub collectors: String,
+    /// `sessions.argv`: JSON array, redacted before it was stored. The list
+    /// shows the command when the session has no name.
+    pub argv: Option<String>,
     /// The same counts the overview reads ([`session_counts`]), so the list
     /// and the overview never disagree.
     pub counts: SessionCounts,
@@ -211,6 +214,8 @@ pub struct SessionSummary {
     pub collectors: String,
     /// Finding rows; see [`SessionCounts::finding_count`].
     pub finding_count: Option<i64>,
+    /// `sessions.argv` as stored (JSON array, redacted).
+    pub argv: Option<String>,
 }
 
 /// One process in a session tree.
@@ -307,6 +312,12 @@ pub struct TimelineRow {
     pub proc_uid: Option<i64>,
     /// Evidence label. Gaps are `E1` as stored by the view.
     pub evidence: String,
+    /// `proc` rows only: the process was already running when the session
+    /// began. True only for an attach session's baseline (`how = 'snapshot'`)
+    /// whose start precedes `sessions.started_ns`. A launch session starts its
+    /// own root, so nothing in it is pre-existing, even when the root's start
+    /// time (whole seconds from `/proc`) reads a little before the session row.
+    pub pre_existing: bool,
 }
 
 /// Resume token. The next page is strictly after this pair.
@@ -356,7 +367,7 @@ pub fn list_sessions(
 ) -> Result<Vec<SessionListItem>, QueryError> {
     let pred = compile_optional(filter.expr.as_deref(), Target::Sessions, None, None)?;
     let mut sql = String::from(
-        "SELECT id, public_id, name, mode, agent, started_ns, ended_ns, pinned, collectors \
+        "SELECT id, public_id, name, mode, agent, started_ns, ended_ns, pinned, collectors, argv \
          FROM sessions WHERE user_id = ?",
     );
     let mut bind: Vec<Param> = vec![Param::Text(user_id.to_string())];
@@ -406,6 +417,7 @@ pub fn list_sessions(
                 ended_ns: row.get(6)?,
                 pinned: row.get(7)?,
                 collectors: row.get(8)?,
+                argv: row.get(9)?,
                 counts: SessionCounts::default(),
             })
         })
@@ -429,7 +441,7 @@ pub fn session_summary(
     let head = conn
         .query_row(
             "SELECT s.id, s.public_id, s.name, s.agent, s.started_ns, s.ended_ns, \
-                    s.mode, s.collectors \
+                    s.mode, s.collectors, s.argv \
              FROM sessions s WHERE s.id = ? AND s.user_id = ?",
             rusqlite::params![session_id, user_id],
             |row| {
@@ -442,12 +454,14 @@ pub fn session_summary(
                     row.get::<_, Option<i64>>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             },
         )
         .optional()
         .map_err(|err| QueryError::sqlite("session_summary", err))?;
-    let Some((id, public_id, name, agent, started_ns, ended_ns, mode, collectors)) = head else {
+    let Some((id, public_id, name, agent, started_ns, ended_ns, mode, collectors, argv)) = head
+    else {
         return Ok(None);
     };
     // Same function as the session list: one source for both pages.
@@ -468,6 +482,7 @@ pub fn session_summary(
         mode,
         collectors,
         finding_count: counts.finding_count,
+        argv,
     });
     Ok(summary)
 }
@@ -604,7 +619,14 @@ pub fn timeline(
     let pred = compile_optional(query.filter, Target::Timeline, started, None)?;
     let mut sql = String::from(
         "SELECT timeline.session_id, timeline.ts_ns, timeline.cat, timeline.id, \
-                timeline.proc_uid, timeline.evidence \
+                timeline.proc_uid, timeline.evidence, \
+                CASE WHEN timeline.cat = 'proc' AND sessions.mode = 'attach' \
+                          AND timeline.ts_ns < sessions.started_ns \
+                          AND EXISTS (SELECT 1 FROM processes p \
+                                      WHERE p.session_id = timeline.session_id \
+                                        AND p.proc_uid = timeline.proc_uid \
+                                        AND p.how = 'snapshot') \
+                     THEN 1 ELSE 0 END \
          FROM timeline \
          JOIN sessions ON sessions.id = timeline.session_id \
          WHERE timeline.session_id = ? AND sessions.user_id = ? AND (",
@@ -650,6 +672,7 @@ pub fn timeline(
                 id: row.get(3)?,
                 proc_uid: row.get(4)?,
                 evidence: row.get(5)?,
+                pre_existing: row.get::<_, i64>(6)? != 0,
             })
         })
         .map_err(|err| QueryError::sqlite("timeline", err))?;
@@ -919,6 +942,8 @@ pub fn around(
                     id: row.get(3)?,
                     proc_uid: row.get(4)?,
                     evidence: row.get(5)?,
+                    // The window view does not label baseline rows.
+                    pre_existing: false,
                 })
             },
         )
@@ -945,6 +970,10 @@ pub struct SearchHit {
     pub ts_ns: Option<i64>,
     /// Record evidence of the source row.
     pub evidence: Option<String>,
+    /// `sessions.name` of the owning session.
+    pub session_name: Option<String>,
+    /// `sessions.argv` of the owning session (JSON array, redacted).
+    pub session_argv: Option<String>,
 }
 
 /// Substring search across the caller's sessions.
@@ -995,6 +1024,8 @@ pub fn search(
                     text: None,
                     ts_ns: None,
                     evidence: None,
+                    session_name: None,
+                    session_argv: None,
                 })
             },
         )
@@ -1008,6 +1039,23 @@ pub fn search(
             hit.ts_ns = ts_ns;
             hit.evidence = evidence;
         }
+        // The page grouped hits under the bare public id. Name or command.
+        let (name, argv) = conn
+            .query_row(
+                "SELECT name, argv FROM sessions WHERE id = ?",
+                rusqlite::params![hit.session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|err| QueryError::sqlite("search", err))?
+            .unwrap_or((None, None));
+        hit.session_name = name;
+        hit.session_argv = argv;
     }
     if let Some(since) = since_ns {
         hits.retain(|hit| hit.ts_ns.unwrap_or(i64::MIN) >= since);
@@ -2639,5 +2687,82 @@ mod tests {
         assert_eq!(items[0].counts.finding_count, None);
         assert_eq!(summary.finding_count, None);
         assert_eq!(items[0].collectors, "[]");
+    }
+
+    fn proc_how(conn: &Connection, session: i64, uid: i64, start: i64, how: &str) {
+        conn.execute(
+            "INSERT INTO processes (session_id, proc_uid, pid, depth, start_ns, how, evidence, source) \
+             VALUES (?1, ?2, ?2, 0, ?3, ?4, 'S', 'test')",
+            rusqlite::params![session, uid, start, how],
+        )
+        .unwrap();
+    }
+
+    fn pre_existing_by_uid(conn: &Connection, session: i64) -> Vec<(i64, bool)> {
+        let page = timeline(
+            conn,
+            "u",
+            session,
+            TimelineQuery {
+                filter: None,
+                from: None,
+                to: None,
+                cursor: None,
+                limit: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        page.rows
+            .iter()
+            .filter(|row| row.cat == "proc")
+            .map(|row| (row.id, row.pre_existing))
+            .collect()
+    }
+
+    /// UI re-review #144 new-2: a program the session launched was tagged
+    /// 「会话开始前已存在」, because its start time (whole seconds) read just
+    /// before `started_ns`. Only an attach session's baseline is pre-existing.
+    #[test]
+    fn only_processes_running_before_an_attach_session_are_pre_existing() {
+        let conn = conn();
+        // Attach session started at 1000.
+        session(&conn, 1, "u", 1_000);
+        conn.execute("UPDATE sessions SET mode = 'attach' WHERE id = 1", [])
+            .unwrap();
+        proc_how(&conn, 1, 1, 500, "snapshot"); // running before: tagged
+        proc_how(&conn, 1, 2, 1_500, "spawn"); // started after: not tagged
+        proc_how(&conn, 1, 3, 900, "spawn"); // seen starting, clock rounded down: not tagged
+        assert_eq!(
+            pre_existing_by_uid(&conn, 1),
+            vec![(1, true), (3, false), (2, false)]
+        );
+
+        // Launch session started at 1000: its own root reads 400 (rounded
+        // down) and is in the sampler's baseline, but the session started it.
+        session(&conn, 2, "u", 1_000);
+        proc_how(&conn, 2, 10, 400, "snapshot");
+        proc_how(&conn, 2, 11, 1_200, "spawn");
+        assert_eq!(
+            pre_existing_by_uid(&conn, 2),
+            vec![(10, false), (11, false)]
+        );
+    }
+
+    /// UI re-review #144 new-5: the list and search need the command of an
+    /// unnamed session, not just its public id.
+    #[test]
+    fn list_and_summary_carry_the_stored_argv() {
+        let conn = conn();
+        session(&conn, 1, "u", 10);
+        conn.execute(
+            "UPDATE sessions SET argv = '[\"sleep\",\"90\"]' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let items = list_sessions(&conn, "u", &SessionFilter::default()).unwrap();
+        assert_eq!(items[0].argv.as_deref(), Some(r#"["sleep","90"]"#));
+        let summary = session_summary(&conn, "u", 1).unwrap().unwrap();
+        assert_eq!(summary.argv.as_deref(), Some(r#"["sleep","90"]"#));
     }
 }

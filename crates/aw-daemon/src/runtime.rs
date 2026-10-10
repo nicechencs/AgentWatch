@@ -588,6 +588,7 @@ pub fn run_foreground(
     // Sessions started from the API (`crate::watch`): one sampler per root.
     let mut watches = crate::watch::Watches::new(data_dir.join("agentwatch.db"));
     watches.recover();
+    report_collectors(&shared, &sampler, &watches);
     let mut polls_until_sample: u32 = SAMPLE_EVERY_POLLS;
 
     while !stop.is_set() {
@@ -599,6 +600,7 @@ pub fn run_foreground(
         if polls_until_sample == 0 {
             sampler.tick();
             watches.tick(&shared);
+            report_collectors(&shared, &sampler, &watches);
             polls_until_sample = SAMPLE_EVERY_POLLS;
         }
         thread::sleep(POLL);
@@ -629,6 +631,25 @@ pub fn run_foreground(
     drop(otlp);
     drop(lock);
     Ok(())
+}
+
+/// Publish what the samplers are doing for `GET /doctor` (Settings, new
+/// session page). Read from the samplers themselves, not from the config.
+fn report_collectors(
+    shared: &Arc<Mutex<ApiState>>,
+    sampler: &HostSampler,
+    watches: &crate::watch::Watches,
+) {
+    let (watched_roots, watched_last) = watches.runtime();
+    let runtime = crate::collector_state::CollectorRuntime {
+        reported: true,
+        daemon_sample: sampler.running(),
+        watched_roots,
+        last_sample_ns: sampler.last_sample_ns().max(watched_last),
+    };
+    if let Ok(mut state) = shared.lock() {
+        state.collector_runtime = runtime;
+    }
 }
 
 /// Open the internal channel. A failure is a warning, not an exit: the daemon

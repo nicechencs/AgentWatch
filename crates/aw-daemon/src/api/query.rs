@@ -1478,6 +1478,7 @@ fn timeline_row_json(row: &aw_store::TimelineRow) -> serde_json::Value {
         "id": row.id,
         "proc_uid": row.proc_uid.map(|id| format!("{id:x}")),
         "evidence": row.evidence,
+        "pre_existing": row.pre_existing,
     })
 }
 
@@ -1490,7 +1491,26 @@ fn search_hit_json(hit: &aw_store::SearchHit) -> serde_json::Value {
         "text": hit.text,
         "ts_ns": hit.ts_ns,
         "evidence": hit.evidence,
+        "session_name": session_label(hit.session_name.as_deref(), hit.session_argv.as_deref()),
     })
+}
+
+/// `sessions.argv` (a JSON array of strings, redacted when stored) as JSON.
+/// Null when absent or not an array of strings; never a guess.
+pub(crate) fn argv_value(raw: Option<&str>) -> serde_json::Value {
+    raw.and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+        .map_or(serde_json::Value::Null, |argv| serde_json::json!(argv))
+}
+
+/// What to call a session: its name, else its command line, else nothing
+/// (the page then shows the public id once).
+pub(crate) fn session_label(name: Option<&str>, argv: Option<&str>) -> Option<String> {
+    if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
+        return Some(name.to_owned());
+    }
+    argv.and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+        .filter(|argv| !argv.is_empty())
+        .map(|argv| argv.join(" "))
 }
 
 /// Parse a filter string with the shared grammar and fold it into the store AST.
@@ -1627,4 +1647,30 @@ fn gap_json(row: &aw_store::GapItem) -> serde_json::Value {
         "count": row.count,
         "detail": row.detail,
     })
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::{argv_value, session_label};
+
+    /// UI re-review #144 new-5: a session started with 「启动程序」 was listed
+    /// as `s-31988513fa4a`; with no name, the command is the label.
+    #[test]
+    fn unnamed_session_is_labelled_by_its_command() {
+        assert_eq!(
+            session_label(None, Some(r#"["sleep","90"]"#)).as_deref(),
+            Some("sleep 90")
+        );
+        assert_eq!(
+            session_label(Some("refactor"), Some(r#"["sleep","90"]"#)).as_deref(),
+            Some("refactor")
+        );
+        assert_eq!(session_label(Some("  "), None), None);
+        assert_eq!(session_label(None, Some("not json")), None);
+        assert_eq!(
+            argv_value(Some(r#"["sleep","90"]"#)),
+            serde_json::json!(["sleep", "90"])
+        );
+        assert!(argv_value(None).is_null());
+    }
 }

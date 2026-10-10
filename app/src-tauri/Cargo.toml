@@ -18,6 +18,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # tauri 2: MIT OR Apache-2.0. Default features only; no updater, no shell plugin.
 tauri = { version = "2", features = [] }
+# tauri-plugin-dialog 2: MIT OR Apache-2.0. Native "Save As" for exports
+# (the webview's download link wrote into the app's launch directory).
+tauri-plugin-dialog = "2"
 # serde / serde_json: MIT OR Apache-2.0.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

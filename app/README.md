@@ -33,7 +33,14 @@ exists. Access:
 
 ## Page ↔ shell interface
 
-The page (`ui/src/api/transport.ts`, `client.ts`) uses three commands.
+The page (`ui/src/api/transport.ts`, `client.ts`) uses four commands.
+
+All of them go to one daemon: the first path in the dial order that answers
+(`AW_SOCKET`, else system socket, then the per-user one) is kept for the life
+of the window. The order is walked again only after that path stops answering
+(not found / refused). Resolving per request let one window talk to two
+daemons when another daemon's socket appeared or vanished, so a page could get
+"session not found" for a session the user's own daemon holds.
 
 ### `aw_request`
 
@@ -64,6 +71,28 @@ again:
 | `refused` | the app will not send this (path/method/body size) | bug |
 
 Each call runs on its own thread; a large export does not block other calls.
+
+### `aw_save_export`
+
+```ts
+invoke('aw_save_export', { sid: 's-1', format: 'jsonl' | 'csv' | 'md' })
+  -> Promise<{
+       status: number,              // export request status
+       path: string | null,         // where the file was written
+       cancelled: boolean,          // the user closed the dialog
+       error_body: string | null,   // daemon JSON error when status is not 2xx
+       bytes: number,
+     }>
+```
+
+The shell fetches `/api/v1/sessions/{sid}/export?format=…` on the channel. A
+daemon error comes back without opening a dialog. Otherwise the native "Save
+As" dialog (`tauri-plugin-dialog`, capability `dialog:allow-save`) opens with
+the daemon's file name (`agentwatch-<sid>.jsonl`, `.csv.zip`, `.md`); the exact
+bytes are written to the chosen path and the page shows "已保存到 <path>".
+A browser keeps the normal download. Rejects with `{ code, message }` as
+above, plus `write_failed`. The dialog itself needs a real window to verify;
+the fetch / name / write steps are unit-tested in `src/export.rs`.
 
 ### `aw_stream_open` / `aw_stream_close`
 

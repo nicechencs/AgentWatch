@@ -133,17 +133,119 @@ pub fn reply_of(response: aw_channel::Response) -> Reply {
 ///
 /// See [`Failure`].
 pub fn exchange(path: &Path, method: &str, target: &str, body: &str) -> Result<Reply, Failure> {
-    exchange_in(path, method, target, body, &|key| std::env::var(key).ok())
+    exchange_response(path, method, target, body).map(reply_of)
 }
 
-/// [`exchange`] with an explicit environment. A default `path` is dialled in
-/// the documented order (system socket, then per-user); a stale system socket
-/// falls through. Each call re-runs the lookup, so the page's Retry finds a
-/// daemon that came up meanwhile.
+/// [`exchange`], keeping the raw response (bytes, headers): the export save
+/// writes these bytes to a file. Goes to the daemon this window is pinned to
+/// (see [`Pin`]).
 ///
 /// # Errors
 ///
 /// See [`Failure`].
+pub fn exchange_response(
+    path: &Path,
+    method: &str,
+    target: &str,
+    body: &str,
+) -> Result<aw_channel::Response, Failure> {
+    check(method, target, body)?;
+    let order = aw_channel::dial_order(path, &|key| std::env::var(key).ok());
+    let request = encode(method, target, body);
+    let response = pinned_exchange(pin(), &order, &|candidate| {
+        aw_channel::exchange(candidate, &request, TIMEOUT)
+    })?;
+    not_gzip(response)
+}
+
+fn not_gzip(response: aw_channel::Response) -> Result<aw_channel::Response, Failure> {
+    if response
+        .header("content-encoding")
+        .is_some_and(|v| v.to_ascii_lowercase().contains("gzip"))
+    {
+        // The daemon gzips only when asked; this client never asks.
+        return Err(Failure::broken("unexpected gzip body"));
+    }
+    Ok(response)
+}
+
+/// The daemon this window talks to, kept for the life of the process.
+///
+/// The dial order is system socket first, then the per-user one. Walking it on
+/// every request let one window talk to two daemons: when another daemon's
+/// `/run/agentwatch/api.sock` came up or went away while the user's own daemon
+/// was running, each request went to whichever answered first at that moment.
+/// That daemon does not have the user's sessions, so a page got "session not
+/// found" (Markdown export, timeline) and the user's daemon logged nothing.
+/// The first path that answers is kept. Only when it stops answering
+/// (not found / refused) is the whole order walked again, so Retry still finds
+/// a daemon that came up meanwhile.
+#[derive(Debug, Default)]
+pub struct Pin {
+    path: std::sync::Mutex<Option<PathBuf>>,
+}
+
+impl Pin {
+    fn current(&self) -> Option<PathBuf> {
+        self.path.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    fn set(&self, path: Option<PathBuf>) {
+        if let Ok(mut slot) = self.path.lock() {
+            *slot = path;
+        }
+    }
+}
+
+fn pin() -> &'static Pin {
+    static PIN: std::sync::OnceLock<Pin> = std::sync::OnceLock::new();
+    PIN.get_or_init(Pin::default)
+}
+
+/// The path requests go to now: the pinned daemon, else `fallback`.
+#[must_use]
+pub fn pinned_path(fallback: PathBuf) -> PathBuf {
+    pin().current().unwrap_or(fallback)
+}
+
+/// One exchange through `pin`: the pinned path alone while it answers,
+/// otherwise the first of `order` that answers (which becomes the pin).
+fn pinned_exchange(
+    pin: &Pin,
+    order: &[PathBuf],
+    dial: &dyn Fn(&Path) -> Result<aw_channel::Response, DialError>,
+) -> Result<aw_channel::Response, DialError> {
+    if let Some(pinned) = pin.current() {
+        match dial(&pinned) {
+            Err(DialError::Unreachable(_)) => pin.set(None),
+            other => return other,
+        }
+    }
+    let mut tried = Vec::new();
+    for candidate in order {
+        match dial(candidate) {
+            Ok(response) => {
+                pin.set(Some(candidate.clone()));
+                return Ok(response);
+            }
+            Err(DialError::Unreachable(detail)) => tried.push(detail),
+            Err(other) => return Err(other),
+        }
+    }
+    if tried.is_empty() {
+        tried.push("no channel path on this OS".to_owned());
+    }
+    Err(DialError::Unreachable(tried.join("; ")))
+}
+
+/// [`exchange`] with an explicit environment and a fresh [`Pin`]: the dial
+/// order (system socket, then per-user) with a stale system socket falling
+/// through. Tests only; the window goes through the process-wide pin.
+///
+/// # Errors
+///
+/// See [`Failure`].
+#[cfg(test)]
 pub fn exchange_in(
     path: &Path,
     method: &str,
@@ -153,15 +255,11 @@ pub fn exchange_in(
 ) -> Result<Reply, Failure> {
     check(method, target, body)?;
     let order = aw_channel::dial_order(path, env);
-    let (_, response) = aw_channel::exchange_first(&order, &encode(method, target, body), TIMEOUT)?;
-    if response
-        .header("content-encoding")
-        .is_some_and(|v| v.to_ascii_lowercase().contains("gzip"))
-    {
-        // The daemon gzips only when asked; this client never asks.
-        return Err(Failure::broken("unexpected gzip body"));
-    }
-    Ok(reply_of(response))
+    let request = encode(method, target, body);
+    let response = pinned_exchange(&Pin::default(), &order, &|candidate| {
+        aw_channel::exchange(candidate, &request, TIMEOUT)
+    })?;
+    not_gzip(response).map(reply_of)
 }
 
 /// Standard base64 with padding. std only.
@@ -189,6 +287,57 @@ pub fn base64(bytes: &[u8]) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{base64, channel_path, check, encode};
+    use super::{pinned_exchange, Pin};
+    use aw_channel::{DialError, Response};
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    /// Test-bot #144: Markdown export and the timeline said "session not found"
+    /// with nothing in the user's daemon log. A window keeps talking to the
+    /// daemon that first answered when another daemon's socket comes up.
+    #[test]
+    fn the_answering_daemon_stays_pinned_until_it_stops_answering() {
+        let system = PathBuf::from("/run/agentwatch/api.sock");
+        let user = PathBuf::from("/run/user/1000/agentwatch/api.sock");
+        let order = vec![system.clone(), user.clone()];
+        let up: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::from([user.clone()]));
+        let hits: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+        let dial = |path: &Path| -> Result<Response, DialError> {
+            if up.borrow().contains(path) {
+                hits.borrow_mut().push(path.to_path_buf());
+                Ok(Response {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                })
+            } else {
+                Err(DialError::Unreachable(path.display().to_string()))
+            }
+        };
+        let pin = Pin::default();
+        assert!(pinned_exchange(&pin, &order, &dial).is_ok());
+        assert_eq!(pin.current(), Some(user.clone()));
+        // Another daemon's system socket comes up: still the user's daemon.
+        up.borrow_mut().insert(system.clone());
+        assert!(pinned_exchange(&pin, &order, &dial).is_ok());
+        assert!(pinned_exchange(&pin, &order, &dial).is_ok());
+        assert_eq!(
+            hits.borrow().as_slice(),
+            [user.clone(), user.clone(), user.clone()]
+        );
+        // The user's daemon stops: the order is walked again.
+        up.borrow_mut().remove(&user);
+        assert!(pinned_exchange(&pin, &order, &dial).is_ok());
+        assert_eq!(pin.current(), Some(system.clone()));
+        // Nothing answers: unreachable, nothing pinned.
+        up.borrow_mut().clear();
+        assert!(matches!(
+            pinned_exchange(&pin, &order, &dial),
+            Err(DialError::Unreachable(_))
+        ));
+        assert_eq!(pin.current(), None);
+    }
 
     #[test]
     fn only_api_and_health_pass() {

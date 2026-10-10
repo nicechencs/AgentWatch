@@ -17,6 +17,7 @@ import type {
   Gap,
   HistogramBucket,
   Me,
+  NetFlow,
   Page,
   ProcessNode,
   SearchResult,
@@ -233,6 +234,93 @@ export function toConfigView(raw: unknown): ConfigView {
   } as unknown as ConfigView;
 }
 
+/** A flow row as the page reads it. Fields the daemon does not send stay null/false. */
+export function toNetFlow(raw: unknown): NetFlow {
+  const r = isObj(raw) ? raw : {};
+  return {
+    ...(r as object),
+    id: typeof r.id === "number" ? r.id : 0,
+    proc_uid: typeof r.proc_uid === "string" ? r.proc_uid : "",
+    proc: isObj(r.proc) ? (r.proc as unknown as NetFlow["proc"]) : null,
+    proto: (strOrNull(r.proto) ?? "tcp") as NetFlow["proto"],
+    local_ip: typeof r.local_ip === "string" ? r.local_ip : "",
+    local_port: typeof r.local_port === "number" ? r.local_port : 0,
+    remote_ip: typeof r.remote_ip === "string" ? r.remote_ip : "",
+    remote_port: typeof r.remote_port === "number" ? r.remote_port : 0,
+    domain: strOrNull(r.domain),
+    domain_source: strOrNull(r.domain_source),
+    domain_alts: Array.isArray(r.domain_alts) ? (r.domain_alts as string[]) : null,
+    start_ns: typeof r.start_ns === "number" ? r.start_ns : 0,
+    end_ns: numOrNull(r.end_ns),
+    bytes_up: numOrNull(r.bytes_up),
+    bytes_down: numOrNull(r.bytes_down),
+    via_proxy: Boolean(r.via_proxy),
+    direct: Boolean(r.direct),
+    evidence: (strOrNull(r.evidence) ?? "NA") as NetFlow["evidence"],
+    na_reason: (strOrNull(r.na_reason) as NetFlow["na_reason"]) ?? null,
+    field_evidence: isObj(r.field_evidence) ? (r.field_evidence as NetFlow["field_evidence"]) : null,
+    source: typeof r.source === "string" ? r.source : "",
+  } as NetFlow;
+}
+
+/** Strongest first. A group is only as strong as its weakest flow. */
+const EVIDENCE_ORDER = ["E1", "E2", "E3", "S", "I", "NA"];
+
+/** Sum, or null when any part was not observed: an unknown is not a zero. */
+function sumOrNull(values: (number | null)[]): number | null {
+  let total = 0;
+  for (const value of values) {
+    if (value === null) return null;
+    total += value;
+  }
+  return total;
+}
+
+/**
+ * Group flows for the network page. `domain` falls back to the remote IP for
+ * a flow with no domain (that label is not a domain, so `inferred` stays
+ * false and `domain_source` null). Groups are sorted by total bytes, unknown
+ * totals last.
+ */
+export function groupFlows(flows: NetFlow[], by: string): FlowGroup[] {
+  const keyOf = (flow: NetFlow): string => {
+    if (by === "ip") return flow.remote_ip;
+    if (by === "port") return String(flow.remote_port);
+    if (by === "proc") return flow.proc_uid;
+    return flow.domain ?? flow.remote_ip;
+  };
+  const groups = new Map<string, NetFlow[]>();
+  for (const flow of flows) {
+    const key = keyOf(flow);
+    const list = groups.get(key);
+    if (list) list.push(flow);
+    else groups.set(key, [flow]);
+  }
+  const out: FlowGroup[] = [];
+  for (const [key, members] of groups) {
+    const weakest = members
+      .map((flow) => flow.evidence)
+      .reduce((a, b) => (EVIDENCE_ORDER.indexOf(b) > EVIDENCE_ORDER.indexOf(a) ? b : a));
+    const first = members[0];
+    out.push({
+      key,
+      label: by === "proc" && first.proc?.exe_name ? `${first.proc.exe_name} (${first.proc.pid})` : key,
+      domain_source: by === "domain" ? (members.find((flow) => flow.domain_source)?.domain_source ?? null) : null,
+      alt_count: members.reduce((n, flow) => n + (flow.domain_alts?.length ?? 0), 0),
+      inferred: false,
+      direct: members.some((flow) => flow.direct),
+      bytes_up: sumOrNull(members.map((flow) => flow.bytes_up)),
+      bytes_down: sumOrNull(members.map((flow) => flow.bytes_down)),
+      connections: members.length,
+      evidence: weakest,
+      flows: members,
+    });
+  }
+  const total = (group: FlowGroup) =>
+    group.bytes_up === null || group.bytes_down === null ? -1 : group.bytes_up + group.bytes_down;
+  return out.sort((a, b) => total(b) - total(a));
+}
+
 function toProcessNode(raw: unknown): ProcessNode {
   const r = isObj(raw) ? raw : {};
   return {
@@ -286,9 +374,12 @@ export const api = {
     ),
 
   flows: async (sid: string, query: Record<string, unknown>) => {
-    // Without grouping the daemon answers `{flows: [...]}`; the page reads groups.
-    const raw = await get<{ groups?: FlowGroup[] }>(`/sessions/${sid}/flows${qs(query)}`);
-    return { ...raw, groups: Array.isArray(raw.groups) ? raw.groups : [] };
+    // Ask for one row per flow and group here: the daemon's grouped answer is
+    // totals only, and the page needs each group's connections underneath.
+    const { group_by: groupBy, ...rest } = query;
+    const raw = await get<{ flows?: unknown[] }>(`/sessions/${sid}/flows${qs(rest)}`);
+    const by = typeof groupBy === "string" ? groupBy : "domain";
+    return { groups: groupFlows(arr(raw.flows).map(toNetFlow), by) };
   },
   traffic: (sid: string, query: Record<string, unknown>) =>
     get<TrafficSeries>(`/sessions/${sid}/traffic${qs(query)}`),

@@ -59,3 +59,28 @@ describe("config adapter", () => {
     expect(view.rules).toEqual([]);
   });
 });
+
+import { groupFlows, toNetFlow } from "./client";
+
+describe("network flow grouping", () => {
+  // Rows in the daemon's ungrouped `GET /flows` shape.
+  const rows = [
+    { id: 1, proc_uid: "a", domain: "api.example.com", remote_ip: "10.0.0.1", remote_port: 443, bytes_up: 100, bytes_down: 1000, start_ns: 1, evidence: "S" },
+    { id: 2, proc_uid: "a", domain: "api.example.com", remote_ip: "10.0.0.2", remote_port: 443, bytes_up: 50, bytes_down: 5, start_ns: 2, evidence: "E1" },
+    { id: 3, proc_uid: "b", domain: null, remote_ip: "192.0.2.9", remote_port: 53, bytes_up: null, bytes_down: 12, start_ns: 3, evidence: "E1" },
+  ].map(toNetFlow);
+
+  it("groups by domain with the flows underneath and IP for a flow with no domain", () => {
+    const groups = groupFlows(rows, "domain");
+    expect(groups.map((g) => g.key)).toEqual(["api.example.com", "192.0.2.9"]);
+    expect(groups[0]).toMatchObject({ connections: 2, bytes_up: 150, bytes_down: 1005, evidence: "S" });
+    expect(groups[0].flows.map((f) => f.id)).toEqual([1, 2]);
+    // An unobserved byte count is not added as zero.
+    expect(groups[1].bytes_up).toBeNull();
+  });
+
+  it("groups by port and process", () => {
+    expect(groupFlows(rows, "port").map((g) => g.key).sort()).toEqual(["443", "53"]);
+    expect(groupFlows(rows, "proc").map((g) => g.connections).sort()).toEqual([1, 2]);
+  });
+});

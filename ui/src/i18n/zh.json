@@ -406,7 +406,7 @@
   "coverage.notCollectedTip": "本版本不采集{kind}（只有进程采样）",
   "coverage.notCollected": "没采：本版本不采集{kind}（只有进程采样）。这里没有数据，不代表没有发生。",
   "coverage.unknown": "没有{kind}记录。后台没有说明是否采集{kind}，所以不能确认是没有发生还是没有采。",
-  "overview.capabilitiesUnknown": "不可得（后台没有返回采集能力）",
+  "overview.capabilitiesUnknown": "后台没有返回采集能力",
   "overview.noRecordedGaps": "没有记录到采集缺口",
   "overview.notCollected": "没采：{kinds}（本版本只有进程采样）",
   "overview.coverageUnknown": "采集范围不可得，不能确认采集完整",
@@ -424,5 +424,6 @@
   "gaps.noCollectors": "后台没有返回这个会话的采集器信息。",
   "gaps.capsNotDescribed": "这个采集器没有说明自己能采什么。",
   "timeline.timeNa": "时间不可得",
-  "timeline.timeNaTip": "这条记录没有可用的时间（采集时没读到）"
+  "timeline.timeNaTip": "这条记录没有可用的时间（采集时没读到）",
+  "settings.patternInvalid": "这不是有效的正则表达式"
 }

@@ -162,10 +162,10 @@ $ aw run --proxy -- claude
 | GET | `/processes` | 当前系统进程树（进程选择器）。参数：`?agents_only&q=` |
 | POST | `/sessions` | 创建会话。body：`{mode:"launch"\|"attach", argv?, cwd?, env?, pid?, follow_children, proxy, agent, name, include_procs, self_report, pin, group?, mcp_tap?}` |
 | GET | `/sessions` | 列表。参数：`?since&until&agent&active&q&cursor&limit` |
-| GET | `/sessions/{sid}` | 会话详情 + `stats` |
+| GET | `/sessions/{sid}` | 会话详情 + `stats`，另带 `mode` 和 `collectors`。`collectors` 是数组，每项 `{name, mode, capabilities:[{kind, evidence, na_reason?}]}`：轮询采集器 `poll` 列 `proc`=S，`file`、`dns`=NA（`collector_unavailable`），`net` 在 Windows 为 S、其他平台为 NA。库里存的采集器名没有能力描述时（未知名字），该项 `capabilities` 为空并带 `note: "collector_not_described"`，界面据此说“不能确认是否采集”，不说“没有发生”。`/summary` 同样带这两个字段。 |
 | PATCH | `/sessions/{sid}` | `{name?, pinned?}` |
 | PATCH | `/sessions/{sid}/findings/{id}` | body：`{user_state: "confirmed"\|"ignored"\|null}`。只接受这三个值。`null` 清除标记。写入 `user_state_by`（当前用户）和 `user_state_ns`（Unix 纳秒）。不属于该用户的会话或发现返回 404。 |
-| POST | `/sessions/{sid}/stop` | 停止监控 |
+| POST | `/sessions/{sid}/stop` | 停止监控。写入 `ended_ns`；之后不再往这个会话写新记录。daemon 自带的 `daemon-sample` 会话也一样：采样器每次采样前读一次 `ended_ns`，已停止就停掉，daemon 重启后也不再恢复采样。 |
 | DELETE | `/sessions/{sid}` | 删除 |
 | GET | `/sessions/{sid}/summary` | 概览页数据：Top 目录、Top 域名、按类别计数、按证据等级计数、缺口摘要 |
 | GET | `/sessions/{sid}/timeline` | 参数：`?filter&from&to&cats&cursor&limit`。每行在视图列（`session_id, ts_ns, cat, id, proc_uid, evidence`）之外带 `summary`（按 `cat` 从来源表的已存列拼一行，NULL 的列不出现，不推测）、`fields`（拼 summary 用到的列，原样）和 `proc: {pid, exe_name}`。来源行不存在时 `summary` 为空串。`/around` 同样。 |
@@ -194,7 +194,7 @@ $ aw run --proxy -- claude
 | GET | `/sessions/{sid}/around` | 参数：`?ref=file_access:123&window=10s` |
 | GET, POST | `/sessions/{sid}/export` | 参数：`?format&filter&redact_paths&redact_hosts&lang`。`format=md`（GET 或 POST）返回 `text/markdown`：会话信息、采集能力、缺口、按证据等级分组的发现（`content_match` 单独一节）、按流记录条数的域名、按访问行数的文件，文末固定附证据等级说明。未知字段写「不可得」并带原因。全文先过 `wording::lint`（内容匹配句只放行 `ContentMatchPhrase`）；有违规时 HTTP 422，body 为 `{"error":{"code":"wording_lint","violations":[...]}}`，不返回报告正文。`format=jsonl` 返回 `application/x-ndjson`，`format=csv` 返回各表 CSV 的 zip（`application/zip`），行与脱敏规则和 `aw export` 相同（`aw-store` 的同一写出函数），`filter`、`redact_paths`、`redact_hosts` 同样生效。其他 `format` 以及没有数据库的内存会话仍是 501。 |
 | GET | `/sessions/{sid}/live` | SSE 实时事件流（已脱敏、已归属的记录增量） |
-| GET | `/search` | 参数：`?q&kind&since&limit`。跨会话搜索 |
+| GET | `/search` | 参数：`?q&kind&since&limit`。跨会话搜索。回复 `{"fts_enabled", "hits":[{src, src_id, session_id, public_id, text, ts_ns, evidence}]}`：`text` 是来源行存的文字（`file_access.path`；`process_images` 为 `exe`，没有 `exe` 时为 `argv`），`ts_ns` 是 `file_access.first_ns` 或 `process_images.ts_ns`（Unix 纳秒），`evidence` 照来源行原样。来源行没有的值为 null，不推测。 |
 | GET/PUT | `/config` | 读取/修改配置（PUT 仅管理员） |
 | GET | `/rules` | 已加载的规则 |
 | GET | `/db/stats` | |

@@ -393,6 +393,10 @@ CREATE VIEW timeline AS
 ### 3.2 全文搜索（S，P2）
 对路径、argv、URL 建 FTS5 索引 `fts_text(table, id, text)`，采用 trigram tokenizer，支持子串搜索。这会增加约 30% 的体积【待验证】，默认开启，可以关闭。
 
+`process_images` 行写入时进索引：有 `argv` 用 `argv`，没有时用 `exe`（轮询采集器只存可执行文件路径，`argv`、`cwd` 为 NA）；两者都没有就不建索引行，不写空串。同一 `(session_id, proc_uid, seq)` 再次写入时忽略（`ON CONFLICT DO NOTHING`），不让整批回滚，也不重复建索引。FTS 关闭时的 `instr` 回退同样匹配 `coalesce(argv, exe)`。
+
+时间列一律是 Unix 纳秒（墙钟）。采集器内部的单调时钟只用来排序和算间隔：`gaps.from_ns/to_ns` 按缺口事件自带的（单调, 墙钟）一对换算；进程退出、以及没见到开始的进程，用事件的墙钟时间。
+
 ## 4. 写入路径
 
 - Batcher 每批执行 `BEGIN IMMEDIATE ... COMMIT`。

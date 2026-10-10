@@ -63,6 +63,12 @@ describe("#2 search Enter white screen", () => {
     expect(result.groups).toHaveLength(1);
     expect(result.groups[0].hits[0]).toMatchObject({ kind: "proc", id: 7, ts_ns: null, summary: null });
   });
+  it("shows the daemon's text and time instead of 记录 #id", () => {
+    const result = toSearchResult({
+      hits: [{ src: "file_access", src_id: 3, session_id: 1, public_id: "s1", text: "/home/u/.aws/credentials", ts_ns: 1_760_000_000_000_000_000, evidence: "E1" }],
+    });
+    expect(result.groups[0].hits[0]).toMatchObject({ kind: "file", summary: "/home/u/.aws/credentials", ts_ns: 1_760_000_000_000_000_000, evidence: "E1" });
+  });
   it("tolerates an empty or odd body", () => {
     expect(toSearchResult({}).groups).toEqual([]);
     expect(toSearchResult(null).groups).toEqual([]);
@@ -183,6 +189,19 @@ describe("details", () => {
     expect(redundantSummary({ summary: "node(280)", proc: { pid: 280, exe_name: "node" } as never })).toBe(true);
     expect(redundantSummary({ summary: "pid 7", proc: { pid: 7, exe_name: null } as never })).toBe(true);
     expect(redundantSummary({ summary: "GET /x", proc: { pid: 7, exe_name: null } as never })).toBe(false);
+  });
+  it("detail 14: the rule preview uses the regex the daemon uses", async () => {
+    const { redactPreview } = await import("@/lib/redact-preview");
+    expect(redactPreview("tok=\\w+", "a tok=abc1 b").text).toBe("a «redacted:custom» b");
+    expect(redactPreview("(", "x").invalid).toBe(true);
+    expect(ZH["settings.customRule"]).toBe("自定义");
+  });
+  it("detail 13: text beside an NA badge does not repeat 不可得", () => {
+    // These keys render right after <EvidenceBadge level="NA" />.
+    for (const key of ["compare.apiNa", "overview.capabilitiesUnknown", "selfReport.httpNa", "selfReport.unmatchedNa"]) {
+      expect(ZH[key]).not.toMatch(/^不可得/u);
+      expect((en as Record<string, string>)[key]).not.toMatch(/^unavailable/iu);
+    }
   });
   it("disk usage unavailable is one sentence, not 不可得 / 不可得", () => {
     const stats = { available: false, reason: "per-user stats are not exported", db_bytes: null, wal_bytes: null } as never;

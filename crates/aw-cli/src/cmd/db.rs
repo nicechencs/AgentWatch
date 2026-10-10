@@ -467,7 +467,7 @@ impl DbApi for HttpDbApi {
         }
         if steps.is_empty() && body.get("steps").is_none() {
             return Err(DbApiError::Failed {
-                detail: "响应缺少 schema 版本字段".to_owned(),
+                detail: "后台返回的数据缺少字段 `file_schema_version`".to_owned(),
             });
         }
         Ok(MigrateReport {
@@ -497,7 +497,7 @@ impl DbApi for HttpDbApi {
             }
             None => {
                 return Err(DbApiError::Failed {
-                    detail: "响应缺少字段 `purged`".to_owned(),
+                    detail: "后台返回的数据缺少字段 `purged`".to_owned(),
                 });
             }
         };

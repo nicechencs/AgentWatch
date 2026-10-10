@@ -64,8 +64,9 @@ pub(crate) struct SessionItem {
     pub mode: String,
     /// Agent profile, or unknown.
     pub agent: Option<String>,
-    /// Start, Unix nanoseconds.
-    pub started_ns: i64,
+    /// Start, Unix nanoseconds. `None` when the answer did not carry one (the
+    /// in-memory stub row is `{ id, user_id, name }`); printed as 不可得, never `0`.
+    pub started_ns: Option<i64>,
     /// End, or still running.
     pub ended_ns: Option<i64>,
     /// Excluded from retention.
@@ -492,8 +493,9 @@ pub(crate) struct SearchHit {
     pub kind: String,
     /// `<table>:<id>` so `aw around` can open it.
     pub reference: String,
-    /// Unix nanoseconds.
-    pub ts_ns: i64,
+    /// Unix nanoseconds. `None` when the hit carried no time; the renderer
+    /// prints 不可得, never `0`.
+    pub ts_ns: Option<i64>,
     /// One-line summary already safe to print. No raw argv or URL.
     pub summary: String,
     /// Record evidence.
@@ -949,7 +951,8 @@ impl QuerySource for MemorySource {
             })
             .filter(|item| !query.active_only || item.ended_ns.is_none())
             .filter(|item| match query.since_ns {
-                Some(since) => item.started_ns >= since,
+                // No recorded start cannot be shown to fall inside the window.
+                Some(since) => item.started_ns.is_some_and(|ts| ts >= since),
                 None => true,
             })
             .collect();
@@ -1145,7 +1148,9 @@ impl QuerySource for MemorySource {
                     }
                 }
                 if let Some(since) = query.since_ns {
-                    if hit.ts_ns < since {
+                    // A hit with no timestamp cannot be shown to fall inside the
+                    // window, so it is left out rather than treated as the epoch.
+                    if hit.ts_ns.is_none_or(|ts| ts < since) {
                         continue;
                     }
                 }
@@ -1772,7 +1777,7 @@ pub(crate) fn sample_source() -> MemorySource {
             name: Some("demo".to_owned()),
             mode: "launch".to_owned(),
             agent: Some("example-agent".to_owned()),
-            started_ns: 1_700_000_000_000_000_000,
+            started_ns: Some(1_700_000_000_000_000_000),
             ended_ns: Some(1_700_000_060_000_000_000),
             pinned: false,
             evidence: Evidence::E1,

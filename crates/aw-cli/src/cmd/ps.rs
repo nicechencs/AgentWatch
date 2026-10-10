@@ -134,12 +134,8 @@ impl ProcessTable for DaemonTable {
 /// than shown with a guessed value.
 fn rows_from_json(body: &Value) -> Result<Vec<ProcessRow>, PsError> {
     if body.get("available").and_then(Value::as_bool) != Some(true) {
-        let reason = body
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("后台没有说明原因");
         return Err(PsError::NotCollected {
-            detail: format!("进程表没采：{reason}"),
+            detail: not_collected_detail(body.get("reason").and_then(Value::as_str)),
         });
     }
     let Some(list) = body.get("processes").and_then(Value::as_array) else {
@@ -174,6 +170,19 @@ fn rows_from_json(body: &Value) -> Result<Vec<ProcessRow>, PsError> {
             }
         })
         .collect()
+}
+
+/// 「没采」 line for a table the daemon could not read.
+///
+/// The JSON error code stays `not_collected`. `reason` is a machine code; the
+/// sentence is the same wording the UI shows (`new.procReason.*`).
+fn not_collected_detail(reason: Option<&str>) -> String {
+    let sentence = match reason.map(str::trim).filter(|text| !text.is_empty()) {
+        Some("no_process_table") => "这个平台上后台没有可读的进程表".to_owned(),
+        Some(code) => format!("原因码 {code}，这个版本还不认识"),
+        None => "后台没说原因".to_owned(),
+    };
+    format!("没采：进程表（{sentence}）")
 }
 
 /// Run `aw ps`.
@@ -435,15 +444,39 @@ mod tests {
 
     #[test]
     fn not_collected_is_not_an_empty_list() {
-        let body = r#"{"available":false,"reason":"no table here","roots":[],"processes":[]}"#;
+        let body = r#"{"available":false,"reason":"no_process_table","detail":"this platform has no process table for the daemon to read (not collected)","scope":"own","roots":[],"processes":[]}"#;
         let outcome = run(false, None, false, &mut daemon(200, body));
         assert_eq!(outcome.code, exit::GENERAL);
         let text = String::from_utf8(outcome.stderr).expect("utf8");
         assert!(
-            text.contains("没采") && text.contains("no table here"),
+            text.contains("没采：进程表（这个平台上后台没有可读的进程表）"),
             "{text}"
         );
+        assert!(!text.contains("no_process_table"), "{text}");
         assert!(outcome.stdout.is_empty());
+        let json = run(false, None, true, &mut daemon(200, body));
+        let doc: serde_json::Value = serde_json::from_slice(&json.stderr).expect("json");
+        assert_eq!(doc["error"]["code"], "not_collected");
+    }
+
+    #[test]
+    fn not_collected_reason_unknown_keeps_the_code() {
+        let body = r#"{"available":false,"reason":"disk_asleep","roots":[],"processes":[]}"#;
+        let outcome = run(false, None, false, &mut daemon(200, body));
+        let text = String::from_utf8(outcome.stderr).expect("utf8");
+        assert!(
+            text.contains("没采：进程表（原因码 disk_asleep，这个版本还不认识）"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn not_collected_without_a_reason_says_so() {
+        let body = r#"{"available":false,"roots":[],"processes":[]}"#;
+        let outcome = run(false, None, false, &mut daemon(200, body));
+        let text = String::from_utf8(outcome.stderr).expect("utf8");
+        assert!(text.contains("没采：进程表（后台没说原因）"), "{text}");
+        assert!(!text.contains("（后台没说原因（"), "{text}");
     }
 
     #[test]

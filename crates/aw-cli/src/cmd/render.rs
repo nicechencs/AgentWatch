@@ -163,7 +163,7 @@ pub(crate) fn session_table(items: &[SessionItem]) -> Table {
                     opt_text(item.name.as_deref()),
                     item.mode.clone(),
                     opt_text(item.agent.as_deref()),
-                    item.started_ns.to_string(),
+                    opt_i64(item.started_ns),
                     opt_i64(item.ended_ns),
                     super::query::yes_no(item.pinned).to_owned(),
                 ],
@@ -207,7 +207,7 @@ pub(crate) fn show_table(show: &SessionShow) -> Table {
         ),
         stat_row(
             "started_ns",
-            show.item.started_ns.to_string(),
+            opt_i64(show.item.started_ns),
             &show.item.evidence,
         ),
         stat_row("ended_ns", opt_i64(show.item.ended_ns), &show.item.evidence),
@@ -688,7 +688,7 @@ pub(crate) fn search_table(rows: &[SearchHit], color: bool) -> Table {
                 cells: vec![
                     row.session.clone(),
                     row.kind.clone(),
-                    row.ts_ns.to_string(),
+                    opt_i64(row.ts_ns),
                     row.reference.clone(),
                     highlight_sensitive(&row.summary, row.sensitive_rule.is_some(), color),
                 ],

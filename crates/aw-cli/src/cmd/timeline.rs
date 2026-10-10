@@ -72,7 +72,7 @@ pub(crate) fn run(args: TimelineArgs<'_>, source: &dyn QuerySource) -> io::Resul
     let started = source
         .show_session(key)
         .ok()
-        .map(|shown| shown.item.started_ns);
+        .and_then(|shown| shown.item.started_ns);
     let from_ns = match resolve(args.from, started, args.json) {
         Ok(value) => value,
         Err(outcome) => return Ok(outcome),

@@ -1485,7 +1485,7 @@ fn session_name_from_body(body: &[u8]) -> String {
 
 /// `GET /` while `debug.preview_ui` is on.
 ///
-/// Issues one ticket for a fixed local-preview identity and redirects to
+/// Issues one ticket for the daemon's own user and redirects to
 /// [`PREVIEW_LANDING`]`#ticket=...`. The fragment is not sent back to the
 /// server, so the target must be a path that does not reach this function
 /// again: redirecting to `/#ticket=` came back as `GET /` and looped, issuing a
@@ -1498,7 +1498,7 @@ fn preview_ticket_redirect(state: &mut ApiState, req: &HttpRequest) -> ApiRespon
     }
     let (_ticket, secret) = state
         .tickets
-        .issue_ui_ticket(PREVIEW_UI_USER, false, clock(state));
+        .issue_ui_ticket(&preview_user(), false, clock(state));
     let mut headers = BTreeMap::new();
     headers.insert(
         "location".to_owned(),
@@ -1521,10 +1521,13 @@ fn preview_ticket_redirect(state: &mut ApiState, req: &HttpRequest) -> ApiRespon
 /// embedded `index.html`, never by [`preview_ticket_redirect`].
 pub const PREVIEW_LANDING: &str = "/index.html";
 
-/// Identity the preview redirect binds its ticket to. Not a real account: the
-/// preview switch is a local convenience, and this name only scopes the
-/// resulting token. It is not read from the request.
-const PREVIEW_UI_USER: &str = "local-preview";
+/// Identity the preview redirect binds its ticket to: the daemon's own user,
+/// the same id the daemon-wide sample session is stored under. A fixed
+/// placeholder name owned no session, so the preview UI listed nothing.
+/// Never admin: the preview switch must not widen what the page may change.
+fn preview_user() -> String {
+    crate::sample::current_user_id()
+}
 
 fn redeem_token(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     if req_host_bad(&req.headers.get("host").cloned(), req.listen_port) {
@@ -2278,8 +2281,29 @@ mod tests {
             )
             .status
         };
-        assert_eq!(redeem(&mut state), 200);
+        let first_redeem = dispatch(
+            &mut state,
+            &req(
+                "POST",
+                "/api/v1/auth/ui-token",
+                Some("127.0.0.1:7456"),
+                None,
+                body.as_bytes(),
+            ),
+        );
+        assert_eq!(first_redeem.status, 200);
         assert_eq!(redeem(&mut state), 401);
+        // The token belongs to the user the daemon-wide sample session is
+        // stored under, so the preview page can list that session.
+        let token = json_body(&first_redeem)["token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let caller = state.tickets.caller_for_token(&token, 1_000);
+        assert_eq!(
+            caller.map(|c| (c.user_id, c.admin)),
+            Ok((crate::sample::current_user_id(), false))
+        );
     }
 
     #[test]

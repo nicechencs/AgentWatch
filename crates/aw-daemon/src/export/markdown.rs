@@ -169,7 +169,7 @@ fn load_gaps(
 ) -> Result<Vec<GapLine>, ReportError> {
     let mut stmt = conn
         .prepare(
-            "SELECT collector, kind, count, reason FROM gaps \
+            "SELECT collector, kind, count, detail FROM gaps \
              WHERE session_id = ?1 \
                AND EXISTS ( \
                  SELECT 1 FROM sessions s \
@@ -727,5 +727,32 @@ fn rule_name(rule: RuleId) -> &'static str {
         RuleId::InstructedSteal => "instructed_steal",
         RuleId::UploadedVia => "uploaded_via",
         RuleId::ContentMatchPhrase => "content_match_phrase",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_gaps;
+
+    #[test]
+    fn gap_query_matches_the_migrated_schema() {
+        // `gaps` has `detail`, not `reason`. The report query ran only against a
+        // real database, so a wrong column was a 500 on every md export.
+        let dir = std::env::temp_dir().join(format!(
+            "aw-md-gaps-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let store = aw_store::Store::open(dir.join("t.db"));
+        assert!(store.is_ok());
+        if let Ok(store) = store {
+            let rows = load_gaps(store.connection(), 1, "u");
+            assert!(rows.is_ok());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

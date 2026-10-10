@@ -593,7 +593,9 @@ fn session_row(started_ns: i64) -> SessionRow {
     }
 }
 
-fn current_user_id() -> String {
+/// User id the daemon-wide sample session is recorded under. The preview UI
+/// ticket binds to the same id so a preview browser can see that session.
+pub(crate) fn current_user_id() -> String {
     #[cfg(unix)]
     {
         unix_uid_string()

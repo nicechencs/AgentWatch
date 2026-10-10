@@ -892,14 +892,35 @@ mod tests {
         assert_eq!(row["user_id"], uid.to_string());
     }
 
+    /// Wait until nothing listens on `path` any more. Another test thread
+    /// may `fork` while the listener is open; the child holds a copy of the
+    /// listening fd until its `exec`, and a connect in that window succeeds,
+    /// so the socket is not yet stale. Bounded; panics with the last result.
+    fn wait_refused(path: &std::path::Path) {
+        let started = std::time::Instant::now();
+        loop {
+            match UnixStream::connect(path) {
+                Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => return,
+                other => assert!(
+                    started.elapsed() < std::time::Duration::from_secs(10),
+                    "{} never became stale: {other:?}",
+                    path.display()
+                ),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn stale_socket_is_replaced() {
         let path = temp_socket("stale");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap()); // crashed daemon
         assert!(path.exists());
+        wait_refused(path.as_ref());
         let state = Arc::new(Mutex::new(ApiState::default()));
-        let _server = IpcServer::bind(&path, state, Control::new(None)).expect("bind over stale");
+        let _server = IpcServer::bind(&path, state, Control::new(None))
+            .unwrap_or_else(|err| panic!("bind over stale {}: {err:?}", path.0.display()));
         let (status, _) = exchange(&path, "GET /health HTTP/1.1\r\n\r\n");
         assert_eq!(status, 200);
     }

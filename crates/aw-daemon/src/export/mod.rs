@@ -1,6 +1,8 @@
 //! Human-readable export (P3-DAEMON-01).
 //!
-//! JSONL and CSV stay in `aw-store`. This module only builds the Markdown
-//! report. It does not open files and does not write a session directory.
+//! JSONL and CSV rows stay in `aw-store`; [`data`] frames them as a response.
+//! [`markdown`] builds the report. Nothing here opens files or writes a
+//! session directory.
 
+pub(crate) mod data;
 pub(crate) mod markdown;

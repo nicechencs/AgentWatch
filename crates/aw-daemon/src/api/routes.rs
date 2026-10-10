@@ -1791,6 +1791,18 @@ fn session_p3_route(state: &ApiState, route: &P3Route<'_>) -> Option<ApiResponse
             state, caller, sid, raw_query,
         ));
     }
+    if (method == "GET" || method == "POST") && tail == "export" {
+        if let Some(format) = crate::export::data::DataFormat::from_query(raw_query) {
+            return Some(crate::export::data::export_data(
+                state, caller, sid, raw_query, format,
+            ));
+        }
+    }
+    if method == "GET" && tail == "agent-events" {
+        return Some(super::agent::list_agent_events(
+            state, caller, sid, raw_query,
+        ));
+    }
     session_tail_more(state, method, sid, tail, &caller.user_id, parsed)
 }
 
@@ -2343,6 +2355,53 @@ mod tests {
             ),
         );
         assert_eq!(response.status, 401);
+    }
+
+    #[test]
+    fn export_data_and_agent_events_answer_on_a_real_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "aw-routes-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let db = dir.join("agentwatch.db");
+        let seeded = aw_store::Store::open(&db).map(|store| {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors) \
+                     VALUES (1, 'sx', 'attach', 'alice', 1, 'linux', '[\"poll\"]')",
+                    [],
+                )
+                .is_ok()
+        });
+        assert!(matches!(seeded, Ok(true)));
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+        let token = token_for(&mut state, "alice", false);
+        let mut get = |path: &str, query: &str| {
+            let mut request = req("GET", path, Some("127.0.0.1:7456"), Some(&token), b"");
+            request.query = query.to_owned();
+            dispatch(&mut state, &request)
+        };
+        let jsonl = get("/api/v1/sessions/sx/export", "format=jsonl");
+        assert_eq!(jsonl.status, 200);
+        assert_eq!(jsonl.header("content-type"), Some("application/x-ndjson"));
+        assert!(!jsonl.body.is_empty());
+        let csv = get("/api/v1/sessions/sx/export", "format=csv");
+        assert_eq!(csv.status, 200);
+        assert!(csv.body.starts_with(b"PK"));
+        let events = get("/api/v1/sessions/sx/agent-events", "");
+        assert_eq!(events.status, 200);
+        assert!(json_body(&events)["events"].is_array());
+        // Another user's session stays hidden.
+        let other = get("/api/v1/sessions/nope/export", "format=jsonl");
+        assert_eq!(other.status, 404);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

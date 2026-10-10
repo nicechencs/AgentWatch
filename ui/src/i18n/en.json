@@ -381,6 +381,7 @@
   "compare.sideA": "Session A",
   "compare.sideB": "Session B",
   "compare.platform": "Platform",
+  "compare.agent": "Agent",
   "compare.collectors": "Collector capabilities",
   "compare.capabilityNote": "Collector capabilities differ. A difference, once one can be listed, may come from what each side could observe.",
   "compare.dim.files": "Files",

@@ -53,10 +53,17 @@ describe("attach picker: process table", () => {
       return out;
     };
     const notCollected = text(
-      <PickerStatus data={{ available: false, reason: "no table", scope: "own", roots: [] }} error={null} loading={false} agentsOnly={false} />,
+      <PickerStatus data={{ available: false, reason: "no_process_table", scope: "own", roots: [] }} error={null} loading={false} agentsOnly={false} />,
     );
     expect(notCollected).toContain("没采");
-    expect(notCollected).toContain("no table");
+    // review-bot: the reason is a code worded in Chinese, never the daemon's English.
+    expect(notCollected).toContain(ZH["new.procReason.noProcessTable"]);
+    expect(notCollected).not.toMatch(/[A-Za-z]{3,}/u);
+    const unknown = text(
+      <PickerStatus data={{ available: false, reason: "some new english reason", scope: "own", roots: [] }} error={null} loading={false} agentsOnly={false} />,
+    );
+    expect(unknown).toContain(ZH["new.procReasonUnknown"]);
+    expect(unknown).not.toContain("english");
     expect(notCollected).not.toContain(ZH["common.empty"]);
 
     const failed = text(

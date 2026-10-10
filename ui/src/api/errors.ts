@@ -44,7 +44,6 @@ const CODE_TEXT: Record<string, string> = {
   program_not_found: "error.programNotFound",
   program_not_permitted: "error.programNotPermitted",
   spawn_failed: "error.spawnFailed",
-  launch_needs_cli: "error.launchNeedsCli",
   launch_other_user: "error.launchOtherUser",
   caller_unidentified: "error.callerUnidentified",
   caller_unknown: "error.callerUnidentified",

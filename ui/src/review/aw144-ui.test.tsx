@@ -30,7 +30,7 @@ describe("UI re-review #144", () => {
     expect(text).not.toMatch(/entity|not found/u);
     // Launch refusals are 403s with their own plain Chinese sentence, never
     // the daemon's English and never "open a terminal".
-    for (const code of ["launch_needs_cli", "launch_other_user", "caller_unidentified", "caller_unknown", "drop_failed"]) {
+    for (const code of ["launch_other_user", "caller_unidentified", "caller_unknown", "drop_failed"]) {
       const said = describeError(new ApiError(403, { error: { code, message: "the daemon starts programs only as its own user; use `aw run -- <cmd>`" } }, "x"), t);
       expect(said).not.toMatch(/\b[a-z]{4,}\b|终端|aw run/u);
       expect(said).not.toBe(ZH["error.forbidden"]);

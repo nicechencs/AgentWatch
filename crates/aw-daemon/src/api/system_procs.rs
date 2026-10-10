@@ -102,7 +102,9 @@ pub(crate) fn system_processes(read: TableReader, caller: &Caller, raw_query: &s
             200,
             &json!({
                 "available": false,
-                "reason": "this platform has no process table for the daemon to read (没采)",
+                // A code the UI words in the user's language; English only in `detail`.
+                "reason": "no_process_table",
+                "detail": "this platform has no process table for the daemon to read (not collected)",
                 "scope": scope,
                 "roots": [],
                 "processes": [],
@@ -436,7 +438,10 @@ mod tests {
             "q=sleep",
         ));
         assert_eq!(doc["available"], false);
-        assert!(doc["reason"].as_str().is_some_and(|r| r.contains("没采")));
+        assert_eq!(doc["reason"], "no_process_table");
+        assert!(doc["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("not collected")));
         assert!(doc["roots"].as_array().is_some_and(Vec::is_empty));
     }
 

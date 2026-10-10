@@ -290,8 +290,16 @@ export function PickerStatus({
   const { t } = useI18n();
   if (error) return <>{t("new.procNotCollected", { reason: describeError(error, t) })}</>;
   if (!data) return <>{loading ? t("common.loading") : t("new.procNotCollected", { reason: t("new.procReasonUnknown") })}</>;
-  if (!data.available) return <>{t("new.procNotCollected", { reason: data.reason ?? t("new.procReasonUnknown") })}</>;
+  // `reason` is a code; the daemon's English is only in `detail`, never shown here.
+  if (!data.available) return <>{t("new.procNotCollected", { reason: procReason(data.reason, t) })}</>;
   return <>{agentsOnly ? t("new.procNoAgent") : t("new.procNoMatch")}</>;
+}
+
+const PROC_REASONS: Record<string, string> = { no_process_table: "new.procReason.noProcessTable" };
+
+function procReason(code: string | null | undefined, t: (key: string) => string): string {
+  const key = code ? PROC_REASONS[code] : undefined;
+  return t(key ?? "new.procReasonUnknown");
 }
 
 interface FlatProc extends SystemProcess {

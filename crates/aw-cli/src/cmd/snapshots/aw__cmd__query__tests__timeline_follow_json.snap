@@ -39,5 +39,5 @@ expression: body
     }
   ],
   "live_connected": false,
-  "note": "real-time /sessions/{sid}/live is not subscribed (真实订阅未接通); rows are the injected source"
+  "note": "没有订阅实时 /sessions/{sid}/live（真实订阅未接通）；这些行来自注入的数据源"
 }

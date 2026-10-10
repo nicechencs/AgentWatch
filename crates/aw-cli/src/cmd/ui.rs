@@ -53,7 +53,7 @@ impl Opener for SystemOpener {
             .stderr(Stdio::null())
             .spawn()
             .map(|_| ())
-            .map_err(|err| format!("{program}: {}", err.kind()))
+            .map_err(|err| format!("打开浏览器失败：{program}: {}", err.kind()))
     }
 }
 
@@ -70,7 +70,7 @@ pub(crate) fn ui(
         return error_outcome(
             exit::USAGE,
             "usage",
-            "aw ui asks for a ticket on the socket or named pipe; a bearer over --http cannot mint one. Drop --http",
+            "aw ui 通过 socket 或命名管道申请 ticket；--http 上的 Bearer 不能签发 ticket。请移除 --http",
             json,
         );
     }
@@ -79,8 +79,24 @@ pub(crate) fn ui(
         Ok(reply) => reply,
         Err(err) => return client_error(&err, endpoint, json),
     };
-    let Some(ticket) = reply
-        .json()
+    let body = reply.json().unwrap_or(Value::Null);
+    // The daemon reports the port its HTTP listener really bound (0 = off).
+    // `--port` still wins, for a listener reached through a forward.
+    let served = body.get("http_port").and_then(Value::as_u64);
+    let http_port = match (port, served) {
+        (Some(port), _) => port,
+        (None, Some(0)) => {
+            return error_outcome(
+                exit::GENERAL,
+                "http_off",
+                "后台的 HTTP 监听已关闭（api.http_port = 0），没有可打开的浏览器页面。请使用 AgentWatch 桌面应用，或在后台配置中设置 api.http_port 后重启",
+                json,
+            )
+        }
+        (None, Some(served)) => u16::try_from(served).unwrap_or(DEFAULT_UI_PORT),
+        (None, None) => DEFAULT_UI_PORT,
+    };
+    let Some(ticket) = Some(body)
         .and_then(|value| {
             value
                 .get("ticket")
@@ -89,17 +105,9 @@ pub(crate) fn ui(
         })
         .filter(|ticket| !ticket.is_empty())
     else {
-        return error_outcome(
-            exit::GENERAL,
-            "bad_reply",
-            "daemon answered without a ticket",
-            json,
-        );
+        return error_outcome(exit::GENERAL, "bad_reply", "后台响应没有 ticket", json);
     };
-    let url = format!(
-        "http://127.0.0.1:{}/#ticket={ticket}",
-        port.unwrap_or(DEFAULT_UI_PORT)
-    );
+    let url = format!("http://127.0.0.1:{http_port}/#ticket={ticket}");
     let opened = if no_open {
         None
     } else {
@@ -135,15 +143,45 @@ pub(crate) fn ui(
 pub(crate) trait Starter {
     /// Start the daemon. `Ok(pid)` when a process was started.
     fn start(&mut self) -> Result<u32, String>;
+
+    /// `Some(reason)` once the started process has exited on its own.
+    fn exited(&mut self) -> Option<String> {
+        None
+    }
+
+    /// Stop the process [`Self::start`] started (the start failed: do not
+    /// leave an orphan daemon behind).
+    fn abort(&mut self) {}
 }
 
 /// Passed to the started daemon as `--config` when set (development runs).
 pub(crate) const DAEMON_CONFIG_ENV: &str = "AW_DAEMON_CONFIG";
 
 /// Spawns `agentwatchd` from next to `aw`, else from `PATH`.
-pub(crate) struct ProcessStarter;
+#[derive(Default)]
+pub(crate) struct ProcessStarter {
+    child: Option<std::process::Child>,
+}
 
 impl Starter for ProcessStarter {
+    fn exited(&mut self) -> Option<String> {
+        let child = self.child.as_mut()?;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                self.child = None;
+                Some(format!("agentwatchd 已退出（{status}）"))
+            }
+            _ => None,
+        }
+    }
+
+    fn abort(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
     fn start(&mut self) -> Result<u32, String> {
         let program = daemon_program();
         let mut process = Process::new(&program);
@@ -156,8 +194,12 @@ impl Starter for ProcessStarter {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map(|child| child.id())
-            .map_err(|err| format!("could not start agentwatchd: {}", err.kind()))
+            .map(|child| {
+                let pid = child.id();
+                self.child = Some(child);
+                pid
+            })
+            .map_err(|err| format!("无法启动 agentwatchd：{}", err.kind()))
     }
 }
 
@@ -210,7 +252,7 @@ pub(crate) fn daemon_start(
     json: bool,
 ) -> Outcome {
     if let Some(version) = health(endpoint, open()) {
-        return running_outcome(endpoint, &version, Some("already running"), json);
+        return running_outcome(endpoint, &version, Some("已在运行"), json);
     }
     let pid = match starter.start() {
         Ok(pid) => pid,
@@ -219,15 +261,26 @@ pub(crate) fn daemon_start(
     let mut waited = Duration::ZERO;
     loop {
         if let Some(version) = health(endpoint, open()) {
-            let note = format!("started pid {pid}");
+            let note = format!("已启动 PID {pid}");
             return running_outcome(endpoint, &version, Some(&note), json);
         }
+        if let Some(reason) = starter.exited() {
+            return error_outcome(
+                exit::GENERAL,
+                "daemon_exited",
+                &format!("{endpoint} 响应前 {reason}；请查看后台日志"),
+                json,
+            );
+        }
         if waited >= wait {
+            // Not answering on the channel means unusable: stop it rather than
+            // leave an orphan the next `start` would trip over.
+            starter.abort();
             return error_outcome(
                 exit::UNREACHABLE,
                 "unreachable",
                 &format!(
-                    "agentwatchd pid {pid} started but {endpoint} did not answer within {} s; see the daemon log",
+                    "agentwatchd 的 PID {pid} 已启动，但 {endpoint} 在 {} 秒内没有响应，已再次停止；请查看后台日志",
                     wait.as_secs()
                 ),
                 json,
@@ -238,7 +291,7 @@ pub(crate) fn daemon_start(
     }
 }
 
-fn health(endpoint: &Endpoint, transport: Box<dyn Transport>) -> Option<String> {
+pub(crate) fn health(endpoint: &Endpoint, transport: Box<dyn Transport>) -> Option<String> {
     let mut client = Client::new(endpoint.clone(), transport);
     let reply = client.call(&ApiRequest::get("/health")).ok()?;
     Some(
@@ -268,9 +321,10 @@ fn running_outcome(endpoint: &Endpoint, version: &str, note: Option<&str>, json:
     }
 }
 
-fn client_error(err: &ClientError, endpoint: &Endpoint, json: bool) -> Outcome {
+pub(crate) fn client_error(err: &ClientError, endpoint: &Endpoint, json: bool) -> Outcome {
     let machine = match err {
         ClientError::Unreachable { .. } => "unreachable",
+        ClientError::Forbidden { .. } => "forbidden",
         ClientError::Transport { .. } => "transport",
         ClientError::Status { .. } => "status",
     };
@@ -422,7 +476,7 @@ mod tests {
         assert_eq!(out.code, exit::OK);
         assert_eq!(starter.0, 1);
         let text = String::from_utf8(out.stdout).expect("utf8");
-        assert!(text.contains("started pid 4242"), "{text}");
+        assert!(text.contains("已启动 PID 4242"), "{text}");
     }
 
     #[test]
@@ -431,5 +485,92 @@ mod tests {
         let mut open = || Box::new(MemoryTransport::failing("down")) as Box<dyn Transport>;
         let out = daemon_start(&sock(), &mut open, &mut starter, Duration::ZERO, false);
         assert_eq!(out.code, exit::UNREACHABLE);
+    }
+
+    struct AbortStarter {
+        aborted: bool,
+        exit_now: bool,
+    }
+    impl Starter for AbortStarter {
+        fn start(&mut self) -> Result<u32, String> {
+            Ok(9)
+        }
+        fn exited(&mut self) -> Option<String> {
+            self.exit_now
+                .then(|| "agentwatchd exited (exit status: 1)".to_owned())
+        }
+        fn abort(&mut self) {
+            self.aborted = true;
+        }
+    }
+
+    #[test]
+    fn start_timeout_stops_the_spawned_daemon() {
+        let mut starter = AbortStarter {
+            aborted: false,
+            exit_now: false,
+        };
+        let mut open = || Box::new(MemoryTransport::failing("down")) as Box<dyn Transport>;
+        let out = daemon_start(&sock(), &mut open, &mut starter, Duration::ZERO, false);
+        assert_eq!(out.code, exit::UNREACHABLE);
+        assert!(starter.aborted, "no orphan daemon left running");
+    }
+
+    #[test]
+    fn start_reports_an_early_exit() {
+        let mut starter = AbortStarter {
+            aborted: false,
+            exit_now: true,
+        };
+        let mut open = || Box::new(MemoryTransport::failing("down")) as Box<dyn Transport>;
+        let out = daemon_start(
+            &sock(),
+            &mut open,
+            &mut starter,
+            Duration::from_secs(5),
+            false,
+        );
+        assert_eq!(out.code, exit::GENERAL);
+        let text = String::from_utf8(out.stderr).unwrap();
+        assert!(text.contains("exited"), "{text}");
+    }
+
+    #[test]
+    fn ui_uses_the_port_the_daemon_reports_and_says_when_http_is_off() {
+        let mut opener = Recorder(Vec::new());
+        let out = ui(
+            &sock(),
+            reply(200, r#"{"ticket":"t1","ttl_s":60,"http_port":9123}"#),
+            None,
+            true,
+            false,
+            &mut opener,
+        );
+        assert_eq!(out.code, exit::OK);
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(text.contains("http://127.0.0.1:9123/#ticket=t1"), "{text}");
+
+        let out = ui(
+            &sock(),
+            reply(200, r#"{"ticket":"t1","ttl_s":60,"http_port":0}"#),
+            None,
+            false,
+            false,
+            &mut opener,
+        );
+        assert_eq!(out.code, exit::GENERAL);
+        assert!(opener.0.is_empty(), "no dead link opened");
+        let text = String::from_utf8(out.stderr).unwrap();
+        assert!(text.contains("HTTP 监听已关闭"), "{text}");
+
+        let out = ui(
+            &sock(),
+            reply(200, r#"{"ticket":"t1","http_port":0}"#),
+            Some(8000),
+            true,
+            false,
+            &mut opener,
+        );
+        assert!(String::from_utf8(out.stdout).unwrap().contains(":8000/"));
     }
 }

@@ -18,17 +18,18 @@
 //! [`aw_store::session_by_public_id`] when a later request names an id this
 //! process has not seen. An unknown public id is "not found", not a guessed id.
 
+use rusqlite::OptionalExtension;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use aw_store::{
     around, delete_session, dns_events, files, flow_buckets, flows, gaps, list_sessions,
-    patch_session, process_detail, process_tree, search, session_by_public_id, session_summary,
-    stop_session, timeline, timeline_histogram, traffic, CompileCtx, Cursor, FileGroupBy,
-    FileQuery, FlowQuery, FtsMode, ProcessNode, PurgeScope, QueryError, Retention, RetentionConfig,
-    SessionFilter, SessionListItem, SessionSummary, Store, StoreError, StoreExpr, TimelinePage,
-    TimelineQuery,
+    newest_session_for_user, patch_session, process_detail, process_tree, public_id_by_session_id,
+    search, session_by_public_id, session_summary, stop_session, timeline, timeline_histogram,
+    traffic, CompileCtx, Cursor, FileGroupBy, FileQuery, FlowQuery, FtsMode, ProcessNode,
+    PurgeScope, QueryError, Retention, RetentionConfig, SessionFilter, SessionListItem,
+    SessionSummary, Store, StoreError, StoreExpr, TimelinePage, TimelineQuery,
 };
 
 // Every method calls a function `aw-store` exports. A filter string is parsed
@@ -64,6 +65,9 @@ pub enum QueryBackendError {
     },
     /// The session is not visible to this user. Routes map this to 404.
     NotFound,
+    /// `@last` for a caller who has no sessions of their own. Routes map this
+    /// to 404 `no_sessions`, distinct from a public id that does not exist.
+    NoSessions,
     /// The backing function is not exported by this build of `aw-store`.
     Unimplemented {
         /// Short name, for the 501 body. Not a SQL statement.
@@ -84,6 +88,7 @@ impl std::fmt::Display for QueryBackendError {
                 write!(f, "bad {name}: expected {expected}")
             }
             Self::NotFound => write!(f, "session not found"),
+            Self::NoSessions => write!(f, "this account has no sessions"),
             Self::Unimplemented { what } => write!(f, "{what} is not available"),
             Self::Store(msg) => write!(f, "{msg}"),
         }
@@ -191,8 +196,9 @@ pub trait SessionQuery {
     /// `DELETE /sessions/{sid}`.
     fn delete_session(&self, user_id: &str, sid: &str) -> Result<Option<()>, QueryBackendError>;
 
-    /// `POST /sessions/{sid}/stop`.
-    fn stop_session(&self, user_id: &str, sid: &str) -> Result<Option<()>, QueryBackendError>;
+    /// `POST /sessions/{sid}/stop`. `Some` carries the public id that was
+    /// stopped, which is not `sid` when `sid` was `@last`.
+    fn stop_session(&self, user_id: &str, sid: &str) -> Result<Option<String>, QueryBackendError>;
 
     /// `GET /sessions/{sid}/timeline`.
     fn timeline(
@@ -434,14 +440,36 @@ impl StoreQuery {
     /// Integer id for `sid`. A public id that is not in [`IdMap`] is looked up
     /// and remembered. `Ok(None)` when the store has no such session for this
     /// user — that is "not found", not a guessed id.
+    ///
+    /// `sid` of `@last` is the newest session this `user_id` owns (greatest
+    /// `started_ns`), never the newest session in the database and never a
+    /// remembered id. A caller with no sessions of their own is
+    /// [`QueryBackendError::NoSessions`], not a lookup of another user's row.
     fn resolve_id(
         &self,
         store: &Store,
         user_id: &str,
         sid: &str,
     ) -> Result<Option<i64>, QueryBackendError> {
+        if sid == "@last" {
+            return match newest_session_for_user(store.connection(), user_id).map_err(map_query)? {
+                Some((id, _)) => Ok(Some(id)),
+                None => Err(QueryBackendError::NoSessions),
+            };
+        }
+        // A remembered or numeric id is only a shortcut for the lookup; the
+        // row must still belong to the caller (peer identity). Without this
+        // check a numeric id, or a public id another account resolved first,
+        // opened that account's session.
         if let Some(id) = self.remembered(sid) {
-            return Ok(Some(id));
+            let owner: Option<String> = store
+                .connection()
+                .query_row("SELECT user_id FROM sessions WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .map_err(|err| QueryBackendError::Store(format!("session owner: {err}")))?;
+            return Ok((owner.as_deref() == Some(user_id)).then_some(id));
         }
         let found = session_by_public_id(store.connection(), user_id, sid).map_err(map_query)?;
         if let Some(id) = found {
@@ -541,16 +569,24 @@ impl SessionQuery for StoreQuery {
         delete_session(store.connection(), user_id, id).map_err(map_query)
     }
 
-    fn stop_session(&self, user_id: &str, sid: &str) -> Result<Option<()>, QueryBackendError> {
+    fn stop_session(&self, user_id: &str, sid: &str) -> Result<Option<String>, QueryBackendError> {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
         let Some(id) = self.resolve_id(&store, user_id, sid)? else {
             return Ok(None);
         };
+        // The public id of the row that was stopped. For `@last` this is the
+        // resolved session, not the token the caller typed.
+        let public_id = public_id_by_session_id(store.connection(), user_id, id)
+            .map_err(map_query)?
+            .unwrap_or_else(|| sid.to_owned());
         // Wall clock of the user action, not an observation time.
         let ended_ns = unix_now_ns();
-        stop_session(store.connection(), user_id, id, ended_ns).map_err(map_query)
+        match stop_session(store.connection(), user_id, id, ended_ns).map_err(map_query)? {
+            Some(()) => Ok(Some(public_id)),
+            None => Ok(None),
+        }
     }
 
     fn timeline(
@@ -1373,6 +1409,7 @@ fn node_json(node: &aw_store::ProcessNode) -> serde_json::Value {
         "depth": node.depth,
         "start_ns": node.start_ns,
         "exit_ns": node.exit_ns,
+        "exit_code": node.exit_code,
         "evidence": node.evidence,
         "exe_name": node.exe_name,
         "proc": { "pid": node.pid, "exe_name": node.exe_name },
@@ -1478,6 +1515,7 @@ fn timeline_row_json(row: &aw_store::TimelineRow) -> serde_json::Value {
         "id": row.id,
         "proc_uid": row.proc_uid.map(|id| format!("{id:x}")),
         "evidence": row.evidence,
+        "pre_existing": row.pre_existing,
     })
 }
 
@@ -1487,7 +1525,29 @@ fn search_hit_json(hit: &aw_store::SearchHit) -> serde_json::Value {
         "src_id": hit.src_id,
         "session_id": hit.session_id,
         "public_id": hit.public_id,
+        "text": hit.text,
+        "ts_ns": hit.ts_ns,
+        "evidence": hit.evidence,
+        "session_name": session_label(hit.session_name.as_deref(), hit.session_argv.as_deref()),
     })
+}
+
+/// `sessions.argv` (a JSON array of strings, redacted when stored) as JSON.
+/// Null when absent or not an array of strings; never a guess.
+pub(crate) fn argv_value(raw: Option<&str>) -> serde_json::Value {
+    raw.and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+        .map_or(serde_json::Value::Null, |argv| serde_json::json!(argv))
+}
+
+/// What to call a session: its name, else its command line, else nothing
+/// (the page then shows the public id once).
+pub(crate) fn session_label(name: Option<&str>, argv: Option<&str>) -> Option<String> {
+    if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
+        return Some(name.to_owned());
+    }
+    argv.and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+        .filter(|argv| !argv.is_empty())
+        .map(|argv| argv.join(" "))
 }
 
 /// Parse a filter string with the shared grammar and fold it into the store AST.
@@ -1624,4 +1684,30 @@ fn gap_json(row: &aw_store::GapItem) -> serde_json::Value {
         "count": row.count,
         "detail": row.detail,
     })
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::{argv_value, session_label};
+
+    /// UI re-review #144 new-5: a session started with 「启动程序」 was listed
+    /// as `s-31988513fa4a`; with no name, the command is the label.
+    #[test]
+    fn unnamed_session_is_labelled_by_its_command() {
+        assert_eq!(
+            session_label(None, Some(r#"["sleep","90"]"#)).as_deref(),
+            Some("sleep 90")
+        );
+        assert_eq!(
+            session_label(Some("refactor"), Some(r#"["sleep","90"]"#)).as_deref(),
+            Some("refactor")
+        );
+        assert_eq!(session_label(Some("  "), None), None);
+        assert_eq!(session_label(None, Some("not json")), None);
+        assert_eq!(
+            argv_value(Some(r#"["sleep","90"]"#)),
+            serde_json::json!(["sleep", "90"])
+        );
+        assert!(argv_value(None).is_null());
+    }
 }

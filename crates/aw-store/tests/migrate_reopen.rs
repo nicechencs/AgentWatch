@@ -11,6 +11,16 @@ use aw_store::{
 };
 use rusqlite::Connection;
 
+const MIGRATION_0001_OLD: &str = include_str!("../migrations/0001_init.sql");
+const MIGRATION_0002: &str = include_str!("../migrations/0002_timeline_view.sql");
+const MIGRATION_0003: &str = include_str!("../migrations/0003_file_access.sql");
+const MIGRATION_0004: &str = include_str!("../migrations/0004_timeline_file.sql");
+const MIGRATION_0005: &str = include_str!("../migrations/0005_fts.sql");
+const MIGRATION_0006: &str = include_str!("../migrations/0006_http_findings.sql");
+const MIGRATION_0007: &str = include_str!("../migrations/0007_timeline_http.sql");
+const MIGRATION_0008: &str = include_str!("../migrations/0008_proxy_flow_marks.sql");
+const MIGRATION_0009: &str = include_str!("../migrations/0009_agent_events.sql");
+
 struct TestDb {
     dir: PathBuf,
     path: PathBuf,
@@ -224,6 +234,52 @@ fn sparse_agent_v9_reopens_writable_without_extra_ddl() {
 #[test]
 fn sparse_inter_agent_v10_reopens_writable_without_extra_ddl() {
     assert_supported_reopen(10);
+}
+
+#[test]
+fn old_v9_database_opens_with_null_exit_codes() {
+    let db = TestDb::new();
+    // A v9 database written by a release before exit codes were recorded:
+    // the column exists (0001) but no row ever had a value.
+    let old_init = MIGRATION_0001_OLD.to_owned();
+    let conn = Connection::open(&db.path).expect("legacy database");
+    for sql in [
+        old_init.as_str(),
+        MIGRATION_0002,
+        MIGRATION_0003,
+        MIGRATION_0004,
+        MIGRATION_0005,
+        MIGRATION_0006,
+        MIGRATION_0007,
+        MIGRATION_0008,
+        MIGRATION_0009,
+    ] {
+        conn.execute_batch(sql).expect("legacy migration");
+    }
+    conn.execute(
+        "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '9')",
+        [],
+    )
+    .expect("legacy schema version");
+    conn.execute_batch(
+        "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors) \
+         VALUES (1, 'legacy-exit', 'launch', 'fixture-user', 1, 'fixture', '[]'); \
+         INSERT INTO processes (session_id, proc_uid, pid, depth, start_ns, how, evidence, source) \
+         VALUES (1, 1, 100, 0, 1, 'spawn', 'S', 'fixture');",
+    )
+    .expect("legacy process row");
+    drop(conn);
+
+    let store = Store::open(&db.path).expect("migrated store");
+    let exit_code: Option<i64> = store
+        .connection()
+        .query_row(
+            "SELECT exit_code FROM processes WHERE session_id = 1 AND proc_uid = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("migrated exit code");
+    assert_eq!(exit_code, None);
 }
 
 #[test]

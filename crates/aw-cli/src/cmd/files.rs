@@ -43,7 +43,7 @@ pub(crate) fn run(args: FilesArgs<'_>, source: &dyn QuerySource) -> io::Result<O
         return Ok(super::error_outcome(
             exit::USAGE,
             "usage",
-            "session is empty",
+            "会话不能为空",
             args.json,
         ));
     }
@@ -52,7 +52,7 @@ pub(crate) fn run(args: FilesArgs<'_>, source: &dyn QuerySource) -> io::Result<O
             return Ok(super::error_outcome(
                 exit::USAGE,
                 "usage",
-                &format!("--group-by `{group_by}` is not path, dir, or proc"),
+                &format!("--group-by `{group_by}` 不是 path、dir 或 proc"),
                 args.json,
             ));
         }
@@ -65,7 +65,7 @@ pub(crate) fn run(args: FilesArgs<'_>, source: &dyn QuerySource) -> io::Result<O
             return Ok(super::error_outcome(
                 exit::USAGE,
                 "usage",
-                &format!("--sort `{sort}` is not time, path, opens, bytes_read, or bytes_written"),
+                &format!("--sort `{sort}` 不是 time、path、opens、bytes_read 或 bytes_written"),
                 args.json,
             ));
         }

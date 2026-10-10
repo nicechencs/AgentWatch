@@ -12,6 +12,7 @@ members = [
     "crates/aw-agent-adapters",
     "crates/aw-daemon",
     "crates/aw-cli",
+    "crates/aw-channel",
     "sim",
     "xtask",
 ]
@@ -41,6 +42,8 @@ aw-collector-windows = { path = "crates/aw-collector-windows" }
 aw-collector-macos = { path = "crates/aw-collector-macos" }
 aw-collector-poll = { path = "crates/aw-collector-poll" }
 aw-agent-adapters = { path = "crates/aw-agent-adapters" }
+# Internal-channel client shared by aw and the desktop app (std only).
+aw-channel = { path = "crates/aw-channel" }
 # P3-PROXY-02. Versions are pinned; member crates use `{ workspace = true }`.
 # hudsucker 0.25.0: MIT OR Apache-2.0. MITM HTTP(S) proxy named by
 # network-attribution §5 and ADR-0006. `default-features = false` drops the

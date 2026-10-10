@@ -37,6 +37,8 @@ use aw_core::NaReason;
 pub(crate) enum QueryError {
     /// The session id or name is not in this source.
     NotFound { session: String },
+    /// `@last` for a caller who has no sessions.
+    NoSessions,
     /// `--group-by` / `--sort` / a time bound the command refused.
     BadArgument { detail: String },
     /// No live query API is wired. The message says so; it is not a fake empty list.
@@ -46,7 +48,8 @@ pub(crate) enum QueryError {
 impl std::fmt::Display for QueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotFound { session } => write!(f, "session `{session}` was not found"),
+            Self::NotFound { session } => write!(f, "找不到会话 `{session}`"),
+            Self::NoSessions => write!(f, "还没有你的会话，@last 无处可指"),
             Self::BadArgument { detail } => write!(f, "{detail}"),
             Self::Unavailable { detail } => write!(f, "{detail}"),
         }
@@ -64,8 +67,9 @@ pub(crate) struct SessionItem {
     pub mode: String,
     /// Agent profile, or unknown.
     pub agent: Option<String>,
-    /// Start, Unix nanoseconds.
-    pub started_ns: i64,
+    /// Start, Unix nanoseconds. `None` when the answer did not carry one (the
+    /// in-memory stub row is `{ id, user_id, name }`); printed as 不可得, never `0`.
+    pub started_ns: Option<i64>,
     /// End, or still running.
     pub ended_ns: Option<i64>,
     /// Excluded from retention.
@@ -187,6 +191,8 @@ pub(crate) struct ProcItem {
     /// labels the column as redacted, so a stored string is not treated as the
     /// original argv.
     pub argv_redacted: Option<String>,
+    /// Exit code, or not observed.
+    pub exit_code: Option<i64>,
     /// Record evidence.
     pub evidence: Evidence,
     /// Children, parent before child. Empty for a flat listing.
@@ -492,8 +498,9 @@ pub(crate) struct SearchHit {
     pub kind: String,
     /// `<table>:<id>` so `aw around` can open it.
     pub reference: String,
-    /// Unix nanoseconds.
-    pub ts_ns: i64,
+    /// Unix nanoseconds. `None` when the hit carried no time; the renderer
+    /// prints 不可得, never `0`.
+    pub ts_ns: Option<i64>,
     /// One-line summary already safe to print. No raw argv or URL.
     pub summary: String,
     /// Record evidence.
@@ -754,7 +761,7 @@ pub(crate) fn encode_query(pairs: &[(&str, &str)]) -> String {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct UnavailableSource;
 
-const UNAVAILABLE: &str = "daemon query API is not connected; /sessions is still a stub, so this command has no records to show";
+const UNAVAILABLE: &str = "后台查询 API 未接通；/sessions 仍是占位实现，所以此命令没有可显示的记录";
 
 impl QuerySource for UnavailableSource {
     fn list_sessions(&self, _: &SessionQuery) -> Result<Vec<SessionItem>, QueryError> {
@@ -795,9 +802,7 @@ impl QuerySource for UnavailableSource {
 
     fn follow(&self, _: &str, _: Option<i64>) -> Result<Vec<TimelineItem>, QueryError> {
         Err(QueryError::Unavailable {
-            detail: format!(
-                "{UNAVAILABLE}; real-time /sessions/{{sid}}/live is not subscribed (真实订阅未接通)"
-            ),
+            detail: format!("{UNAVAILABLE}；没有订阅实时 /sessions/{{sid}}/live（真实订阅未接通）"),
         })
     }
 
@@ -826,26 +831,26 @@ impl QuerySource for UnavailableSource {
 
     fn files(&self, _: &str, _: &FileQuery) -> Result<Vec<FileItem>, QueryError> {
         Err(QueryError::Unavailable {
-            detail: format!("{UNAVAILABLE}; GET /sessions/{{sid}}/files is not served yet"),
+            detail: format!("{UNAVAILABLE}；尚未提供 GET /sessions/{{sid}}/files"),
         })
     }
 
     fn around(&self, _: &str, _: &AroundQuery) -> Result<AroundPage, QueryError> {
         Err(QueryError::Unavailable {
-            detail: format!("{UNAVAILABLE}; GET /sessions/{{sid}}/around is not served yet"),
+            detail: format!("{UNAVAILABLE}；尚未提供 GET /sessions/{{sid}}/around"),
         })
     }
 
     fn search(&self, _: &SearchQuery) -> Result<Vec<SearchHit>, QueryError> {
         Err(QueryError::Unavailable {
-            detail: format!("{UNAVAILABLE}; GET /search is not served yet"),
+            detail: format!("{UNAVAILABLE}；尚未提供 GET /search"),
         })
     }
 
     fn http(&self, _: &str, _: &HttpQuery) -> Result<HttpPage, QueryError> {
         Err(QueryError::Unavailable {
             detail: format!(
-                "{UNAVAILABLE}; GET /sessions/{{sid}}/http is not served yet, so this command does not invent an empty list"
+                "{UNAVAILABLE}；尚未提供 GET /sessions/{{sid}}/http，所以此命令不会编造空列表"
             ),
         })
     }
@@ -853,7 +858,7 @@ impl QuerySource for UnavailableSource {
     fn findings(&self, _: &str, _: &FindingQuery) -> Result<Vec<FindingItem>, QueryError> {
         Err(QueryError::Unavailable {
             detail: format!(
-                "{UNAVAILABLE}; GET /sessions/{{sid}}/findings is not served yet, so this command does not invent an empty list"
+                "{UNAVAILABLE}；尚未提供 GET /sessions/{{sid}}/findings，所以此命令不会编造空列表"
             ),
         })
     }
@@ -951,7 +956,8 @@ impl QuerySource for MemorySource {
             })
             .filter(|item| !query.active_only || item.ended_ns.is_none())
             .filter(|item| match query.since_ns {
-                Some(since) => item.started_ns >= since,
+                // No recorded start cannot be shown to fall inside the window.
+                Some(since) => item.started_ns.is_some_and(|ts| ts >= since),
                 None => true,
             })
             .collect();
@@ -1147,7 +1153,9 @@ impl QuerySource for MemorySource {
                     }
                 }
                 if let Some(since) = query.since_ns {
-                    if hit.ts_ns < since {
+                    // A hit with no timestamp cannot be shown to fall inside the
+                    // window, so it is left out rather than treated as the epoch.
+                    if hit.ts_ns.is_none_or(|ts| ts < since) {
                         continue;
                     }
                 }
@@ -1644,8 +1652,8 @@ pub(crate) fn resolve_time(
             Ok(now_ns.saturating_sub(delta))
         }
         crate::output::TimeArg::FromSessionStart(duration) => {
-            let start = started_ns
-                .ok_or_else(|| "session-relative time needs a known session start".to_owned())?;
+            let start =
+                started_ns.ok_or_else(|| "相对会话的时间需要已知的会话开始时间".to_owned())?;
             let delta = duration_ns(duration)?;
             Ok(start.saturating_add(delta))
         }
@@ -1653,8 +1661,7 @@ pub(crate) fn resolve_time(
 }
 
 fn duration_ns(duration: crate::output::DurationArg) -> Result<i64, String> {
-    let count =
-        i64::try_from(duration.count).map_err(|_| "duration does not fit in i64".to_owned())?;
+    let count = i64::try_from(duration.count).map_err(|_| "时长超出 i64 范围".to_owned())?;
     let unit: i64 = match duration.unit {
         crate::output::TimeUnit::Millis => 1_000_000,
         crate::output::TimeUnit::Seconds => 1_000_000_000,
@@ -1664,7 +1671,7 @@ fn duration_ns(duration: crate::output::DurationArg) -> Result<i64, String> {
     };
     count
         .checked_mul(unit)
-        .ok_or_else(|| "duration overflowed nanoseconds".to_owned())
+        .ok_or_else(|| "时长换算为纳秒时溢出".to_owned())
 }
 
 /// `YYYY-MM-DDThh:mm:ss` plus optional fraction and `Z` or `±hh:mm`.
@@ -1672,7 +1679,7 @@ fn duration_ns(duration: crate::output::DurationArg) -> Result<i64, String> {
 fn rfc3339_to_ns(text: &str) -> Result<i64, String> {
     let bytes = text.as_bytes();
     if bytes.len() < 19 {
-        return Err(format!("time `{text}` is not RFC 3339"));
+        return Err(format!("时间 `{text}` 不是 RFC 3339"));
     }
     let year: i64 = parse_fixed(&text[0..4])?;
     let month: i64 = parse_fixed(&text[5..7])?;
@@ -1686,7 +1693,7 @@ fn rfc3339_to_ns(text: &str) -> Result<i64, String> {
         || minute > 59
         || second > 60
     {
-        return Err(format!("time `{text}` has an out-of-range field"));
+        return Err(format!("时间 `{text}` 的字段超出范围"));
     }
     let mut rest = &text[19..];
     let mut frac_ns: i64 = 0;
@@ -1696,7 +1703,7 @@ fn rfc3339_to_ns(text: &str) -> Result<i64, String> {
             .take_while(|ch| ch.is_ascii_digit())
             .collect();
         if digits.is_empty() {
-            return Err(format!("time `{text}` has an empty fraction"));
+            return Err(format!("时间 `{text}` 的小数部分为空"));
         }
         let mut padded = digits.clone();
         if padded.len() > 9 {
@@ -1716,7 +1723,7 @@ fn rfc3339_to_ns(text: &str) -> Result<i64, String> {
         let om: i64 = parse_fixed(&rest[4..6])?;
         sign * (oh * 3600 + om * 60)
     } else {
-        return Err(format!("time `{text}` has an unsupported offset"));
+        return Err(format!("时间 `{text}` 的时区偏移不受支持"));
     };
     let days = days_from_civil(year, month, day)?;
     let epoch_days = days - days_from_civil(1970, 1, 1)?;
@@ -1724,15 +1731,15 @@ fn rfc3339_to_ns(text: &str) -> Result<i64, String> {
         .checked_mul(86_400)
         .and_then(|d| d.checked_add(hour * 3600 + minute * 60 + second))
         .and_then(|s| s.checked_sub(offset))
-        .ok_or_else(|| format!("time `{text}` overflowed"))?;
+        .ok_or_else(|| format!("时间 `{text}` 溢出"))?;
     secs.checked_mul(1_000_000_000)
         .and_then(|ns| ns.checked_add(frac_ns))
-        .ok_or_else(|| format!("time `{text}` overflowed nanoseconds"))
+        .ok_or_else(|| format!("时间 `{text}` 换算为纳秒时溢出"))
 }
 
 fn parse_fixed(text: &str) -> Result<i64, String> {
     text.parse::<i64>()
-        .map_err(|_| format!("`{text}` is not an integer"))
+        .map_err(|_| format!("`{text}` 不是整数"))
 }
 
 /// Howard Hinnant civil-from-days, inverted. Days before 1970 are negative.
@@ -1775,7 +1782,7 @@ pub(crate) fn sample_source() -> MemorySource {
             name: Some("demo".to_owned()),
             mode: "launch".to_owned(),
             agent: Some("example-agent".to_owned()),
-            started_ns: 1_700_000_000_000_000_000,
+            started_ns: Some(1_700_000_000_000_000_000),
             ended_ns: Some(1_700_000_060_000_000_000),
             pinned: false,
             evidence: Evidence::E1,
@@ -1832,6 +1839,7 @@ pub(crate) fn sample_source() -> MemorySource {
             parent_uid: None,
             exe_name: Some("demo".to_owned()),
             argv_redacted: Some("<redacted>".to_owned()),
+            exit_code: Some(7),
             evidence: Evidence::E1,
             children: vec![ProcItem {
                 proc_uid: 11,
@@ -1839,6 +1847,7 @@ pub(crate) fn sample_source() -> MemorySource {
                 parent_uid: Some(10),
                 exe_name: Some("helper".to_owned()),
                 argv_redacted: None,
+                exit_code: None,
                 evidence: Evidence::S,
                 children: Vec::new(),
             }],
@@ -2175,6 +2184,9 @@ mod tests {
         assert_evidence_column(&rendered);
         assert!(rendered.contains("P1 脱敏为占位"), "{rendered}");
         assert!(rendered.contains("不可得"), "{rendered}");
+        assert!(rendered.contains("退出码"), "{rendered}");
+        assert!(rendered.contains("7"), "{rendered}");
+        assert!(rendered.contains("没采"), "{rendered}");
         // The placeholder text is what was stored. No raw argv is in the sample.
         assert!(!rendered.contains("--token"), "{rendered}");
         insta::assert_snapshot!("procs_tree_table", rendered);
@@ -2182,6 +2194,8 @@ mod tests {
         let json = procs::run("@last", true, true, &source).expect("procs");
         let body = text(&json.stdout);
         assert!(body.contains("P1 脱敏为占位"), "{body}");
+        assert!(body.contains("\"exit_code\": 7"), "{body}");
+        assert!(body.contains("\"exit_code\": null"), "{body}");
         assert_json_evidence(&body);
         insta::assert_snapshot!("procs_tree_json", body);
     }
@@ -2269,7 +2283,7 @@ mod tests {
         let source = MemorySource::new();
         let outcome = gaps::run("missing", false, &source).expect("gaps");
         assert_eq!(outcome.code, exit::GENERAL);
-        assert!(text(&outcome.stderr).contains("not found"));
+        assert!(text(&outcome.stderr).contains("找不到会话"));
         assert!(outcome.stdout.is_empty());
     }
 

@@ -31,7 +31,7 @@ pub use poll::{
 };
 // The daemon's foreground sampler has to name `PollCollector`'s type
 // parameters. The host adapters stay unconstructed outside `with_host`.
-pub use host::{HostConnectionSource, HostProcessSource};
+pub use host::{host_process_table, HostConnectionSource, HostProcess, HostProcessSource};
 pub use source::{
     ConnectionRow, ConnectionSnapshot, ConnectionSource, ProcessRow, ProcessSnapshot,
     ProcessSource, ProcessStartTime, StaticConnectionSource, StaticProcessSource,

@@ -8,13 +8,16 @@ import { Count } from "@/components/Count";
 import { DetailPanel, type DetailRecord } from "@/components/DetailPanel/DetailPanel";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { ProcLabel } from "@/components/ProcLabel";
+import { CoverageNote } from "@/components/NotCollected";
 import { EmptyNote, ErrorNote, Loading } from "@/components/QueryState";
+import { coverage } from "@/lib/capabilities";
 import { useI18n } from "@/lib/i18n";
 import { composedFilter, useSessionQuery } from "@/lib/session-query";
 import { TrafficChart } from "./TrafficChart";
 import { fetchHttp, groupByFlow, HTTP_PAGE_LIMIT, type HttpPage, type HttpRow } from "./http";
 import { FlowMarks, HttpTable } from "./HttpRows";
 import { fill, useNetStrings } from "./strings";
+import { sessionQueryOptions } from "@/lib/live-session";
 
 type GroupBy = "domain" | "proc" | "ip" | "port";
 
@@ -36,6 +39,8 @@ export function NetworkPage() {
   const [selected, setSelected] = useState<NetFlow | null>(null);
   const filter = composedFilter(query);
   const s = useNetStrings();
+  const session = useQuery(sessionQueryOptions(sid));
+  const netCoverage = coverage(session.data, "net");
 
   const flows = useQuery({
     queryKey: ["flows", sid, filter, groupBy],
@@ -65,6 +70,19 @@ export function NetworkPage() {
     update(next);
   };
 
+  if (netCoverage === "not_collected") {
+    // No connection table in this build: an empty chart and 「没有网络记录」
+    // would read as "the agent did not use the network".
+    return (
+      <div className="h-full overflow-auto">
+        <CoverageNote kind="net" coverage={netCoverage} />
+      </div>
+    );
+  }
+
+  const groups = flows.data?.groups ?? [];
+  const hasTraffic = (traffic.data?.buckets.length ?? 0) > 0;
+
   return (
     <div className="flex h-full">
       <div className="min-w-0 flex-1 overflow-auto">
@@ -77,7 +95,8 @@ export function NetworkPage() {
           ))}
           {traffic.data?.approximate ? <EvidenceBadge level="S" /> : null}
         </div>
-        {traffic.data ? <TrafficChart series={traffic.data} direction={direction} label={t("net.chart")} /> : null}
+        {traffic.data && hasTraffic ? <TrafficChart series={traffic.data} direction={direction} label={t("net.chart")} /> : null}
+        {traffic.data && !hasTraffic ? <p className="px-3 py-2 text-[11px] text-ink-faint">{t("net.chartEmpty")}</p> : null}
 
         <div className="flex flex-wrap items-center gap-2 border-y border-line px-3 py-1.5 text-[11px]">
           <span className="text-ink-faint">{t("net.col.target")}</span>
@@ -104,9 +123,14 @@ export function NetworkPage() {
         ) : null}
 
         {flows.isLoading ? <Loading /> : null}
-        {flows.isError ? <ErrorNote message={flows.error instanceof Error ? flows.error.message : ""} onRetry={() => void flows.refetch()} /> : null}
-        {flows.data && flows.data.groups.length === 0 ? <EmptyNote>{t("net.empty")}</EmptyNote> : null}
+        {flows.isError ? <ErrorNote error={flows.error} onRetry={() => void flows.refetch()} /> : null}
+        {flows.data && flows.data.groups.length === 0 ? (
+          netCoverage === "unknown" ? <CoverageNote kind="net" coverage={netCoverage} /> : <EmptyNote>{t("net.empty")}</EmptyNote>
+        ) : null}
 
+        {/* No header row over an empty list: the empty note used to sit above
+            a lone header. */}
+        {groups.length > 0 ? (
         <table className="w-full border-collapse text-xs">
           <thead className="text-left text-ink-faint">
             <tr>
@@ -116,7 +140,7 @@ export function NetworkPage() {
             </tr>
           </thead>
           <tbody>
-            {flows.data?.groups.map((group) => (
+            {groups.map((group) => (
               <GroupRows
                 key={group.key}
                 group={group}
@@ -135,6 +159,7 @@ export function NetworkPage() {
             ))}
           </tbody>
         </table>
+        ) : null}
       </div>
       {selected ? <DetailPanel record={toRecord(selected)} patch={patch} onClose={() => setSelected(null)} /> : null}
     </div>

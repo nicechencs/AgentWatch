@@ -1,15 +1,22 @@
+import { isWallTime } from "@/lib/format";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { api } from "@/api/client";
-import type { Session } from "@/api/types";
+import { refreshListWhileRecording } from "@/lib/live-session";
+import type { DbStats, Session } from "@/api/types";
 import { Bytes } from "@/components/Bytes";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Count } from "@/components/Count";
 import { EmptyNote, ErrorNote, Loading } from "@/components/QueryState";
 import { RelTime } from "@/components/RelTime";
 import { formatDuration } from "@/lib/format";
+import { NotCollected } from "@/components/NotCollected";
+import { coverage } from "@/lib/capabilities";
+import { diskUnavailableText, diskUsed } from "@/lib/disk";
+import { sessionTitle } from "@/lib/session-title";
 import { useI18n } from "@/lib/i18n";
+import { useExport } from "@/lib/use-export";
 
 const RANGES = ["7d", "30d", "all"] as const;
 
@@ -29,6 +36,9 @@ export function SessionsPage() {
   const sessions = useQuery({
     queryKey: ["sessions", q, agent, range, activeOnly],
     queryFn: () => api.sessions({ q, agent: agent || undefined, since, active: activeOnly || undefined, limit: 200 }),
+    // A program that exits on its own ends its session: the row must turn
+    // 「已停止」 without reopening the page.
+    refetchInterval: refreshListWhileRecording,
   });
   const stats = useQuery({ queryKey: ["db-stats"], queryFn: () => api.dbStats() });
 
@@ -109,7 +119,7 @@ export function SessionsPage() {
       </div>
 
       {sessions.isLoading ? <Loading /> : null}
-      {sessions.isError ? <ErrorNote message={sessions.error instanceof Error ? sessions.error.message : ""} onRetry={() => void sessions.refetch()} /> : null}
+      {sessions.isError ? <ErrorNote error={sessions.error} onRetry={() => void sessions.refetch()} /> : null}
       {sessions.data && sessions.data.items.length === 0 ? <EmptyNote>{t("sessions.empty")}</EmptyNote> : null}
 
       {sessions.data && sessions.data.items.length > 0 ? (
@@ -150,7 +160,7 @@ export function SessionsPage() {
       <ConfirmDialog
         open={pendingDelete !== null}
         title={t("sessions.delete")}
-        body={t("sessions.deleteConfirm", { name: pendingDelete?.name ?? pendingDelete?.public_id ?? "" })}
+        body={t("sessions.deleteConfirm", { name: pendingDelete ? sessionTitle(pendingDelete) : "" })}
         confirmLabel={t("sessions.delete")}
         onCancel={() => setPendingDelete(null)}
         onConfirm={() => {
@@ -162,11 +172,16 @@ export function SessionsPage() {
   );
 }
 
-function Disk({ stats }: { stats: { db_bytes: number; wal_bytes: number; max_db_bytes: number; max_age_days: number } }) {
+function Disk({ stats }: { stats: DbStats }) {
   const { t } = useI18n();
+  const used = diskUsed(stats);
+  if (used === null) {
+    // One sentence instead of 「磁盘 不可得 / 不可得」.
+    return <span data-disk="unavailable">{diskUnavailableText(stats, t)}</span>;
+  }
   return (
     <span>
-      {t("sessions.diskLabel")} <Bytes value={stats.db_bytes + stats.wal_bytes} /> /{" "}
+      {t("sessions.diskLabel")} <Bytes value={used} /> /{" "}
       <Bytes value={stats.max_db_bytes} />
       {/* db/stats can answer `available: false` with no numbers: never print a raw `{days}`. */}
       {typeof stats.max_age_days === "number" ? <> · {t("sessions.diskKeep", { days: stats.max_age_days })}</> : null}
@@ -188,6 +203,7 @@ function SessionRow({
   onDelete: () => void;
 }) {
   const { t } = useI18n();
+  const exporter = useExport();
   const [draft, setDraft] = useState(session.name ?? "");
   const active = session.ended_ns === null && !session.purged;
   const duration = session.ended_ns ? formatDuration((session.ended_ns - session.started_ns) / 1_000_000) : active ? "…" : "–";
@@ -198,7 +214,9 @@ function SessionRow({
       <td className="px-1">
         <input type="checkbox" checked={checked} disabled={purged} onChange={onToggle} aria-label={session.public_id} />
       </td>
-      <td className="px-2 py-1">{purged ? "◌" : session.pinned ? "📌" : active ? "●" : "○"}</td>
+      <td className="px-2 py-1">
+        <StatusCell purged={purged} pinned={session.pinned} active={active} />
+      </td>
       <td className="px-2 py-1">
         {purged ? (
           <span title={t("sessions.purgedTip")}>{t("sessions.purged")}</span>
@@ -216,20 +234,29 @@ function SessionRow({
           />
         ) : (
           <button type="button" onClick={onOpen} className="text-left">
-            <span className="block">{session.name ?? session.argv?.[0] ?? session.public_id}</span>
+            <span className="block">{sessionTitle(session)}</span>
             <span className="font-mono text-[11px] text-ink-faint">{session.public_id}</span>
           </button>
         )}
       </td>
       <td className="px-2 py-1">{session.agent ?? "–"}</td>
       <td className="px-2 py-1">{t(`sessions.mode.${session.mode}`)}</td>
-      <td className="px-2 py-1"><RelTime ns={session.started_ns} /></td>
+      <td className="px-2 py-1">{isWallTime(session.started_ns) ? <RelTime ns={session.started_ns} /> : <span className="text-ink-faint">–</span>}</td>
       <td className="px-2 py-1 tabular-nums">{duration}</td>
-      <td className="px-2 py-1"><Count value={session.stats?.proc_count} /></td>
+      <td className="px-2 py-1"><ListStat value={session.stats?.proc_count} /></td>
       <td className="px-2 py-1">
-        <Bytes value={session.stats?.bytes_up} /> / <Bytes value={session.stats?.bytes_down} />
+        {coverage(session, "net") === "not_collected" ? (
+          // Same wording as the overview: not collected, not 0 and not 不可得.
+          <NotCollected kind="net" />
+        ) : session.stats ? (
+          <>
+            <Bytes value={session.stats.bytes_up} /> / <Bytes value={session.stats.bytes_down} />
+          </>
+        ) : (
+          <ListStat value={undefined} />
+        )}
       </td>
-      <td className="px-2 py-1"><Count value={session.stats?.finding_count} /></td>
+      <td className="px-2 py-1"><ListStat value={session.stats?.finding_count} unknownTip /></td>
       <td className="px-2 py-1">
         {session.stats?.gap_count ? <span className="text-gap">{session.stats.gap_count}</span> : <Count value={session.stats?.gap_count ?? 0} />}
       </td>
@@ -240,10 +267,46 @@ function SessionRow({
             <button type="button" onClick={onRenameStart}>{t("sessions.rename")}</button>
             <button type="button" onClick={onPin}>{session.pinned ? t("sessions.unpin") : t("sessions.pin")}</button>
             <button type="button" onClick={onDelete}>{t("sessions.delete")}</button>
-            <a href={api.exportUrl(session.public_id, "jsonl")}>{t("session.export")}</a>
+            <button
+              type="button"
+              disabled={exporter.pending !== null}
+              onClick={() => void exporter.run(session.public_id, "jsonl")}
+            >
+              {t("session.export")}
+            </button>
+            {exporter.error ? <span role="alert" className="text-gap">{exporter.error}</span> : null}
+            {exporter.notice ? <span role="status" className="text-ink-soft">{exporter.notice}</span> : null}
           </span>
         )}
       </td>
     </tr>
   );
+}
+
+/**
+ * Status as text, not only a glyph: 「● 录制中」「○ 已停止」. A pinned session
+ * keeps its recording state and adds the pin.
+ */
+function StatusCell({ purged, pinned, active }: { purged: boolean; pinned: boolean; active: boolean }) {
+  const { t } = useI18n();
+  if (purged) return <span className="whitespace-nowrap text-ink-faint" title={t("sessions.purgedTip")}>◌ {t("sessions.purged")}</span>;
+  const label = active ? t("session.recording") : t("session.stopped");
+  return (
+    <span className={`whitespace-nowrap ${active ? "text-accent" : "text-ink-faint"}`} title={pinned ? `${label} · ${t("sessions.pinned")}` : label}>
+      {active ? "●" : "○"} {label}
+      {pinned ? <span aria-label={t("sessions.pinned")}> 📌</span> : null}
+    </span>
+  );
+}
+
+/**
+ * A count the list endpoint does not return. The overview has it; saying
+ * 「不可得」 here contradicted the number there, so the cell points to it.
+ */
+function ListStat({ value, unknownTip = false }: { value: number | null | undefined; unknownTip?: boolean }) {
+  const { t } = useI18n();
+  if (value === undefined || (unknownTip && value === null)) {
+    return <span className="text-ink-faint" title={t("sessions.statInOverview")}>–</span>;
+  }
+  return <Count value={value} />;
 }

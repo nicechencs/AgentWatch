@@ -42,7 +42,7 @@ pub(crate) fn run(args: AroundArgs<'_>, source: &dyn QuerySource) -> io::Result<
         return Ok(super::error_outcome(
             exit::USAGE,
             "usage",
-            "session is empty",
+            "会话不能为空",
             args.json,
         ));
     }
@@ -84,16 +84,13 @@ fn window_ns(text: &str) -> Result<i64, String> {
     let duration = match arg {
         crate::output::TimeArg::BeforeNow(duration) => duration,
         crate::output::TimeArg::FromSessionStart(_) => {
-            return Err(
-                "`--window` is a duration such as 10s, not a session-relative time".to_owned(),
-            );
+            return Err("`--window` 必须是 10s 这样的时长，不能是相对会话的时间".to_owned());
         }
         crate::output::TimeArg::Rfc3339(_) => {
-            return Err("`--window` is a duration such as 10s, not an absolute time".to_owned());
+            return Err("`--window` 必须是 10s 这样的时长，不能是绝对时间".to_owned());
         }
     };
-    let count =
-        i64::try_from(duration.count).map_err(|_| "window does not fit in i64".to_owned())?;
+    let count = i64::try_from(duration.count).map_err(|_| "窗口时长超出 i64 范围".to_owned())?;
     let unit: i64 = match duration.unit {
         crate::output::TimeUnit::Millis => 1_000_000,
         crate::output::TimeUnit::Seconds => 1_000_000_000,
@@ -103,5 +100,5 @@ fn window_ns(text: &str) -> Result<i64, String> {
     };
     count
         .checked_mul(unit)
-        .ok_or_else(|| "window overflowed nanoseconds".to_owned())
+        .ok_or_else(|| "窗口时长换算为纳秒时溢出".to_owned())
 }

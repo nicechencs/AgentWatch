@@ -30,6 +30,8 @@ use super::routes::{error_response, ApiResponse, HttpRequest};
 pub const STOP_PATH: &str = "/api/v1/daemon/stop";
 /// Logs route.
 pub const LOGS_PATH: &str = "/api/v1/daemon/logs";
+/// UI ticket route (answered by routes.rs, decorated here).
+pub const TICKET_PATH: &str = "/api/v1/auth/ui-ticket";
 
 const DEFAULT_TAIL: usize = 200;
 const MAX_TAIL: usize = 5000;
@@ -41,6 +43,9 @@ const TAIL_WINDOW: u64 = 1024 * 1024;
 #[derive(Debug, Default)]
 pub struct Control {
     stop: AtomicBool,
+    /// Port the loopback HTTP listener bound; 0 = off. Returned with a UI
+    /// ticket so `aw ui` opens the real port.
+    http_port: std::sync::atomic::AtomicU32,
     /// Active log file, when the daemon writes one.
     pub log_path: Option<PathBuf>,
     /// User id the daemon runs as, in the channel's `Caller::user_id` form.
@@ -53,6 +58,7 @@ impl Control {
     pub fn new(log_path: Option<PathBuf>) -> Arc<Self> {
         Arc::new(Self {
             stop: AtomicBool::new(false),
+            http_port: std::sync::atomic::AtomicU32::new(0),
             log_path,
             owner: own_user_id(),
         })
@@ -62,6 +68,17 @@ impl Control {
     #[must_use]
     pub fn stop_requested(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
+    }
+
+    /// Record the HTTP port actually bound (0 = listener off).
+    pub fn set_http_port(&self, port: u16) {
+        self.http_port.store(u32::from(port), Ordering::SeqCst);
+    }
+
+    /// HTTP port actually bound; 0 = off.
+    #[must_use]
+    pub fn http_port(&self) -> u16 {
+        u16::try_from(self.http_port.load(Ordering::SeqCst)).unwrap_or(0)
     }
 
     fn allowed(&self, caller: &Caller) -> bool {
@@ -113,6 +130,24 @@ pub fn handle(control: &Control, req: &HttpRequest, caller: &Caller) -> Option<A
         ("GET", LOGS_PATH) => logs(control, &req.query),
         _ => error_response(405, "method_not_allowed", "method not allowed"),
     })
+}
+
+/// Add channel facts to a normal route's reply. Today: a successful
+/// `POST /api/v1/auth/ui-ticket` gains `http_port` (the bound port, 0 = off).
+#[must_use]
+pub fn decorate(control: &Control, req: &HttpRequest, mut reply: ApiResponse) -> ApiResponse {
+    if req.method != "POST" || req.path != TICKET_PATH || reply.status != 200 {
+        return reply;
+    }
+    if let Ok(serde_json::Value::Object(mut map)) =
+        serde_json::from_slice::<serde_json::Value>(&reply.body)
+    {
+        map.insert("http_port".to_owned(), json!(control.http_port()));
+        if let Ok(body) = serde_json::to_vec(&serde_json::Value::Object(map)) {
+            reply.body = body;
+        }
+    }
+    reply
 }
 
 fn logs(control: &Control, query: &str) -> ApiResponse {
@@ -233,6 +268,20 @@ mod tests {
             owner: Some("1000".to_owned()),
             ..Control::default()
         }
+    }
+
+    #[test]
+    fn ticket_reply_gains_the_bound_http_port() {
+        let ctl = control(None);
+        ctl.set_http_port(9123);
+        let reply = super::json_reply(200, &serde_json::json!({ "ticket": "t", "ttl_s": 60 }));
+        let out = super::decorate(&ctl, &req("POST", super::TICKET_PATH, ""), reply);
+        let body: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(body["http_port"], 9123);
+        assert_eq!(body["ticket"], "t");
+        let other = super::json_reply(200, &serde_json::json!({}));
+        let out = super::decorate(&ctl, &req("GET", "/health", ""), other);
+        assert_eq!(out.body, b"{}");
     }
 
     #[test]

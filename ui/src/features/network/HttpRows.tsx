@@ -96,7 +96,7 @@ function HttpRowView({ row }: { row: HttpRow }) {
       {shown.length > 0 || hidden > 0 ? (
         <tr>
           <td colSpan={7} className="px-1 pb-1 text-ink-faint">
-            <span>{s.headers}：</span>
+            <span>{s.headers}{s.colon}</span>
             {shown.map(([name, value]) => (
               <span key={name} className="mr-2 font-mono">{name}: {value}</span>
             ))}

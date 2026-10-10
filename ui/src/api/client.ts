@@ -5,7 +5,7 @@
  * a later browser start does not inherit the token.
  */
 import { ApiError } from "./errors";
-import { send as transportSend } from "./transport";
+import { openStream, saveExportInApp, send as transportSend, sendBytes as transportSendBytes } from "./transport";
 import type {
   ApiErrorBody,
   ConfigView,
@@ -25,6 +25,7 @@ import type {
   SessionListQuery,
   SessionSummary,
   SystemProcess,
+  SystemProcessTable,
   TimelineItem,
   TrafficSeries,
 } from "./types";
@@ -130,10 +131,106 @@ export function toSession(raw: unknown): Session {
     proxy_port: numOrNull(r.proxy_port),
     platform: typeof r.platform === "string" ? r.platform : "",
     os_version: strOrNull(r.os_version),
-    collectors: arr(r.collectors).filter(isObj) as unknown as Session["collectors"],
+    collectors: arr(r.collectors).map(toCollector).filter((c): c is Session["collectors"][number] => c !== null),
     pinned: Boolean(r.pinned),
     stats: stats ? { ...(stats as object), proc_count: numOrNull(stats.proc_count ?? stats.process_count) } : null,
   } as Session;
+}
+
+/**
+ * One collector on a session. The daemon sends `{name, mode, capabilities}`;
+ * an older answer sent the stored name only, which has no capability list
+ * (the pages then say capability is unknown, not that nothing happened).
+ */
+function toCollector(raw: unknown): Session["collectors"][number] | null {
+  if (typeof raw === "string") return { name: raw, mode: null, capabilities: [] };
+  if (!isObj(raw) || typeof raw.name !== "string") return null;
+  return {
+    ...(raw as object),
+    name: raw.name,
+    mode: strOrNull(raw.mode),
+    capabilities: arr(raw.capabilities).filter(isObj) as unknown as Session["collectors"][number]["capabilities"],
+  } as Session["collectors"][number];
+}
+
+const SEARCH_KIND: Record<string, string> = { file_access: "file", process_images: "proc", http: "url" };
+
+/**
+ * Search: the daemon answers `{hits: [{src, src_id, session_id, public_id,
+ * text, ts_ns, evidence}]}`. The page reads groups per session. A field the
+ * daemon left null stays null (never invented).
+ */
+export function toSearchResult(raw: unknown): SearchResult {
+  const r = isObj(raw) ? raw : {};
+  if (Array.isArray(r.groups)) return { groups: r.groups as SearchResult["groups"], fts_enabled: Boolean(r.fts_enabled) };
+  const groups = new Map<string, SearchResult["groups"][number]>();
+  for (const hit of arr(r.hits).filter(isObj)) {
+    const sid = typeof hit.public_id === "string" ? hit.public_id : typeof hit.session_id === "string" ? hit.session_id : String(hit.session_id ?? "");
+    const src = typeof hit.src === "string" ? hit.src : "";
+    const group = groups.get(sid) ?? { session_id: sid, session_name: strOrNull(hit.session_name), count: 0, hits: [] };
+    group.count += 1;
+    group.hits.push({
+      session_id: sid,
+      session_name: group.session_name,
+      kind: SEARCH_KIND[src] ?? (typeof hit.kind === "string" ? hit.kind : src),
+      id: typeof hit.src_id === "number" ? hit.src_id : typeof hit.id === "number" ? hit.id : 0,
+      ts_ns: numOrNull(hit.ts_ns),
+      // The daemon sends the row's stored text (file path / executable path).
+      summary: strOrNull(hit.summary) ?? strOrNull(hit.text),
+      evidence: (strOrNull(hit.evidence) as SearchResult["groups"][number]["hits"][number]["evidence"]) ?? null,
+    });
+    groups.set(sid, group);
+  }
+  return { groups: [...groups.values()], fts_enabled: Boolean(r.fts_enabled) };
+}
+
+/**
+ * Doctor: the daemon may answer `probed: false` with no capability list. The
+ * page must still render its forms, so the list defaults to empty and the
+ * reason is kept for the "不可得" note.
+ */
+function toSystemProcess(raw: unknown): SystemProcess | null {
+  if (!isObj(raw) || typeof raw.pid !== "number") return null;
+  return {
+    pid: raw.pid,
+    ppid: numOrNull(raw.ppid),
+    name: typeof raw.name === "string" && raw.name ? raw.name : `pid ${raw.pid}`,
+    exe: strOrNull(raw.exe),
+    argv: Array.isArray(raw.argv) ? raw.argv.filter((a): a is string => typeof a === "string") : null,
+    user_id: strOrNull(raw.user_id),
+    agent: strOrNull(raw.agent),
+    children: arr(raw.children).map(toSystemProcess).filter((p): p is SystemProcess => p !== null),
+  };
+}
+
+/** Only an explicit `available: true` is a table; anything else is "not collected". */
+export function toSystemProcessTable(raw: unknown): SystemProcessTable {
+  const r = isObj(raw) ? raw : {};
+  const available = r.available === true;
+  return {
+    available,
+    reason: strOrNull(r.reason),
+    scope: strOrNull(r.scope),
+    roots: available ? arr(r.roots).map(toSystemProcess).filter((p): p is SystemProcess => p !== null) : [],
+  };
+}
+
+export function toDoctor(raw: unknown): DoctorReport {
+  const r = isObj(raw) ? raw : {};
+  const host = isObj(r.host) ? r.host : {};
+  const caps = arr(r.capabilities).filter(isObj) as unknown as DoctorReport["capabilities"];
+  return {
+    ...(r as object),
+    platform: typeof r.platform === "string" ? r.platform : typeof host.os === "string" ? host.os : "",
+    os_version: strOrNull(r.os_version),
+    mode: strOrNull(r.mode),
+    capabilities: caps,
+    collectors: arr(r.collectors).filter(isObj) as unknown as DoctorReport["collectors"],
+    probed: typeof r.probed === "boolean" ? r.probed : caps.length > 0,
+    reason: strOrNull(r.reason),
+    privileged: typeof host.privileged === "boolean" ? host.privileged : null,
+    privileged_note: strOrNull(host.privileged_note),
+  } as DoctorReport;
 }
 
 /** `{items}` from whichever array key the daemon used. */
@@ -154,6 +251,7 @@ export function toTimelineItem(raw: unknown): TimelineItem {
     source: strOrNull(r.source),
     proc_uid: strOrNull(r.proc_uid),
     proc: isObj(r.proc) ? (r.proc as unknown as TimelineItem["proc"]) : null,
+    pre_existing: r.pre_existing === true,
   } as TimelineItem;
 }
 
@@ -172,6 +270,13 @@ export function toSummary(raw: unknown): SessionSummary {
     top_dirs: list(r.top_dirs),
     top_domains: list(r.top_domains),
     top_commands: list(r.top_commands),
+    // Whether the daemon sent each top list at all. An absent list is "not
+    // summarised", not an empty one.
+    top_available: {
+      domains: Array.isArray(r.top_domains),
+      dirs: Array.isArray(r.top_dirs),
+      commands: Array.isArray(r.top_commands),
+    },
     direct_count: typeof r.direct_count === "number" ? r.direct_count : 0,
     gap_count: typeof r.gap_count === "number" ? r.gap_count : typeof stats.gap_count === "number" ? stats.gap_count : 0,
     finding_count: typeof r.finding_count === "number" ? r.finding_count : 0,
@@ -227,11 +332,40 @@ export function toConfigView(raw: unknown): ConfigView {
       ...(retention as object),
       max_db_bytes: numOrNull(retention.max_db_bytes) ?? (mb === null ? undefined : mb * 1024 * 1024),
     },
-    redaction: { ...(redaction as object), rules: arr(redaction.rules) },
-    collectors: arr(r.collectors),
+    // Built-in rules come next to the config (`builtin_redaction_rules`):
+    // read-only, always on. Custom rules stay in `config.redaction.rules`.
+    redaction: {
+      ...(redaction as object),
+      rules: [
+        ...arr(outer.builtin_redaction_rules)
+          .filter(isObj)
+          .map((rule) => ({ id: String(rule.id ?? ""), builtin: true, pattern: strOrNull(rule.pattern) ?? "", description: null, scope: strOrNull(rule.scope) })),
+        ...arr(redaction.rules),
+      ],
+    },
+    collectors: configCollectors(r.collectors),
     proxy: { ca_fingerprint: null, ca_created_ns: null, ...(proxy as object) },
     rules: arr(r.rules),
   } as unknown as ConfigView;
+}
+
+/**
+ * `[collectors]` in the daemon config is a table per platform
+ * (`{linux: {tls_uprobe: false, ...}}`), not a list. Each platform becomes one
+ * row whose note lists its switches, so the section is not an empty title.
+ */
+function configCollectors(raw: unknown): ConfigView["collectors"] {
+  if (Array.isArray(raw)) return raw.filter(isObj) as unknown as ConfigView["collectors"];
+  if (!isObj(raw)) return [];
+  return Object.entries(raw).map(([name, value]) => {
+    const switches = isObj(value)
+      ? Object.entries(value)
+          .filter(([, flag]) => typeof flag === "boolean")
+          .map(([key, flag]) => `${key}=${flag ? "on" : "off"}`)
+      : [];
+    const enabled = isObj(value) && Object.values(value).some((flag) => flag === true);
+    return { name, enabled, note: switches.length ? switches.join(" · ") : null };
+  });
 }
 
 /** A flow row as the page reads it. Fields the daemon does not send stay null/false. */
@@ -321,10 +455,12 @@ export function groupFlows(flows: NetFlow[], by: string): FlowGroup[] {
   return out.sort((a, b) => total(b) - total(a));
 }
 
-function toProcessNode(raw: unknown): ProcessNode {
+export function toProcessNode(raw: unknown): ProcessNode {
   const r = isObj(raw) ? raw : {};
+  const proc = isObj(r.proc) ? r.proc : {};
   return {
     ...(r as object),
+    exe_name: strOrNull(r.exe_name) ?? strOrNull(proc.exe_name),
     images: arr(r.images),
     children: arr(r.children).map(toProcessNode),
   } as ProcessNode;
@@ -343,14 +479,15 @@ export const api = {
   sessions: async (query: SessionListQuery = {}) =>
     toPage(await get<unknown>(`/sessions${qs({ ...query })}`), ["sessions"], toSession),
   session: async (sid: string) => toSession(await get<unknown>(`/sessions/${sid}`)),
-  createSession: (body: CreateSessionBody) => send<Session>("POST", "/sessions", body),
+  /** `201 {id, session_id, mode, root_pid}`; `id` is the public id the routes use. */
+  createSession: async (body: CreateSessionBody) => toSession(await send<unknown>("POST", "/sessions", body)),
   patchSession: (sid: string, body: { name?: string; pinned?: boolean }) =>
     send<Session>("PATCH", `/sessions/${sid}`, body),
   stopSession: (sid: string) => send<Session>("POST", `/sessions/${sid}/stop`),
   deleteSession: (sid: string) => send<void>("DELETE", `/sessions/${sid}`),
   summary: async (sid: string) => toSummary(await get<unknown>(`/sessions/${sid}/summary`)),
-  exportUrl: (sid: string, format: "jsonl" | "csv" | "md") =>
-    `${API}/sessions/${sid}/export?format=${format}`,
+  /** Raw bytes of an export, through the same request layer as every call. */
+  exportFile: (sid: string, format: ExportFormat) => fetchExport(sid, format),
 
   timeline: async (sid: string, query: Record<string, unknown>) =>
     toPage(await get<unknown>(`/sessions/${sid}/timeline${qs(query)}`), ["rows"], toTimelineItem),
@@ -363,8 +500,10 @@ export const api = {
     const raw = await get<{ roots?: unknown[]; processes?: unknown[] }>(`/sessions/${sid}/processes${qs({ tree: tree ? 1 : 0 })}`);
     return { roots: arr(raw.roots ?? raw.processes).map(toProcessNode) };
   },
-  processChildren: (sid: string, procUid: string) =>
-    get<{ children: ProcessNode[] }>(`/sessions/${sid}/processes/${procUid}`),
+  processChildren: async (sid: string, procUid: string) => {
+    const raw = await get<{ children?: unknown[] }>(`/sessions/${sid}/processes/${procUid}`);
+    return { children: arr(raw.children).map(toProcessNode) };
+  },
 
   files: async (sid: string, query: Record<string, unknown>) =>
     toPage<FileAccess>(await get<unknown>(`/sessions/${sid}/files${qs(query)}`), ["files", "rows"]),
@@ -384,16 +523,22 @@ export const api = {
   traffic: (sid: string, query: Record<string, unknown>) =>
     get<TrafficSeries>(`/sessions/${sid}/traffic${qs(query)}`),
 
+  /** E3 self-reports (`GET /sessions/{sid}/agent-events`). */
+  agentEvents: async (sid: string) => {
+    const raw = await get<{ events?: unknown[]; reason?: string }>(`/sessions/${sid}/agent-events?limit=500`);
+    return { events: arr(raw.events).filter(isObj), reason: strOrNull(raw.reason) };
+  },
+
   gaps: async (sid: string) => {
     const raw = await get<{ gaps?: unknown[] }>(`/sessions/${sid}/gaps`);
     return { gaps: arr(raw.gaps).map(toGap) };
   },
 
-  search: (query: Record<string, unknown>) => get<SearchResult>(`/search${qs(query)}`),
+  search: async (query: Record<string, unknown>) => toSearchResult(await get<unknown>(`/search${qs(query)}`)),
 
-  doctor: () => get<DoctorReport>("/doctor"),
-  systemProcesses: (query: { agents_only?: boolean; q?: string }) =>
-    get<{ roots: SystemProcess[] }>(`/processes${qs({ ...query })}`),
+  doctor: async () => toDoctor(await get<unknown>("/doctor")),
+  systemProcesses: async (query: { agents_only?: boolean; q?: string }) =>
+    toSystemProcessTable(await get<unknown>(`/processes${qs({ ...query })}`)),
 
   config: async () => toConfigView(await get<unknown>("/config")),
   putConfig: (body: unknown) => send<ConfigView>("PUT", "/config", body),
@@ -402,28 +547,242 @@ export const api = {
   purgePreview: (body: { older_than?: string; all?: boolean }) =>
     send<{ would_purge: { public_id: string; session_id: number }[] }>("POST", "/db/purge", { ...body, dry_run: true }),
   /** Call only after the user confirmed: the daemon refuses a purge without `confirm`. */
-  purge: (body: { older_than?: string; all?: boolean }) => send<void>("POST", "/db/purge", { ...body, confirm: true }),
+  purge: (body: { older_than?: string; all?: boolean }) =>
+    send<{ purged: { public_id: string }[] }>("POST", "/db/purge", { ...body, confirm: true }),
 };
+
+export type ExportFormat = "jsonl" | "csv" | "md";
+
+// CSV is one file per table in a zip (storage.md §export), so it is named a zip.
+const EXPORT_EXT: Record<ExportFormat, string> = { jsonl: "jsonl", csv: "csv.zip", md: "md" };
+
+export interface ExportFile {
+  name: string;
+  blob: Blob;
+}
+
+/** `filename="…"` from a content-disposition header, or null. */
+export function dispositionName(header: string | null): string | null {
+  const match = header ? /filename="?([^";]+)"?/iu.exec(header) : null;
+  return match ? match[1] : null;
+}
+
+/**
+ * `GET /sessions/{sid}/export?format=` with the token (browser) or over the
+ * internal channel (app), read as bytes so the CSV zip is not mangled as text.
+ * A daemon error is thrown as {@link ApiError}; the page shows it in place.
+ */
+/** The reader's UTC offset in minutes; the Markdown report shows local times. */
+export function readerTz(): number {
+  return -new Date().getTimezoneOffset();
+}
+
+export async function fetchExport(sid: string, format: ExportFormat): Promise<ExportFile> {
+  const headers = new Headers();
+  if (token) headers.set("authorization", `Bearer ${token}`);
+  const response = await transportSendBytes(`${API}/sessions/${encodeURIComponent(sid)}/export?format=${format}&tz=${readerTz()}`, {
+    method: "GET",
+    headers,
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    let body: ApiErrorBody | null = null;
+    try {
+      body = text ? (JSON.parse(text) as ApiErrorBody) : null;
+    } catch {
+      body = null;
+    }
+    throw new ApiError(response.status, body, response.statusText);
+  }
+  const blob = await response.blob();
+  const name = dispositionName(response.headers.get("content-disposition")) ?? `${sid}.${EXPORT_EXT[format]}`;
+  return { name, blob };
+}
+
+async function errorOf(response: Response): Promise<ApiError> {
+  const text = await response.text();
+  let body: ApiErrorBody | null = null;
+  try {
+    body = text ? (JSON.parse(text) as ApiErrorBody) : null;
+  } catch {
+    body = null;
+  }
+  return new ApiError(response.status, body, response.statusText);
+}
+
+/** How an export ended: saved by the app (path), downloaded (name), or cancelled. */
+export type ExportOutcome =
+  | { kind: "saved"; path: string }
+  | { kind: "downloaded"; name: string }
+  | { kind: "cancelled" };
+
+/**
+ * Export a session for the user. In the desktop app the shell asks where to
+ * save (native dialog) and writes the file; in a browser it is a download.
+ */
+export async function exportToFile(sid: string, format: ExportFormat): Promise<ExportOutcome> {
+  const inApp = await saveExportInApp(sid, format, readerTz());
+  if (inApp === null) {
+    const file = await fetchExport(sid, format);
+    saveFile(file);
+    return { kind: "downloaded", name: file.name };
+  }
+  if (inApp instanceof Response) throw await errorOf(inApp);
+  if (inApp.status < 200 || inApp.status >= 300) {
+    throw await errorOf(new Response(inApp.error_body ?? "", { status: inApp.status }));
+  }
+  if (inApp.cancelled || !inApp.path) return { kind: "cancelled" };
+  return { kind: "saved", path: inApp.path };
+}
+
+/** Hand a file to the user as a download without leaving the page. */
+export function saveFile(file: ExportFile): void {
+  const url = URL.createObjectURL(file.blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = file.name;
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
 
 export interface LiveHandlers {
   onRecord: (item: TimelineItem) => void;
-  onLagged: (dropped: number) => void;
-  onError: () => void;
+  /** `dropped` is null when the daemon only says that records were dropped. */
+  onLagged: (dropped: number | null) => void;
+  /** A poll failed. Polling continues; the caller shows the reason. */
+  onError: (error: unknown) => void;
+  /** A poll succeeded (clears a previous error). */
+  onOk?: () => void;
 }
 
-/** SSE subscription to /live. Returns a close function. */
-export function subscribeLive(sid: string, filter: string, handlers: LiveHandlers): () => void {
-  const params = new URLSearchParams();
-  if (filter) params.set("filter", filter);
-  if (token) params.set("access_token", token);
-  const source = new EventSource(`${API}/sessions/${sid}/live?${params.toString()}`);
-  source.addEventListener("record", (event) => {
-    handlers.onRecord(JSON.parse((event as MessageEvent).data) as TimelineItem);
-  });
-  source.addEventListener("lagged", (event) => {
-    const data = JSON.parse((event as MessageEvent).data) as { dropped?: number };
-    handlers.onLagged(data.dropped ?? 0);
-  });
-  source.onerror = () => handlers.onError();
-  return () => source.close();
+interface SseEvent {
+  id: number | null;
+  event: string;
+  data: string;
+}
+
+/** Parse a `text/event-stream` body into events. Comments are skipped. */
+export function parseSse(text: string): SseEvent[] {
+  const events: SseEvent[] = [];
+  for (const block of text.split(/\r?\n\r?\n/u)) {
+    let id: number | null = null;
+    let event = "message";
+    const data: string[] = [];
+    for (const line of block.split(/\r?\n/u)) {
+      if (line === "" || line.startsWith(":")) continue;
+      const colon = line.indexOf(":");
+      const field = colon === -1 ? line : line.slice(0, colon);
+      const value = colon === -1 ? "" : line.slice(colon + 1).replace(/^ /u, "");
+      if (field === "id") id = Number.isFinite(Number(value)) ? Number(value) : null;
+      else if (field === "event") event = value;
+      else if (field === "data") data.push(value);
+    }
+    if (data.length > 0) events.push({ id, event, data: data.join("\n") });
+  }
+  return events;
+}
+
+/**
+ * Follow `/sessions/{sid}/live` through the unified request layer.
+ *
+ * - Browser: the daemon answers each request with the records after `cursor`
+ *   and closes, so this polls through the same path as every other call (the
+ *   bearer header). `EventSource` could not send that header, got 401, and the
+ *   page unticked "跟随最新" on the first error.
+ * - Desktop app: the shell's `aw_stream_open` channel stream over the internal
+ *   channel (app/README.md); the shell polls and pushes each SSE event.
+ *
+ * Errors go to `onError` (the page shows them next to the checkbox) and
+ * following continues; `onOk` clears them. Returns a stop function.
+ */
+export function subscribeLive(sid: string, filter: string, handlers: LiveHandlers, intervalMs = 1000): () => void {
+  let closed = false;
+  let cursor = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let closeStream: (() => void) | null = null;
+  const onFrame = (event: string, data: string) => {
+    if (event === "record") {
+      try {
+        handlers.onRecord(toTimelineItem(JSON.parse(data)));
+      } catch {
+        // A record that is not JSON is skipped, not shown as an empty row.
+      }
+    } else if (event === "lagged") {
+      try {
+        const parsed = JSON.parse(data) as { dropped?: unknown };
+        handlers.onLagged(typeof parsed.dropped === "number" ? parsed.dropped : null);
+      } catch {
+        handlers.onLagged(null);
+      }
+    }
+  };
+  const tick = async () => {
+    try {
+      const headers = new Headers({ accept: "text/event-stream" });
+      if (token) headers.set("authorization", `Bearer ${token}`);
+      const response = await transportSend(
+        `${API}/sessions/${encodeURIComponent(sid)}/live${qs({ filter: filter || undefined, cursor: cursor || undefined })}`,
+        { method: "GET", headers },
+      );
+      const text = await response.text();
+      if (!response.ok) {
+        let body: ApiErrorBody | null = null;
+        try {
+          body = text ? (JSON.parse(text) as ApiErrorBody) : null;
+        } catch {
+          body = null;
+        }
+        throw new ApiError(response.status, body, response.statusText);
+      }
+      if (closed) return;
+      for (const event of parseSse(text)) {
+        if (event.id !== null && event.id > cursor) cursor = event.id;
+        onFrame(event.event, event.data);
+      }
+      handlers.onOk?.();
+    } catch (caught) {
+      if (!closed) handlers.onError(caught);
+    } finally {
+      if (!closed) timer = setTimeout(() => void tick(), intervalMs);
+    }
+  };
+  const target = `${API}/sessions/${encodeURIComponent(sid)}/live${qs({ filter: filter || undefined })}`;
+  openStream(target, (message) => {
+    if (closed) return;
+    if (message.kind === "event") {
+      onFrame(message.event, message.data);
+      handlers.onOk?.();
+    } else {
+      handlers.onError(
+        new ApiError(message.status ?? 0, { error: { code: message.code, message: message.message } }, message.message),
+      );
+    }
+  }).then(
+    (close) => {
+      if (close === null) {
+        // Not in the app: poll.
+        if (!closed) void tick();
+      } else if (closed) {
+        close();
+      } else {
+        closeStream = close;
+      }
+    },
+    (caught: unknown) => {
+      // aw_stream_open itself was refused ({code, message}).
+      if (closed) return;
+      const err = caught as { code?: string; message?: string } | null;
+      handlers.onError(
+        new ApiError(0, { error: { code: err?.code ?? "channel_broken", message: err?.message ?? String(caught) } }, ""),
+      );
+    },
+  );
+  return () => {
+    closed = true;
+    if (timer) clearTimeout(timer);
+    closeStream?.();
+  };
 }

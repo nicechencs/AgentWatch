@@ -56,6 +56,12 @@ pub use unix_macos::{launch_command, production};
 #[allow(unused_imports)]
 pub use unix_linux::LocalCgroupHost;
 
+/// Linux launch errors, so `aw run` can decide when to fall back from a
+/// cgroup scope to process-tree tracking.
+#[cfg(target_os = "linux")]
+#[allow(unused_imports)]
+pub use unix_linux::{LaunchError as LinuxLaunchError, LaunchResult as LinuxLaunchResult};
+
 /// What `aw run` asks a platform launcher to do.
 ///
 /// `command`, `cwd`, and `env` are inputs, not log fields. A launcher must not
@@ -180,13 +186,15 @@ pub struct UnsupportedUnixLauncher;
 impl UnixLauncher for UnsupportedUnixLauncher {
     fn launch(&mut self, _spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
         Err(LaunchDispatchError::NotImplemented {
-            detail: "no Unix launcher is built into this binary; process start is provided by P1-LNX-04 and P1-MAC-03".to_owned(),
+            detail: "此二进制没有内置 Unix 启动器；进程启动由 P1-LNX-04 和 P1-MAC-03 提供"
+                .to_owned(),
         })
     }
 
     fn forward_interrupt(&mut self, _pid: u32) -> Result<(), LaunchDispatchError> {
         Err(LaunchDispatchError::NotImplemented {
-            detail: "no Unix launcher is built into this binary; interrupt forwarding is provided by P1-LNX-04 and P1-MAC-03".to_owned(),
+            detail: "此二进制没有内置 Unix 启动器；中断转发由 P1-LNX-04 和 P1-MAC-03 提供"
+                .to_owned(),
         })
     }
 }

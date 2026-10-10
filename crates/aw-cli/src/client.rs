@@ -131,12 +131,16 @@ impl Transport for Box<dyn Transport> {
 pub enum ClientError {
     /// The daemon did not answer. Exit 3.
     Unreachable { detail: String },
+    /// The socket or pipe exists but this account may not open it. Exit 4.
+    Forbidden { detail: String },
     /// The exchange failed after connect. Exit 1.
     Transport { detail: String },
     /// The daemon answered with a non-success status.
     Status {
         /// HTTP status.
         status: u16,
+        /// Daemon machine error code, when the JSON error object provided one.
+        code: Option<String>,
         /// Short message taken from the JSON body, or a fallback. No token.
         message: String,
     },
@@ -147,12 +151,18 @@ impl fmt::Display for ClientError {
         match self {
             Self::Unreachable { detail } => write!(
                 f,
-                "daemon unreachable ({detail}). Start it with `aw daemon start`, or pass --no-daemon (polling collectors, all evidence S)"
+                "连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：{detail}"
             ),
-            Self::Transport { detail } => write!(f, "daemon request failed: {detail}"),
-            Self::Status { status, message } => {
-                write!(f, "daemon returned HTTP {status}: {message}")
-            }
+            Self::Forbidden { detail } => write!(
+                f,
+                "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。详情：{detail}"
+            ),
+            Self::Transport { detail } => write!(f, "向后台发请求失败：{detail}"),
+            Self::Status {
+                status,
+                code,
+                message,
+            } => crate::daemon_errors::write_status(f, *status, code.as_deref(), message),
         }
     }
 }
@@ -165,6 +175,7 @@ impl ClientError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Unreachable { .. } => exit::UNREACHABLE,
+            Self::Forbidden { .. } => exit::PERMISSION,
             Self::Transport { .. } => exit::GENERAL,
             Self::Status { status, .. } => from_http_status(*status),
         }
@@ -174,7 +185,9 @@ impl ClientError {
 /// Client bound to one endpoint and one transport.
 pub struct Client<T: Transport> {
     endpoint: Endpoint,
-    transport: T,
+    /// The transport. Public so a caller that lends one can take it back
+    /// after [`Self::call`].
+    pub transport: T,
 }
 
 impl<T: Transport> Client<T> {
@@ -209,6 +222,7 @@ impl<T: Transport> Client<T> {
         } else {
             Err(ClientError::Status {
                 status: reply.status,
+                code: status_code(&reply),
                 message: status_message(&reply),
             })
         }
@@ -217,7 +231,7 @@ impl<T: Transport> Client<T> {
 
 fn status_message(reply: &ApiReply) -> String {
     let Some(value) = reply.json() else {
-        return format!("non-JSON body, {} bytes", reply.body.len());
+        return format!("非 JSON 响应体，{} 字节", reply.body.len());
     };
     if let Some(message) = value
         .get("error")
@@ -234,6 +248,12 @@ fn status_message(reply: &ApiReply) -> String {
         return format!("{code} ({op})");
     }
     format!("HTTP {}", reply.status)
+}
+
+fn status_code(reply: &ApiReply) -> Option<String> {
+    reply
+        .json()
+        .and_then(|value| value.get("error")?.get("code")?.as_str().map(str::to_owned))
 }
 
 /// Production HTTP transport. Dials `127.0.0.1` only, writes one HTTP/1.1
@@ -299,7 +319,7 @@ fn http_exchange(
     let mut stream =
         TcpStream::connect_timeout(&addr, timeout).map_err(|_| ClientError::Unreachable {
             detail: format!(
-                "tcp connect to {} timed out or was refused (token {})",
+                "连接 {} 超时或被拒绝（token {}）",
                 base.origin(),
                 token_hint(token)
             ),
@@ -307,69 +327,65 @@ fn http_exchange(
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|err| ClientError::Transport {
-            detail: format!("set read timeout: {err}"),
+            detail: format!("设置读取超时失败：{err}"),
         })?;
     stream
         .set_write_timeout(Some(timeout))
         .map_err(|err| ClientError::Transport {
-            detail: format!("set write timeout: {err}"),
+            detail: format!("设置写入超时失败：{err}"),
         })?;
     let bytes = encode_request(base, token, request);
     roundtrip(&mut stream, &bytes)
 }
 
-#[cfg(unix)]
 fn socket_exchange(
     path: &std::path::Path,
     timeout: Duration,
     request: &ApiRequest,
 ) -> Result<ApiReply, ClientError> {
-    let mut stream =
-        std::os::unix::net::UnixStream::connect(path).map_err(|err| ClientError::Unreachable {
-            detail: format!("unix socket {}: {}", path.display(), err.kind()),
-        })?;
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-    roundtrip(&mut stream, &encode_local_request(request))
+    local_exchange(path, timeout, request)
 }
 
-#[cfg(not(unix))]
-fn socket_exchange(
-    path: &std::path::Path,
-    _timeout: Duration,
-    _request: &ApiRequest,
-) -> Result<ApiReply, ClientError> {
-    Err(ClientError::Unreachable {
-        detail: format!(
-            "unix socket {} is not available on this operating system",
-            path.display()
-        ),
-    })
-}
-
-/// A Windows named pipe opens like a file. No platform API is named here.
+/// Socket and pipe both go through aw-channel, the client the desktop app
+/// uses too: same error classes, pipe-busy retry, and timeout.
 fn pipe_exchange(path: &std::path::Path, request: &ApiRequest) -> Result<ApiReply, ClientError> {
-    let mut pipe = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|err| ClientError::Unreachable {
-            detail: format!("named pipe {}: {}", path.display(), err.kind()),
+    local_exchange(path, aw_channel::TIMEOUT, request)
+}
+
+fn local_exchange(
+    path: &std::path::Path,
+    timeout: Duration,
+    request: &ApiRequest,
+) -> Result<ApiReply, ClientError> {
+    use aw_channel::DialError;
+    // A default path expands to the documented order (system, then per-user):
+    // a stale system socket must not hide a live per-user daemon.
+    let order = aw_channel::dial_order(path, &|key| std::env::var(key).ok());
+    let (_, reply) = aw_channel::exchange_first(&order, &encode_local_request(request), timeout)
+        .map_err(|err| match err {
+            DialError::Unreachable(detail) => ClientError::Unreachable { detail },
+            DialError::Forbidden(detail) => ClientError::Forbidden { detail },
+            other => ClientError::Transport {
+                detail: other.to_string(),
+            },
         })?;
-    roundtrip(&mut pipe, &encode_local_request(request))
+    Ok(ApiReply {
+        status: reply.status,
+        body: reply.body,
+    })
 }
 
 fn roundtrip<S: Read + Write>(stream: &mut S, bytes: &[u8]) -> Result<ApiReply, ClientError> {
     stream
         .write_all(bytes)
         .map_err(|err| ClientError::Transport {
-            detail: format!("write request: {err}"),
+            detail: format!("写入请求失败：{err}"),
         })?;
     let mut buf = Vec::new();
     stream
         .read_to_end(&mut buf)
         .map_err(|err| ClientError::Transport {
-            detail: format!("read response: {err}"),
+            detail: format!("读取响应失败：{err}"),
         })?;
     parse_response(&buf).map_err(|detail| ClientError::Transport { detail })
 }
@@ -424,21 +440,21 @@ fn parse_response(bytes: &[u8]) -> Result<ApiReply, String> {
     let split = bytes
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| "HTTP response has no header terminator".to_owned())?;
-    let head = std::str::from_utf8(&bytes[..split])
-        .map_err(|_| "HTTP response headers are not UTF-8".to_owned())?;
+        .ok_or_else(|| "HTTP 响应没有头部结束符".to_owned())?;
+    let head =
+        std::str::from_utf8(&bytes[..split]).map_err(|_| "HTTP 响应头不是 UTF-8".to_owned())?;
     let body = bytes[split + 4..].to_vec();
     let status_line = head.lines().next().unwrap_or("");
     let mut parts = status_line.split_whitespace();
     let version = parts.next().unwrap_or("");
     if !version.starts_with("HTTP/") {
-        return Err(format!("not an HTTP status line: `{status_line}`"));
+        return Err(format!("不是 HTTP 状态行：`{status_line}`"));
     }
     let code = parts
         .next()
         .unwrap_or("")
         .parse::<u16>()
-        .map_err(|_| format!("HTTP status is not a number in `{status_line}`"))?;
+        .map_err(|_| format!("HTTP 状态行中的状态码不是数字：`{status_line}`"))?;
     Ok(ApiReply { status: code, body })
 }
 
@@ -501,7 +517,10 @@ impl Transport for MemoryTransport {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{encode_request, parse_response, token_hint, ApiRequest, Client, MemoryTransport};
+    use super::{
+        encode_request, parse_response, token_hint, ApiRequest, Client, ClientError,
+        MemoryTransport,
+    };
     use crate::endpoint::{resolve, EndpointInput};
     use crate::exit;
 
@@ -541,7 +560,7 @@ mod tests {
             .expect_err("401");
         assert_eq!(err.exit_code(), exit::PERMISSION);
         let text = err.to_string();
-        assert!(text.contains("401"), "{text}");
+        assert!(text.contains("没有通过后台的身份验证"), "{text}");
         assert!(text.contains("bearer token required"), "{text}");
         assert!(!text.contains("unit-test-token"), "{text}");
         assert!(!text.contains("ABCD") || text.contains("len="), "{text}");
@@ -568,13 +587,27 @@ mod tests {
         assert!(text.contains("--no-daemon"), "{text}");
     }
 
+    #[test]
+    fn unreachable_message_starts_with_the_daemon_instruction_and_keeps_detail() {
+        let detail = "x.sock: connection refused";
+        let text = ClientError::Unreachable {
+            detail: detail.to_owned(),
+        }
+        .to_string();
+        assert!(
+            text.starts_with("连不上后台，请先运行 `aw daemon start`"),
+            "{text}"
+        );
+        assert!(text.contains(detail), "{text}");
+    }
+
     /// The bug: socket endpoints were refused before any dial, so `aw` could
     /// never reach a daemon on its documented channel.
     #[cfg(unix)]
     #[test]
     fn socket_endpoint_dials_and_sends_no_bearer() {
         use std::io::{Read, Write};
-        let dir = std::env::temp_dir().join(format!("aw-cli-sock-{}", std::process::id()));
+        let dir = aw_channel::short_temp_dir("cli");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("api.sock");
         let _ = std::fs::remove_file(&path);
@@ -608,7 +641,7 @@ mod tests {
             !seen.to_ascii_lowercase().contains("authorization"),
             "{seen}"
         );
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

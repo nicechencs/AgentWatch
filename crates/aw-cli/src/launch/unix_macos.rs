@@ -157,21 +157,18 @@ pub enum LaunchError {
 impl std::fmt::Display for LaunchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyCommand => f.write_str("launch command is empty"),
-            Self::Unsupported => f.write_str(
-                "POSIX_SPAWN_START_SUSPENDED is not available; fork-and-pipe is the fallback",
-            ),
-            Self::SpawnFailed { detail } => write!(f, "posix_spawn failed: {detail}"),
-            Self::ForkFailed { detail } => write!(f, "fork-and-pipe failed: {detail}"),
-            Self::AdoptTimeout => f.write_str("adopt timed out; the child was terminated"),
-            Self::AdoptFailed { detail } => write!(f, "adopt failed: {detail}"),
-            Self::ContinueFailed { detail } => {
-                write!(f, "continuing the child failed: {detail}")
+            Self::EmptyCommand => f.write_str("启动命令为空"),
+            Self::Unsupported => {
+                f.write_str("POSIX_SPAWN_START_SUSPENDED 不可用；改用 fork-and-pipe")
             }
-            Self::NotVerified { step } => write!(
-                f,
-                "{step} is not verified in this environment; no process was created"
-            ),
+            Self::SpawnFailed { detail } => write!(f, "posix_spawn 失败：{detail}"),
+            Self::ForkFailed { detail } => write!(f, "fork-and-pipe 失败：{detail}"),
+            Self::AdoptTimeout => f.write_str("adopt 超时；子进程已结束"),
+            Self::AdoptFailed { detail } => write!(f, "adopt 失败：{detail}"),
+            Self::ContinueFailed { detail } => {
+                write!(f, "继续子进程失败：{detail}")
+            }
+            Self::NotVerified { step } => write!(f, "步骤 {step} 未在此环境验证；没有创建进程"),
         }
     }
 }
@@ -274,7 +271,7 @@ pub fn run_launch<A: SpawnApi>(
         // The enum has one variant today. This guard stays so a future variant
         // cannot silently become a root launch.
         return Err(LaunchError::SpawnFailed {
-            detail: "only the calling user may launch; root is not a path".to_owned(),
+            detail: "只能以调用用户身份启动；root 不是路径".to_owned(),
         });
     }
 
@@ -402,7 +399,7 @@ impl SpawnApi for UnverifiedSpawnApi {
 /// not E1 scope.
 #[cfg(target_os = "macos")]
 const NO_SUSPEND_NOTE: &str =
-    "suspension was not applied; no job/suspension on this build; POSIX_SPAWN_START_SUSPENDED was not set; grandchild scope is not claimed";
+    "未应用挂起；此构建没有 Job 或挂起机制，未设置 POSIX_SPAWN_START_SUSPENDED；不保证孙进程范围";
 
 /// Production [`SpawnApi`] for macOS.
 ///
@@ -456,14 +453,14 @@ impl PosixSpawnApi {
         self.child
             .as_mut()
             .ok_or_else(|| LaunchError::ContinueFailed {
-                detail: "no child exists for this step".to_owned(),
+                detail: "此步骤没有子进程".to_owned(),
             })
     }
 
     fn spawn_command(&mut self, request: &LaunchRequest) -> Result<u32, LaunchError> {
         if request.identity != LaunchIdentity::CallingUser {
             return Err(LaunchError::SpawnFailed {
-                detail: "only the calling user may launch; root is not a path".to_owned(),
+                detail: "只能以调用用户身份启动；root 不是路径".to_owned(),
             });
         }
         let Some((program, args)) = request.command.split_first() else {
@@ -483,7 +480,7 @@ impl PosixSpawnApi {
             }
             Err(err) => Err(LaunchError::SpawnFailed {
                 // `err` is an io::Error. Its Display is the OS message, not argv.
-                detail: format!("posix_spawn via Command failed: {err}; {NO_SUSPEND_NOTE}"),
+                detail: format!("通过 Command 调用 posix_spawn 失败：{err}；{NO_SUSPEND_NOTE}"),
             }),
         }
     }
@@ -509,7 +506,7 @@ impl SpawnApi for PosixSpawnApi {
         let child_pid = self.child_mut()?.id();
         if child_pid != pid {
             return Ok(AdoptWait::Failed {
-                detail: "pid does not match the spawned child".to_owned(),
+                detail: "PID 与已启动的子进程不匹配".to_owned(),
             });
         }
         // No daemon. Accepting locally lets `run_launch` wait for the exit
@@ -521,7 +518,7 @@ impl SpawnApi for PosixSpawnApi {
         let child_pid = self.child_mut()?.id();
         if child_pid != pid {
             return Err(LaunchError::ContinueFailed {
-                detail: "pid does not match the spawned child".to_owned(),
+                detail: "PID 与已启动的子进程不匹配".to_owned(),
             });
         }
         // The child was not suspended, so SIGCONT is not sent. `Ok` here means
@@ -536,11 +533,11 @@ impl SpawnApi for PosixSpawnApi {
         let child_pid = self.child_mut()?.id();
         if child_pid != pid {
             return Err(LaunchError::ContinueFailed {
-                detail: "pid does not match the spawned child".to_owned(),
+                detail: "PID 与已启动的子进程不匹配".to_owned(),
             });
         }
         Err(LaunchError::ContinueFailed {
-            detail: "no pipe was held; suspension was not applied".to_owned(),
+            detail: "没有持有管道；未挂起进程".to_owned(),
         })
     }
 
@@ -548,11 +545,11 @@ impl SpawnApi for PosixSpawnApi {
         let child = self.child_mut()?;
         if child.id() != pid {
             return Err(LaunchError::ContinueFailed {
-                detail: "pid does not match the spawned child".to_owned(),
+                detail: "PID 与已启动的子进程不匹配".to_owned(),
             });
         }
         child.kill().map_err(|err| LaunchError::ContinueFailed {
-            detail: format!("kill failed: {err}"),
+            detail: format!("结束进程失败：{err}"),
         })?;
         let _ = child.wait();
         Ok(())
@@ -562,13 +559,13 @@ impl SpawnApi for PosixSpawnApi {
         let child = self.child_mut()?;
         if child.id() != pid {
             return Err(LaunchError::ContinueFailed {
-                detail: "pid does not match the spawned child".to_owned(),
+                detail: "PID 与已启动的子进程不匹配".to_owned(),
             });
         }
         match child.wait() {
             Ok(status) => Ok(status.code().unwrap_or(-1)),
             Err(err) => Err(LaunchError::ContinueFailed {
-                detail: format!("waitpid via Child::wait failed: {err}"),
+                detail: format!("通过 Child::wait 调用 waitpid 失败：{err}"),
             }),
         }
     }

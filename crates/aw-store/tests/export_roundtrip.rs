@@ -42,8 +42,8 @@ fn seed(conn: &Connection) {
     .unwrap();
 
     conn.execute(
-        "INSERT INTO processes (session_id, proc_uid, pid, parent_uid, ppid, depth, start_ns, how, user_id, evidence, field_evidence, source, agent) \
-         VALUES (1, 8, 400, NULL, NULL, 0, 10, 'spawn', 'user-a', 'E1', '{\"pid\":\"E1\"}', 'etw', 'codex')",
+        "INSERT INTO processes (session_id, proc_uid, pid, parent_uid, ppid, depth, start_ns, exit_code, how, user_id, evidence, field_evidence, source, agent) \
+         VALUES (1, 8, 400, NULL, NULL, 0, 10, 7, 'spawn', 'user-a', 'E1', '{\"pid\":\"E1\"}', 'etw', 'codex')",
         [],
     )
     .unwrap();
@@ -358,6 +358,13 @@ fn jsonl_round_trip_matches_the_database() {
         ]
     );
 
+    // Test-bot #144: process rows carry the executable name (basename of the
+    // newest process_images.exe), so a JSONL reader sees "curl.exe", not a pid.
+    assert_eq!(str_field(&json_object(lines[1]), "exe_name"), "node.exe");
+    assert_eq!(str_field(&json_object(lines[4]), "exe_name"), "curl.exe");
+    assert_eq!(num_field(&json_object(lines[1]), "exit_code"), 7);
+    assert!(is_null(&json_object(lines[4]), "exit_code"));
+
     let net4 = json_object(lines[5]);
     assert!(is_null(&net4, "bytes_up"));
     assert!(is_null(&net4, "bytes_down"));
@@ -623,6 +630,17 @@ fn csv_zip_has_readme_and_stable_headers() {
     assert_eq!(nets.len(), 3);
     assert_eq!(dns.len(), 3);
     assert_eq!(gaps.len(), 2);
+
+    let root = processes
+        .iter()
+        .find(|row| row[1].as_deref() == Some("8"))
+        .unwrap();
+    assert_eq!(root[8].as_deref(), Some("7"));
+    let unknown_exit = processes
+        .iter()
+        .find(|row| row[1].as_deref() == Some("1"))
+        .unwrap();
+    assert!(unknown_exit[8].is_none(), "unknown exit code stays empty");
 
     let example = nets
         .iter()

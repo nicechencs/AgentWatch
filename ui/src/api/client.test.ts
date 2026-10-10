@@ -3,7 +3,8 @@
  * fetch("/api/v1…") itself keeps its own token and error handling, and a
  * transport change (desktop IPC) would silently miss it.
  */
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { setToken } from "./client";
 
 const sources = import.meta.glob<string>("/src/**/*.{ts,tsx}", { query: "?raw", import: "default", eager: true });
 
@@ -55,7 +56,8 @@ describe("config adapter", () => {
     expect(view.retention.max_age_days).toBe(30);
     expect(view.retention.max_db_bytes).toBe(2048 * 1024 * 1024);
     expect(view.redaction.rules).toEqual([]);
-    expect(view.collectors).toEqual([]);
+    // `collectors` is an object in the daemon body; the page lists it.
+    expect(view.collectors.map((c) => c.name)).toEqual(["linux"]);
     expect(view.rules).toEqual([]);
   });
 });
@@ -82,5 +84,125 @@ describe("network flow grouping", () => {
   it("groups by port and process", () => {
     expect(groupFlows(rows, "port").map((g) => g.key).sort()).toEqual(["443", "53"]);
     expect(groupFlows(rows, "proc").map((g) => g.connections).sort()).toEqual([1, 2]);
+  });
+});
+
+import { dispositionName, fetchExport, parseSse, subscribeLive } from "./client";
+
+describe("export and live go through the request layer", () => {
+  afterEach(() => {
+    delete (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    vi.restoreAllMocks();
+    setToken(null);
+  });
+
+  it("browser: export sends the bearer token and keeps zip bytes intact", async () => {
+    setToken("k-test");
+    const zip = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0xff, 0x00, 0x80]);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(zip, { status: 200, headers: { "content-disposition": 'attachment; filename="s1.zip"' } }),
+    );
+    const file = await fetchExport("s1", "csv");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe(`/api/v1/sessions/s1/export?format=csv&tz=${-new Date().getTimezoneOffset()}`);
+    expect(new Headers((init as RequestInit).headers).get("authorization")).toBe("Bearer k-test");
+    expect(file.name).toBe("s1.zip");
+    expect(new Uint8Array(await file.blob.arrayBuffer())).toEqual(zip);
+  });
+
+  it("desktop: export uses the binary-safe channel command", async () => {
+    // `body` is what a text decode would give; only `body_base64` is exact.
+    const invoke = vi
+      .fn()
+      .mockResolvedValue({ status: 200, headers: {}, body: "PK\u0003\u0004\ufffd", body_base64: btoa("PK\u0003\u0004\u00ff") });
+    (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = { invoke };
+    const file = await fetchExport("s1", "csv");
+    expect(invoke).toHaveBeenCalledWith("aw_request", expect.objectContaining({ target: `/api/v1/sessions/s1/export?format=csv&tz=${-new Date().getTimezoneOffset()}` }));
+    expect(Array.from(new Uint8Array(await file.blob.arrayBuffer()))).toEqual([0x50, 0x4b, 3, 4, 0xff]);
+    // No disposition header: the default name says it is a zip of CSVs.
+    expect(file.name).toBe("s1.csv.zip");
+  });
+
+  it("an export error is thrown, not navigated to", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response('{"error":{"code":"unauthorized","message":"bearer token required"}}', { status: 401 }),
+    );
+    await expect(fetchExport("s1", "md")).rejects.toMatchObject({ status: 401, code: "unauthorized" });
+  });
+
+  it("parses the daemon's SSE frames and filename headers", () => {
+    const frames = parseSse('retry: 1000\nid: 7\nevent: record\ndata: {"a":1}\n\n: keepalive\n\n');
+    expect(frames).toEqual([{ event: "record", data: '{"a":1}', id: 7 }]);
+    expect(dispositionName('attachment; filename="x.md"')).toBe("x.md");
+  });
+
+  it("live: polls /live with the token and advances the cursor", async () => {
+    vi.useFakeTimers();
+    setToken("k-live");
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response('id: 3\nevent: record\ndata: {"cat":"proc"}\n\n', { status: 200 }))
+      .mockResolvedValue(new Response(": keepalive\n\n", { status: 200 }));
+    const records: unknown[] = [];
+    const close = subscribeLive("s1", "", { onRecord: (r) => records.push(r), onLagged: () => {}, onError: () => {} });
+    await vi.waitFor(() => expect(records).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(1000);
+    close();
+    vi.useRealTimers();
+    expect(new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers).get("authorization")).toBe("Bearer k-live");
+    expect(String(fetchMock.mock.calls[1][0])).toContain("cursor=3");
+  });
+
+  it("desktop: live uses aw_stream_open with a channel and closes it", async () => {
+    let deliver: ((raw: unknown) => void) | null = null;
+    const invoke = vi.fn().mockImplementation((cmd: string) => Promise.resolve(cmd === "aw_stream_open" ? 9 : null));
+    (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
+      invoke,
+      transformCallback: (cb: (raw: unknown) => void) => {
+        deliver = cb;
+        return 1;
+      },
+      unregisterCallback: () => {},
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const records: unknown[] = [];
+    const errors: unknown[] = [];
+    const close = subscribeLive("s1", "", { onRecord: (r) => records.push(r), onLagged: () => {}, onError: (e) => errors.push(e) });
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledWith("aw_stream_open", expect.objectContaining({ target: "/api/v1/sessions/s1/live" })));
+    deliver!({ index: 0, message: { kind: "event", id: "4", event: "record", data: '{"cat":"net"}' } });
+    deliver!({ index: 1, message: { kind: "error", code: "daemon_unreachable", message: "x", status: null } });
+    expect(records).toHaveLength(1);
+    expect((records[0] as { cat: string }).cat).toBe("net");
+    // The page shows the channel's own code next to the checkbox.
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as { code: string }).code).toBe("daemon_unreachable");
+    close();
+    expect(invoke).toHaveBeenCalledWith("aw_stream_close", { id: 9 });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("purge: preview is a dry run and the delete carries confirm", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response('{"dry_run":true,"would_purge":[{"public_id":"a","session_id":2}]}', { status: 200 }))
+      .mockResolvedValueOnce(new Response('{"purged":[{"public_id":"a"}]}', { status: 200 }));
+    const { api } = await import("./client");
+    expect((await api.purgePreview({ older_than: "30d" })).would_purge).toHaveLength(1);
+    expect((await api.purge({ older_than: "30d" })).purged).toHaveLength(1);
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({ older_than: "30d", dry_run: true });
+    expect(JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body))).toEqual({ older_than: "30d", confirm: true });
+  });
+});
+
+describe("create session", () => {
+  it("maps the daemon's {id} to public_id so the page does not open /s/undefined", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response('{"id":"s-0123456789ab","session_id":2,"mode":"attach","root_pid":42}', { status: 201 }),
+    );
+    const { api } = await import("./client");
+    const session = await api.createSession({ mode: "attach", pid: 42 });
+    expect(session.public_id).toBe("s-0123456789ab");
+    expect(session.mode).toBe("attach");
+    vi.restoreAllMocks();
   });
 });

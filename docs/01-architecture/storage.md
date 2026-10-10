@@ -393,6 +393,10 @@ CREATE VIEW timeline AS
 ### 3.2 全文搜索（S，P2）
 对路径、argv、URL 建 FTS5 索引 `fts_text(table, id, text)`，采用 trigram tokenizer，支持子串搜索。这会增加约 30% 的体积【待验证】，默认开启，可以关闭。
 
+`process_images` 行写入时进索引：有 `argv` 用 `argv`，没有时用 `exe`（轮询采集器只存可执行文件路径，`argv`、`cwd` 为 NA）；两者都没有就不建索引行，不写空串。同一 `(session_id, proc_uid, seq)` 再次写入时忽略（`ON CONFLICT DO NOTHING`），不让整批回滚，也不重复建索引。FTS 关闭时的 `instr` 回退同样匹配 `coalesce(argv, exe)`。
+
+时间列一律是 Unix 纳秒（墙钟）。采集器内部的单调时钟只用来排序和算间隔：`gaps.from_ns/to_ns` 按缺口事件自带的（单调, 墙钟）一对换算；进程退出、以及没见到开始的进程，用事件的墙钟时间。
+
 ## 4. 写入路径
 
 - Batcher 每批执行 `BEGIN IMMEDIATE ... COMMIT`。
@@ -450,8 +454,8 @@ loop every check_interval:
 
 | 格式 | 内容 | 用途 |
 |---|---|---|
-| JSONL（默认） | 开头一行 `{"type":"header","export_version":1,"session":{...},"collectors":[...],"gaps_summary":{...}}`；之后每行一条记录 `{"type":"file_access", ...表字段}`，按时间排序 | 程序处理、归档 |
-| CSV | 每类记录一个文件，打包为 zip：`processes.csv`、`file_access.csv`、`net_flows.csv`、`dns.csv`、`http.csv`、`findings.csv`、`gaps.csv`、`watch_groups.csv`、`agent_instances.csv`、`ipc_channels.csv`、`agent_rpc.csv`、`agent_links.csv`、`README.txt`（字段说明与字节口径）。`agent_rpc.csv` 额外带上所属通道的 `session_id`（表本身没有这列） | 表格分析 |
+| JSONL（默认） | 开头一行 `{"type":"header","export_version":1,"session":{...},"collectors":[...],"gaps_summary":{...}}`；之后每行一条记录 `{"type":"file_access", ...表字段}`，按时间排序。`processes` 行另带 `exe_name`（该进程最新一条 `process_images.exe` 的文件名，读不到为 `null`）和 `exit_code`（`null` = 没采，未观测，绝不表示 `0`），读 JSONL 不必再查 `process_images` 才知道进程名 | 程序处理、归档 |
+| CSV | 每类记录一个文件，打包为 zip：`processes.csv`、`file_access.csv`、`net_flows.csv`、`dns.csv`、`http.csv`、`findings.csv`、`gaps.csv`、`watch_groups.csv`、`agent_instances.csv`、`ipc_channels.csv`、`agent_rpc.csv`、`agent_links.csv`、`README.txt`（字段说明与字节口径）。`processes.csv.exit_code` 为空 = 没采，未观测，绝不表示 `0`。`agent_rpc.csv` 额外带上所属通道的 `session_id`（表本身没有这列） | 表格分析 |
 | Markdown 报告（S，P3） | 会话概览、发现列表、敏感访问、外联域名 Top N、缺口列表 | 人工评审、附到 Issue |
 | SQLite 子集（C） | 只含单个会话的独立 .db | 跨机器打开 |
 

@@ -36,17 +36,8 @@ use std::path::PathBuf;
 #[allow(dead_code)]
 pub const DEFAULT_HTTP_PORT: u16 = 7456;
 
-/// Linux CLI socket (api-and-cli §1).
-#[allow(dead_code)]
-pub const LINUX_SOCKET: &str = "/run/agentwatch/api.sock";
-
-/// macOS CLI socket (api-and-cli §1).
-#[allow(dead_code)]
-pub const MACOS_SOCKET: &str = "/var/run/agentwatch/api.sock";
-
-/// Windows CLI named pipe (api-and-cli §1).
-#[cfg(target_os = "windows")]
-pub const WINDOWS_PIPE: &str = r"\\.\pipe\agentwatch-api";
+// Socket and pipe paths (and their order) live in aw-channel, shared with
+// the daemon and the desktop app.
 
 /// Environment variable read when `--token` is absent on an HTTP address.
 pub const TOKEN_ENV: &str = "AW_TOKEN";
@@ -65,13 +56,13 @@ pub enum EndpointError {
 impl fmt::Display for EndpointError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BadHttpUrl { detail } => write!(f, "refusing HTTP address: {detail}"),
+            Self::BadHttpUrl { detail } => write!(f, "拒绝 HTTP 地址：{detail}"),
             Self::MissingToken => write!(
                 f,
-                "HTTP transport requires a bearer token; pass --token or set {TOKEN_ENV}. An empty token is not a credential"
+                "HTTP 通道需要 Bearer token；请传入 --token 或设置 {TOKEN_ENV}。空 token 不能用于认证"
             ),
             Self::NoPlatformDefault => {
-                write!(f, "no default CLI socket or named pipe on this operating system; pass --socket or --http")
+                write!(f, "当前操作系统没有默认 CLI socket 或命名管道；请传入 --socket 或 --http")
             }
         }
     }
@@ -119,10 +110,10 @@ impl HttpBase {
 impl fmt::Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unix { path } => write!(f, "unix socket {}", path.display()),
-            Self::Pipe { path } => write!(f, "named pipe {}", path.display()),
+            Self::Unix { path } => write!(f, "Unix socket {}", path.display()),
+            Self::Pipe { path } => write!(f, "命名管道 {}", path.display()),
             Self::Http { base, token } => {
-                write!(f, "http {} (token {})", base.origin(), token_hint(token))
+                write!(f, "HTTP {}（token {}）", base.origin(), token_hint(token))
             }
         }
     }
@@ -217,27 +208,13 @@ fn platform_default() -> Option<Endpoint> {
     if let Some(path) = blank_to_none(env::var(SOCKET_ENV).ok()) {
         return Some(classify_socket_path(path));
     }
-    #[cfg(target_os = "linux")]
-    {
-        Some(Endpoint::Unix {
-            path: PathBuf::from(LINUX_SOCKET),
-        })
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Some(Endpoint::Unix {
-            path: PathBuf::from(MACOS_SOCKET),
-        })
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Some(Endpoint::Pipe {
-            path: PathBuf::from(WINDOWS_PIPE),
-        })
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        None
+    // Same order as the daemon and the desktop app: system path, then the
+    // per-user path an unprivileged daemon falls back to (aw-channel).
+    let path = aw_channel::resolve_from_env()?;
+    if cfg!(windows) {
+        Some(Endpoint::Pipe { path })
+    } else {
+        Some(Endpoint::Unix { path })
     }
 }
 
@@ -249,27 +226,26 @@ fn platform_default() -> Option<Endpoint> {
 fn parse_loopback_http(raw: &str) -> Result<HttpBase, EndpointError> {
     let Some(rest) = raw.strip_prefix("http://") else {
         return Err(EndpointError::BadHttpUrl {
-            detail: "only http://127.0.0.1:<port> or http://localhost:<port> is accepted"
-                .to_owned(),
+            detail: "只接受 http://127.0.0.1:<port> 或 http://localhost:<port>".to_owned(),
         });
     };
     if rest.contains('/') || rest.contains('?') || rest.contains('#') || rest.contains('@') {
         return Err(EndpointError::BadHttpUrl {
-            detail: "the URL must be an origin with no path, query, or userinfo".to_owned(),
+            detail: "URL 必须只含来源，不能带路径、查询参数或用户信息".to_owned(),
         });
     }
     let (host, port_text) = split_host_port(rest)?;
     if !is_loopback_host(host) {
         return Err(EndpointError::BadHttpUrl {
-            detail: "host must be 127.0.0.1 or localhost; other hosts are refused".to_owned(),
+            detail: "主机必须是 127.0.0.1 或 localhost；其他主机不接受".to_owned(),
         });
     }
     let port: u16 = port_text.parse().map_err(|_| EndpointError::BadHttpUrl {
-        detail: format!("port `{port_text}` is not a number"),
+        detail: format!("端口 `{port_text}` 不是数字"),
     })?;
     if port == 0 {
         return Err(EndpointError::BadHttpUrl {
-            detail: "port 0 is not a daemon address".to_owned(),
+            detail: "端口 0 不是后台地址".to_owned(),
         });
     }
     Ok(HttpBase {
@@ -282,8 +258,7 @@ fn split_host_port(origin: &str) -> Result<(&str, &str), EndpointError> {
     match origin.rsplit_once(':') {
         Some((host, port)) if !host.is_empty() && !port.is_empty() => Ok((host, port)),
         _ => Err(EndpointError::BadHttpUrl {
-            detail: "a non-zero port is required; there is no default HTTP port on this flag"
-                .to_owned(),
+            detail: "必须提供非零端口；此参数没有默认 HTTP 端口".to_owned(),
         }),
     }
 }

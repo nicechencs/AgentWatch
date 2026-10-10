@@ -14,6 +14,7 @@ import type { Session } from "@/api/types";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { EmptyNote, ErrorNote, Loading } from "@/components/QueryState";
 import { useI18n } from "@/lib/i18n";
+import { sessionTitle } from "@/lib/session-title";
 import { loadSide, type CompareSide } from "./api";
 
 const DIMENSIONS = ["files", "commands", "domains", "findings"] as const;
@@ -62,7 +63,7 @@ export function ComparePage({ initialA, initialB }: { initialA?: string; initial
 
       {pair.isLoading ? <Loading /> : null}
       {pair.isError ? (
-        <ErrorNote message={pair.error instanceof Error ? pair.error.message : ""} onRetry={() => void pair.refetch()} />
+        <ErrorNote error={pair.error} onRetry={() => void pair.refetch()} />
       ) : null}
 
       {pair.data ? <PairView left={pair.data[0]} right={pair.data[1]} dimension={dimension} onDimension={setDimension} /> : null}
@@ -120,7 +121,7 @@ function SessionSelect({
         <option value="">{t("compare.none")}</option>
         {items.map((session) => (
           <option key={session.public_id} value={session.public_id}>
-            {session.name ?? session.argv?.[0] ?? session.public_id}
+            {sessionTitle(session)}
           </option>
         ))}
       </select>
@@ -199,12 +200,12 @@ function SideCard({ side, label }: { side: CompareSide; label: string }) {
       </p>
       <p>{session.name ?? session.argv?.[0] ?? t("common.unavailable")}</p>
       <p className="text-ink-faint">
-        {t("compare.platform")}：{session.platform}
+        {t("compare.platform")}{t("common.colon")}{session.platform}
         {session.os_version ? ` ${session.os_version}` : ""}
         {session.agent ? ` · ${session.agent}` : ""}
       </p>
       <p className="mt-1 text-ink-faint">
-        {t("compare.collectors")}：{kinds.length > 0 ? kinds.join(", ") : t("common.unavailable")}
+        {t("compare.collectors")}{t("common.colon")}{kinds.length > 0 ? kinds.join(", ") : t("common.unavailable")}
       </p>
     </section>
   );

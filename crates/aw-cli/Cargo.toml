@@ -21,6 +21,8 @@ path = "src/lib.rs"
 
 [dependencies]
 aw-core = { workspace = true }
+# Internal channel: path order, dial, error classes (shared with the app).
+aw-channel = { workspace = true }
 aw-store = { workspace = true }
 aw-pipeline = { workspace = true }
 aw-proxy = { workspace = true }
@@ -41,6 +43,12 @@ aw-collector-windows = { workspace = true }
 clap = { version = "=4.5.31", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "derive"] }
 serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive", "std"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+
+# Unix `aw run` holds the caller-created child at a pipe gate until the daemon
+# has acknowledged `/adopt`. nix is MIT and keeps this fd work safe under the
+# binary's `#![forbid(unsafe_code)]` policy.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", default-features = false, features = ["fs"] }
 
 [dev-dependencies]
 # insta is MIT OR Apache-2.0. Same pin as aw-core. Snapshots record `aw --help`.

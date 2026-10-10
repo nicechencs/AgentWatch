@@ -9,21 +9,24 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_agentwatchd"))
 }
 
+/// Short root: daemons here bind `<root>/api.sock` (and deeper), and Unix
+/// socket paths are capped (104 bytes on macOS, whose temp dir is long).
 fn scratch(label: &str) -> io::Result<PathBuf> {
-    let nanos = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos(),
-        Err(_) => 0,
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = if cfg!(unix) {
+        PathBuf::from(format!("/tmp/aw-{}-{seq}", std::process::id()))
+    } else {
+        std::env::temp_dir().join(format!("agentwatchd-{label}-{}-{seq}", std::process::id()))
     };
-    let dir = std::env::temp_dir().join(format!(
-        "agentwatchd-{label}-{}-{nanos}",
-        std::process::id()
-    ));
+    let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -57,8 +60,25 @@ fn minimal_body() -> io::Result<String> {
     fs::read_to_string(path)
 }
 
+/// Every daemon here gets its own channel paths next to its config, never
+/// the system socket or the real per-user one.
+fn isolated(args: &[&str]) -> Command {
+    let dir = args
+        .iter()
+        .position(|a| *a == "--config")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|config| Path::new(config).parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("aw-fg-{}", std::process::id())));
+    let mut command = Command::new(bin());
+    command
+        .env("AW_SOCKET", dir.join("api.sock"))
+        .env("AW_SYSTEM_SOCKET", dir.join("system.sock"))
+        .env("XDG_RUNTIME_DIR", &dir);
+    command
+}
+
 fn spawn(args: &[&str]) -> io::Result<Child> {
-    Command::new(bin())
+    isolated(args)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -66,7 +86,7 @@ fn spawn(args: &[&str]) -> io::Result<Child> {
 }
 
 fn output(args: &[&str]) -> io::Result<std::process::Output> {
-    Command::new(bin())
+    isolated(args)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -267,5 +287,107 @@ impl WaitTimeout for Child {
             }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+}
+
+/// `GET /health` over the socket at `path`; `true` on a 200.
+#[cfg(unix)]
+fn socket_healthy(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(path) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    if stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut reply = Vec::new();
+    let _ = stream.read_to_end(&mut reply);
+    reply.starts_with(b"HTTP/1.1 200")
+}
+
+#[cfg(unix)]
+fn wait_healthy(path: &Path, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if socket_healthy(path) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[cfg(unix)]
+const NO_HTTP: &str = "\n[api]\nhttp_port = 0\n";
+
+/// A crashed daemon left its socket file: the next daemon replaces it.
+#[cfg(unix)]
+#[test]
+fn stale_socket_is_replaced_by_a_new_daemon() -> io::Result<()> {
+    let root = scratch("stale")?;
+    let config = write_config(&root, &root.join("data"), NO_HTTP)?;
+    let socket = root.join("api.sock");
+    drop(std::os::unix::net::UnixListener::bind(&socket)?);
+    let config = config.display().to_string();
+    let mut daemon = spawn(&["--foreground", "--config", &config])?;
+    let healthy = wait_healthy(&socket, Duration::from_secs(5));
+    kill(&mut daemon);
+    let _ = fs::remove_dir_all(&root);
+    if healthy {
+        Ok(())
+    } else {
+        Err(io::Error::other(
+            "daemon did not take over the stale socket",
+        ))
+    }
+}
+
+/// Two daemons (separate data dirs) on one socket path: the later one exits
+/// with failure and the first one's socket keeps answering.
+#[cfg(unix)]
+#[test]
+fn second_daemon_on_a_live_socket_exits_and_the_first_survives() -> io::Result<()> {
+    let root = scratch("sockrace")?;
+    let socket = root.join("shared").join("api.sock");
+    fs::create_dir_all(socket.parent().unwrap_or(&root))?;
+    let run = |name: &str| -> io::Result<Command> {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir)?;
+        let config = write_config(&dir, &dir.join("data"), NO_HTTP)?;
+        let mut command = isolated(&[]);
+        command
+            .env("AW_SOCKET", &socket)
+            .args(["--foreground", "--config", &config.display().to_string()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Ok(command)
+    };
+    let mut first = run("one")?.spawn()?;
+    if !wait_healthy(&socket, Duration::from_secs(5)) {
+        kill(&mut first);
+        let _ = fs::remove_dir_all(&root);
+        return Err(io::Error::other("first daemon never answered"));
+    }
+    let mut second = run("two")?.spawn()?;
+    let exited = second.wait_timeout_ms(5_000).unwrap_or_default();
+    if !exited {
+        kill(&mut second);
+    }
+    let out = second.wait_with_output()?;
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let survived = socket_healthy(&socket);
+    kill(&mut first);
+    let _ = fs::remove_dir_all(&root);
+    if exited && !out.status.success() && survived {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "exited={exited} status={:?} survived={survived} stderr={stderr}",
+            out.status
+        )))
     }
 }

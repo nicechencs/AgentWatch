@@ -28,6 +28,7 @@ mod assets;
 // module is part of the binary and clippy sees it. The session path calls
 // `file_hasher::hash_file` once a proxied read is correlated.
 mod capabilities;
+mod collector_state;
 mod collectors;
 mod config;
 mod file_hasher;
@@ -38,6 +39,7 @@ mod sample;
 mod service;
 mod session;
 mod supervisor;
+mod watch;
 
 fn main() -> ExitCode {
     // Keeps the collector crates linked. No platform collector is started here.
@@ -89,6 +91,11 @@ fn dispatch(args: impl IntoIterator<Item = String>) -> Result<ExitCode, CliError
     }
     if args[0] == "config" {
         return command_config(&args[1..]);
+    }
+    // Internal: the root daemon's account-switch helper (see `api::launch_as`).
+    #[cfg(target_os = "linux")]
+    if args[0] == api::LAUNCH_AS_HELPER_ARG {
+        return Ok(api::launch_as_helper());
     }
 
     let mut foreground = false;

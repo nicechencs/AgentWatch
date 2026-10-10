@@ -83,13 +83,13 @@ impl DoctorSource for Unprobed {
         DoctorReport {
             host: HostFacts {
                 os: std::env::consts::OS.to_owned(),
-                version: "unknown".to_owned(),
+                version: "不可得".to_owned(),
                 privileged: false,
             },
             collectors: vec![CollectorProbe {
-                name: "none".to_owned(),
-                status: "unavailable".to_owned(),
-                detail: Some("no collector was probed in this build".to_owned()),
+                name: "无".to_owned(),
+                status: "没采".to_owned(),
+                detail: Some("此构建没有探测采集器".to_owned()),
             }],
             categories: default_categories(),
         }
@@ -124,7 +124,7 @@ impl DoctorSource for HttpDoctor {
             reply
                 .json()
                 .ok_or_else(|| crate::client::ClientError::Transport {
-                    detail: "daemon returned a non-JSON body".to_owned(),
+                    detail: "后台返回的响应体不是 JSON".to_owned(),
                 })
         })();
         match fetched {
@@ -154,13 +154,13 @@ fn report_from_doctor_json(body: &Value) -> DoctorReport {
     };
     if collectors.is_empty() {
         collectors.push(CollectorProbe {
-            name: "none".to_owned(),
+            name: "无".to_owned(),
             status: if probed {
-                "ok".to_owned()
+                "可用".to_owned()
             } else {
-                "unavailable".to_owned()
+                "没采".to_owned()
             },
-            detail: reason.or_else(|| Some("daemon doctor listed no collectors".to_owned())),
+            detail: reason.or_else(|| Some("后台 doctor 没有列出采集器".to_owned())),
         });
     }
     let mut categories = default_categories();
@@ -206,7 +206,7 @@ fn report_from_doctor_json(body: &Value) -> DoctorReport {
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
                 .map(str::to_owned)
-                .unwrap_or_else(|| "unknown".to_owned()),
+                .unwrap_or_else(|| "不可得".to_owned()),
             privileged: host
                 .get("privileged")
                 .and_then(Value::as_bool)
@@ -226,7 +226,7 @@ fn collector_from_json(value: &Value) -> Option<CollectorProbe> {
         .get("status")
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
-        .unwrap_or("unavailable");
+        .unwrap_or("没采");
     let detail = value
         .get("detail")
         .and_then(Value::as_str)
@@ -296,12 +296,12 @@ pub(crate) const CATEGORIES: [&str; 7] = ["proc", "file", "net", "dns", "url", "
 fn fix_for(category: &str) -> &'static str {
     match category {
         "proc" | "file" | "net" | "dns" => {
-            "run the daemon as administrator (Windows), root (Linux/macOS), or use --no-daemon (evidence S)"
+            "请以管理员权限（Windows）或 root（Linux/macOS）运行后台，或使用 --no-daemon（证据 S）"
         }
-        "url" => "URL needs the explicit proxy (P3); without it the field is NA(tls_no_proxy)",
-        "scope" => "launch mode needs a job, cgroup, or process-tree scope; attach is evidence S before the attach point",
-        "priv" => "install and uninstall need an administrator terminal or sudo",
-        _ => "no fix is known for this category",
+        "url" => "URL 需要显式代理（P3）；否则字段为 NA(tls_no_proxy)",
+        "scope" => "启动模式需要 Job、cgroup 或进程树范围；附着点之前为证据 S",
+        "priv" => "install 和 uninstall 需要管理员终端或 sudo",
+        _ => "此类别没有已知修复方法",
     }
 }
 
@@ -407,7 +407,7 @@ pub(crate) fn run(perf: bool, json: bool, source: &mut dyn DoctorSource) -> Outc
         return super::error_outcome(
             exit::USAGE,
             "not_implemented",
-            "`aw doctor --perf` is not implemented (P2)",
+            "`aw doctor --perf` 尚未实现（P2）",
             json,
         );
     }

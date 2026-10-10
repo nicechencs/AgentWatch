@@ -8,6 +8,7 @@
 
 mod client;
 mod cmd;
+mod daemon_errors;
 mod endpoint;
 mod exit;
 mod launch;
@@ -31,13 +32,13 @@ fn main() -> ExitCode {
         Ok(outcome) => {
             let code = outcome.code;
             if let Err(err) = write_outcome(&outcome) {
-                let _ = writeln!(io::stderr(), "aw: write output: {err}");
+                let _ = writeln!(io::stderr(), "aw: 写出结果失败：{err}");
                 return ExitCode::from(1);
             }
             exit_code(code)
         }
         Err(err) => {
-            let _ = writeln!(io::stderr(), "aw: {err}");
+            let _ = writeln!(io::stderr(), "aw: 执行失败：{err}");
             ExitCode::from(1)
         }
     }

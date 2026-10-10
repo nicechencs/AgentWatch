@@ -97,6 +97,9 @@ pub struct ProcessRecord {
     pub source: String,
     /// Recognized agent id, or unknown.
     pub agent: Option<String>,
+    /// Executable name (last path segment of the newest `process_images.exe`),
+    /// or unknown. JSONL only; the CSV columns are the table's.
+    pub exe_name: Option<String>,
 }
 
 /// One `net_flows` row.
@@ -435,6 +438,8 @@ fn write_process<W: Write>(
     w.i64(row.proc_uid)?;
     w.key("pid")?;
     w.i64(row.pid)?;
+    w.key("exe_name")?;
+    w.opt_string(row.exe_name.as_deref())?;
     w.key("parent_uid")?;
     w.opt_i64(row.parent_uid)?;
     w.key("ppid")?;
@@ -899,7 +904,10 @@ AgentWatch session export (P1 CSV)\n\
 Files: processes.csv, net_flows.csv, dns.csv, gaps.csv.\n\
 process_images is not included. exe and argv are not in processes.csv.\n\
 \n\
-Time columns (*_ns) are Unix epoch nanoseconds.\n\
+Time columns (*_ns) are Unix epoch nanoseconds, UTC (machine columns).\n\
+To read one as a date-time: seconds = value / 1e9 since 1970-01-01 UTC;\n\
+in a spreadsheet, =A2/86400000000000+DATE(1970,1,1) then add your UTC offset.\n\
+The Markdown export shows the same times as local date-times and durations.\n\
 \n\
 Byte columns bytes_up, bytes_down, platform_total_up, and platform_total_down\n\
 count octets. An empty unquoted field means SQL NULL: the count was not\n\

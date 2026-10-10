@@ -31,7 +31,7 @@ pub(crate) fn write_out(
     match mode {
         OutputMode::Json => {
             let mut bytes = serde_json::to_vec_pretty(json_doc)
-                .map_err(|err| io::Error::other(format!("encode json: {err}")))?;
+                .map_err(|err| io::Error::other(format!("编码 JSON 失败：{err}")))?;
             bytes.push(b'\n');
             out.write_all(&bytes)
         }
@@ -163,7 +163,7 @@ pub(crate) fn session_table(items: &[SessionItem]) -> Table {
                     opt_text(item.name.as_deref()),
                     item.mode.clone(),
                     opt_text(item.agent.as_deref()),
-                    item.started_ns.to_string(),
+                    opt_i64(item.started_ns),
                     opt_i64(item.ended_ns),
                     super::query::yes_no(item.pinned).to_owned(),
                 ],
@@ -207,7 +207,7 @@ pub(crate) fn show_table(show: &SessionShow) -> Table {
         ),
         stat_row(
             "started_ns",
-            show.item.started_ns.to_string(),
+            opt_i64(show.item.started_ns),
             &show.item.evidence,
         ),
         stat_row("ended_ns", opt_i64(show.item.ended_ns), &show.item.evidence),
@@ -317,7 +317,7 @@ pub(crate) fn timeline_json(rows: &[TimelineItem], live_connected: bool) -> Valu
         "note": if live_connected {
             Value::Null
         } else {
-            json!("real-time /sessions/{sid}/live is not subscribed (真实订阅未接通); rows are the injected source")
+            json!("没有订阅实时 /sessions/{sid}/live（真实订阅未接通）；这些行来自注入的数据源")
         },
         "events": rows.iter().map(|row| json!({
             "ts_ns": row.ts_ns,
@@ -361,6 +361,7 @@ pub(crate) fn procs_table(nodes: &[ProcItem], tree: bool) -> Table {
             "pid".to_owned(),
             "exe".to_owned(),
             "argv".to_owned(),
+            "退出码".to_owned(),
             "redaction".to_owned(),
         ],
         rows: flatten_proc_rows(nodes, tree)
@@ -377,6 +378,8 @@ pub(crate) fn procs_table(nodes: &[ProcItem], tree: bool) -> Table {
                         node.pid.to_string(),
                         opt_text(node.exe_name.as_deref()),
                         opt_text(node.argv_redacted.as_deref()),
+                        node.exit_code
+                            .map_or_else(|| "没采".to_owned(), |code| code.to_string()),
                         ARGV_NOTE.to_owned(),
                     ],
                     evidence: node.evidence,
@@ -397,6 +400,7 @@ pub(crate) fn procs_json(nodes: &[ProcItem], tree: bool) -> Value {
             "depth": if tree { Some(depth) } else { None },
             "exe": node.exe_name,
             "argv": node.argv_redacted,
+            "exit_code": node.exit_code,
             "redaction": ARGV_NOTE,
             "evidence": evidence_json(&node.evidence),
         })).collect::<Vec<_>>(),
@@ -688,7 +692,7 @@ pub(crate) fn search_table(rows: &[SearchHit], color: bool) -> Table {
                 cells: vec![
                     row.session.clone(),
                     row.kind.clone(),
-                    row.ts_ns.to_string(),
+                    opt_i64(row.ts_ns),
                     row.reference.clone(),
                     highlight_sensitive(&row.summary, row.sensitive_rule.is_some(), color),
                 ],

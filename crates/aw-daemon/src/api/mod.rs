@@ -18,18 +18,23 @@ mod findings;
 mod http;
 mod http_events;
 mod ipc;
+mod launch_as;
 mod openapi;
 mod proxy;
 mod query;
 mod routes;
+mod system_procs;
 mod timeline_rows;
+mod watch_routes;
 
 pub(crate) use agent::OtlpRegistry;
 pub(crate) use findings::share;
 
 pub(crate) use control::Control;
 pub(crate) use http::HttpServer;
-pub(crate) use ipc::{socket_path, IpcServer};
+pub(crate) use ipc::{fallback_socket_path, should_fall_back, socket_path, IpcServer};
+#[cfg(target_os = "linux")]
+pub(crate) use launch_as::{helper_main as launch_as_helper, HELPER_ARG as LAUNCH_AS_HELPER_ARG};
 pub(crate) use query::StoreQuery;
 pub(crate) use routes::ApiState;
 

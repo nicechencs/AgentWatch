@@ -104,7 +104,7 @@ pub(crate) fn export_data(
 }
 
 /// Session ids are short tokens; anything else becomes `_` in a file name.
-fn safe_name(sid: &str) -> String {
+pub(crate) fn safe_name(sid: &str) -> String {
     sid.chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {

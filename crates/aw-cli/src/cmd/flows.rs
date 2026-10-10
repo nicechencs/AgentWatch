@@ -30,7 +30,7 @@ pub(crate) fn run(
         return Ok(super::error_outcome(
             exit::USAGE,
             "usage",
-            "session is empty",
+            "会话不能为空",
             json,
         ));
     }

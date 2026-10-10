@@ -35,7 +35,10 @@ use tracing::{Event, Level, Subscriber};
 use tracing_core::span::{Attributes, Id, Record};
 use tracing_core::Metadata;
 
-use crate::api::{socket_path, ApiState, Control, HttpServer, IpcServer, OtlpRegistry, StoreQuery};
+use crate::api::{
+    fallback_socket_path, should_fall_back, socket_path, ApiState, Control, HttpServer, IpcServer,
+    OtlpRegistry, StoreQuery,
+};
 use crate::config::{resolve_data_dir, ConfigWarning, DaemonConfig};
 use crate::paths::ensure_data_dir;
 use crate::sample::HostSampler;
@@ -106,6 +109,16 @@ pub enum RuntimeError {
         /// Underlying I/O error.
         #[source]
         source: io::Error,
+    },
+
+    /// Another daemon holds the internal channel (live socket or its start
+    /// lock). This daemon must not run beside it.
+    #[error("internal channel `{}` is in use by another agentwatchd: {detail}", path.display())]
+    ChannelInUse {
+        /// Socket or pipe path.
+        path: PathBuf,
+        /// What was found.
+        detail: String,
     },
 
     /// Logging could not be started.
@@ -554,9 +567,15 @@ pub fn run_foreground(
     // One state for both listeners: a ticket issued on the internal channel
     // (`aw ui`, the desktop app) must be redeemable on loopback HTTP.
     let shared = Arc::new(Mutex::new(foreground_api(config, &data_dir)));
+    // Sessions started from the API (`crate::watch`): one sampler per root.
+    // Close the last run's unfinished sessions before any listener opens, so
+    // a session created by the first request is never swept up as stale.
+    let mut watches = crate::watch::Watches::new(data_dir.join("agentwatch.db"));
+    watches.recover();
     // `aw daemon stop` / `logs` arrive on the internal channel (api/control.rs).
     let control = Control::new(Some(data_dir.join(LOG_FILE_NAME)));
-    let mut ipc = start_ipc(&shared, &control);
+    // HTTP first, so the port it really bound is known before the channel
+    // hands out the first UI ticket.
     let mut http = if http_port == 0 {
         tracing::info!("http listener disabled (api.http_port = 0)");
         None
@@ -564,6 +583,7 @@ pub fn run_foreground(
         match HttpServer::bind_shared(http_port, Arc::clone(&shared)) {
             Ok(server) => {
                 tracing::info!(port = server.addr.port(), "http listener started");
+                control.set_http_port(server.addr.port());
                 Some(server)
             }
             Err(err) => {
@@ -572,6 +592,7 @@ pub fn run_foreground(
             }
         }
     };
+    let mut ipc = start_ipc(&shared, &control)?;
 
     // Poll only. No ETW, eBPF, or eslogger. The sampler attaches to pid 1 so
     // the host source refreshes the process table; launch scope would not.
@@ -579,6 +600,7 @@ pub fn run_foreground(
     // not start sampling — that is logged, and the stop loop still runs.
     let mut sampler = HostSampler::new(data_dir.join("agentwatch.db"));
     sampler.start();
+    report_collectors(&shared, &sampler, &watches);
     let mut polls_until_sample: u32 = SAMPLE_EVERY_POLLS;
 
     while !stop.is_set() {
@@ -589,6 +611,8 @@ pub fn run_foreground(
         polls_until_sample = polls_until_sample.saturating_sub(1);
         if polls_until_sample == 0 {
             sampler.tick();
+            watches.tick(&shared);
+            report_collectors(&shared, &sampler, &watches);
             polls_until_sample = SAMPLE_EVERY_POLLS;
         }
         thread::sleep(POLL);
@@ -607,6 +631,7 @@ pub fn run_foreground(
     // this order: tests match them.
     sampler.flush();
     sampler.stop();
+    watches.shutdown();
 
     // Order is part of the acceptance test. Do not reorder these lines.
     tracing::info!("{}", SHUTDOWN_STOP_COLLECTORS);
@@ -620,23 +645,72 @@ pub fn run_foreground(
     Ok(())
 }
 
+/// Publish what the samplers are doing for `GET /doctor` (Settings, new
+/// session page). Read from the samplers themselves, not from the config.
+fn report_collectors(
+    shared: &Arc<Mutex<ApiState>>,
+    sampler: &HostSampler,
+    watches: &crate::watch::Watches,
+) {
+    let (watched_roots, watched_last) = watches.runtime();
+    let runtime = crate::collector_state::CollectorRuntime {
+        reported: true,
+        daemon_sample: sampler.running(),
+        watched_roots,
+        last_sample_ns: sampler.last_sample_ns().max(watched_last),
+    };
+    if let Ok(mut state) = shared.lock() {
+        state.collector_runtime = runtime;
+    }
+}
+
 /// Open the internal channel. A failure is a warning, not an exit: the daemon
 /// keeps collecting, and `aw` reports the socket as unreachable (exit 3).
-fn start_ipc(state: &Arc<Mutex<ApiState>>, control: &Arc<Control>) -> Option<IpcServer> {
+fn start_ipc(
+    state: &Arc<Mutex<ApiState>>,
+    control: &Arc<Control>,
+) -> Result<Option<IpcServer>, RuntimeError> {
     let Some(path) = socket_path() else {
         tracing::warn!("internal channel not started: no socket path on this platform");
-        return None;
+        return Ok(None);
     };
-    match IpcServer::bind(&path, Arc::clone(state), Arc::clone(control)) {
+    let err = match IpcServer::bind(&path, Arc::clone(state), Arc::clone(control)) {
         Ok(server) => {
             tracing::info!(socket = %server.path.display(), "internal channel started");
-            Some(server)
+            return Ok(Some(server));
         }
-        Err(err) => {
-            tracing::warn!(error = %err, "internal channel not started");
-            None
-        }
+        Err(err) => err,
+    };
+    if err.kind() == io::ErrorKind::AddrInUse {
+        // A live daemon answers there (or is starting): refuse to run a
+        // second one that nobody could reach.
+        return Err(RuntimeError::ChannelInUse {
+            path,
+            detail: err.to_string(),
+        });
     }
+    // An unprivileged daemon cannot create /run/agentwatch (or remove a root
+    // daemon's stale socket there): use the per-user socket, which aw and
+    // the desktop app look at second.
+    if let Some(fallback) = fallback_socket_path().filter(|_| should_fall_back(&err)) {
+        tracing::info!(system = %path.display(), error = %err, "system socket not available; using the per-user socket");
+        return match IpcServer::bind(&fallback, Arc::clone(state), Arc::clone(control)) {
+            Ok(server) => {
+                tracing::info!(socket = %server.path.display(), "internal channel started (per-user)");
+                Ok(Some(server))
+            }
+            Err(err) if err.kind() == io::ErrorKind::AddrInUse => Err(RuntimeError::ChannelInUse {
+                path: fallback,
+                detail: err.to_string(),
+            }),
+            Err(err) => {
+                tracing::warn!(socket = %fallback.display(), error = %err, "internal channel not started");
+                Ok(None)
+            }
+        };
+    }
+    tracing::warn!(socket = %path.display(), error = %err, "internal channel not started");
+    Ok(None)
 }
 
 /// API state for the foreground listener: the data-dir database, the loaded

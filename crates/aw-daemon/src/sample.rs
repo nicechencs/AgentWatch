@@ -38,8 +38,8 @@ use aw_core::{
 use aw_pipeline::gaps::{self, DEPTH_UNOBSERVED_DETAIL, STORE_FAILURE_DETAIL};
 use aw_pipeline::{GapRec, NetFlowRec, Output, Pipeline, PipelineConfig, ProcessRec};
 use aw_store::{
-    DnsRow, GapRow, NetFlowBucketRow, NetFlowRow, ProcessRow, RecordSink, SessionRow, SqliteSink,
-    Store, WriteBatch,
+    DnsRow, GapRow, NetFlowBucketRow, NetFlowRow, ProcessImageRow, ProcessRow, RecordSink,
+    SessionRow, SqliteSink, Store, WriteBatch,
 };
 
 /// Public id of the one daemon-wide sample session. Stable for the process.
@@ -78,12 +78,92 @@ struct ProcFact {
     uid: ProcUid,
 }
 
+/// Root identity captured by `/adopt` while the Unix pipe gate still holds the
+/// child before its real program can exec. It is only a sampling-level hint:
+/// executable path, argv, cwd, and OS user were not sampled and remain NA.
+#[derive(Debug, Clone)]
+pub(crate) struct RootHint {
+    /// Process id supplied to `/adopt`.
+    pub(crate) pid: u32,
+    /// Parent pid read from `/proc/<pid>/stat`.
+    pub(crate) ppid: u32,
+    /// Unix start time in seconds, matching the poll collector's identity.
+    pub(crate) start_secs: u64,
+    /// Stable process identity for this boot / pid / start time.
+    pub(crate) uid: ProcUid,
+    /// Basename of the session argv[0], not a sampled executable path.
+    pub(crate) name: String,
+}
+
+/// Which session a sampler writes and which process subtree it watches.
+///
+/// The daemon-wide sample is [`SampleTarget::daemon`]: session 1, rooted at
+/// pid 1. `POST /sessions` (attach) and `/sessions/{sid}/adopt` (run) build
+/// one per watched root ([`crate::watch`]).
+#[derive(Debug, Clone)]
+pub struct SampleTarget {
+    /// `sessions.id`.
+    pub db_id: i64,
+    /// `sessions.public_id`.
+    pub public_id: String,
+    /// `sessions.name`.
+    pub name: Option<String>,
+    /// `attach` or `launch`.
+    pub mode: &'static str,
+    /// Root of the watched subtree.
+    pub root_pid: u32,
+    /// `sessions.user_id`.
+    pub user_id: String,
+    /// `sessions.argv` as a JSON array, already redacted. `None` when not given.
+    pub argv_json: Option<String>,
+    /// `sessions.agent`.
+    pub agent: Option<String>,
+    /// Write the `sessions` row on the first batch. `false` when the route
+    /// already inserted it.
+    pub write_session_row: bool,
+    /// Identity captured at adoption. It makes a root that exits before the
+    /// first poll recordable without pretending the missing fields were seen.
+    pub root_hint: Option<RootHint>,
+}
+
+impl SampleTarget {
+    /// The daemon-wide attach sample (pid 1, session 1).
+    pub fn daemon() -> Self {
+        Self {
+            db_id: SESSION_DB_ID,
+            public_id: SESSION_PUBLIC_ID.to_owned(),
+            name: Some("daemon-wide attach sample".to_owned()),
+            mode: "attach",
+            root_pid: SAMPLE_ROOT_PID,
+            user_id: current_user_id(),
+            argv_json: None,
+            agent: None,
+            write_session_row: true,
+            root_hint: None,
+        }
+    }
+
+    /// The `sessions` row for this target.
+    pub fn session_row(&self, started_ns: i64) -> SessionRow {
+        let mut row = session_row(started_ns);
+        row.id = self.db_id;
+        row.public_id.clone_from(&self.public_id);
+        row.name.clone_from(&self.name);
+        row.mode = self.mode.to_owned();
+        row.user_id.clone_from(&self.user_id);
+        row.argv.clone_from(&self.argv_json);
+        row.agent.clone_from(&self.agent);
+        row
+    }
+}
+
 /// Host poll collector and the session it writes.
 ///
 /// `HostProcessSource` and `HostConnectionSource` are named only so this
 /// struct can hold the value [`PollCollector::with_host`] returns. The
 /// foreground loop calls [`HostSampler::tick`]; there is no sampler thread.
 pub struct HostSampler {
+    target: SampleTarget,
     collector: PollCollector<
         aw_collector_poll::HostProcessSource,
         aw_collector_poll::HostConnectionSource,
@@ -100,35 +180,69 @@ pub struct HostSampler {
     pending_store_failure: bool,
     /// Monotonic nanoseconds handed to the collector. Not a wall clock.
     mono_ns: u64,
+    /// Processes whose executable path is already in `process_images`. One
+    /// image row per process per run; the store also ignores a repeat.
+    imaged: BTreeSet<u64>,
+    /// Identity of the root at `start`, for [`Self::root_alive`].
+    root_uid: Option<ProcUid>,
+    /// Wall time of the last sample that was taken and stored.
+    last_sample_ns: Option<i64>,
 }
 
 impl HostSampler {
-    /// Build the collector. Does not read the process table.
+    /// Build the collector for the daemon-wide sample. Does not read the
+    /// process table.
     pub fn new(db_path: impl Into<std::path::PathBuf>) -> Self {
+        Self::for_target(db_path, SampleTarget::daemon())
+    }
+
+    /// Build the collector for `target`. Does not read the process table.
+    pub fn for_target(db_path: impl Into<std::path::PathBuf>, target: SampleTarget) -> Self {
         Self {
+            session_written: !target.write_session_row,
+            target,
             collector: PollCollector::with_host(PollConfig::standard()),
             db_path: db_path.into(),
-            session_written: false,
             started: false,
             seen_pids: BTreeSet::new(),
             seq: 0,
             pending_store_failure: false,
             mono_ns: 1,
+            imaged: BTreeSet::new(),
+            root_uid: None,
+            last_sample_ns: None,
         }
     }
 
-    /// Attach to pid 1 and take the baseline.
+    /// Attach to the target's root pid and take the baseline.
     ///
     /// A missing boot id or a missing start time does not start the collector.
-    /// Inventing either would attach to a process that is not pid 1.
-    pub fn start(&mut self) {
-        let Some(uid) = init_proc_uid() else {
-            tracing::warn!("poll sampler not started: pid 1 identity unavailable");
-            return;
+    /// Inventing either would attach to a different process. Returns whether
+    /// the collector started.
+    pub fn start(&mut self) -> bool {
+        // A database from an earlier run already holds the session row.
+        // Inserting it again hit the primary key and failed every batch. A
+        // session the user stopped stays stopped: sampling it again would make
+        // the UI's 「已停止」 untrue.
+        match sample_session_state(&self.db_path, self.target.db_id) {
+            SampleSessionState::Ended => {
+                tracing::info!("poll sampler not started: the session was stopped");
+                return false;
+            }
+            SampleSessionState::Active => self.session_written = true,
+            SampleSessionState::Absent => {}
+        }
+        let Some(uid) = proc_uid_of(self.target.root_pid) else {
+            tracing::warn!(
+                pid = self.target.root_pid,
+                "poll sampler not started: root process identity unavailable"
+            );
+            return false;
         };
+        self.root_uid = Some(uid);
         let Ok(scope) = Scope::attach([uid]) else {
             tracing::warn!("poll sampler not started: attach scope rejected");
-            return;
+            return false;
         };
         let mut sink = VecSink::with_capacity(SINK_CAPACITY);
         let wall_ns = wall_now_ns();
@@ -137,7 +251,7 @@ impl HostSampler {
         // every process, and returns pid 1 plus its descendants as
         // `StartHow::Snapshot` at evidence S. `ProcessStart` has no pid and
         // no `ProcUid`, so the rows are paired with `/proc` below.
-        let starts = self.collector.snapshot(SAMPLE_ROOT_PID);
+        let starts = self.collector.snapshot(self.target.root_pid);
         match self
             .collector
             .start_at(&scope, &mut sink, self.mono_ns, wall_ns)
@@ -149,6 +263,8 @@ impl HostSampler {
                 if let Err(err) = self.persist(&events, wall_ns) {
                     tracing::warn!(error = %err, "poll baseline write failed");
                     self.pending_store_failure = true;
+                } else {
+                    self.last_sample_ns = Some(wall_ns);
                 }
             }
             Err(err) => {
@@ -156,6 +272,101 @@ impl HostSampler {
                 tracing::warn!(error = %err, "poll collector start failed");
             }
         }
+        self.started
+    }
+
+    /// Persist the adopted root from the synchronous hint if it disappeared
+    /// before this sampler could start. The process row goes through the same
+    /// event-to-batch path as an ordinary snapshot, so its evidence and NA
+    /// fields remain honest.
+    pub fn persist_gone_root_hint(&mut self) -> bool {
+        // A live process with this identity failed for some other reason;
+        // do not replace a real sampler with a synthetic snapshot in that
+        // case. A reused pid is also not the adopted root.
+        if self
+            .target
+            .root_hint
+            .as_ref()
+            .is_some_and(|hint| proc_uid_of(hint.pid) == Some(hint.uid))
+        {
+            return false;
+        }
+        self.persist_root_hint()
+    }
+
+    /// Write the adopted root's row from the identity `/adopt` captured,
+    /// before the first poll: a root that exits before (or between) polls is
+    /// still one process with its exit code, never zero processes. The
+    /// sampler's own row for the same process is the same id (same pid and
+    /// start), so a later poll updates it rather than adding a second.
+    pub fn persist_root_hint(&mut self) -> bool {
+        let Some(hint) = self.target.root_hint.clone() else {
+            return false;
+        };
+        if sample_session_state(&self.db_path, self.target.db_id) == SampleSessionState::Ended {
+            return false;
+        }
+        let Some(start_ns) = hint
+            .start_secs
+            .checked_mul(1_000_000_000)
+            .and_then(|ns| i64::try_from(ns).ok())
+        else {
+            return false;
+        };
+        let wall_ns = wall_now_ns();
+        let start = ProcessStart::new(
+            hint.ppid,
+            None,
+            start_ns,
+            Some(hint.name),
+            None,
+            None,
+            None,
+            StartHow::Snapshot,
+            None,
+            None,
+        );
+        let fact = ProcFact {
+            pid: hint.pid,
+            ppid: hint.ppid,
+            start_secs: hint.start_secs,
+            uid: hint.uid,
+        };
+        let Some(event) = self.start_event(&start, &fact, wall_ns) else {
+            return false;
+        };
+        match self.persist(&[event], wall_ns) {
+            Ok(()) => {
+                self.last_sample_ns = Some(wall_ns);
+                true
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "poll root hint write failed");
+                self.pending_store_failure = true;
+                false
+            }
+        }
+    }
+
+    /// Whether the root process is still the one this sampler attached to:
+    /// same pid and same start time. A reused pid is not the same process.
+    pub fn root_alive(&self) -> bool {
+        proc_uid_of(self.target.root_pid).is_some_and(|uid| Some(uid) == self.root_uid)
+    }
+
+    /// Whether the collector is started (sampling on each tick).
+    pub fn running(&self) -> bool {
+        self.started
+    }
+
+    /// Wall time of the last stored sample, Unix nanoseconds.
+    pub fn last_sample_ns(&self) -> Option<i64> {
+        self.last_sample_ns
+    }
+
+    /// The session this sampler writes.
+    pub fn target(&self) -> &SampleTarget {
+        &self.target
     }
 
     /// Take one sample. The foreground loop decides when this is due.
@@ -182,6 +393,16 @@ impl HostSampler {
     }
 
     fn sample_now(&mut self) {
+        // `POST /sessions/daemon-sample/stop` only writes `ended_ns`. The
+        // sampler kept polling into the stopped session, so the page said
+        // 「已停止」 while the process count kept rising. Stop here instead.
+        if self.session_written
+            && sample_session_state(&self.db_path, self.target.db_id) == SampleSessionState::Ended
+        {
+            tracing::info!("poll sampler stopped: the sample session was stopped");
+            self.stop();
+            return;
+        }
         self.mono_ns = self.mono_ns.saturating_add(sample_period_ns());
         let wall_ns = wall_now_ns();
         let mut sink = VecSink::with_capacity(SINK_CAPACITY);
@@ -193,6 +414,8 @@ impl HostSampler {
         if let Err(err) = self.persist(sink.events(), wall_ns) {
             tracing::warn!(error = %err, "poll sample write failed");
             self.pending_store_failure = true;
+        } else {
+            self.last_sample_ns = Some(wall_ns);
         }
     }
 
@@ -204,7 +427,11 @@ impl HostSampler {
     /// which is what `snapshot` kept. A start that matches no `/proc` row
     /// is not given a pid of 0; it is counted in one gap.
     fn events_from_snapshot(&mut self, starts: &[ProcessStart], wall_ns: i64) -> Vec<RawEvent> {
-        let table = proc_table();
+        // Only rows inside the watched subtree may pair. Two processes with the
+        // same parent that started in the same second are otherwise
+        // indistinguishable by `(ppid, start)`, and a sibling outside the
+        // subtree would be recorded under this session.
+        let table = subtree_of(proc_table(), self.target.root_pid);
         let mut used = BTreeSet::new();
         let mut events = Vec::new();
         let mut unmatched = 0_u64;
@@ -213,7 +440,11 @@ impl HostSampler {
         // back. The row is still in `table`. It is added here, evidence S,
         // with no parent uid (not observed as a ProcUid) and ppid 0, which is
         // the ppid `/proc/1/stat` reported.
-        if let Some(init) = table.iter().find(|row| row.pid == SAMPLE_ROOT_PID) {
+        let root_is_init = self.target.root_pid == SAMPLE_ROOT_PID;
+        if let Some(init) = table
+            .iter()
+            .find(|row| root_is_init && row.pid == SAMPLE_ROOT_PID)
+        {
             if let Some(event) = self.init_event(init, wall_ns) {
                 used.insert(init.pid);
                 events.push(event);
@@ -276,7 +507,7 @@ impl HostSampler {
             seq,
             ts_mono_ns: self.mono_ns,
             ts_wall_ns: wall_ns,
-            session_id: Some(SessionId(u64::try_from(SESSION_DB_ID).unwrap_or(1))),
+            session_id: Some(SessionId(u64::try_from(self.target.db_id).unwrap_or(1))),
             proc: Some(ProcRef {
                 uid: row.uid,
                 pid: row.pid,
@@ -331,7 +562,7 @@ impl HostSampler {
             seq,
             ts_mono_ns: self.mono_ns,
             ts_wall_ns: wall_ns,
-            session_id: Some(SessionId(u64::try_from(SESSION_DB_ID).unwrap_or(1))),
+            session_id: Some(SessionId(u64::try_from(self.target.db_id).unwrap_or(1))),
             proc: None,
             source,
             evidence: Evidence::E1,
@@ -342,7 +573,7 @@ impl HostSampler {
             seq,
             ts_mono_ns: self.mono_ns,
             ts_wall_ns: wall_ns,
-            session_id: Some(SessionId(1)),
+            session_id: Some(SessionId(u64::try_from(self.target.db_id).unwrap_or(1))),
             proc: None,
             source: Source::new(PROC_SOURCE),
             evidence: Evidence::E1,
@@ -370,19 +601,38 @@ impl HostSampler {
         // remembers the process and emits no `ProcessRec` (scope.rs
         // `remember_open`). The events were still redacted and counted.
         // Rows are built from the events, not from a second reading of argv.
-        let mut batch = map_events(events, self.mono_ns);
-        let from_output = map_output(&output, self.mono_ns);
+        let clock = Clock {
+            mono_ns: self.mono_ns,
+            wall_ns,
+        };
+        let mut batch = map_events(events, wall_ns);
+        batch.process_images = image_rows(events, &self.imaged, wall_ns);
+        let from_output = map_output(&output, clock);
         batch.processes.extend(from_output.processes);
         batch.net_flows.extend(from_output.net_flows);
         batch.net_flow_buckets.extend(from_output.net_flow_buckets);
         batch.dns.extend(from_output.dns);
         batch.gaps.extend(from_output.gaps);
         if !self.session_written {
-            batch.sessions.insert(0, session_row(wall_ns));
+            batch.sessions.insert(0, self.target.session_row(wall_ns));
         }
         if self.pending_store_failure {
             batch.gaps.push(store_failure_gap(wall_ns));
             self.pending_store_failure = false;
+        }
+        // Rows mapped without a session id fall back to the daemon sample's
+        // id; this sampler's rows belong to its own session.
+        let own = self.target.db_id;
+        if own != SESSION_DB_ID {
+            for row in &mut batch.processes {
+                row.session_id = own;
+            }
+            for row in &mut batch.gaps {
+                row.session_id = Some(own);
+            }
+            for row in &mut batch.process_images {
+                row.session_id = own;
+            }
         }
         if batch_is_empty(&batch) {
             return Ok(());
@@ -393,6 +643,10 @@ impl HostSampler {
             Ok(()) => {
                 if !batch.sessions.is_empty() {
                     self.session_written = true;
+                }
+                for image in &batch.process_images {
+                    self.imaged
+                        .insert(u64::from_ne_bytes(image.proc_uid.to_ne_bytes()));
                 }
                 Ok(())
             }
@@ -408,6 +662,16 @@ impl HostSampler {
     }
 }
 
+/// Wall-clock nanoseconds of an event, for columns read as unix time
+/// (`processes.start_ns` / `exit_ns`). `ts_mono_ns` counts from the sampler's
+/// start and is only used when the wall clock was not read (before the epoch).
+fn event_wall_ns(event: &aw_core::RawEvent) -> u64 {
+    u64::try_from(event.ts_wall_ns)
+        .ok()
+        .filter(|ns| *ns > 0)
+        .unwrap_or(event.ts_mono_ns)
+}
+
 fn sample_period_ns() -> u64 {
     u64::try_from(SAMPLE_EVERY.as_nanos()).unwrap_or(250_000_000)
 }
@@ -420,8 +684,85 @@ fn wall_now_ns() -> i64 {
     }
 }
 
+/// Whether the sample session row exists and whether it was stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SampleSessionState {
+    /// No database or no row yet.
+    Absent,
+    /// Row present, `ended_ns` NULL.
+    Active,
+    /// Row present with `ended_ns` set (the user pressed stop).
+    Ended,
+}
+
+/// Read-only look at the sample session row. A database that cannot be read
+/// is `Absent`; the next write reports its own failure.
+fn sample_session_state(db_path: &std::path::Path, db_id: i64) -> SampleSessionState {
+    if !db_path.is_file() {
+        return SampleSessionState::Absent;
+    }
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return SampleSessionState::Absent;
+    };
+    let row: Result<Option<i64>, rusqlite::Error> = conn.query_row(
+        "SELECT ended_ns FROM sessions WHERE id = ?1",
+        rusqlite::params![db_id],
+        |row| row.get(0),
+    );
+    match row {
+        Ok(Some(_)) => SampleSessionState::Ended,
+        Ok(None) => SampleSessionState::Active,
+        Err(_) => SampleSessionState::Absent,
+    }
+}
+
+/// One `process_images` row per started process whose executable path was
+/// read. The process page and timeline take the name from this table; without
+/// it every process showed as 「?」. Only the path is stored: argv and cwd come
+/// from raw events that did not pass the redactor, so they stay NULL (NA).
+fn image_rows(events: &[RawEvent], imaged: &BTreeSet<u64>, wall_ns: i64) -> Vec<ProcessImageRow> {
+    let mut seen = BTreeSet::new();
+    let mut rows = Vec::new();
+    for event in events {
+        let EventKind::ProcessStart(start) = &event.kind else {
+            continue;
+        };
+        let (Some(proc), Some(exe)) = (event.proc.as_ref(), start.exe.as_ref()) else {
+            continue;
+        };
+        if imaged.contains(&proc.uid.0) || !seen.insert(proc.uid.0) {
+            continue;
+        }
+        let session_id = event
+            .session_id
+            .and_then(|SessionId(id)| i64::try_from(id).ok())
+            .unwrap_or(SESSION_DB_ID);
+        rows.push(ProcessImageRow {
+            id: None,
+            session_id,
+            proc_uid: uid_bits(proc.uid),
+            seq: 0,
+            ts_ns: wall_ns,
+            exe: Some(exe.clone()),
+            argv: None,
+            cwd: None,
+            env: None,
+            evidence: gaps::evidence_code(&event.evidence).to_owned(),
+            field_evidence: Some(
+                r#"{"argv":{"level":"NA","reason":"collector_unavailable"},"cwd":{"level":"NA","reason":"collector_unavailable"}}"#
+                    .to_owned(),
+            ),
+            source: event.source.as_str().to_owned(),
+        });
+    }
+    rows
+}
+
 fn batch_is_empty(batch: &WriteBatch) -> bool {
     batch.sessions.is_empty()
+        && batch.process_images.is_empty()
         && batch.processes.is_empty()
         && batch.net_flows.is_empty()
         && batch.net_flow_buckets.is_empty()
@@ -487,6 +828,26 @@ fn proc_table() -> Vec<ProcFact> {
     }
 }
 
+/// `table` rows that are `root` or descend from it.
+fn subtree_of(table: Vec<ProcFact>, root: u32) -> Vec<ProcFact> {
+    let mut keep: BTreeSet<u32> = BTreeSet::from([root]);
+    loop {
+        let before = keep.len();
+        for row in &table {
+            if keep.contains(&row.ppid) {
+                keep.insert(row.pid);
+            }
+        }
+        if keep.len() == before {
+            break;
+        }
+    }
+    table
+        .into_iter()
+        .filter(|row| keep.contains(&row.pid))
+        .collect()
+}
+
 /// Pair `start` with the unused `/proc` row that has the same parent and start.
 fn find_proc<'a>(
     table: &'a [ProcFact],
@@ -507,10 +868,30 @@ fn read_ppid(pid: u32) -> Option<u32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
-fn init_proc_uid() -> Option<ProcUid> {
+#[cfg(not(target_os = "linux"))]
+fn read_ppid(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// [`ProcUid`] of `pid`, hashed the way the poll collector hashes a row.
+/// `None` when the process is gone or its identity cannot be read.
+pub(crate) fn proc_uid_of(pid: u32) -> Option<ProcUid> {
     let boot = read_boot_id()?;
-    let start_secs = read_pid_start_secs(1)?;
-    ProcessIdentity::from_parts(&boot, 1, start_secs, StartTimeUnit::Seconds).map(|id| id.uid)
+    let start_secs = read_pid_start_secs(pid)?;
+    ProcessIdentity::from_parts(&boot, pid, start_secs, StartTimeUnit::Seconds).map(|id| id.uid)
+}
+
+/// Capture the adopted root while the caller still holds it behind the pipe
+/// gate. `None` means one required `/proc` fact was unavailable; callers keep
+/// the adoption valid, but cannot later claim a root snapshot they lack.
+pub(crate) fn root_hint(pid: u32, name: String) -> Option<RootHint> {
+    Some(RootHint {
+        pid,
+        ppid: read_ppid(pid)?,
+        start_secs: read_pid_start_secs(pid)?,
+        uid: proc_uid_of(pid)?,
+        name,
+    })
 }
 
 fn read_boot_id() -> Option<Vec<u8>> {
@@ -638,7 +1019,7 @@ fn unix_uid_string() -> String {
 /// Depth is the parent walk. A start whose parent uid is set but not in this
 /// batch is skipped and counted, not stored at depth 0. Evidence stays the
 /// event's evidence.
-fn map_events(events: &[aw_core::RawEvent], now_ns: u64) -> WriteBatch {
+fn map_events(events: &[aw_core::RawEvent], now_ns: i64) -> WriteBatch {
     let mut drafts: Vec<ProcessRec> = Vec::new();
     let mut gaps = Vec::new();
     let mut skipped_pid = 0_u64;
@@ -659,7 +1040,8 @@ fn map_events(events: &[aw_core::RawEvent], now_ns: u64) -> WriteBatch {
                     // produce: a start that reached here had a ppid.
                     ppid: Some(start.ppid),
                     depth: None,
-                    start_ns: u64::try_from(start.start_time_ns).unwrap_or(event.ts_mono_ns),
+                    start_ns: u64::try_from(start.start_time_ns)
+                        .unwrap_or_else(|_| event_wall_ns(event)),
                     exit_ns: None,
                     exit_code: None,
                     exit_signal: None,
@@ -678,7 +1060,7 @@ fn map_events(events: &[aw_core::RawEvent], now_ns: u64) -> WriteBatch {
                     continue;
                 };
                 if let Some(existing) = drafts.iter_mut().find(|row| row.proc_uid == proc.uid) {
-                    existing.exit_ns = Some(event.ts_mono_ns);
+                    existing.exit_ns = Some(event_wall_ns(event));
                     existing.exit_code = exit.exit_code;
                     existing.exit_signal = exit.signal;
                 } else {
@@ -689,8 +1071,11 @@ fn map_events(events: &[aw_core::RawEvent], now_ns: u64) -> WriteBatch {
                         parent_uid: None,
                         ppid: None,
                         depth: None,
-                        start_ns: event.ts_mono_ns,
-                        exit_ns: Some(event.ts_mono_ns),
+                        // Start unknown: the exit instant is the only time
+                        // there is. It must be wall time; the monotonic tick
+                        // was stored here and showed as 1970-01-01.
+                        start_ns: event_wall_ns(event),
+                        exit_ns: Some(event_wall_ns(event)),
                         exit_code: exit.exit_code,
                         exit_signal: exit.signal,
                         how: StartHow::Unknown,
@@ -770,7 +1155,8 @@ fn walk_pid(parent: &BTreeMap<u32, Option<u32>>, pid: u32) -> Option<i64> {
     }
 }
 
-fn map_output(output: &Output, now_ns: u64) -> WriteBatch {
+fn map_output(output: &Output, clock: Clock) -> WriteBatch {
+    let now_ns = clock.wall_ns;
     let mut batch = WriteBatch::default();
     let depths = depths_of(&output.processes);
     let mut skipped = 0_u64;
@@ -803,7 +1189,7 @@ fn map_output(output: &Output, now_ns: u64) -> WriteBatch {
         }
     }
     for gap in &output.gaps {
-        batch.gaps.push(gap_row(gap));
+        batch.gaps.push(gap_row(gap, clock));
     }
     batch
 }
@@ -1000,7 +1386,35 @@ fn dns_row(dns: &aw_pipeline::DnsRec) -> Option<DnsRow> {
     })
 }
 
-fn gap_row(gap: &GapRec) -> GapRow {
+/// The sampler's two clocks read at the same instant. Collectors stamp gaps
+/// with the monotonic tick; the `gaps` table is read as unix time.
+#[derive(Debug, Clone, Copy)]
+struct Clock {
+    mono_ns: u64,
+    wall_ns: i64,
+}
+
+impl Clock {
+    /// Wall time of an earlier (or equal) monotonic tick. Stored as-is, the
+    /// tick read as a few seconds after 1970-01-01 on the gaps page.
+    fn wall_of(self, mono_ns: u64) -> i64 {
+        let back = i64::try_from(self.mono_ns.saturating_sub(mono_ns)).unwrap_or(i64::MAX);
+        let ahead = i64::try_from(mono_ns.saturating_sub(self.mono_ns)).unwrap_or(i64::MAX);
+        self.wall_ns.saturating_sub(back).saturating_add(ahead)
+    }
+}
+
+fn gap_row(gap: &GapRec, clock: Clock) -> GapRow {
+    // Anchor on the gap event's own pair of clocks when it carries a wall
+    // time; otherwise on the sampler's reading for this batch.
+    let clock = if gap.ts_wall_ns > 0 {
+        Clock {
+            mono_ns: gap.ts_mono_ns,
+            wall_ns: gap.ts_wall_ns,
+        }
+    } else {
+        clock
+    };
     GapRow {
         id: None,
         session_id: gap
@@ -1010,8 +1424,8 @@ fn gap_row(gap: &GapRec) -> GapRow {
         collector: gap.collector.as_str().to_owned(),
         kind: gaps::gap_kind_name(gap.gap_kind).to_owned(),
         affects: json_string_array(&gap.affects),
-        from_ns: i64::try_from(gap.from_mono_ns).unwrap_or(i64::MAX),
-        to_ns: i64::try_from(gap.to_mono_ns).unwrap_or(i64::MAX),
+        from_ns: clock.wall_of(gap.from_mono_ns),
+        to_ns: clock.wall_of(gap.to_mono_ns),
         count: gap.count.and_then(|n| i64::try_from(n).ok()),
         detail: gap.detail.clone(),
     }
@@ -1031,8 +1445,8 @@ fn store_failure_gap(now_ns: i64) -> GapRow {
     }
 }
 
-fn depth_gap(now_ns: u64, count: u64) -> GapRow {
-    let ns = i64::try_from(now_ns).unwrap_or(i64::MAX);
+fn depth_gap(now_ns: i64, count: u64) -> GapRow {
+    let ns = now_ns;
     GapRow {
         id: None,
         session_id: Some(SESSION_DB_ID),
@@ -1150,6 +1564,74 @@ mod depth_tests {
         .expect("event")
     }
 
+    /// Gap rows were stored with the collector's monotonic tick, which the
+    /// gaps page read as unix time (a few seconds after 1970-01-01).
+    #[test]
+    fn gap_rows_are_stored_at_wall_time() {
+        let wall = 1_700_000_000_000_000_000_i64;
+        let gap = aw_pipeline::GapRec {
+            seq: 1,
+            ts_mono_ns: 10_000_000_000,
+            ts_wall_ns: wall,
+            session_id: Some(aw_core::SessionId(1)),
+            proc: None,
+            evidence: Evidence::S,
+            field_evidence: std::collections::BTreeMap::new(),
+            source: Source::new("poll/sysinfo"),
+            collector: Source::new("poll/sysinfo"),
+            gap_kind: aw_core::GapKind::Unknown,
+            affects: vec!["process".to_owned()],
+            from_mono_ns: 8_000_000_000,
+            to_mono_ns: 10_000_000_000,
+            count: None,
+            detail: None,
+        };
+        let clock = super::Clock {
+            mono_ns: 12_000_000_000,
+            wall_ns: wall + 2_000_000_000,
+        };
+        let row = super::gap_row(&gap, clock);
+        assert_eq!(row.from_ns, wall - 2_000_000_000);
+        assert_eq!(row.to_ns, wall);
+        // A gap event without a wall time falls back to the batch's clocks.
+        let unstamped = aw_pipeline::GapRec {
+            ts_wall_ns: 0,
+            ..gap
+        };
+        let row = super::gap_row(&unstamped, clock);
+        assert_eq!(row.from_ns, wall - 2_000_000_000);
+        assert_eq!(row.to_ns, wall);
+        assert_eq!(clock.wall_of(13_000_000_000), wall + 3_000_000_000);
+    }
+
+    /// UI review of #143: an exit whose start was never seen was stored with
+    /// the monotonic tick as `start_ns` / `exit_ns`, so the timeline showed
+    /// it at 1970-01-01 08:00.
+    #[test]
+    fn exit_without_a_seen_start_is_stored_at_wall_time() {
+        let (dir, db) = temp_db("exit-wall");
+        let mut sampler = super::HostSampler::new(&db);
+        let exit = proc_event(
+            5,
+            77,
+            aw_core::EventKind::ProcessExit(aw_core::ProcessExit::new(None, None)),
+        );
+        sampler.persist(&[exit], 1).expect("batch");
+        let store = aw_store::Store::open(&db).expect("open");
+        let (start_ns, exit_ns): (i64, Option<i64>) = store
+            .connection()
+            .query_row(
+                "SELECT start_ns, exit_ns FROM processes WHERE pid = 77",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row 77");
+        assert_eq!(start_ns, 1_700_000_000_000_000_000);
+        assert_eq!(exit_ns, Some(1_700_000_000_000_000_000));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// BUGS B4: a baseline process's exit arrived in a later tick as a second
     /// `processes` row with the same key. The insert hit the primary key, the
     /// whole batch rolled back, and the log only said `store_failure`.
@@ -1205,7 +1687,9 @@ mod depth_tests {
                 row.get(0)
             })
             .expect("row 42");
-        assert_eq!(exit_ns, Some(2_000));
+        // Wall time, not the sampler's monotonic tick (UI review: exits and
+        // start-unknown processes showed as 01/01 08:00, i.e. 1970).
+        assert_eq!(exit_ns, Some(1_700_000_000_000_000_000));
         let count: i64 = store
             .connection()
             .query_row("SELECT COUNT(*) FROM processes", [], |row| row.get(0))
@@ -1242,5 +1726,138 @@ mod depth_tests {
         assert_eq!(depths.get(&20).copied(), Some(1));
         assert!(!depths.contains_key(&7));
         assert!(!depths.contains_key(&8));
+    }
+
+    fn temp_db(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("aw-sample-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = dir.join("agentwatch.db");
+        (dir, db)
+    }
+
+    fn start_with_exe(exe: Option<&str>) -> aw_core::EventKind {
+        aw_core::EventKind::ProcessStart(aw_core::ProcessStart::new(
+            1,
+            None,
+            1_700_000_000_000_000_000,
+            exe.map(str::to_owned),
+            None,
+            None,
+            None,
+            StartHow::Snapshot,
+            None,
+            None,
+        ))
+    }
+
+    /// UI review P1-6: every process showed as 「?」 because the sampler wrote
+    /// `processes` rows and never a `process_images` row, which is where the
+    /// process page and the timeline read the executable name from.
+    #[test]
+    fn sampler_stores_the_executable_name_once_per_process() {
+        let (dir, db) = temp_db("images");
+        let mut sampler = super::HostSampler::new(&db);
+        let first = proc_event(1, 42, start_with_exe(Some("/usr/bin/bash")));
+        let nameless = proc_event(2, 43, start_with_exe(None));
+        sampler
+            .persist(&[first.clone(), nameless], 1)
+            .expect("batch");
+        // Same process again in a later batch, and again after a restart on
+        // the same database: neither may duplicate nor fail the batch.
+        sampler
+            .persist(std::slice::from_ref(&first), 2)
+            .expect("repeat");
+        let mut restarted = super::HostSampler::new(&db);
+        restarted.session_written = true;
+        restarted.persist(&[first], 3).expect("restart repeat");
+
+        let store = aw_store::Store::open(&db).expect("open");
+        let rows: Vec<(i64, Option<String>, Option<String>)> = {
+            let mut stmt = store
+                .connection()
+                .prepare("SELECT seq, exe, argv FROM process_images ORDER BY id")
+                .expect("prepare");
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("rows")
+        };
+        assert_eq!(rows, vec![(0, Some("/usr/bin/bash".to_owned()), None)]);
+        let tree = aw_store::process_tree(store.connection(), &super::current_user_id(), 1)
+            .expect("tree")
+            .expect("visible");
+        let names: Vec<Option<String>> = flatten(&tree).into_iter().map(|n| n.exe_name).collect();
+        assert!(names.contains(&Some("bash".to_owned())), "{names:?}");
+        // UI review #6: the name must also be searchable across sessions,
+        // with the FTS index and with the instr fallback.
+        let fts_on = aw_store::read_fts_mode(store.connection())
+            .expect("fts mode")
+            .enabled();
+        for fts in [fts_on, false] {
+            let hits = aw_store::search(
+                store.connection(),
+                &super::current_user_id(),
+                "bash",
+                fts,
+                None,
+                None,
+            )
+            .expect("search");
+            assert_eq!(hits.len(), 1, "fts={fts}: {hits:?}");
+            assert_eq!(hits[0].src, "process_images");
+            // The hit says what it is and when, not just a row id.
+            assert_eq!(hits[0].text.as_deref(), Some("/usr/bin/bash"));
+            assert!(hits[0].ts_ns.is_some_and(|ns| ns > 0), "{hits:?}");
+            assert_eq!(hits[0].evidence.as_deref(), Some("S"));
+        }
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn flatten(nodes: &[aw_store::ProcessNode]) -> Vec<aw_store::ProcessNode> {
+        let mut out = Vec::new();
+        for node in nodes {
+            out.push(node.clone());
+            out.extend(flatten(&node.children));
+        }
+        out
+    }
+
+    /// UI review P1-7: stop wrote `ended_ns` but the sampler kept polling into
+    /// the session, so the page said 「已停止」 while the counts kept rising.
+    #[test]
+    fn a_stopped_sample_session_is_not_sampled_again() {
+        let (dir, db) = temp_db("stop");
+        let mut sampler = super::HostSampler::new(&db);
+        let first = proc_event(1, 42, start_with_exe(Some("/usr/bin/bash")));
+        sampler.persist(&[first], 1).expect("baseline");
+        assert_eq!(
+            super::sample_session_state(&db, 1),
+            super::SampleSessionState::Active
+        );
+        {
+            let store = aw_store::Store::open(&db).expect("open");
+            aw_store::stop_session(store.connection(), &super::current_user_id(), 1, 5)
+                .expect("stop")
+                .expect("visible");
+        }
+        assert_eq!(
+            super::sample_session_state(&db, 1),
+            super::SampleSessionState::Ended
+        );
+        // Pretend the collector is running: the next sample must stop it
+        // before polling, and a later tick does nothing.
+        sampler.started = true;
+        sampler.sample_now();
+        assert!(!sampler.started, "sampler must stop once the session ended");
+        sampler.tick();
+        assert!(!sampler.started);
+
+        // A daemon restarted on this database leaves the session stopped.
+        let mut restarted = super::HostSampler::new(&db);
+        restarted.start();
+        assert!(!restarted.started);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

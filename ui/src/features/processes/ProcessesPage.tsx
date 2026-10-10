@@ -6,10 +6,13 @@ import type { ProcessNode } from "@/api/types";
 import { Bytes } from "@/components/Bytes";
 import { Count } from "@/components/Count";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
+import { NotCollected } from "@/components/NotCollected";
 import { EmptyNote, ErrorNote, Loading } from "@/components/QueryState";
+import { coverage, type Coverage } from "@/lib/capabilities";
 import { copyText, joinCommand } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
 import { useSessionQuery } from "@/lib/session-query";
+import { sessionQueryOptions } from "@/lib/live-session";
 
 interface MenuState {
   x: number;
@@ -21,17 +24,25 @@ export function ProcessesPage() {
   const { t } = useI18n();
   const { sid } = useParams({ strict: false }) as { sid: string };
   const tree = useQuery({ queryKey: ["processes", sid], queryFn: () => api.processes(sid) });
+  const session = useQuery(sessionQueryOptions(sid));
+  const files = coverage(session.data, "file");
+  const net = coverage(session.data, "net");
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [extra, setExtra] = useState<Record<string, ProcessNode[]>>({});
   const [menu, setMenu] = useState<MenuState | null>(null);
+  const [nameFilter, setNameFilter] = useState("");
   const client = useQueryClient();
 
   if (tree.isLoading) return <Loading />;
   if (tree.isError || !tree.data) {
-    return <ErrorNote message={tree.error instanceof Error ? tree.error.message : ""} onRetry={() => void tree.refetch()} />;
+    return <ErrorNote error={tree.error} onRetry={() => void tree.refetch()} />;
   }
 
-  const rows = visible(tree.data.roots, collapsed, extra);
+  // While filtering, search the whole loaded tree: a match under a folded
+  // parent must still show up.
+  const rows = nameFilter.trim()
+    ? filterByName(visible(tree.data.roots, new Set(), extra), nameFilter)
+    : visible(tree.data.roots, collapsed, extra);
   const toggle = (node: ProcessNode) => {
     setCollapsed((current) => {
       const next = new Set(current);
@@ -49,7 +60,17 @@ export function ProcessesPage() {
 
   return (
     <div className="h-full overflow-auto" onClick={() => setMenu(null)}>
-      {rows.length === 0 ? <EmptyNote>{t("procs.empty")}</EmptyNote> : null}
+      <div className="flex items-center gap-2 border-b border-line px-3 py-1.5 text-[11px]">
+        <input
+          value={nameFilter}
+          onChange={(event) => setNameFilter(event.target.value)}
+          placeholder={t("procs.filterName")}
+          aria-label={t("procs.filterName")}
+          className="w-56 rounded border border-line bg-paper px-2 py-0.5"
+        />
+        {nameFilter ? <span className="text-ink-faint">{t("procs.filterCount", { count: rows.length })}</span> : null}
+      </div>
+      {rows.length === 0 ? <EmptyNote>{nameFilter ? t("procs.filterEmpty") : t("procs.empty")}</EmptyNote> : null}
       <table className="w-full border-collapse text-xs">
         <thead className="sticky top-0 bg-paper">
           <tr className="border-b border-line text-left text-ink-faint">
@@ -65,6 +86,8 @@ export function ProcessesPage() {
               key={node.proc_uid}
               node={node}
               folded={folded}
+              files={files}
+              net={net}
               onToggle={() => toggle(node)}
               onLoad={() => void loadChildren(node)}
               onMenu={(event) => {
@@ -81,17 +104,20 @@ export function ProcessesPage() {
 }
 
 function ProcessRow({
-  node, folded, onToggle, onLoad, onMenu,
+  node, folded, files: fileCoverage, net: netCoverage, onToggle, onLoad, onMenu,
 }: {
   node: ProcessNode;
   folded: boolean;
+  files: Coverage;
+  net: Coverage;
   onToggle: () => void;
   onLoad: () => void;
   onMenu: (event: React.MouseEvent) => void;
 }) {
   const { t } = useI18n();
   const image = node.images[node.images.length - 1];
-  const chain = node.images.map((item) => item.exe?.split(/[/\\]/u).pop() ?? "?").join(" → ");
+  const name = processName(node);
+  const chain = node.images.map((item) => item.exe?.split(/[/\\]/u).pop() ?? t("procs.nameNa")).join(" → ");
   const hasChildren = node.children.length > 0 || node.truncated;
   const files = folded ? node.subtree_files : node.files;
   const writes = folded ? node.subtree_writes : node.writes;
@@ -110,7 +136,11 @@ function ProcessRow({
           ) : (
             <span className="w-4" />
           )}
-          <span className="font-mono">{image?.exe?.split(/[/\\]/u).pop() ?? "?"}</span>
+          {name ? (
+            <span className="font-mono">{name}</span>
+          ) : (
+            <span className="text-ink-faint" title={t("procs.nameNaTip")}>{t("procs.nameNa")}</span>
+          )}
           <span className="text-ink-faint">({node.pid})</span>
           {node.images.length > 1 ? <span className="text-ink-soft">{chain}</span> : null}
           <span className="truncate text-ink-faint" title={joinCommand(image?.argv)}>{joinCommand(image?.argv)}</span>
@@ -123,9 +153,15 @@ function ProcessRow({
           ) : null}
         </div>
       </td>
-      <td className="px-2 py-1" title={folded ? t("procs.subtree") : t("procs.own")}><Count value={files} /></td>
-      <td className="px-2 py-1"><Count value={writes} /> / <Count value={deletes} /></td>
-      <td className="px-2 py-1"><Bytes value={up} /> / <Bytes value={down} /></td>
+      <td className="px-2 py-1" title={folded ? t("procs.subtree") : t("procs.own")}>
+        {fileCoverage === "not_collected" ? <NotCollected kind="file" /> : <Count value={files} />}
+      </td>
+      <td className="px-2 py-1">
+        {fileCoverage === "not_collected" ? <NotCollected kind="file" /> : <><Count value={writes} /> / <Count value={deletes} /></>}
+      </td>
+      <td className="px-2 py-1">
+        {netCoverage === "not_collected" ? <NotCollected kind="net" /> : <><Bytes value={up} /> / <Bytes value={down} /></>}
+      </td>
     </tr>
   );
 }
@@ -168,6 +204,23 @@ function ContextMenu({ state, sid, onClose }: { state: MenuState; sid: string; o
       ))}
     </ul>
   );
+}
+
+/**
+ * Executable base name: the daemon's `exe_name`, else the latest image path.
+ * `null` when neither was recorded (shown as 「名称不可得」, never 「?」).
+ */
+export function processName(node: ProcessNode): string | null {
+  if (node.exe_name) return node.exe_name;
+  const image = node.images[node.images.length - 1];
+  return image?.exe?.split(/[/\\]/u).pop() ?? null;
+}
+
+/** Rows whose name or pid contains `text` (case-insensitive). Empty text keeps every row. */
+export function filterByName(rows: VisibleRow[], text: string): VisibleRow[] {
+  const needle = text.trim().toLowerCase();
+  if (!needle) return rows;
+  return rows.filter(({ node }) => (processName(node) ?? "").toLowerCase().includes(needle) || String(node.pid) === needle);
 }
 
 interface VisibleRow {

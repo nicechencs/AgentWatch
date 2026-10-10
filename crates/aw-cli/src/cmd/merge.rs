@@ -37,7 +37,7 @@ pub(crate) fn run(args: MergeArgs<'_>) -> Outcome {
         return super::error_outcome(
             exit::USAGE,
             "usage",
-            "`aw merge` needs -o <merged.db>",
+            "`aw merge` 需要 -o <merged.db>",
             args.json,
         );
     };
@@ -45,7 +45,7 @@ pub(crate) fn run(args: MergeArgs<'_>) -> Outcome {
         return super::error_outcome(
             exit::USAGE,
             "usage",
-            "merge reads local files only and refuses a URL",
+            "merge 只读取本地文件，拒绝 URL",
             args.json,
         );
     }
@@ -54,7 +54,7 @@ pub(crate) fn run(args: MergeArgs<'_>) -> Outcome {
             return super::error_outcome(
                 exit::USAGE,
                 "usage",
-                "merge reads local files only and refuses a URL",
+                "merge 只读取本地文件，拒绝 URL",
                 args.json,
             );
         }

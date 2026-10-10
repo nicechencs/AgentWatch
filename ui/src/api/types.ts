@@ -148,6 +148,8 @@ export interface SessionSummary {
   top_dirs: TopEntry[];
   top_domains: TopEntry[];
   top_commands: TopEntry[];
+  /** False for a top list the daemon did not send. Optional for older test fixtures. */
+  top_available?: { domains: boolean; dirs: boolean; commands: boolean };
   direct_count: number;
   gap_count: number;
   finding_count: number;
@@ -184,6 +186,8 @@ export interface TimelineItem {
   /** Collapse group produced by the "merge" density mode. */
   collapsed?: { count: number; dir: string } | null;
   gap?: Gap | null;
+  /** `proc` rows: running before the session began (daemon decides; attach baselines only). */
+  pre_existing?: boolean;
 }
 
 export interface HistogramBucket {
@@ -215,6 +219,8 @@ export interface ProcessNode {
   source: string;
   agent: string | null;
   images: ProcessImage[];
+  /** Base name of the latest image's executable, as the daemon sends it. */
+  exe_name?: string | null;
   children: ProcessNode[];
   /** Own counters; subtree counters cover descendants. */
   files: number;
@@ -333,7 +339,22 @@ export interface DoctorReport {
   os_version: string | null;
   mode: string | null;
   capabilities: DoctorCapability[];
-  collectors: { name: string; status: string; note: string | null }[];
+  /** Runtime state from the service, not the config: `running` / `stopped` / `not_built` / `unknown`. */
+  collectors: {
+    name: string;
+    status: string;
+    note?: string | null;
+    running?: boolean | null;
+    daemon_sample?: boolean;
+    watched_roots?: number;
+    last_sample_ns?: number | null;
+    capabilities?: { kind: string; evidence: string | null; na_reason?: string | null }[];
+  }[];
+  /** False when the daemon did not probe collectors (capabilities is then empty). */
+  probed: boolean;
+  reason: string | null;
+  privileged: boolean | null;
+  privileged_note: string | null;
 }
 
 export interface SystemProcess {
@@ -341,18 +362,33 @@ export interface SystemProcess {
   ppid: number | null;
   name: string;
   exe: string | null;
+  /** Redacted by the service before it is sent. Null when unreadable. */
+  argv: string[] | null;
+  /** Owner uid or SID. Null when the service could not read it. */
+  user_id: string | null;
   agent: string | null;
   children: SystemProcess[];
+}
+
+/** `GET /processes`. `available: false` is "not collected", not an empty table. */
+export interface SystemProcessTable {
+  available: boolean;
+  reason: string | null;
+  /** "all" for an administrator, "own" for everyone else. */
+  scope: string | null;
+  roots: SystemProcess[];
 }
 
 export interface SearchHit {
   session_id: string;
   session_name: string | null;
+  /** UI category: `file`, `proc`, `url`, or the source table when unknown. */
   kind: string;
   id: number;
-  ts_ns: number;
-  summary: string;
-  evidence: EvidenceLevel;
+  /** The daemon's search answer names the row only; time, text and evidence stay null. */
+  ts_ns: number | null;
+  summary: string | null;
+  evidence: EvidenceLevel | null;
 }
 
 export interface SearchGroup {
@@ -372,6 +408,8 @@ export interface RedactionRule {
   builtin: boolean;
   pattern: string;
   description: string | null;
+  /** Built-in rules: `text`, `argv`, `env`, `url` or `header`. */
+  scope?: string | null;
 }
 
 export interface ConfigView {
@@ -389,6 +427,9 @@ export interface ConfigView {
 }
 
 export interface DbStats {
+  /** False when the daemon did not report sizes; the numbers are then absent. */
+  available?: boolean;
+  reason?: string | null;
   db_bytes: number;
   wal_bytes: number;
   max_db_bytes: number;

@@ -1232,7 +1232,8 @@ pub fn search_sql() -> &'static str {
      LIMIT ?"
 }
 
-/// Same search without FTS: `instr` on `file_access.path` and `process_images.argv`.
+/// Same search without FTS: `instr` on `file_access.path` and `process_images.argv`
+/// (the executable path when argv is unknown).
 ///
 /// Three bound parameters before the limit: `user_id`, needle, `user_id`, needle.
 pub fn search_sql_instr() -> &'static str {
@@ -1244,7 +1245,7 @@ pub fn search_sql_instr() -> &'static str {
      SELECT 'process_images', process_images.id, sessions.id, sessions.public_id \
      FROM process_images \
      JOIN sessions ON sessions.id = process_images.session_id \
-     WHERE sessions.user_id = ? AND process_images.argv IS NOT NULL \
-       AND instr(lower(process_images.argv), ?) > 0 \
+     WHERE sessions.user_id = ? \
+       AND instr(lower(coalesce(process_images.argv, process_images.exe, '')), ?) > 0 \
      LIMIT ?"
 }

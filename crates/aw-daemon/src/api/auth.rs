@@ -88,10 +88,13 @@ pub enum TicketError {
     UnknownOrUsed,
     /// `now` is at or after `issued_at + UI_TICKET_TTL`.
     Expired,
+    /// The OS random source failed. No ticket or token was issued: an empty or
+    /// predictable secret is never handed out.
+    RandomUnavailable,
 }
 
 /// A one-time ticket. The secret is the map key, not a field we display.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UiTicket {
     /// User the ticket is bound to.
     pub user_id: String,
@@ -119,10 +122,14 @@ const SECRET_BYTES: usize = 32;
 
 /// `prefix` + 64 hex chars from the OS CSPRNG.
 ///
-/// If the OS refuses randomness the secret is empty, and callers refuse to
-/// store it: an empty or predictable secret is never handed out.
-fn random_secret(prefix: &str) -> Option<String> {
+/// `None` when the OS refuses randomness; callers turn that into an error and
+/// never hand out an empty or predictable secret.
+pub(crate) fn random_secret(prefix: &str) -> Option<String> {
     let mut bytes = [0_u8; SECRET_BYTES];
+    #[cfg(test)]
+    if FAIL_RANDOM.with(std::cell::Cell::get) {
+        return None;
+    }
     getrandom::fill(&mut bytes).ok()?;
     let mut out = String::with_capacity(prefix.len() + SECRET_BYTES * 2);
     out.push_str(prefix);
@@ -130,6 +137,12 @@ fn random_secret(prefix: &str) -> Option<String> {
         out.push_str(&format!("{byte:02x}"));
     }
     Some(out)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: make [`random_secret`] behave as if the OS source failed.
+    pub(crate) static FAIL_RANDOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl TicketStore {
@@ -145,9 +158,16 @@ impl TicketStore {
     /// id. Callers must not log it. Expired tickets are dropped first, so an
     /// unredeemed ticket does not stay in memory forever.
     ///
-    /// If the OS CSPRNG fails, the returned secret is empty and nothing is
-    /// stored; redeeming an empty ticket is refused.
-    pub fn issue_ui_ticket(&mut self, user_id: &str, admin: bool, now: u64) -> (UiTicket, String) {
+    /// # Errors
+    ///
+    /// [`TicketError::RandomUnavailable`] when the OS CSPRNG fails; nothing is
+    /// stored and no secret is returned.
+    pub fn issue_ui_ticket(
+        &mut self,
+        user_id: &str,
+        admin: bool,
+        now: u64,
+    ) -> Result<(UiTicket, String), TicketError> {
         self.prune(now);
         let ticket = UiTicket {
             user_id: user_id.to_owned(),
@@ -155,10 +175,10 @@ impl TicketStore {
             issued_at: now,
         };
         let Some(secret) = random_secret("t-") else {
-            return (ticket, String::new());
+            return Err(TicketError::RandomUnavailable);
         };
         self.tickets.insert(secret.clone(), ticket.clone());
-        (ticket, secret)
+        Ok((ticket, secret))
     }
 
     /// Drop tickets and tokens whose lifetime ended at or before `now`.
@@ -181,7 +201,8 @@ impl TicketStore {
     ///
     /// # Errors
     ///
-    /// [`TicketError::UnknownOrUsed`] or [`TicketError::Expired`].
+    /// [`TicketError::UnknownOrUsed`], [`TicketError::Expired`], or
+    /// [`TicketError::RandomUnavailable`] (the ticket is consumed, no token).
     pub fn redeem(&mut self, ticket: &str, now: u64) -> Result<String, TicketError> {
         let Some(issued) = self.tickets.get(ticket) else {
             return Err(TicketError::UnknownOrUsed);
@@ -195,7 +216,7 @@ impl TicketStore {
             None => return Err(TicketError::UnknownOrUsed),
         };
         let Some(token) = random_secret("k-") else {
-            return Err(TicketError::UnknownOrUsed);
+            return Err(TicketError::RandomUnavailable);
         };
         let expires_at = now.saturating_add(UI_TOKEN_TTL);
         self.tokens
@@ -321,7 +342,7 @@ pub fn bearer_token(authorization: Option<&str>) -> Option<&str> {
 mod tests {
     use super::{
         authorize, bearer_token, visible_sessions, AuthDecision, AuthInput, Caller, SessionView,
-        TicketError, TicketStore, UI_TICKET_TTL,
+        TicketError, TicketStore, FAIL_RANDOM, UI_TICKET_TTL,
     };
 
     fn http_input(host: Option<&str>, caller: Option<Caller>, operation: &str) -> AuthInput {
@@ -356,8 +377,12 @@ mod tests {
     #[test]
     fn secrets_are_random_and_not_counter_shaped() {
         let mut store = TicketStore::new();
-        let (_a, first) = store.issue_ui_ticket("alice", false, 1_000);
-        let (_b, second) = store.issue_ui_ticket("alice", false, 1_000);
+        let (_a, first) = store
+            .issue_ui_ticket("alice", false, 1_000)
+            .unwrap_or_default();
+        let (_b, second) = store
+            .issue_ui_ticket("alice", false, 1_000)
+            .unwrap_or_default();
         assert_ne!(first, second);
         for secret in [&first, &second] {
             assert_eq!(secret.len(), 2 + 64, "t- plus 256 bits in hex");
@@ -372,9 +397,13 @@ mod tests {
     #[test]
     fn expired_tickets_are_pruned_on_issue() {
         let mut store = TicketStore::new();
-        let _ = store.issue_ui_ticket("alice", false, 1_000);
+        let _ = store
+            .issue_ui_ticket("alice", false, 1_000)
+            .unwrap_or_default();
         assert_eq!(store.ticket_count(), 1);
-        let _ = store.issue_ui_ticket("alice", false, 1_000 + UI_TICKET_TTL);
+        let _ = store
+            .issue_ui_ticket("alice", false, 1_000 + UI_TICKET_TTL)
+            .unwrap_or_default();
         assert_eq!(store.ticket_count(), 1);
     }
 
@@ -382,13 +411,17 @@ mod tests {
     fn ticket_second_use_and_late_use_fail() {
         let mut store = TicketStore::new();
         let now = 1_000_u64;
-        let (_ticket, secret) = store.issue_ui_ticket("alice", false, now);
+        let (_ticket, secret) = store
+            .issue_ui_ticket("alice", false, now)
+            .unwrap_or_default();
         let first = store.redeem(&secret, now);
         assert!(first.is_ok());
         let second = store.redeem(&secret, now);
         assert_eq!(second, Err(TicketError::UnknownOrUsed));
 
-        let (_again, secret_late) = store.issue_ui_ticket("alice", false, now);
+        let (_again, secret_late) = store
+            .issue_ui_ticket("alice", false, now)
+            .unwrap_or_default();
         let late = store.redeem(&secret_late, now + UI_TICKET_TTL + 1);
         assert_eq!(late, Err(TicketError::Expired));
     }
@@ -397,7 +430,9 @@ mod tests {
     fn token_expires_after_twelve_hours() {
         let mut store = TicketStore::new();
         let now = 50_u64;
-        let (_ticket, secret) = store.issue_ui_ticket("alice", false, now);
+        let (_ticket, secret) = store
+            .issue_ui_ticket("alice", false, now)
+            .unwrap_or_default();
         let token = store.redeem(&secret, now);
         assert!(token.is_ok());
         let token = match token {
@@ -481,5 +516,20 @@ mod tests {
         assert_eq!(bearer_token(Some("Basic abc")), None);
         assert_eq!(bearer_token(Some("Bearer ")), None);
         assert_eq!(bearer_token(Some("Bearer secret")), Some("secret"));
+    }
+
+    #[test]
+    fn a_failed_random_source_issues_no_ticket_and_no_token() {
+        let mut store = TicketStore::new();
+        let (_ticket, secret) = store
+            .issue_ui_ticket("alice", false, 1_000)
+            .unwrap_or_default();
+        FAIL_RANDOM.with(|fail| fail.set(true));
+        let ticket = store.issue_ui_ticket("alice", false, 1_000);
+        let token = store.redeem(&secret, 1_000);
+        FAIL_RANDOM.with(|fail| fail.set(false));
+        assert_eq!(ticket.err(), Some(TicketError::RandomUnavailable));
+        assert_eq!(token, Err(TicketError::RandomUnavailable));
+        assert_eq!(store.ticket_count(), 0, "nothing stored under an empty key");
     }
 }

@@ -12,10 +12,12 @@
 //! `ts_ns,id`, not an `after` bound, and this client reads one HTTP response then
 //! closes the socket, so it cannot consume `GET /sessions/{sid}/live` (SSE).
 
+use std::cell::RefCell;
+
 use aw_core::{Evidence, NaReason};
 use serde_json::Value;
 
-use crate::client::{ApiRequest, Client, ClientError, LoopbackHttp};
+use crate::client::{ApiRequest, Client, ClientError, LoopbackHttp, Transport};
 use crate::endpoint::Endpoint;
 
 use super::query::{
@@ -25,29 +27,79 @@ use super::query::{
     SessionShow, TimelineBounds, TimelineItem, TimelinePage,
 };
 
-/// One resolved daemon endpoint. The token lives inside [`Endpoint`] and is not logged.
-pub(crate) struct HttpQuerySource {
-    endpoint: Endpoint,
+/// Lends a [`Transport`] to [`Client`], which takes one by value.
+struct Passthrough<'a, T>(&'a mut T);
+
+impl<T: Transport> Transport for Passthrough<'_, T> {
+    fn exchange(&mut self, request: &ApiRequest) -> Result<crate::client::ApiReply, ClientError> {
+        self.0.exchange(request)
+    }
 }
 
-impl HttpQuerySource {
+/// One resolved daemon endpoint. The token lives inside [`Endpoint`] and is not logged.
+pub(crate) struct HttpQuerySource<T: Transport = LoopbackHttp> {
+    endpoint: Endpoint,
+    /// `None` dials per call. Tests pass a scripted transport. Interior
+    /// mutability because [`QuerySource`] hands out `&self`.
+    transport: Option<RefCell<T>>,
+}
+
+impl HttpQuerySource<LoopbackHttp> {
     /// Bind to `endpoint`. Does not connect.
     #[must_use]
     pub(crate) fn new(endpoint: Endpoint) -> Self {
-        Self { endpoint }
+        Self {
+            endpoint,
+            transport: None,
+        }
+    }
+}
+
+impl<T: Transport> HttpQuerySource<T> {
+    /// Bind to `endpoint` and answer every call with `transport`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_transport(endpoint: Endpoint, transport: T) -> Self {
+        Self {
+            endpoint,
+            transport: Some(RefCell::new(transport)),
+        }
     }
 
     fn call(&self, request: &ApiRequest) -> Result<Value, QueryError> {
-        let transport = LoopbackHttp::new(&self.endpoint).map_err(client_to_query)?;
-        let mut client = Client::new(self.endpoint.clone(), transport);
-        let reply = client.call(request).map_err(client_to_query)?;
+        self.call_session(request, None)
+    }
+
+    /// `session` is what the user typed. A 404 names it, instead of the
+    /// daemon's English message.
+    fn call_session(
+        &self,
+        request: &ApiRequest,
+        session: Option<&str>,
+    ) -> Result<Value, QueryError> {
+        let reply = match self.transport.as_ref() {
+            Some(transport) => {
+                let mut transport = transport.borrow_mut();
+                let mut client = Client::new(self.endpoint.clone(), Passthrough(&mut *transport));
+                client
+                    .call(request)
+                    .map_err(|err| client_to_query_for(&err, session))?
+            }
+            None => {
+                let transport = LoopbackHttp::new(&self.endpoint).map_err(client_to_query)?;
+                let mut client = Client::new(self.endpoint.clone(), transport);
+                client
+                    .call(request)
+                    .map_err(|err| client_to_query_for(&err, session))?
+            }
+        };
         reply.json().ok_or_else(|| QueryError::Unavailable {
-            detail: "daemon returned a non-JSON body".to_owned(),
+            detail: "后台返回的响应体不是 JSON".to_owned(),
         })
     }
 }
 
-impl QuerySource for HttpQuerySource {
+impl<T: Transport> QuerySource for HttpQuerySource<T> {
     fn list_sessions(&self, query: &SessionQuery) -> Result<Vec<SessionItem>, QueryError> {
         let mut pairs: Vec<(String, String)> = Vec::new();
         if let Some(agent) = query.agent.as_deref() {
@@ -69,12 +121,18 @@ impl QuerySource for HttpQuerySource {
     }
 
     fn show_session(&self, key: &str) -> Result<SessionShow, QueryError> {
-        let path = format!("/api/v1/sessions/{}", encode_path_segment(key));
-        let body = self.call(&ApiRequest::get(&path))?;
-        // The store summary omits `mode` and `pinned`. Do not invent them.
-        let mode = required_str(&body, "mode")?;
-        let pinned = required_bool(&body, "pinned")?;
-        let item = session_from_fields(&body, mode, pinned)?;
+        // `@last` is resolved by the daemon against this caller's sessions, so
+        // it is sent as-is. A name is resolved here, but only among the
+        // sessions the daemon already filtered to this caller.
+        let (resolved, fetched) = self.resolve_session_key(key)?;
+        let body = match fetched {
+            Some(body) => body,
+            None => {
+                let path = format!("/api/v1/sessions/{}", encode_path_segment(&resolved));
+                self.call_session(&ApiRequest::get(&path), Some(key))?
+            }
+        };
+        let item = session_item(&body)?;
         let stats = body.get("stats").cloned().unwrap_or(Value::Null);
         Ok(SessionShow {
             item,
@@ -119,7 +177,7 @@ impl QuerySource for HttpQuerySource {
                 Some(Value::Bool(true)) => removed = removed.saturating_add(1),
                 _ => {
                     return Err(QueryError::Unavailable {
-                        detail: "response is missing field `deleted`".to_owned(),
+                        detail: missing_field("deleted"),
                     });
                 }
             }
@@ -154,7 +212,7 @@ impl QuerySource for HttpQuerySource {
             Some(Value::String(text)) => !text.is_empty(),
             Some(_) => {
                 return Err(QueryError::Unavailable {
-                    detail: "field `next_cursor` is not a string".to_owned(),
+                    detail: "字段 `next_cursor` 不是字符串".to_owned(),
                 });
             }
         };
@@ -166,9 +224,7 @@ impl QuerySource for HttpQuerySource {
         // closes. The timeline page's cursor is `ts_ns,id`, not an `after` bound,
         // so polling it would replay the same page. Do not invent a stream.
         Err(QueryError::Unavailable {
-            detail: format!(
-                "{FOLLOW_NOTE}; real-time /sessions/{{sid}}/live is not subscribed (真实订阅未接通)"
-            ),
+            detail: format!("{FOLLOW_NOTE}；没有订阅实时 /sessions/{{sid}}/live（真实订阅未接通）"),
         })
     }
 
@@ -217,7 +273,7 @@ impl QuerySource for HttpQuerySource {
         // Mapping a root onto FileItem would invent `op` and `first_ns`.
         if body.get("files").is_none() && body.get("roots").is_some() {
             return Err(QueryError::Unavailable {
-                detail: "GET /sessions/{sid}/files group_by=dir returns directory roots, not file rows; this command does not invent a file from a directory count".to_owned(),
+                detail: "GET /sessions/{sid}/files 的 group_by=dir 返回目录根，不是文件行；此命令不会根据目录计数编造文件".to_owned(),
             });
         }
         let rows = array_field(&body, "files")?;
@@ -241,16 +297,7 @@ impl QuerySource for HttpQuerySource {
         let request = super::query::search_request(query, since.as_deref());
         let body = self.call(&request)?;
         let rows = array_field(&body, "hits")?;
-        // The daemon hit is `{ src, src_id, session_id, public_id }`. A hit
-        // needs `summary`, `ts_ns`, and `evidence` to print, and those fields
-        // are not in the document. An empty page is a real empty page.
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-        let _ = search_hit(&rows[0])?;
-        Err(QueryError::Unavailable {
-            detail: "GET /search hits omit summary, ts_ns, and evidence; this command does not invent them".to_owned(),
-        })
+        rows.iter().map(search_hit).collect()
     }
 
     fn http(&self, key: &str, query: &HttpQuery) -> Result<HttpPage, QueryError> {
@@ -264,7 +311,7 @@ impl QuerySource for HttpQuerySource {
             Some(Value::String(text)) => Some(text.clone()),
             Some(_) => {
                 return Err(QueryError::Unavailable {
-                    detail: "field `reason` is not a string".to_owned(),
+                    detail: "字段 `reason` 不是字符串".to_owned(),
                 });
             }
         };
@@ -282,7 +329,45 @@ impl QuerySource for HttpQuerySource {
     }
 }
 
-impl HttpQuerySource {
+impl<T: Transport> HttpQuerySource<T> {
+    /// `@last` and `s-` ids pass through (`None`: the caller still fetches).
+    /// Anything else is a name, resolved among the caller's own sessions. One
+    /// match returns that row's document, so the caller does not fetch again.
+    /// No match returns the key unchanged and the daemon answers 404.
+    fn resolve_session_key(&self, key: &str) -> Result<(String, Option<Value>), QueryError> {
+        if key == "@last" || key.starts_with("s-") {
+            return Ok((key.to_owned(), None));
+        }
+        let body = self.call(&get_pairs(
+            "/api/v1/sessions",
+            &[("limit".to_owned(), "500".to_owned())],
+        ))?;
+        let rows = array_field(&body, "sessions")?;
+        let matches: Vec<&Value> = rows
+            .iter()
+            .filter(|row| row.get("name").and_then(Value::as_str) == Some(key))
+            .collect();
+        match matches.as_slice() {
+            [] => Ok((key.to_owned(), None)),
+            [one] => {
+                let id = one
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| QueryError::Unavailable {
+                        detail: "响应缺少字段 `id`".to_owned(),
+                    })?;
+                Ok((id.to_owned(), Some((*one).clone())))
+            }
+            many => Err(QueryError::BadArgument {
+                detail: format!(
+                    "有 {} 个会话名为 `{key}`；请传入 `aw sessions list` 中的公开 ID",
+                    many.len()
+                ),
+            }),
+        }
+    }
+
     fn patch(&self, key: &str, body: &Value) -> Result<Value, QueryError> {
         let path = format!("/api/v1/sessions/{}", encode_path_segment(key));
         self.call(&ApiRequest::json_method_public("PATCH", &path, body))
@@ -290,7 +375,7 @@ impl HttpQuerySource {
 }
 
 const FOLLOW_NOTE: &str =
-    "daemon timeline has no after cursor this client can poll, and GET /sessions/{sid}/live is an event stream this HTTP client does not keep open";
+    "后台时间线没有可供此客户端轮询的 after 游标，且 GET /sessions/{sid}/live 是此 HTTP 客户端不会保持打开的事件流";
 
 fn get_pairs(path: &str, pairs: &[(String, String)]) -> ApiRequest {
     let borrowed: Vec<(&str, &str)> = pairs
@@ -315,22 +400,31 @@ fn ns_to_window(ns: i64) -> String {
 }
 
 fn client_to_query(err: ClientError) -> QueryError {
+    client_to_query_for(&err, None)
+}
+
+/// [`client_to_query`], but a 404 names `key` — what the user typed — instead
+/// of the daemon's English message.
+fn client_to_query_for(err: &ClientError, key: Option<&str>) -> QueryError {
     match err {
         ClientError::Status {
             status: 404,
-            message,
-        } => QueryError::NotFound {
-            session: clip(&message),
+            code: Some(code),
+            ..
+        } if code == "no_sessions" => QueryError::NoSessions,
+        ClientError::Status { status: 404, .. } => QueryError::NotFound {
+            session: key.unwrap_or("").to_owned(),
         },
         ClientError::Status {
             status: 400 | 422, ..
         } => QueryError::BadArgument {
             detail: clip(&err.to_string()),
         },
-        ClientError::Status {
+        ClientError::Forbidden { .. }
+        | ClientError::Status {
             status: 401 | 403, ..
         } => QueryError::Unavailable {
-            detail: clip(&format!("auth: {err}")),
+            detail: clip(&format!("认证失败：{err}")),
         },
         ClientError::Unreachable { .. }
         | ClientError::Transport { .. }
@@ -350,10 +444,21 @@ fn clip(text: &str) -> String {
 }
 
 fn session_item(value: &Value) -> Result<SessionItem, QueryError> {
-    // Memory-stub rows are `{ id, user_id, name }` with no `mode`. That is not
-    // a session record this command can print.
-    let mode = required_str(value, "mode")?;
-    let pinned = required_bool(value, "pinned")?;
+    // `GET /sessions` (store page) sends both. `GET /sessions/{id}` is the store
+    // summary, which has `mode` and omits `pinned`; an unpinned session is the
+    // store default, so a missing flag is false rather than a guessed row.
+    // The in-memory stub answers `{ id, user_id, name }` with neither: `mode`
+    // stays unknown and is printed as 不可得, not invented.
+    let mode = match value.get("mode") {
+        Some(Value::String(text)) if !text.is_empty() => text.clone(),
+        Some(Value::String(_)) | Some(Value::Null) | None => "不可得".to_owned(),
+        Some(_) => {
+            return Err(QueryError::Unavailable {
+                detail: "字段 `mode` 不是字符串".to_owned(),
+            });
+        }
+    };
+    let pinned = optional_bool(value, "pinned")?.unwrap_or(false);
     session_from_fields(value, mode, pinned)
 }
 
@@ -366,7 +471,7 @@ fn session_from_fields(
         Some(text) if !text.is_empty() => text.to_owned(),
         _ => {
             return Err(QueryError::Unavailable {
-                detail: "response is missing field `id`".to_owned(),
+                detail: missing_field("id"),
             });
         }
     };
@@ -375,7 +480,9 @@ fn session_from_fields(
         name: opt_string(value, "name")?,
         mode,
         agent: opt_string(value, "agent")?,
-        started_ns: required_i64(value, "started_ns")?,
+        // The store page sends it. The in-memory stub row does not; a missing
+        // start stays unknown rather than failing the whole list.
+        started_ns: opt_i64_field(value, "started_ns")?,
         ended_ns: opt_i64_field(value, "ended_ns")?,
         pinned,
         // The list and summary documents do not carry an evidence level.
@@ -410,7 +517,7 @@ fn proc_item(value: &Value, tree: bool) -> Result<ProcItem, QueryError> {
                 .collect::<Result<Vec<_>, _>>()?,
             Some(_) => {
                 return Err(QueryError::Unavailable {
-                    detail: "field `children` is not an array".to_owned(),
+                    detail: "字段 `children` 不是数组".to_owned(),
                 });
             }
         }
@@ -424,6 +531,7 @@ fn proc_item(value: &Value, tree: bool) -> Result<ProcItem, QueryError> {
         exe_name: opt_string(value, "exe_name")?,
         // Process nodes do not carry argv. Leave it unknown.
         argv_redacted: None,
+        exit_code: opt_i64_field(value, "exit_code")?,
         evidence: evidence_field(value, "evidence")?,
         children,
     })
@@ -468,7 +576,7 @@ fn gap_item(value: &Value) -> Result<GapItem, QueryError> {
                     Some(text) => parts.push(text.to_owned()),
                     None => {
                         return Err(QueryError::Unavailable {
-                            detail: "field `affects` has a non-string entry".to_owned(),
+                            detail: "字段 `affects` 有非字符串条目".to_owned(),
                         });
                     }
                 }
@@ -477,12 +585,12 @@ fn gap_item(value: &Value) -> Result<GapItem, QueryError> {
         }
         None | Some(Value::Null) => {
             return Err(QueryError::Unavailable {
-                detail: "response is missing field `affects`".to_owned(),
+                detail: missing_field("affects"),
             });
         }
         Some(_) => {
             return Err(QueryError::Unavailable {
-                detail: "field `affects` is not a string or array".to_owned(),
+                detail: "字段 `affects` 不是字符串或数组".to_owned(),
             });
         }
     };
@@ -566,6 +674,10 @@ fn around_item(value: &Value, anchor_ref: &str) -> Result<AroundItem, QueryError
 }
 
 fn search_hit(value: &Value) -> Result<SearchHit, QueryError> {
+    // The daemon hit is `{ src, src_id, session_id, public_id, text, ts_ns,
+    // evidence, session_name }`. `text` is the stored row (file path or
+    // executable path); the page calls that the summary. A field the daemon
+    // left null stays unknown: time prints 不可得, evidence prints NA.
     let src = required_str(value, "src")?;
     let src_id = required_i64(value, "src_id")?;
     let kind = match src.as_str() {
@@ -578,23 +690,23 @@ fn search_hit(value: &Value) -> Result<SearchHit, QueryError> {
         Some(text) if !text.is_empty() => text.to_owned(),
         _ => {
             return Err(QueryError::Unavailable {
-                detail: "response is missing field `public_id`".to_owned(),
+                detail: missing_field("public_id"),
             });
         }
     };
-    // The search document is `{ src, src_id, session_id, public_id }`. It has
-    // no summary, evidence, or timestamp. Those are required to print a hit,
-    // and inventing them would mark a guess as a record.
     let summary = match value.get("summary").and_then(Value::as_str) {
         Some(text) if !text.is_empty() => text.to_owned(),
-        _ => {
-            return Err(QueryError::Unavailable {
-                detail: "response is missing field `summary`".to_owned(),
-            });
-        }
+        _ => match value.get("text").and_then(Value::as_str) {
+            Some(text) if !text.is_empty() => text.to_owned(),
+            _ => "不可得".to_owned(),
+        },
     };
-    let evidence = evidence_field(value, "evidence")?;
-    let ts_ns = required_i64(value, "ts_ns")?;
+    let evidence = match value.get("evidence") {
+        None | Some(Value::Null) => Evidence::NA(NaReason::Unknown),
+        Some(_) => evidence_field(value, "evidence")?,
+    };
+    // Absent time stays unknown. `0` would be the epoch, which was not observed.
+    let ts_ns = opt_i64_field(value, "ts_ns")?;
     Ok(SearchHit {
         session,
         session_name: opt_string(value, "session_name")?,
@@ -644,12 +756,12 @@ fn finding_item(value: &Value) -> Result<FindingItem, QueryError> {
                     Value::Bool(flag) => flag.to_string(),
                     Value::Null => {
                         return Err(QueryError::Unavailable {
-                            detail: format!("field `params.{key}` is null"),
+                            detail: format!("字段 `params.{key}` 为 null"),
                         });
                     }
                     _ => {
                         return Err(QueryError::Unavailable {
-                            detail: format!("field `params.{key}` is not a scalar"),
+                            detail: format!("字段 `params.{key}` 不是标量"),
                         });
                     }
                 };
@@ -667,14 +779,14 @@ fn finding_item(value: &Value) -> Result<FindingItem, QueryError> {
                 match (key, text) {
                     (Some(key), Some(text)) => Ok((key.to_owned(), text.to_owned())),
                     _ => Err(QueryError::Unavailable {
-                        detail: "field `params` entry is missing `key` or `value`".to_owned(),
+                        detail: "字段 `params` 的条目缺少 `key` 或 `value`".to_owned(),
                     }),
                 }
             })
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => {
             return Err(QueryError::Unavailable {
-                detail: "field `params` is not an object or array".to_owned(),
+                detail: "字段 `params` 不是对象或数组".to_owned(),
             });
         }
     };
@@ -686,7 +798,7 @@ fn finding_item(value: &Value) -> Result<FindingItem, QueryError> {
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => {
             return Err(QueryError::Unavailable {
-                detail: "field `refs` is not an array".to_owned(),
+                detail: "字段 `refs` 不是数组".to_owned(),
             });
         }
     };
@@ -731,18 +843,23 @@ fn finding_ref(value: &Value) -> Result<FindingRef, QueryError> {
         }
     }
     Err(QueryError::Unavailable {
-        detail: "field `refs` entry is missing `table` and `id`".to_owned(),
+        detail: "字段 `refs` 的条目缺少 `table` 和 `id`".to_owned(),
     })
+}
+
+/// User-facing text for a JSON field the daemon left out.
+fn missing_field(name: &str) -> String {
+    format!("后台返回的数据缺少字段 `{name}`")
 }
 
 fn array_field<'a>(value: &'a Value, name: &str) -> Result<&'a Vec<Value>, QueryError> {
     match value.get(name) {
         Some(Value::Array(rows)) => Ok(rows),
         Some(_) => Err(QueryError::Unavailable {
-            detail: format!("field `{name}` is not an array"),
+            detail: format!("字段 `{name}` 不是数组"),
         }),
         None => Err(QueryError::Unavailable {
-            detail: format!("response is missing field `{name}`"),
+            detail: missing_field(name),
         }),
     }
 }
@@ -751,25 +868,24 @@ fn required_str(value: &Value, name: &str) -> Result<String, QueryError> {
     match value.get(name) {
         Some(Value::String(text)) if !text.is_empty() => Ok(text.clone()),
         Some(Value::String(_)) => Err(QueryError::Unavailable {
-            detail: format!("field `{name}` is empty"),
+            detail: format!("字段 `{name}` 为空"),
         }),
         Some(Value::Null) | None => Err(QueryError::Unavailable {
-            detail: format!("response is missing field `{name}`"),
+            detail: missing_field(name),
         }),
         Some(_) => Err(QueryError::Unavailable {
-            detail: format!("field `{name}` is not a string"),
+            detail: format!("字段 `{name}` 不是字符串"),
         }),
     }
 }
 
-fn required_bool(value: &Value, name: &str) -> Result<bool, QueryError> {
+/// A bool the daemon may omit. `None` is "not sent", distinct from `Some(false)`.
+fn optional_bool(value: &Value, name: &str) -> Result<Option<bool>, QueryError> {
     match value.get(name) {
-        Some(Value::Bool(flag)) => Ok(*flag),
-        Some(Value::Null) | None => Err(QueryError::Unavailable {
-            detail: format!("response is missing field `{name}`"),
-        }),
+        Some(Value::Bool(flag)) => Ok(Some(*flag)),
+        Some(Value::Null) | None => Ok(None),
         Some(_) => Err(QueryError::Unavailable {
-            detail: format!("field `{name}` is not a bool"),
+            detail: format!("字段 `{name}` 不是布尔值"),
         }),
     }
 }
@@ -778,7 +894,7 @@ fn required_i64(value: &Value, name: &str) -> Result<i64, QueryError> {
     match value.get(name).and_then(json_i64) {
         Some(n) => Ok(n),
         None => Err(QueryError::Unavailable {
-            detail: format!("response is missing field `{name}`"),
+            detail: missing_field(name),
         }),
     }
 }
@@ -789,7 +905,7 @@ fn opt_i64_field(value: &Value, name: &str) -> Result<Option<i64>, QueryError> {
         Some(other) => json_i64(other)
             .map(Some)
             .ok_or_else(|| QueryError::Unavailable {
-                detail: format!("field `{name}` is not an integer"),
+                detail: format!("字段 `{name}` 不是整数"),
             }),
     }
 }
@@ -800,7 +916,7 @@ fn opt_string(value: &Value, name: &str) -> Result<Option<String>, QueryError> {
         Some(Value::String(text)) if text.is_empty() => Ok(None),
         Some(Value::String(text)) => Ok(Some(text.clone())),
         Some(_) => Err(QueryError::Unavailable {
-            detail: format!("field `{name}` is not a string"),
+            detail: format!("字段 `{name}` 不是字符串"),
         }),
     }
 }
@@ -820,20 +936,20 @@ fn opt_proc_uid(value: &Value, name: &str) -> Result<Option<i64>, QueryError> {
             parse_hex_i64(text)
                 .map(Some)
                 .ok_or_else(|| QueryError::Unavailable {
-                    detail: format!("field `{name}` is not a proc uid"),
+                    detail: format!("字段 `{name}` 不是进程 UID"),
                 })
         }
         Some(other) => json_i64(other)
             .map(Some)
             .ok_or_else(|| QueryError::Unavailable {
-                detail: format!("field `{name}` is not a proc uid"),
+                detail: format!("字段 `{name}` 不是进程 UID"),
             }),
     }
 }
 
 fn required_proc_uid(value: &Value) -> Result<i64, QueryError> {
     opt_proc_uid(value, "proc_uid")?.ok_or_else(|| QueryError::Unavailable {
-        detail: "response is missing field `proc_uid`".to_owned(),
+        detail: missing_field("proc_uid"),
     })
 }
 
@@ -848,17 +964,17 @@ fn evidence_field(value: &Value, name: &str) -> Result<Evidence, QueryError> {
         Some(Value::Object(obj)) => return parse_evidence_object(obj),
         Some(Value::Null) | None => {
             return Err(QueryError::Unavailable {
-                detail: format!("response is missing field `{name}`"),
+                detail: missing_field(name),
             });
         }
         Some(_) => {
             return Err(QueryError::Unavailable {
-                detail: format!("field `{name}` is not an evidence code"),
+                detail: format!("字段 `{name}` 不是证据代码"),
             });
         }
     };
     parse_evidence_code(text).ok_or_else(|| QueryError::Unavailable {
-        detail: format!("field `{name}` is not an evidence code"),
+        detail: format!("字段 `{name}` 不是证据代码"),
     })
 }
 
@@ -873,7 +989,7 @@ fn parse_evidence_object(value: &serde_json::Map<String, Value>) -> Result<Evide
         return Ok(Evidence::NA(reason));
     }
     parse_evidence_code(level).ok_or_else(|| QueryError::Unavailable {
-        detail: "field `evidence` is not an evidence code".to_owned(),
+        detail: "字段 `evidence` 不是证据代码".to_owned(),
     })
 }
 
@@ -920,5 +1036,145 @@ fn parse_na_reason(text: &str) -> NaReason {
         "peer_unknown" => NaReason::PeerUnknown,
         "protocol_not_observed" => NaReason::ProtocolNotObserved,
         _ => NaReason::Unknown,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{gap_item, search_hit, session_item};
+    use crate::cmd::query::SessionShow;
+    use crate::cmd::render;
+    use crate::output::OutputMode;
+    use aw_core::Evidence;
+
+    /// `GET /sessions/{id}` as the daemon builds it: the store summary, which
+    /// has `mode` and `stats` and no `pinned`.
+    const SESSION_DETAIL: &str = r#"{
+        "id": "s-7k2m",
+        "session_id": 4,
+        "name": "demo",
+        "agent": "example-agent",
+        "started_ns": 1700000000000000000,
+        "ended_ns": null,
+        "mode": "launch",
+        "collectors": [],
+        "argv": null,
+        "stats": {
+            "process_count": 2,
+            "flow_count": 1,
+            "dns_count": 0,
+            "gap_count": 0,
+            "bytes_up": null,
+            "bytes_down": null,
+            "finding_count": null
+        }
+    }"#;
+
+    /// The show page `aw sessions show` prints, built the same way
+    /// `HttpQuerySource::show_session` builds it.
+    fn shown(body: &str) -> SessionShow {
+        let value: serde_json::Value = serde_json::from_str(body).expect("json");
+        let item = session_item(&value).expect("parse");
+        let stats = value
+            .get("stats")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        SessionShow {
+            item,
+            process_count: super::opt_i64_field(&stats, "process_count").expect("count"),
+            flow_count: super::opt_i64_field(&stats, "flow_count").expect("count"),
+            dns_count: super::opt_i64_field(&stats, "dns_count").expect("count"),
+            gap_count: super::opt_i64_field(&stats, "gap_count").expect("count"),
+            bytes_up: super::opt_i64_field(&stats, "bytes_up").expect("count"),
+            bytes_down: super::opt_i64_field(&stats, "bytes_down").expect("count"),
+            capabilities: Vec::new(),
+            gap_summaries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn session_detail_without_pinned_parses_and_renders() {
+        let shown = shown(SESSION_DETAIL);
+        assert!(!shown.item.pinned);
+        assert_eq!(shown.item.public_id, "s-7k2m");
+        assert_eq!(shown.item.mode, "launch");
+        assert_eq!(shown.item.started_ns, Some(1_700_000_000_000_000_000));
+        assert_eq!(shown.process_count, Some(2));
+        // A null byte count stays unknown; it is not printed as 0.
+        assert_eq!(shown.bytes_up, None);
+
+        let mut buf = Vec::new();
+        render::write_out(
+            &mut buf,
+            OutputMode::Table,
+            &render::show_table(&shown),
+            &render::show_json(&shown),
+        )
+        .expect("render");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(text.contains("demo"), "{text}");
+        assert!(text.contains("launch"), "{text}");
+        assert!(text.contains("no"), "{text}");
+    }
+
+    /// A list row the stub serves has no `mode` and no `pinned`. Both are
+    /// optional: pinned defaults to false, mode is reported as unknown.
+    #[test]
+    fn session_list_row_without_mode_or_pinned_parses() {
+        let value = serde_json::json!({ "id": "s-1", "user_id": "u", "name": "n" });
+        let item = session_item(&value).expect("parse");
+        assert!(!item.pinned);
+        assert_eq!(item.mode, "不可得");
+        assert_eq!(item.name.as_deref(), Some("n"));
+    }
+
+    /// `GET /search` hit as `search_hit_json` builds it: the row's stored text
+    /// stands in for a summary, and a null time stays unknown.
+    #[test]
+    fn search_hit_uses_text_and_keeps_a_missing_time_unknown() {
+        let value = serde_json::json!({
+            "src": "file_access",
+            "src_id": 3,
+            "session_id": 1,
+            "public_id": "s-7k2m",
+            "text": "/tmp/notes.txt",
+            "ts_ns": null,
+            "evidence": null,
+            "session_name": null,
+        });
+        let hit = search_hit(&value).expect("parse");
+        assert_eq!(hit.kind, "file");
+        assert_eq!(hit.reference, "file_access:3");
+        assert_eq!(hit.summary, "/tmp/notes.txt");
+        assert_eq!(hit.ts_ns, None);
+        assert!(matches!(hit.evidence, Evidence::NA(_)));
+    }
+
+    /// `gap_json` sends `affects` as the stored JSON array, not one string.
+    #[test]
+    fn gap_affects_array_is_joined() {
+        let value = serde_json::json!({
+            "id": 7,
+            "collector": "poll",
+            "kind": "dropped",
+            "affects": ["proc", "net"],
+            "from_ns": 10,
+            "to_ns": 20,
+            "count": null,
+            "detail": null,
+        });
+        let gap = gap_item(&value).expect("parse");
+        assert_eq!(gap.affects, "proc,net");
+        assert!(matches!(gap.evidence, Evidence::E1));
+    }
+
+    #[test]
+    fn missing_field_is_named_in_chinese() {
+        let value = serde_json::json!({ "name": "demo" });
+        let err = session_item(&value).expect_err("no id");
+        let text = err.to_string();
+        assert!(text.contains("后台返回的数据缺少字段 `id`"), "{text}");
+        assert!(!text.contains("response is missing"), "{text}");
     }
 }

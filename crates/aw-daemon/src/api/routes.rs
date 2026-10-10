@@ -113,7 +113,7 @@ pub struct ApiResponse {
 }
 
 impl ApiResponse {
-    fn json(status: u16, value: &Value) -> Self {
+    pub(crate) fn json(status: u16, value: &Value) -> Self {
         let mut headers = BTreeMap::new();
         headers.insert("content-type".to_owned(), "application/json".to_owned());
         let body = match serde_json::to_vec(value) {
@@ -147,6 +147,15 @@ impl ApiResponse {
 
 /// JSON body for an endpoint this card does not back with a store.
 #[must_use]
+/// Attach / adopt on a daemon without a database: recording needs the store.
+fn no_store_to_record() -> ApiResponse {
+    error_response(
+        503,
+        "store_unavailable",
+        "recording needs the session database; this daemon has none open",
+    )
+}
+
 pub fn not_implemented(op: &str) -> ApiResponse {
     ApiResponse::json(
         501,
@@ -184,6 +193,13 @@ pub struct ApiState {
     /// browser opened by hand reaches the UI. Default false: a normal daemon
     /// never hands out a ticket over HTTP.
     pub preview_ui: bool,
+    /// Sessions the routes asked the foreground loop to start or stop
+    /// ([`crate::watch`]). Drained on every sample tick.
+    pub watch_requests: Vec<crate::watch::WatchRequest>,
+    /// `POST /sessions/run` tickets waiting for `/adopt`, by public id.
+    pub pending_launches: crate::watch::PendingLaunches,
+    /// Collector state written by the foreground loop; read by `/doctor`.
+    pub collector_runtime: crate::collector_state::CollectorRuntime,
 }
 
 impl Default for ApiState {
@@ -201,6 +217,9 @@ impl Default for ApiState {
                 crate::assets::AssetMode::Embedded => None,
             },
             preview_ui: false,
+            watch_requests: Vec::new(),
+            collector_runtime: crate::collector_state::CollectorRuntime::default(),
+            pending_launches: crate::watch::PendingLaunches::new(),
         }
     }
 }
@@ -729,6 +748,62 @@ pub fn dispatch(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     route_authed(state, req, &caller)
 }
 
+/// Work that runs after the shared-state lock is released.
+pub(crate) type Deferred = Box<dyn FnOnce() -> ApiResponse + Send>;
+
+/// Requests that only read the database and can take long (exports) are
+/// authenticated under the lock and then built without it, so one large
+/// export does not hold every other request on the socket and the HTTP
+/// listener behind the same mutex. `peer` is the internal channel's caller;
+/// `None` means HTTP, where the bearer is checked here. Anything else, or a
+/// request that fails authentication, returns `None` and goes through
+/// [`dispatch`] / [`dispatch_peer`] as before (so errors are unchanged).
+pub(crate) fn take_slow(
+    state: &mut ApiState,
+    req: &HttpRequest,
+    peer: Option<&Caller>,
+) -> Option<Deferred> {
+    if req.body_too_large {
+        return None;
+    }
+    let get_or_post =
+        req.method.eq_ignore_ascii_case("GET") || req.method.eq_ignore_ascii_case("POST");
+    let sid = req
+        .path
+        .strip_prefix("/api/v1/sessions/")?
+        .strip_suffix("/export")?
+        .to_owned();
+    if !get_or_post || sid.is_empty() || sid.contains('/') {
+        return None;
+    }
+    let db_path = state.query.db_path.clone()?;
+    let caller = match peer {
+        Some(caller) => caller.clone(),
+        None => authenticate(state, req).ok()?,
+    };
+    let query = req.query.clone();
+    let md = export_format_is_md(&query);
+    let data = crate::export::data::DataFormat::from_query(&query);
+    if !md && data.is_none() {
+        return None;
+    }
+    Some(Box::new(move || {
+        // A read-only view: the database path and nothing else. Tickets, the
+        // live hub, and the watch queue stay behind the lock.
+        let snapshot = ApiState {
+            query: StoreQuery::open_path(db_path),
+            ..ApiState::default()
+        };
+        match data {
+            _ if md => crate::export::markdown::export_markdown(&snapshot, &caller, &sid, &query),
+            Some(format) => {
+                crate::export::data::export_data(&snapshot, &caller, &sid, &query, format)
+            }
+            None => error_response(400, "bad_argument", "format"),
+        }
+    }))
+}
+
 /// Dispatch one request that arrived on the internal channel (Unix socket or
 /// named pipe, see `api/ipc.rs`).
 ///
@@ -1065,10 +1140,14 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                 }),
             );
         }
-        let (_ticket, secret) =
+        let now = clock(state);
+        let Ok((_ticket, secret)) =
             state
                 .tickets
-                .issue_ui_ticket(&caller.user_id, caller.admin, clock(state));
+                .issue_ui_ticket(&caller.user_id, caller.admin, now)
+        else {
+            return random_unavailable();
+        };
         // The secret is the response body, not a log line.
         return ApiResponse::json(200, &json!({ "ticket": secret, "ttl_s": 60 }));
     }
@@ -1107,6 +1186,9 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                             "started_ns": row.started_ns,
                             "ended_ns": row.ended_ns,
                             "pinned": row.pinned != 0,
+                            "collectors": stored_collectors_json(&row.collectors),
+                            "argv": super::query::argv_value(row.argv.as_deref()),
+                            "stats": counts_json(&row.counts),
                         })
                     })
                     .collect();
@@ -1120,6 +1202,26 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
             }
             Err(err) => from_backend(err),
         };
+    }
+
+    if path == "/api/v1/sessions/run" && method == "POST" {
+        return super::watch_routes::run(state, caller, &req.body);
+    }
+    if path == "/api/v1/sessions" && method == "POST" && state.query.db_path.is_some() {
+        return super::watch_routes::create(state, caller, &req.body);
+    }
+    if method == "POST" && state.query.db_path.is_some() {
+        if let Some(rest) = path.strip_prefix("/api/v1/sessions/") {
+            if let Some(sid) = rest.strip_suffix("/exit") {
+                return super::watch_routes::record_exit(state, caller, sid, &req.body);
+            }
+            if let Some(sid) = rest.strip_suffix("/adopt") {
+                return super::watch_routes::adopt(state, caller, sid, &req.body);
+            }
+            if let Some(sid) = rest.strip_suffix("/attach") {
+                return super::watch_routes::attach(state, caller, sid, &req.body);
+            }
+        }
     }
 
     if path == "/api/v1/sessions" && method == "POST" {
@@ -1144,16 +1246,23 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
             &json!({ "user_id": caller.user_id, "admin": caller.admin }),
         ),
         ("GET", "/api/v1/doctor") => doctor(state),
-        ("GET", "/api/v1/processes") => system_processes(req),
-        ("POST", "/api/v1/sessions/run") => not_implemented("run"),
+        ("GET", "/api/v1/processes") => super::system_procs::system_processes(
+            super::system_procs::live_table,
+            caller,
+            &req.query,
+        ),
         ("GET", "/api/v1/db/stats") => db_stats(state, caller),
         ("POST", "/api/v1/db/purge") => db_purge(state, caller, &req.body),
         ("POST", "/api/v1/db/vacuum") => db_admin(state, caller, StoreOp::Vacuum),
         ("POST", "/api/v1/db/migrate") => db_admin(state, caller, StoreOp::Migrate),
         ("PUT", "/api/v1/config") => put_config(state, caller, &req.body),
-        ("GET", "/api/v1/config") => {
-            ApiResponse::json(200, &json!({ "config": state.config_json }))
-        }
+        ("GET", "/api/v1/config") => ApiResponse::json(
+            200,
+            &json!({
+                "config": state.config_json,
+                "builtin_redaction_rules": builtin_redaction_json(),
+            }),
+        ),
         ("GET", "/api/v1/openapi.json") => {
             ApiResponse::json(200, &super::openapi::document(req.listen_port))
         }
@@ -1304,7 +1413,10 @@ fn session_sub(
     body: &[u8],
     query: &str,
 ) -> ApiResponse {
-    let (sid, tail) = split_sid(rest);
+    // `@last` may arrive percent-encoded (`%40last`). Every session route
+    // resolves it the same way, so decode the id before anything matches on it.
+    let rest = percent_decode(rest);
+    let (sid, tail) = split_sid(&rest);
     let memory = state.sessions.iter().find(|row| row.id == sid).cloned();
     if let Some(session) = &memory {
         if !caller.admin && session.user_id != caller.user_id {
@@ -1398,11 +1510,13 @@ fn session_sub(
     };
 
     if op == "attach" {
-        // No process table in this card. `process_owner` in the JSON body stands
-        // in for "this pid belongs to another user". A different owner is
-        // admin-only and returns 403. A missing owner is not treated as "ours";
-        // the attach itself stays unimplemented (501) because there is no process
-        // table to attach to.
+        // Only reached without a database: with one, `/sessions/{sid}/attach`
+        // is answered by `watch_routes::attach` before this point, and the
+        // foreground daemon always opens `agentwatch.db`. A recording here would
+        // have nowhere to be written, so after the owner check the answer is
+        // 503 `store_unavailable`, not 501. `process_owner` in the body stands in
+        // for "this pid belongs to another user": a different owner is
+        // admin-only (403).
         if let Some(process_owner) = json_string_field_bytes(body, "process_owner") {
             if process_owner != caller.user_id {
                 let input = AuthInput {
@@ -1416,11 +1530,14 @@ fn session_sub(
                     target_process_owner: Some(process_owner),
                 };
                 return match authorize(&input) {
-                    AuthDecision::Allow(_) => not_implemented("attach"),
+                    AuthDecision::Allow(_) => no_store_to_record(),
                     _ => forbidden(),
                 };
             }
         }
+    }
+    if op == "attach" || op == "run" {
+        return no_store_to_record();
     }
 
     not_implemented(op)
@@ -1483,18 +1600,92 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
                 "agent": summary.agent,
                 "started_ns": summary.started_ns,
                 "ended_ns": summary.ended_ns,
-                "stats": {
-                    "process_count": summary.process_count,
-                    "flow_count": summary.flow_count,
-                    "dns_count": summary.dns_count,
-                    "gap_count": summary.gap_count,
-                    "bytes_up": summary.bytes_up,
-                    "bytes_down": summary.bytes_down,
-                }
+                "exit_code": summary.exit_code,
+                "mode": summary.mode,
+                "collectors": stored_collectors_json(&summary.collectors),
+                "argv": super::query::argv_value(summary.argv.as_deref()),
+                "stats": counts_json(&aw_store::SessionCounts {
+                    process_count: summary.process_count,
+                    flow_count: summary.flow_count,
+                    dns_count: summary.dns_count,
+                    gap_count: summary.gap_count,
+                    bytes_up: summary.bytes_up,
+                    bytes_down: summary.bytes_down,
+                    finding_count: summary.finding_count,
+                }),
             }),
         ),
         Err(err) => from_backend(err),
     }
+}
+
+/// Built-in redaction rules (always on, read-only), so Settings can list
+/// them instead of an empty "内置规则只读" section.
+fn builtin_redaction_json() -> serde_json::Value {
+    let rules: Vec<serde_json::Value> = aw_pipeline::builtin_rules()
+        .into_iter()
+        .map(|rule| json!({ "id": rule.id, "scope": rule.scope, "pattern": rule.pattern }))
+        .collect();
+    serde_json::Value::Array(rules)
+}
+
+/// `stats` for the session list and the overview: one shape, one source
+/// (`aw_store::session_counts`), so the two pages show the same numbers.
+fn counts_json(counts: &aw_store::SessionCounts) -> serde_json::Value {
+    json!({
+        "process_count": counts.process_count,
+        "flow_count": counts.flow_count,
+        "dns_count": counts.dns_count,
+        "gap_count": counts.gap_count,
+        "bytes_up": counts.bytes_up,
+        "bytes_down": counts.bytes_down,
+        "finding_count": counts.finding_count,
+    })
+}
+
+/// What each collector named on a session row can observe in this build.
+///
+/// `sessions.collectors` stores names only (`["poll"]`). Without a capability
+/// list the overview printed an empty 「采集能力」 and then 「缺口：无」, and the
+/// files and network pages said 「没有记录」 for categories that were never
+/// collected. Each name becomes `{name, mode, capabilities: [{kind, evidence,
+/// na_reason}]}`. A name this build does not know gets an empty list and a
+/// `note`, never a guessed capability.
+fn stored_collectors_json(stored: &str) -> serde_json::Value {
+    let names: Vec<String> = serde_json::from_str(stored).unwrap_or_default();
+    let collectors: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| match name.as_str() {
+            "poll" => json!({
+                "name": "poll",
+                "mode": "poll",
+                "capabilities": poll_capabilities(),
+            }),
+            other => json!({
+                "name": other,
+                "mode": null,
+                "capabilities": [],
+                "note": "collector_not_described",
+            }),
+        })
+        .collect();
+    serde_json::Value::Array(collectors)
+}
+
+/// The poll collector: process table samples everywhere; connection table
+/// only on Windows (`netstat -ano`). Files and DNS are never polled.
+fn poll_capabilities() -> serde_json::Value {
+    let net = if cfg!(windows) {
+        json!({ "kind": "net", "evidence": "S" })
+    } else {
+        json!({ "kind": "net", "evidence": "NA", "na_reason": "collector_unavailable" })
+    };
+    json!([
+        { "kind": "proc", "evidence": "S" },
+        { "kind": "file", "evidence": "NA", "na_reason": "collector_unavailable" },
+        net,
+        { "kind": "dns", "evidence": "NA", "na_reason": "collector_unavailable" },
+    ])
 }
 
 fn session_name_from_body(body: &[u8]) -> String {
@@ -1514,9 +1705,10 @@ fn preview_ticket_redirect(state: &mut ApiState, req: &HttpRequest) -> ApiRespon
     if req_host_bad(&req.headers.get("host").cloned(), req.listen_port) {
         return misdirected();
     }
-    let (_ticket, secret) = state
-        .tickets
-        .issue_ui_ticket(&preview_user(), false, clock(state));
+    let now = clock(state);
+    let Ok((_ticket, secret)) = state.tickets.issue_ui_ticket(&preview_user(), false, now) else {
+        return random_unavailable();
+    };
     let mut headers = BTreeMap::new();
     headers.insert(
         "location".to_owned(),
@@ -1558,11 +1750,21 @@ fn redeem_token(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     let now = clock(state);
     match state.tickets.redeem(&ticket, now) {
         Ok(token) => ApiResponse::json(200, &json!({ "token": token, "ttl_s": 12 * 60 * 60 })),
+        Err(super::auth::TicketError::RandomUnavailable) => random_unavailable(),
         Err(_) => ApiResponse::json(
             401,
             &json!({ "error": { "code": "unauthorized", "message": "ticket refused" } }),
         ),
     }
+}
+
+/// 503 when the OS random source failed. No ticket or token is issued.
+fn random_unavailable() -> ApiResponse {
+    error_response(
+        503,
+        "random_unavailable",
+        "the OS random source failed; no ticket or token was issued",
+    )
 }
 
 /// JSON error. `offset` is included only for filter parse failures.
@@ -1593,6 +1795,9 @@ fn from_backend(err: QueryBackendError) -> ApiResponse {
             error_response(400, "bad_argument", &format!("{name}: expected {expected}"))
         }
         QueryBackendError::NotFound => error_response(404, "not_found", "session not found"),
+        QueryBackendError::NoSessions => {
+            error_response(404, "no_sessions", "this account has no sessions")
+        }
         QueryBackendError::Unimplemented { what } => not_implemented(what),
         QueryBackendError::Store(message) => error_response(500, "store", &message),
     }
@@ -1791,7 +1996,26 @@ fn session_query_route(
         ("GET", "live") => live_snapshot(state, sid, caller, &parsed),
         ("POST", "stop") => match state.query.stop_session(user, sid) {
             Ok(None) => stop_memory(state, sid, caller),
-            Ok(Some(())) => ApiResponse::json(200, &json!({ "stopped": sid })),
+            Ok(Some(public_id)) => {
+                // A `/sessions/run` the CLI never adopted (it could not start the
+                // program) has no process to record. Stopping it discards the
+                // empty row instead of leaving a session that never ran.
+                let unadopted = state.pending_launches.contains_key(&public_id);
+                super::watch_routes::stopped(state, &public_id);
+                if unadopted {
+                    match state.query.delete_session(user, &public_id) {
+                        Ok(Some(())) => {
+                            return Some(ApiResponse::json(
+                                200,
+                                &json!({ "stopped": sid, "id": public_id, "discarded": true }),
+                            ));
+                        }
+                        Ok(None) => {}
+                        Err(err) => return Some(from_backend(err)),
+                    }
+                }
+                ApiResponse::json(200, &json!({ "stopped": sid, "id": public_id }))
+            }
             Err(err) => from_backend(err),
         },
         _ => {
@@ -1991,6 +2215,7 @@ fn timeline_json(page: &aw_store::TimelinePage) -> serde_json::Value {
             "id": row.id,
             "proc_uid": row.proc_uid.map(|id| format!("{id:x}")),
             "evidence": row.evidence,
+            "pre_existing": row.pre_existing,
         })).collect::<Vec<_>>(),
         "next_cursor": page.next.map(|c| format!("{},{}", c.ts_ns, c.id)),
     })
@@ -2078,35 +2303,24 @@ fn filter_mentions_body(filter: &str, json_body: &str) -> bool {
 }
 
 fn doctor(state: &ApiState) -> ApiResponse {
-    let _ = state;
-    // No collector is probed on the HTTP thread. The report says so. The host
+    // Collectors: the foreground loop's runtime state, not the config names.
+    // Capabilities: the same poll list the session answers carry. The host
     // block is the daemon's own privilege, read from the OS (BUGS B5); `null`
     // means the check failed, not "not privileged".
+    let runtime = &state.collector_runtime;
+    let caps = poll_capabilities();
     ApiResponse::json(
         200,
         &json!({
-            "probed": false,
-            "reason": "collector probe is not run on the request path",
-            "collectors": [],
+            "probed": runtime.reported,
+            "reason": if runtime.reported { None } else { Some("the collector loop has not reported yet") },
+            "collectors": crate::collector_state::doctor_collectors(runtime, &caps),
+            "capabilities": crate::collector_state::doctor_capabilities(&caps),
             "host": {
                 "os": std::env::consts::OS,
                 "privileged": crate::privilege::current(),
                 "privileged_note": "poll collector only in this build; eBPF, ETW, and eslogger are not attached even when privileged",
             },
-        }),
-    )
-}
-
-fn system_processes(req: &HttpRequest) -> ApiResponse {
-    // Reading the OS process table is platform code (task: stay in aw-daemon
-    // API). Report unavailable rather than a partial or invented tree.
-    let _ = req;
-    ApiResponse::json(
-        200,
-        &json!({
-            "processes": [],
-            "available": false,
-            "reason": "system process tree is not collected by this build",
         }),
     )
 }
@@ -2294,7 +2508,10 @@ mod tests {
     }
 
     fn token_for(state: &mut ApiState, user: &str, admin: bool) -> String {
-        let (_ticket, secret) = state.tickets.issue_ui_ticket(user, admin, state.now);
+        let (_ticket, secret) = state
+            .tickets
+            .issue_ui_ticket(user, admin, state.now)
+            .unwrap_or_default();
         state.tickets.redeem(&secret, state.now).unwrap_or_default()
     }
 
@@ -2357,12 +2574,17 @@ mod tests {
     fn ticket_second_use_fails_and_late_use_fails() {
         let mut tickets = TicketStore::new();
         let now = 5_000_u64;
-        let (_ticket, secret) = tickets.issue_ui_ticket("alice", false, now);
+        let (_ticket, secret) = tickets
+            .issue_ui_ticket("alice", false, now)
+            .unwrap_or_default();
         assert!(tickets.redeem(&secret, now).is_ok());
         assert!(tickets.redeem(&secret, now).is_err());
 
         let mut state = ApiState::new(now);
-        let (_ticket, secret) = state.tickets.issue_ui_ticket("alice", false, now);
+        let (_ticket, secret) = state
+            .tickets
+            .issue_ui_ticket("alice", false, now)
+            .unwrap_or_default();
         state.now = now + UI_TICKET_TTL + 1;
         let body = format!(r#"{{"ticket":"{secret}"}}"#);
         let response = dispatch(
@@ -2445,10 +2667,10 @@ mod tests {
         let mut state = ApiState::new(0);
         let wall = super::clock(&state);
         // A ticket issued 61 s ago must be refused, not redeemed against 1970.
-        let (_ticket, stale) =
-            state
-                .tickets
-                .issue_ui_ticket("alice", false, wall - UI_TICKET_TTL - 1);
+        let (_ticket, stale) = state
+            .tickets
+            .issue_ui_ticket("alice", false, wall - UI_TICKET_TTL - 1)
+            .unwrap_or_default();
         let body = format!(r#"{{"ticket":"{stale}"}}"#);
         let late = dispatch(
             &mut state,
@@ -2462,7 +2684,10 @@ mod tests {
         );
         assert_eq!(late.status, 401);
         // A token whose 12 h ran out is refused on a real request.
-        let (_ticket, old) = state.tickets.issue_ui_ticket("alice", false, 1_000);
+        let (_ticket, old) = state
+            .tickets
+            .issue_ui_ticket("alice", false, 1_000)
+            .unwrap_or_default();
         let token = state.tickets.redeem(&old, 1_000).unwrap_or_default();
         assert!(!token.is_empty());
         let response = dispatch(
@@ -2496,6 +2721,895 @@ mod tests {
         });
         assert!(seeded.is_ok());
         (dir, db)
+    }
+
+    type SessionEnd = (String, Option<i64>, Option<String>, Option<i64>);
+
+    /// Session row `(mode, ended_ns, end_reason, exit_code)` by public id.
+    fn session_end(db: &std::path::Path, sid: &str) -> Option<SessionEnd> {
+        rusqlite::Connection::open(db)
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT mode, ended_ns, end_reason, exit_code FROM sessions WHERE public_id = ?1",
+                    [sid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+            })
+            .ok()
+    }
+
+    fn proc_rows(db: &std::path::Path, sid: &str, pid: u32) -> i64 {
+        rusqlite::Connection::open(db)
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM processes p JOIN sessions s ON s.id = p.session_id \
+                     WHERE s.public_id = ?1 AND p.pid = ?2",
+                    rusqlite::params![sid, pid],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap_or(-1)
+    }
+
+    fn post(state: &mut ApiState, token: &str, path: &str, body: &str) -> (u16, serde_json::Value) {
+        let response = dispatch(
+            state,
+            &req(
+                "POST",
+                path,
+                Some("127.0.0.1:7456"),
+                Some(token),
+                body.as_bytes(),
+            ),
+        );
+        (response.status, json_body(&response))
+    }
+
+    const LAST_SESSIONS_SQL: &str = "
+        INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors)
+        VALUES
+            (1, 's-root-old', 'launch', '0', 100, 'linux', '[]'),
+            (2, 's-user-old', 'launch', '1000', 200, 'linux', '[]'),
+            (3, 's-user-new', 'launch', '1000', 300, 'linux', '[]'),
+            (4, 's-root-new', 'launch', '0', 400, 'linux', '[]');
+    ";
+
+    fn get_as(state: &mut ApiState, user: &str, path: &str) -> (u16, serde_json::Value) {
+        let token = token_for(state, user, false);
+        let response = dispatch(
+            state,
+            &req("GET", path, Some("127.0.0.1:7456"), Some(&token), b""),
+        );
+        (response.status, json_body(&response))
+    }
+
+    /// `@last` is the newest session of the caller, never the daemon-wide
+    /// newest and never another user's — including when the caller is root and
+    /// root's own session is the newest row in the database.
+    #[test]
+    fn at_last_follows_the_caller_not_the_newest_row() {
+        let (dir, db) = seeded_db("at-last", LAST_SESSIONS_SQL);
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+
+        // Root's newest row starts after everyone else's. Caller 1000 still
+        // resolves to their own newest session.
+        let (status, body) = get_as(&mut state, "1000", "/api/v1/sessions/@last");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["id"], "s-user-new");
+
+        let token = token_for(&mut state, "1000", false);
+        let (status, body) = post(&mut state, &token, "/api/v1/sessions/@last/stop", "{}");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["stopped"], "@last");
+        assert_eq!(
+            session_end(&db, "s-user-new").and_then(|row| row.2),
+            Some("stopped".to_owned())
+        );
+        // The newer root session was not the one stopped.
+        assert_eq!(session_end(&db, "s-root-new").and_then(|row| row.1), None);
+
+        // Root, even as an administrator, gets root's newest — not user 1000's.
+        let token = token_for(&mut state, "0", true);
+        let response = dispatch(
+            &mut state,
+            &req(
+                "GET",
+                "/api/v1/sessions/@last",
+                Some("127.0.0.1:7456"),
+                Some(&token),
+                b"",
+            ),
+        );
+        let body = json_body(&response);
+        assert_eq!(response.status, 200, "{body}");
+        assert_eq!(body["id"], "s-root-new");
+
+        // Percent-encoded `@` takes the same path.
+        let (status, body) = get_as(&mut state, "0", "/api/v1/sessions/%40last");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["id"], "s-root-new");
+
+        // A caller with nothing of their own is a distinct 404, not someone
+        // else's session.
+        let (status, body) = get_as(&mut state, "1001", "/api/v1/sessions/@last");
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(body["error"]["code"], "no_sessions");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// None of these may answer 501 any more (the bug this card fixes).
+    #[test]
+    fn attach_run_adopt_and_purge_never_answer_501() {
+        let (dir, db) = seeded_db("no501", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+        let me = crate::sample::current_user_id();
+        let token = token_for(&mut state, &me, true);
+        for (path, body) in [
+            ("/api/v1/sessions", r#"{"mode":"attach","pid":1}"#),
+            ("/api/v1/sessions/run", r#"{"argv":["true"]}"#),
+            ("/api/v1/sessions/nope/adopt", r#"{"ticket":"x","pid":1}"#),
+            ("/api/v1/sessions/nope/attach", r#"{"pid":1}"#),
+            ("/api/v1/db/purge", r#"{"all":true,"dry_run":true}"#),
+        ] {
+            let (status, body) = post(&mut state, &token, path, body);
+            assert_ne!(status, 501, "{path}: {body}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn attach_records_a_real_process_and_ends_when_it_exits() {
+        let (dir, db) = seeded_db("attach", "");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let me = crate::sample::current_user_id();
+        let token = token_for(&mut state, &me, false);
+        let other = token_for(&mut state, "someone-else", false);
+        assert_eq!(
+            post(
+                &mut state,
+                &other,
+                "/api/v1/sessions",
+                &format!(r#"{{"mode":"attach","pid":{pid}}}"#)
+            )
+            .0,
+            403,
+            "another user's process needs an administrator"
+        );
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            &format!(r#"{{"mode":"attach","pid":{pid},"name":"t"}}"#),
+        );
+        assert_eq!(status, 201, "{body}");
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        assert!(sid.starts_with("s-"));
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut watches = crate::watch::Watches::new(db.clone());
+        watches.tick(&shared);
+        assert_eq!(watches.len(), 1);
+        assert_eq!(
+            proc_rows(&db, &sid, pid),
+            1,
+            "the attached root is a process row"
+        );
+        assert_eq!(
+            session_end(&db, &sid).map(|r| r.1),
+            Some(None),
+            "still open"
+        );
+        // It shows in the list next to whatever else is there.
+        let list = {
+            let mut guard = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            dispatch(
+                &mut guard,
+                &req(
+                    "GET",
+                    "/api/v1/sessions",
+                    Some("127.0.0.1:7456"),
+                    Some(&token),
+                    b"",
+                ),
+            )
+        };
+        assert!(String::from_utf8_lossy(&list.body).contains(&sid));
+        let _ = child.kill();
+        let _ = child.wait();
+        watches.tick(&shared);
+        assert_eq!(watches.len(), 0);
+        let end = session_end(&db, &sid);
+        assert_eq!(end.as_ref().map(|r| r.2.as_deref()), Some(Some("exited")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn run_then_adopt_watches_the_callers_process_and_wrong_ticket_is_403() {
+        let (dir, db) = seeded_db("run", "");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &crate::sample::current_user_id(), false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions/run",
+            r#"{"argv":["sleep","30","--token=hunter2"]}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        let ticket = body["ticket"].as_str().unwrap_or_default().to_owned();
+        assert!(ticket.len() > 20);
+        assert_eq!(body["adopt_timeout_ms"], 5000);
+        let adopt = format!("/api/v1/sessions/{sid}/adopt");
+        assert_eq!(
+            post(
+                &mut state,
+                &token,
+                &adopt,
+                &format!(r#"{{"ticket":"bad","pid":{pid}}}"#)
+            )
+            .0,
+            403
+        );
+        let (status, body) = post(
+            &mut state,
+            &token,
+            &adopt,
+            &format!(r#"{{"ticket":"{ticket}","pid":{pid}}}"#),
+        );
+        assert_eq!(status, 200, "{body}");
+        // A second adopt finds nothing waiting.
+        assert_eq!(
+            post(
+                &mut state,
+                &token,
+                &adopt,
+                &format!(r#"{{"ticket":"{ticket}","pid":{pid}}}"#)
+            )
+            .0,
+            404
+        );
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut watches = crate::watch::Watches::new(db.clone());
+        watches.tick(&shared);
+        assert_eq!(proc_rows(&db, &sid, pid), 1);
+        let end = session_end(&db, &sid);
+        assert_eq!(end.as_ref().map(|r| r.0.as_str()), Some("launch"));
+        // `stop` ends the session and the sampler; it does not kill the target.
+        {
+            let mut guard = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (status, _) = post(
+                &mut guard,
+                &token,
+                &format!("/api/v1/sessions/{sid}/stop"),
+                "",
+            );
+            assert_eq!(status, 200);
+        }
+        watches.tick(&shared);
+        assert_eq!(watches.len(), 0);
+        assert!(session_end(&db, &sid).and_then(|r| r.1).is_some());
+        assert!(
+            child.try_wait().ok().flatten().is_none(),
+            "target still running"
+        );
+        let argv: String = rusqlite::Connection::open(&db)
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT argv FROM sessions WHERE public_id = ?1",
+                    [&sid],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap_or_default();
+        assert!(!argv.contains("hunter2"), "argv is redacted: {argv}");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn session_count(db: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(db)
+            .and_then(|c| c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)))
+            .unwrap_or(-1)
+    }
+
+    /// Pid 1 is owned by root. A non-root caller cannot attach to it, and cannot
+    /// adopt it either — not even with an administrator token.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn another_accounts_pid_is_refused_for_attach_and_for_adopt() {
+        if nix::unistd::geteuid().as_raw() == 0 {
+            return;
+        }
+        let (dir, db) = seeded_db("notyours", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let me = crate::sample::current_user_id();
+        let user = token_for(&mut state, &me, false);
+        let admin = token_for(&mut state, &me, true);
+        let before = session_count(&db);
+        let (status, body) = post(
+            &mut state,
+            &user,
+            "/api/v1/sessions",
+            r#"{"mode":"attach","pid":1}"#,
+        );
+        assert_eq!(status, 403, "{body}");
+        assert_eq!(body["error"]["code"], "not_your_process");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("不属于你的账户"), "{message}");
+        assert_eq!(session_count(&db), before, "a refused attach writes no row");
+
+        let (status, body) = post(
+            &mut state,
+            &user,
+            "/api/v1/sessions/run",
+            r#"{"argv":["sleep","30"]}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        let ticket = body["ticket"].as_str().unwrap_or_default().to_owned();
+        let adopt = format!("/api/v1/sessions/{sid}/adopt");
+        for token in [&user, &admin] {
+            let (status, body) = post(
+                &mut state,
+                token,
+                &adopt,
+                &format!(r#"{{"ticket":"{ticket}","pid":1}}"#),
+            );
+            assert_eq!(status, 403, "{body}");
+            assert_eq!(body["error"]["code"], "not_your_process");
+        }
+        // Still waiting: the refused adopt did not consume the launch.
+        assert!(state.pending_launches.contains_key(&sid));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `/sessions/run` whose program the CLI could not start is an empty row.
+    /// Stopping it discards the row. A launch that fails to spawn writes none.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stopping_an_unadopted_run_discards_the_empty_session() {
+        let (dir, db) = seeded_db("discard", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &crate::sample::current_user_id(), false);
+        let before = session_count(&db);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions/run",
+            r#"{"argv":["/nonexistent/prog"]}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        assert_eq!(session_count(&db), before + 1);
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        let (status, body) = post(
+            &mut state,
+            &token,
+            &format!("/api/v1/sessions/{sid}/stop"),
+            "",
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["discarded"], true);
+        assert_eq!(session_count(&db), before, "the empty row is gone");
+
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["/nonexistent/prog"]}"#,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["error"]["code"], "program_not_found");
+        assert_eq!(session_count(&db), before, "a failed launch writes no row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No `name` in the body: the label is the program base name plus the
+    /// redacted arguments. A given `name` wins, and a secret never lands in it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_name_comes_from_the_argv_when_not_given() {
+        let (dir, db) = seeded_db("label", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &crate::sample::current_user_id(), false);
+        let name_of = |state: &mut ApiState, body: &str| {
+            let (status, response) = post(state, &token, "/api/v1/sessions/run", body);
+            assert_eq!(status, 201, "{response}");
+            let sid = response["id"].as_str().unwrap_or_default().to_owned();
+            rusqlite::Connection::open(&db)
+                .and_then(|c| {
+                    c.query_row(
+                        "SELECT name FROM sessions WHERE public_id = ?1",
+                        [&sid],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        };
+        let derived = name_of(
+            &mut state,
+            r#"{"argv":["/usr/bin/python3","tool.py","--token=hunter2"]}"#,
+        );
+        assert!(
+            derived.starts_with("python3 tool.py"),
+            "label from argv: {derived}"
+        );
+        assert!(!derived.contains("hunter2"), "secret stays out: {derived}");
+        assert!(derived.chars().count() <= 60, "capped at 60: {derived}");
+        let given = name_of(
+            &mut state,
+            r#"{"argv":["/usr/bin/python3","tool.py"],"name":"mine"}"#,
+        );
+        assert_eq!(given, "mine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `aw run` posts `/exit` as soon as the root exits, which can be before
+    /// the foreground loop's first poll starts a sampler. The root's row must
+    /// already exist (written at `/adopt`) so the code lands on it, and the
+    /// later poll keeps it: one row, exit code 7, never NULL.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn exit_posted_before_any_poll_lands_on_the_root_row() {
+        use std::os::fd::AsRawFd;
+
+        let (dir, db) = seeded_db("exit-before-poll", "");
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                r#"fd=$1; shift; IFS= read -r _ < "/dev/fd/$fd" || exit 125; case "$fd" in [0-9]) eval "exec $fd<&-" ;; esac; exec "$@""#,
+            )
+            .arg("aw-daemon-test-gate")
+            .arg(read_fd.as_raw_fd().to_string())
+            .arg("sh")
+            .arg("-c")
+            .arg("exit 7")
+            .spawn()
+            .expect("held child");
+        let pid = child.id();
+        drop(read_fd);
+
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &crate::sample::current_user_id(), false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions/run",
+            r#"{"argv":["sh","-c","exit 7"]}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        let ticket = body["ticket"].as_str().unwrap_or_default();
+        let (status, body) = post(
+            &mut state,
+            &token,
+            &format!("/api/v1/sessions/{sid}/adopt"),
+            &format!(r#"{{"ticket":"{ticket}","pid":{pid}}}"#),
+        );
+        assert_eq!(status, 200, "{body}");
+
+        nix::unistd::write(&write_fd, b"1\n").expect("release gate");
+        drop(write_fd);
+        assert_eq!(child.wait().expect("reap child").code(), Some(7));
+
+        let (status, body) = post(
+            &mut state,
+            &token,
+            &format!("/api/v1/sessions/{sid}/exit"),
+            r#"{"exit_code":7}"#,
+        );
+        assert_eq!(status, 200, "{body}");
+        let root_code = |db: &std::path::Path| -> Vec<Option<i64>> {
+            let conn = rusqlite::Connection::open(db).expect("db");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT p.exit_code FROM processes p JOIN sessions s ON s.id = p.session_id \
+                     WHERE s.public_id = ?1 AND p.pid = ?2",
+                )
+                .expect("prepare");
+            stmt.query_map(rusqlite::params![sid, pid], |r| r.get(0))
+                .expect("query")
+                .map(|r| r.expect("row"))
+                .collect()
+        };
+        assert_eq!(root_code(&db), vec![Some(7)], "before any poll");
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut watches = crate::watch::Watches::new(db.clone());
+        watches.tick(&shared);
+        watches.tick(&shared);
+        assert_eq!(
+            root_code(&db),
+            vec![Some(7)],
+            "after the poll: one row, code kept"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn adopted_pipe_gated_root_is_snapshotted_after_an_immediate_exit_and_reports_its_code() {
+        use std::os::fd::AsRawFd;
+
+        let (dir, db) = seeded_db("gated-fast-exit", "");
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                r#"fd=$1; shift; IFS= read -r _ < "/dev/fd/$fd" || exit 125; case "$fd" in [0-9]) eval "exec $fd<&-" ;; esac; exec "$@""#,
+            )
+            .arg("aw-daemon-test-gate")
+            .arg(read_fd.as_raw_fd().to_string())
+            .arg("sh")
+            .arg("-c")
+            .arg("exit 7")
+            .spawn()
+            .expect("held child");
+        let pid = child.id();
+        drop(read_fd);
+
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &crate::sample::current_user_id(), false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions/run",
+            r#"{"argv":["sh","-c","exit 7"]}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        let ticket = body["ticket"].as_str().unwrap_or_default();
+        let (status, body) = post(
+            &mut state,
+            &token,
+            &format!("/api/v1/sessions/{sid}/adopt"),
+            &format!(r#"{{"ticket":"{ticket}","pid":{pid}}}"#),
+        );
+        assert_eq!(status, 200, "{body}");
+
+        nix::unistd::write(&write_fd, b"1\n").expect("release gate");
+        drop(write_fd);
+        assert_eq!(child.wait().expect("reap child").code(), Some(7));
+
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut watches = crate::watch::Watches::new(db.clone());
+        watches.tick(&shared);
+        assert_eq!(proc_rows(&db, &sid, pid), 1);
+        let end = session_end(&db, &sid);
+        assert_eq!(
+            end.as_ref().and_then(|row| row.2.as_deref()),
+            Some("exited")
+        );
+
+        let (status, body) = {
+            let mut guard = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            post(
+                &mut guard,
+                &token,
+                &format!("/api/v1/sessions/{sid}/exit"),
+                r#"{"exit_code":7}"#,
+            )
+        };
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["id"], sid);
+        assert_eq!(body["exit_code"], 7);
+        assert_eq!(session_end(&db, &sid).and_then(|row| row.3), Some(7));
+        let root_code: Option<i64> = rusqlite::Connection::open(&db)
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT p.exit_code FROM processes p JOIN sessions s ON s.id = p.session_id \
+                     WHERE s.public_id = ?1 AND p.pid = ?2",
+                    rusqlite::params![sid, pid],
+                    |r| r.get(0),
+                )
+            })
+            .expect("root row");
+        assert_eq!(
+            root_code,
+            Some(7),
+            "the root process row carries the exit code"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Real uid of a running process, from `/proc/<pid>/status` (all four ids).
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::expect_used)]
+    fn proc_uids(pid: u64) -> Vec<u32> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("status");
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("Uid:"))
+            .expect("Uid line");
+        line[4..]
+            .split_whitespace()
+            .map(|p| p.parse().expect("uid"))
+            .collect()
+    }
+
+    /// A `uid` / `user` in the body never chooses the account: the program
+    /// runs as the verified caller.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn launch_ignores_a_uid_in_the_body() {
+        let (dir, db) = seeded_db("spoof", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let me = crate::sample::current_user_id();
+        let token = token_for(&mut state, &me, false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["sleep","5"],"uid":0,"user":"root","user_id":"0"}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let pid = body["root_pid"].as_u64().expect("root_pid");
+        let want: u32 = me.parse().expect("numeric uid");
+        assert_eq!(proc_uids(pid), vec![want; 4]);
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Root daemon, ordinary caller: the program runs as the caller, not root.
+    /// Needs root, so it is ignored by default (CI runs tests unprivileged):
+    /// `sudo -E env PATH=$PATH cargo test -p aw-daemon -- --ignored launch_as_root`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root: the daemon must be able to switch accounts"]
+    #[allow(clippy::expect_used)]
+    fn launch_as_root_drops_to_the_caller() {
+        assert_eq!(nix::unistd::geteuid().as_raw(), 0, "run this test as root");
+        let nobody = nix::unistd::User::from_name("nobody")
+            .ok()
+            .flatten()
+            .expect("this test needs the `nobody` account");
+        let caller = nobody.uid.as_raw();
+        let (dir, db) = seeded_db("asroot", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &caller.to_string(), false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["sleep","5"],"cwd":"/","uid":0}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let pid = body["root_pid"].as_u64().expect("root_pid");
+        assert_eq!(
+            proc_uids(pid),
+            vec![caller; 4],
+            "dropped to the caller, cannot regain root"
+        );
+        let env = std::fs::read(format!("/proc/{pid}/environ")).expect("environ");
+        let env = String::from_utf8_lossy(&env);
+        assert!(env.contains(&format!("USER={}", nobody.name)), "{env}");
+        assert!(!env.contains("HOME=/root"), "{env}");
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+        // A directory the caller cannot enter is checked as the caller.
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["true"],"cwd":"/root"}"#,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["error"]["code"], "program_not_permitted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Root daemon, caller in a supplementary group: the program carries the
+    /// caller's login group list (as `id -G` reports it), not just the
+    /// primary group. The caller is the account that ran `sudo` (`SUDO_UID`),
+    /// which must be in at least one supplementary group; the test fails
+    /// otherwise, it does not pass vacuously.
+    /// `sudo -E env PATH=$PATH cargo test -p aw-daemon -- --ignored launch_as_root`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root: the daemon must be able to switch accounts"]
+    #[allow(clippy::expect_used)]
+    fn launch_as_root_keeps_the_callers_supplementary_groups() {
+        assert_eq!(nix::unistd::geteuid().as_raw(), 0, "run this test as root");
+        let caller: u32 = std::env::var("SUDO_UID")
+            .expect("run through sudo so SUDO_UID names the caller")
+            .parse()
+            .expect("numeric SUDO_UID");
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(caller))
+            .ok()
+            .flatten()
+            .expect("caller account");
+        let out = std::process::Command::new("id")
+            .args(["-G", &user.name])
+            .output()
+            .expect("id -G");
+        let mut want: Vec<u32> = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(|g| g.parse().expect("gid"))
+            .collect();
+        want.sort_unstable();
+        want.dedup();
+        assert!(
+            want.iter().any(|g| *g != user.gid.as_raw()),
+            "the caller must be in a supplementary group: {want:?}"
+        );
+        let (dir, db) = seeded_db("asrootgroups", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &caller.to_string(), false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["sleep","5"],"cwd":"/"}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let pid = body["root_pid"].as_u64().expect("root_pid");
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("status");
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("Groups:"))
+            .expect("Groups line");
+        let mut have: Vec<u32> = line[7..]
+            .split_whitespace()
+            .map(|g| g.parse().expect("gid"))
+            .collect();
+        have.push(user.gid.as_raw());
+        have.sort_unstable();
+        have.dedup();
+        assert_eq!(have, want, "login groups of the caller");
+        assert_eq!(proc_uids(pid), vec![caller; 4]);
+        assert!(
+            !have.contains(&0) || want.contains(&0),
+            "no root group leaked"
+        );
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_from_the_api_starts_the_program_and_records_its_exit_code() {
+        let (dir, db) = seeded_db("launch", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let other = token_for(&mut state, "someone-else", false);
+        assert_eq!(
+            post(
+                &mut state,
+                &other,
+                "/api/v1/sessions",
+                r#"{"mode":"launch","argv":["true"]}"#
+            )
+            .1["error"]["code"],
+            "caller_unidentified"
+        );
+        let token = token_for(&mut state, &crate::sample::current_user_id(), false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["sh","-c","sleep 1; exit 7"]}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut watches = crate::watch::Watches::new(db.clone());
+        watches.tick(&shared);
+        assert_eq!(watches.len(), 1);
+        let started = std::time::Instant::now();
+        while watches.len() > 0 && started.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            watches.tick(&shared);
+        }
+        let end = session_end(&db, &sid);
+        assert_eq!(
+            end.as_ref().and_then(|r| r.2.clone()).as_deref(),
+            Some("exited")
+        );
+        assert_eq!(end.and_then(|r| r.3), Some(7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Under a root daemon a normal user can neither see nor stop root's
+    /// session: not by public id, not by numeric id, and not after root
+    /// opened it first (the id cache is not a way around the owner check).
+    #[test]
+    fn another_accounts_session_is_invisible_and_unstoppable() {
+        let (dir, db) = seeded_db(
+            "owner",
+            "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, ended_ns, platform, collectors, pinned) VALUES \
+               (2, 's-rootsess', 'attach', '0', 1, NULL, 'linux', '[]', 0), \
+               (3, 's-usersess', 'attach', '1000', 2, NULL, 'linux', '[]', 0);",
+        );
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let root = token_for(&mut state, "0", true);
+        let user = token_for(&mut state, "1000", false);
+        let mut call = |token: &str, method: &str, path: &str| {
+            let response = dispatch(
+                &mut state,
+                &req(method, path, Some("127.0.0.1:7456"), Some(token), b""),
+            );
+            (response.status, json_body(&response))
+        };
+        // Root opens its session first, so its id is remembered.
+        assert_eq!(call(&root, "GET", "/api/v1/sessions/s-rootsess").0, 200);
+        for path in ["/api/v1/sessions/s-rootsess", "/api/v1/sessions/2"] {
+            assert_eq!(call(&user, "GET", path).0, 404, "{path}");
+            assert_eq!(
+                call(&user, "GET", &format!("{path}/processes")).0,
+                404,
+                "{path}"
+            );
+            assert_eq!(
+                call(&user, "GET", &format!("{path}/timeline")).0,
+                404,
+                "{path}"
+            );
+            assert_eq!(
+                call(&user, "POST", &format!("{path}/stop")).0,
+                404,
+                "{path}"
+            );
+        }
+        let (status, body) = call(&user, "GET", "/api/v1/sessions");
+        assert_eq!(status, 200);
+        let ids: Vec<&str> = body["sessions"]
+            .as_array()
+            .map(|rows| rows.iter().filter_map(|r| r["id"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(ids, vec!["s-usersess"], "{body}");
+        let ended: Option<i64> = rusqlite::Connection::open(&db)
+            .and_then(|c| {
+                c.query_row("SELECT ended_ns FROM sessions WHERE id = 2", [], |r| {
+                    r.get(0)
+                })
+            })
+            .unwrap_or(Some(-1));
+        assert_eq!(ended, None, "root's session was not stopped");
+        assert_eq!(call(&user, "GET", "/api/v1/sessions/s-usersess").0, 200);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2607,6 +3721,93 @@ mod tests {
             "daemon/poll unknown store_failure ×2"
         );
         assert_eq!(by_cat("gap")["fields"]["count"], 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_is_built_after_the_lock_with_the_same_answer() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "aw-routes-slow-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let db = dir.join("agentwatch.db");
+        let seeded = aw_store::Store::open(&db).map(|store| {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors) \
+                     VALUES (1, 'sx', 'attach', 'alice', 1, 'linux', '[\"poll\"]')",
+                    [],
+                )
+                .is_ok()
+        });
+        assert!(matches!(seeded, Ok(true)));
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+        let alice = token_for(&mut state, "alice", false);
+        let bob = token_for(&mut state, "bob", false);
+        let request = |token: Option<&str>, query: &str| {
+            let mut r = req(
+                "GET",
+                "/api/v1/sessions/sx/export",
+                Some("127.0.0.1:7456"),
+                token,
+                b"",
+            );
+            r.query = query.to_owned();
+            r
+        };
+        // Not an export, no token, a foreign Host, an unknown format: the
+        // normal path answers (and keeps its error codes).
+        let mut list = request(Some(&alice), "");
+        list.path = "/api/v1/sessions".to_owned();
+        assert!(super::take_slow(&mut state, &list, None).is_none());
+        assert!(super::take_slow(&mut state, &request(None, "format=jsonl"), None).is_none());
+        let mut foreign = request(Some(&alice), "format=jsonl");
+        foreign
+            .headers
+            .insert("host".to_owned(), "evil.com".to_owned());
+        assert!(super::take_slow(&mut state, &foreign, None).is_none());
+        assert!(super::take_slow(&mut state, &request(Some(&alice), "format=pdf"), None).is_none());
+
+        let mut jobs = Vec::new();
+        for format in ["jsonl", "csv", "md"] {
+            let r = request(Some(&alice), &format!("format={format}"));
+            let expected = dispatch(&mut state, &r);
+            assert_eq!(expected.status, 200, "{format}");
+            let job = super::take_slow(&mut state, &r, None);
+            assert!(job.is_some(), "{format}");
+            jobs.push((format, expected, job));
+        }
+        let hidden = super::take_slow(&mut state, &request(Some(&bob), "format=jsonl"), None);
+        let peer = super::Caller {
+            user_id: "alice".to_owned(),
+            admin: false,
+        };
+        let over_channel =
+            super::take_slow(&mut state, &request(None, "format=jsonl"), Some(&peer));
+        // The jobs own everything they need: the state can go away first.
+        drop(state);
+        for (format, expected, job) in jobs {
+            let Some(job) = job else { continue };
+            let got = job();
+            assert_eq!(got.status, expected.status, "{format}");
+            assert_eq!(
+                got.header("content-type"),
+                expected.header("content-type"),
+                "{format}"
+            );
+            if format != "md" {
+                // Markdown carries a generation time; the data formats are exact.
+                assert_eq!(got.body, expected.body, "{format}");
+            }
+        }
+        assert_eq!(hidden.map(|job| job().status), Some(404));
+        assert_eq!(over_channel.map(|job| job().status), Some(200));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2774,6 +3975,27 @@ mod tests {
             ),
         );
         assert_eq!(response.status, 403);
+        // Own process, or an admin: still no 501. Without a database there is
+        // nowhere to record, and the daemon says so.
+        for body in [&br#"{"pid":1}"#[..], &br#"{"process_owner":"alice"}"#[..]] {
+            let own = dispatch(
+                &mut state,
+                &req("POST", &path, Some("127.0.0.1:7456"), Some(&alice), body),
+            );
+            assert_eq!(own.status, 503);
+            assert_eq!(json_body(&own)["error"]["code"], "store_unavailable");
+        }
+        let adopt = dispatch(
+            &mut state,
+            &req(
+                "POST",
+                &format!("/api/v1/sessions/{id}/adopt"),
+                Some("127.0.0.1:7456"),
+                Some(&alice),
+                br#"{"ticket":"x","pid":1}"#,
+            ),
+        );
+        assert_eq!(adopt.status, 503);
     }
 
     #[test]
@@ -2820,6 +4042,31 @@ mod tests {
                 .and_then(Value::as_bool),
             crate::privilege::current()
         );
+        // UI re-review #144 new-3/new-4: collectors come from the runtime
+        // state the foreground loop reports; capabilities are the poll list
+        // the session answers carry, even before the loop reports.
+        assert_eq!(json_body(&doctor)["collectors"][0]["status"], "unknown");
+        assert_eq!(json_body(&doctor)["capabilities"][0]["kind"], "proc");
+        assert_eq!(json_body(&doctor)["capabilities"][0]["available"], true);
+        state.collector_runtime = crate::collector_state::CollectorRuntime {
+            reported: true,
+            daemon_sample: true,
+            watched_roots: 0,
+            last_sample_ns: Some(7),
+        };
+        let running = dispatch(
+            &mut state,
+            &req(
+                "GET",
+                "/api/v1/doctor",
+                Some("127.0.0.1:7456"),
+                Some(&alice),
+                b"",
+            ),
+        );
+        assert_eq!(json_body(&running)["probed"], true);
+        assert_eq!(json_body(&running)["collectors"][0]["name"], "poll");
+        assert_eq!(json_body(&running)["collectors"][0]["status"], "running");
         let processes = dispatch(
             &mut state,
             &req(
@@ -2835,7 +4082,8 @@ mod tests {
             json_body(&processes)
                 .get("available")
                 .and_then(Value::as_bool),
-            Some(false)
+            Some(true),
+            "the live process table is wired (real-window #144 blocker 3)"
         );
         // No database is configured on this state, so stats are null, not 0.
         let stats = dispatch(
@@ -2916,5 +4164,74 @@ mod tests {
         // address was loopback and that the function returned a real port.
         assert_ne!(bound.port(), 0);
         Ok(())
+    }
+
+    /// UI re-review #144 new-2: the page tags 「会话开始前已存在」 from this
+    /// field only; the store decides it (attach baseline started before the session).
+    #[test]
+    fn timeline_answer_carries_pre_existing() {
+        let row = |id: i64, pre_existing: bool| aw_store::TimelineRow {
+            session_id: 1,
+            ts_ns: 5,
+            cat: "proc".to_owned(),
+            id,
+            proc_uid: Some(id),
+            evidence: "S".to_owned(),
+            pre_existing,
+        };
+        let body = super::timeline_json(&aw_store::TimelinePage {
+            rows: vec![row(1, true), row(2, false)],
+            next: None,
+        });
+        assert_eq!(body["rows"][0]["pre_existing"], true);
+        assert_eq!(body["rows"][1]["pre_existing"], false);
+    }
+
+    /// UI review detail 9: Settings listed no built-in redaction rule.
+    #[test]
+    fn config_answer_lists_builtin_redaction_rules() {
+        let rules = super::builtin_redaction_json();
+        let list = rules.as_array().cloned().unwrap_or_default();
+        assert!(list.iter().any(|rule| rule["id"] == "tok.github"));
+        assert!(list
+            .iter()
+            .any(|rule| rule["id"] == "env.secret_name" && rule["pattern"].is_null()));
+        let counts = super::counts_json(&aw_store::SessionCounts {
+            process_count: 3,
+            finding_count: None,
+            ..Default::default()
+        });
+        assert_eq!(counts["process_count"], 3);
+        assert!(counts["finding_count"].is_null());
+    }
+
+    /// UI review P1-5: a poll-only session must say which categories were not
+    /// collected, so the pages do not read 「没有记录」 as "nothing happened".
+    #[test]
+    fn stored_poll_collector_lists_uncollected_categories() {
+        let value = super::stored_collectors_json(r#"["poll","mystery"]"#);
+        let empty = Vec::new();
+        let list = value.as_array().unwrap_or(&empty);
+        assert_eq!(list.len(), 2);
+        let caps = list[0]["capabilities"].as_array().unwrap_or(&empty);
+        let by_kind = |kind: &str| {
+            caps.iter()
+                .find(|cap| cap["kind"] == kind)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        };
+        assert_eq!(by_kind("proc")["evidence"], "S");
+        assert_eq!(by_kind("file")["evidence"], "NA");
+        assert_eq!(by_kind("file")["na_reason"], "collector_unavailable");
+        assert_eq!(by_kind("dns")["evidence"], "NA");
+        if !cfg!(windows) {
+            assert_eq!(by_kind("net")["evidence"], "NA");
+        }
+        assert_eq!(list[1]["capabilities"], serde_json::json!([]));
+        assert_eq!(list[1]["note"], "collector_not_described");
+        assert_eq!(
+            super::stored_collectors_json("not json"),
+            serde_json::json!([])
+        );
     }
 }

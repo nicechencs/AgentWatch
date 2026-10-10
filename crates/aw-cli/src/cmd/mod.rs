@@ -1,9 +1,4 @@
-//! Command dispatch (P1-CLI-01).
-//!
-//! This card only routes. A recognised command that is not `version` probes the
-//! daemon with `GET /health` and then reports that the command is not implemented.
-//! Unreachable is exit 3. A 2xx health check followed by "not implemented" is
-//! exit 1, so a live daemon is never a silent success.
+//! Command dispatch for CLI commands and the daemon's local API channel.
 
 mod around;
 mod attach;
@@ -20,6 +15,7 @@ mod gaps;
 mod hook;
 mod http;
 mod http_source;
+mod lifecycle;
 mod mcp_tap;
 mod merge;
 mod procs;
@@ -63,6 +59,22 @@ pub(crate) trait HttpFactory {
     /// Build a transport. Called only for an HTTP endpoint, and only when a
     /// command is about to probe the daemon.
     fn open(&mut self, endpoint: &Endpoint) -> Result<Box<dyn Transport>, ClientError>;
+}
+
+/// Build the session-control client for one endpoint. Tests substitute a stub
+/// so `aw stop` can be exercised without a daemon.
+pub(crate) trait ControlFactory {
+    /// Session control bound to `endpoint`.
+    fn open(&mut self, endpoint: &Endpoint) -> Box<dyn attach::DaemonSessions>;
+}
+
+/// Production control. Dials inside each call, not here.
+struct LiveControl;
+
+impl ControlFactory for LiveControl {
+    fn open(&mut self, endpoint: &Endpoint) -> Box<dyn attach::DaemonSessions> {
+        Box::new(attach::HttpDaemonSessions::new(endpoint.clone()))
+    }
 }
 
 /// Production factory. Dials inside [`LoopbackHttp::exchange`], not here.
@@ -116,7 +128,10 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
     if let Some(outcome) = proxy_command(&cli.command, json) {
         return Ok(outcome);
     }
-    if let Some(outcome) = launch_command(&cli, json) {
+    if let Some(outcome) = live_session_preflight(&cli, json) {
+        return Ok(outcome);
+    }
+    if let Some(outcome) = live_launch_command(&cli, json) {
         return Ok(outcome);
     }
     if let Some(detail) = usage_gap(&cli.command) {
@@ -127,11 +142,13 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
         return Ok(outcome);
     }
 
-    let needs_endpoint = is_query(&cli.command) || is_wired_ops(&cli.command);
+    let needs_endpoint = is_query(&cli.command)
+        || is_wired_ops(&cli.command)
+        || is_live_session_command(&cli.command);
     if !needs_endpoint {
         // Stubs that probe `/health`, and ops that stay unwired (export, daemon).
         let mut source = query::UnavailableSource;
-        return dispatch(cli, env_token, &mut LiveHttp, &mut source);
+        return dispatch(cli, env_token, &mut LiveHttp, &mut source, &mut LiveControl);
     }
 
     let input = EndpointInput {
@@ -145,6 +162,9 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
         Err(err) => return Ok(endpoint_outcome(err, json)),
     };
     let mut source = http_source::HttpQuerySource::new(endpoint.clone());
+    if let Some(outcome) = session_command(&cli, &endpoint, json, &mut LiveControl) {
+        return Ok(outcome);
+    }
     if let Some(outcome) = query_command(&cli.command, json, lang, &mut source)? {
         return Ok(outcome);
     }
@@ -154,15 +174,12 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
     Ok(error_outcome(
         exit::GENERAL,
         "not_implemented",
-        &format!(
-            "`{}` is not implemented yet (尚未实现)",
-            command_label(&cli.command)
-        ),
+        &format!("`{}` 尚未实现", command_label(&cli.command)),
         json,
     ))
 }
 
-/// `aw ui`, `aw daemon start`, and `aw daemon status`: the commands that need
+/// `aw ui`, `aw daemon start|status|stop|restart|logs`, and `aw ps`: the commands that need
 /// the internal channel itself (api-and-cli §1). Production path only.
 fn channel_command(cli: &Cli, env_token: Option<String>, json: bool) -> Option<Outcome> {
     let wanted = matches!(
@@ -170,6 +187,10 @@ fn channel_command(cli: &Cli, env_token: Option<String>, json: bool) -> Option<O
         Command::Ui { .. }
             | Command::Daemon(tree::DaemonCmd::Start)
             | Command::Daemon(tree::DaemonCmd::Status)
+            | Command::Daemon(tree::DaemonCmd::Stop)
+            | Command::Daemon(tree::DaemonCmd::Restart)
+            | Command::Daemon(tree::DaemonCmd::Logs { .. })
+            | Command::Ps { .. }
     );
     if !wanted {
         return None;
@@ -184,12 +205,13 @@ fn channel_command(cli: &Cli, env_token: Option<String>, json: bool) -> Option<O
         Ok(endpoint) => endpoint,
         Err(err) => return Some(endpoint_outcome(err, json)),
     };
-    let open = |endpoint: &Endpoint| -> Box<dyn Transport> {
-        match LoopbackHttp::new(endpoint) {
+    // Re-resolved per dial: a daemon started just now may have bound the
+    // per-user socket because it could not create the system one.
+    let open = |fallback: &Endpoint| -> Box<dyn Transport> {
+        let current = endpoint::resolve(&input).unwrap_or_else(|_| fallback.clone());
+        match LoopbackHttp::new(&current) {
             Ok(transport) => Box::new(transport),
-            Err(_) => Box::new(crate::client::MemoryTransport::failing(
-                "transport not built",
-            )),
+            Err(_) => Box::new(crate::client::MemoryTransport::failing("传输通道未建立")),
         }
     };
     Some(match &cli.command {
@@ -204,9 +226,43 @@ fn channel_command(cli: &Cli, env_token: Option<String>, json: bool) -> Option<O
         Command::Daemon(tree::DaemonCmd::Start) => ui::daemon_start(
             &endpoint,
             &mut || open(&endpoint),
-            &mut ui::ProcessStarter,
+            &mut ui::ProcessStarter::default(),
             ui::START_WAIT,
             json,
+        ),
+        Command::Daemon(tree::DaemonCmd::Stop) => lifecycle::daemon_stop(
+            &endpoint,
+            &mut || open(&endpoint),
+            lifecycle::STOP_WAIT,
+            json,
+        ),
+        Command::Daemon(tree::DaemonCmd::Restart) => lifecycle::daemon_restart(
+            &endpoint,
+            &mut || open(&endpoint),
+            &mut ui::ProcessStarter::default(),
+            lifecycle::STOP_WAIT,
+            ui::START_WAIT,
+            json,
+        ),
+        Command::Daemon(tree::DaemonCmd::Logs { follow, lines }) => lifecycle::daemon_logs(
+            &endpoint,
+            &mut || open(&endpoint),
+            *lines,
+            follow.then_some(lifecycle::Follow {
+                poll: lifecycle::FOLLOW_POLL,
+                max_polls: None,
+            }),
+            json,
+            &mut std::io::stdout(),
+        ),
+        Command::Ps {
+            agents_only,
+            filter,
+        } => ps::run(
+            *agents_only,
+            filter.as_deref(),
+            json,
+            &mut ps::DaemonTable::new(endpoint.clone(), open(&endpoint)),
         ),
         _ => ui::daemon_status(&endpoint, open(&endpoint), json),
     })
@@ -237,6 +293,186 @@ fn is_wired_ops(command: &Command) -> bool {
     }
 }
 
+/// Commands whose production implementation must first resolve the daemon
+/// channel. `--no-daemon` deliberately stays on the existing local launcher.
+fn is_live_session_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Run {
+            no_daemon: false,
+            ..
+        } | Command::Attach { .. }
+            | Command::Stop { .. }
+    )
+}
+
+/// Preserve all session-command refusals before endpoint resolution or a daemon
+/// request. This includes attach switches the daemon cannot apply.
+fn live_session_preflight(cli: &Cli, json: bool) -> Option<Outcome> {
+    match &cli.command {
+        Command::Run {
+            no_daemon: false, ..
+        } => {
+            let (args, deferred) = run_parts(&cli.command, json, cli.quiet)?;
+            run::preflight(&args, deferred).err()
+        }
+        Command::Attach { .. } => {
+            let args = attach_parts(&cli.command, json)?;
+            attach::preflight(&args).err()
+        }
+        _ => None,
+    }
+}
+
+/// Production-only local commands. The injected test dispatcher retains the
+/// broader [`launch_command`] path and never opens a real socket.
+fn live_launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
+    match &cli.command {
+        // `aw ps` is a channel command (`channel_command`).
+        Command::Run {
+            no_daemon: true, ..
+        } => launch_command(cli, json),
+        _ => None,
+    }
+}
+
+/// Build the run arguments shared by the local and daemon-backed paths.
+fn run_parts<'a>(
+    command: &'a Command,
+    json: bool,
+    quiet: bool,
+) -> Option<(run::RunArgs<'a>, run::DeferredFlags<'a>)> {
+    let Command::Run {
+        agent,
+        name,
+        proxy,
+        proxy_on_reject,
+        no_follow_children,
+        include_proc,
+        self_report,
+        cwd,
+        env_vars,
+        summary,
+        pin,
+        group,
+        mcp_tap,
+        no_daemon,
+        raw,
+        unsafe_no_redact,
+        cmd,
+    } = command
+    else {
+        return None;
+    };
+    let args = run::RunArgs {
+        agent: agent.as_deref(),
+        name: name.as_deref(),
+        no_follow_children: *no_follow_children,
+        cwd: cwd.as_deref(),
+        env: env_vars,
+        summary: summary.as_deref(),
+        pin: *pin,
+        no_daemon: *no_daemon,
+        raw: raw.as_deref(),
+        command: cmd,
+        json,
+        quiet,
+    };
+    let deferred = run::DeferredFlags {
+        proxy: *proxy,
+        proxy_on_reject: proxy_on_reject.is_some(),
+        proxy_on_reject_value: proxy_on_reject.as_deref(),
+        self_report: self_report.is_some(),
+        mcp_tap: *mcp_tap,
+        unsafe_no_redact: *unsafe_no_redact,
+        include_proc: !include_proc.is_empty(),
+        group: group.is_some(),
+    };
+    Some((args, deferred))
+}
+
+fn attach_parts<'a>(command: &'a Command, json: bool) -> Option<attach::AttachArgs<'a>> {
+    let Command::Attach {
+        pid,
+        name,
+        no_follow_children,
+        no_existing_children,
+        move_to_cgroup,
+        agent,
+        pin,
+        group,
+        until_exit,
+        duration,
+    } = command
+    else {
+        return None;
+    };
+    Some(attach::AttachArgs {
+        pid: *pid,
+        name: name.as_deref(),
+        no_follow_children: *no_follow_children,
+        no_existing_children: *no_existing_children,
+        move_to_cgroup: *move_to_cgroup,
+        until_exit: *until_exit,
+        duration: duration.as_deref(),
+        agent: agent.as_deref(),
+        pin: *pin,
+        group: group.as_deref(),
+        json,
+    })
+}
+
+/// `aw run` (except `--no-daemon`), `aw attach`, and `aw stop` on the resolved
+/// production channel.
+fn session_command(
+    cli: &Cli,
+    endpoint: &Endpoint,
+    json: bool,
+    control: &mut dyn ControlFactory,
+) -> Option<Outcome> {
+    match &cli.command {
+        Command::Run {
+            no_daemon: false, ..
+        } => {
+            let (args, deferred) = run_parts(&cli.command, json, cli.quiet)?;
+            Some(run::daemon_run(
+                &args,
+                deferred,
+                &mut *control.open(endpoint),
+                &mut run::CommandSpawner,
+                &mut run::DaemonSummary::new(endpoint.clone()),
+            ))
+        }
+        Command::Attach { .. } => {
+            let args = attach_parts(&cli.command, json)?;
+            Some(attach::run(&args, &mut *control.open(endpoint)))
+        }
+        Command::Stop { session } => Some(stop::run(session, json, &mut *control.open(endpoint))),
+        _ => None,
+    }
+}
+
+/// `aw stop` on the test path. The factory supplies the endpoint, so a test can
+/// record what was sent without this dispatcher resolving one of its own.
+fn injected_session_command(
+    cli: &Cli,
+    json: bool,
+    control: &mut dyn ControlFactory,
+) -> Option<Outcome> {
+    let Command::Stop { session } = &cli.command else {
+        return None;
+    };
+    use crate::endpoint::HttpBase;
+    let endpoint = Endpoint::Http {
+        base: HttpBase {
+            host: "127.0.0.1".to_owned(),
+            port: 9,
+        },
+        token: cli.token.clone().unwrap_or_default(),
+    };
+    Some(stop::run(session, json, &mut *control.open(&endpoint)))
+}
+
 /// Same as [`execute_args`], with the token, HTTP factory, and query source injected.
 ///
 /// `env_token` is the value tests would have put in `AW_TOKEN`. Passing it here
@@ -254,8 +490,22 @@ pub(crate) fn execute_args_with(
     http: &mut dyn HttpFactory,
     source: &mut dyn QuerySource,
 ) -> io::Result<Outcome> {
+    execute_args_with_control(args, env_token, http, source, &mut LiveControl)
+}
+
+/// [`execute_args_with`] with the session-control client injected too.
+///
+/// `aw stop` talks to the daemon through `control`, not through `source`. Tests
+/// that send `@last` pass a factory whose transport records the request.
+pub(crate) fn execute_args_with_control(
+    args: &[String],
+    env_token: Option<String>,
+    http: &mut dyn HttpFactory,
+    source: &mut dyn QuerySource,
+    control: &mut dyn ControlFactory,
+) -> io::Result<Outcome> {
     match Cli::try_parse_from(std::iter::once("aw".to_owned()).chain(args.iter().cloned())) {
-        Ok(cli) => dispatch(cli, env_token, http, source),
+        Ok(cli) => dispatch(cli, env_token, http, source, control),
         Err(err) => Ok(usage_outcome(err)),
     }
 }
@@ -285,6 +535,7 @@ fn dispatch(
     env_token: Option<String>,
     http: &mut dyn HttpFactory,
     source: &mut dyn QuerySource,
+    control: &mut dyn ControlFactory,
 ) -> io::Result<Outcome> {
     let json = cli.json;
     // `--lang` selects the wording table for `findings` and `config rules test`.
@@ -314,6 +565,9 @@ fn dispatch(
     if let Some(outcome) = query_command(&cli.command, json, lang, source)? {
         return Ok(outcome);
     }
+    if let Some(outcome) = injected_session_command(&cli, json, control) {
+        return Ok(outcome);
+    }
     if let Some(outcome) = ops_command(&cli.command, json, lang, None) {
         return Ok(outcome);
     }
@@ -337,7 +591,7 @@ fn dispatch(
         Ok(()) => Ok(error_outcome(
             exit::GENERAL,
             "not_implemented",
-            &format!("`{label}` is not implemented yet (尚未实现)"),
+            &format!("`{label}` 尚未实现"),
             json,
         )),
         Err(err) => Ok(client_outcome(err, &endpoint, json)),
@@ -408,9 +662,10 @@ fn proxy_command(command: &Command, json: bool) -> Option<Outcome> {
 
 /// `run`, `attach`, `stop`, and `ps` (P1-CLI-02).
 ///
-/// These do not probe `/health`. Each one calls an injected trait; the
-/// production values start no process and open no daemon session. `None` for
-/// every other command.
+/// This is the injected, socket-free dispatch path used by
+/// [`execute_args_with`]. Production dispatch only reaches it for
+/// `run --no-daemon` and `ps`; daemon-backed run, attach, and stop are handled
+/// by [`session_command`]. `None` for every other command.
 ///
 /// `usage_gap` still runs first for an empty `run` or an `attach` with neither
 /// `--pid` nor `--name`, via the check below this function's caller. An empty
@@ -500,15 +755,6 @@ fn launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
             Some(attach::run(&args, &mut attach::UnwiredControl))
         }
         Command::Stop { session } => Some(stop::run(session, json, &mut attach::UnwiredControl)),
-        Command::Ps {
-            agents_only,
-            filter,
-        } => Some(ps::run(
-            *agents_only,
-            filter.as_deref(),
-            json,
-            &mut ps::UnwiredTable,
-        )),
         _ => None,
     }
 }
@@ -684,16 +930,18 @@ fn ops_command(
         }
         Command::Daemon(cmd) => {
             let op = match cmd {
-                tree::DaemonCmd::Status => daemon::DaemonOp::Status,
-                tree::DaemonCmd::Start => daemon::DaemonOp::Start,
-                tree::DaemonCmd::Stop => daemon::DaemonOp::Stop,
-                tree::DaemonCmd::Restart => daemon::DaemonOp::Restart,
+                // Real commands over the internal channel; `channel_command`
+                // answers them before this point.
+                tree::DaemonCmd::Status
+                | tree::DaemonCmd::Start
+                | tree::DaemonCmd::Stop
+                | tree::DaemonCmd::Restart
+                | tree::DaemonCmd::Logs { .. } => return None,
                 tree::DaemonCmd::Install { yes } => daemon::DaemonOp::Install { confirm: *yes },
                 tree::DaemonCmd::Uninstall { purge, check } => daemon::DaemonOp::Uninstall {
                     purge: *purge,
                     check: *check,
                 },
-                tree::DaemonCmd::Logs { follow } => daemon::DaemonOp::Logs { follow: *follow },
             };
             Some(daemon::run(
                 op,
@@ -774,16 +1022,16 @@ fn ops_command(
 fn usage_gap(command: &Command) -> Option<String> {
     match command {
         Command::Run { cmd, .. } if cmd.is_empty() => {
-            Some("`aw run` needs a command after the flags".to_owned())
+            Some("`aw run` 需要在参数后提供命令".to_owned())
         }
         Command::McpTap { cmd, .. } if cmd.is_empty() => {
-            Some("`aw mcp-tap` needs a command to wrap".to_owned())
+            Some("`aw mcp-tap` 需要提供要包装的命令".to_owned())
         }
         Command::Dev { args, .. } if args.is_empty() => {
-            Some("`aw dev` needs the arguments of the single-process mode".to_owned())
+            Some("`aw dev` 需要提供单进程模式的参数".to_owned())
         }
         Command::Attach { pid, name, .. } if pid.is_none() && name.is_none() => {
-            Some("`aw attach` needs --pid or --name".to_owned())
+            Some("`aw attach` 需要 --pid 或 --name".to_owned())
         }
         _ => None,
     }
@@ -794,7 +1042,7 @@ fn version_outcome(check: bool, json: bool) -> Outcome {
         return error_outcome(
             exit::GENERAL,
             "not_implemented",
-            "`aw version --check` does not contact the network and is not implemented yet (尚未实现)",
+            "`aw version --check` 不会访问网络，尚未实现",
             json,
         );
     }
@@ -837,6 +1085,7 @@ fn client_outcome(err: ClientError, endpoint: &Endpoint, json: bool) -> Outcome 
     let code = err.exit_code();
     let machine = match &err {
         ClientError::Unreachable { .. } => "unreachable",
+        ClientError::Forbidden { .. } => "forbidden",
         ClientError::Transport { .. } => "transport",
         ClientError::Status { status, .. } => match *status {
             401 => "unauthorized",
@@ -985,7 +1234,7 @@ mod tests {
         );
         assert_eq!(outcome.code, exit::GENERAL);
         let err = text(&outcome.stderr);
-        assert!(err.contains("not implemented"), "{err}");
+        assert!(err.contains("尚未实现"), "{err}");
         assert!(err.contains("尚未实现"), "{err}");
         assert!(!err.contains(TOKEN), "{err}");
         assert_eq!(http.opened, 1);
@@ -1005,7 +1254,7 @@ mod tests {
         );
         assert_eq!(outcome.code, exit::PERMISSION);
         let err = text(&outcome.stderr);
-        assert!(err.contains("401"), "{err}");
+        assert!(err.contains("没有通过后台的身份验证"), "{err}");
         assert!(err.contains("len=19"), "{err}");
         assert!(err.contains("WXYZ"), "{err}");
         assert!(!err.contains(TOKEN), "{err}");
@@ -1018,7 +1267,10 @@ mod tests {
         let outcome = run(&["--http", "http://127.0.0.1:7456", "ui"], None, &mut http);
         assert_eq!(outcome.code, exit::GENERAL);
         let err = text(&outcome.stderr);
-        assert!(err.contains("AW_TOKEN") || err.contains("missing"), "{err}");
+        assert!(
+            err.contains("AW_TOKEN") || err.contains("空 token"),
+            "{err}"
+        );
         assert!(err.contains("token"), "{err}");
         assert_eq!(http.opened, 0);
         assert!(paths(&http).is_empty());
@@ -1036,18 +1288,23 @@ mod tests {
         // production source reports that the daemon query API is not connected.
         assert_eq!(outcome.code, exit::GENERAL);
         let err = text(&outcome.stderr);
-        assert!(
-            err.contains("not connected") || err.contains("stub"),
-            "{err}"
-        );
+        assert!(err.contains("未接通") || err.contains("占位实现"), "{err}");
         assert!(!err.contains(TOKEN), "{err}");
         assert_eq!(http.opened, 0);
     }
 
     #[test]
     fn default_socket_is_unreachable_and_does_not_open() {
+        // Hermetic: a real daemon on this machine's platform socket (for
+        // example a root agentwatchd on /run/agentwatch/api.sock) must not
+        // change the result, so the channel is pointed at a path that cannot
+        // exist instead of the platform default.
+        let missing = std::env::temp_dir()
+            .join(format!("aw-no-daemon-{}", std::process::id()))
+            .join("api.sock");
+        let missing = missing.to_string_lossy().into_owned();
         let mut http = script(200, r#"{"status":"ok"}"#);
-        let outcome = run(&["ui"], None, &mut http);
+        let outcome = run(&["--socket", &missing, "ui"], None, &mut http);
         assert_eq!(outcome.code, exit::UNREACHABLE);
         let err = text(&outcome.stderr);
         assert!(err.contains("aw daemon start"), "{err}");
@@ -1066,7 +1323,7 @@ mod tests {
         let check = run(&["version", "--check"], None, &mut http);
         assert_eq!(check.code, exit::GENERAL);
         let err = text(&check.stderr);
-        assert!(err.contains("does not contact the network"), "{err}");
+        assert!(err.contains("不会访问网络"), "{err}");
         assert!(err.contains("尚未实现"), "{err}");
         assert_eq!(http.opened, 0);
     }
@@ -1092,7 +1349,7 @@ mod tests {
         );
         assert_eq!(outcome.code, exit::USAGE);
         assert!(
-            text(&outcome.stderr).contains("port 0"),
+            text(&outcome.stderr).contains("端口 0"),
             "{}",
             text(&outcome.stderr)
         );
@@ -1162,12 +1419,12 @@ mod tests {
     }
 
     #[test]
-    fn attach_and_ps_stubs_are_exit_3_and_do_not_open_http() {
+    fn attach_and_stop_stubs_are_exit_3_and_do_not_open_http() {
         let mut http = script(200, "{}");
         let attach = run(&["attach", "--pid", "100"], None, &mut http);
         assert_eq!(attach.code, exit::UNREACHABLE, "{}", text(&attach.stderr));
         let err = text(&attach.stderr);
-        assert!(err.contains("not connected"), "{err}");
+        assert!(err.contains("连不上后台"), "{err}");
         assert!(
             err.contains("aw daemon start") || err.contains("--no-daemon"),
             "{err}"
@@ -1176,13 +1433,8 @@ mod tests {
         let stop = run(&["stop", "s-1"], None, &mut http);
         assert_eq!(stop.code, exit::UNREACHABLE, "{}", text(&stop.stderr));
 
-        let ps = run(&["ps", "--agents-only"], None, &mut http);
-        assert_eq!(ps.code, exit::UNREACHABLE, "{}", text(&ps.stderr));
-        let ps_err = text(&ps.stderr);
-        assert!(
-            ps_err.contains("不可用") || ps_err.contains("not available"),
-            "{ps_err}"
-        );
+        // `aw ps` is a channel command now (it reads the daemon's
+        // `/processes`); `tests/dispatch.rs` runs it over a real socket.
         assert_eq!(http.opened, 0);
     }
 

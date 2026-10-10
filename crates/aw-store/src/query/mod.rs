@@ -106,6 +106,78 @@ pub struct SessionListItem {
     pub ended_ns: Option<i64>,
     /// `1` when excluded from retention.
     pub pinned: i64,
+    /// `sessions.collectors`: JSON array of collector names, as stored.
+    pub collectors: String,
+    /// `sessions.argv`: JSON array, redacted before it was stored. The list
+    /// shows the command when the session has no name.
+    pub argv: Option<String>,
+    /// The same counts the overview reads ([`session_counts`]), so the list
+    /// and the overview never disagree.
+    pub counts: SessionCounts,
+}
+
+/// Row counts for one session, shared by the session list and the overview.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionCounts {
+    /// Process rows.
+    pub process_count: i64,
+    /// Flow rows.
+    pub flow_count: i64,
+    /// DNS rows.
+    pub dns_count: i64,
+    /// Gap rows.
+    pub gap_count: i64,
+    /// Sum of `bytes_up`. `None` when every flow left the column NULL.
+    pub bytes_up: Option<i64>,
+    /// Sum of `bytes_down`. `None` when every flow left the column NULL.
+    pub bytes_down: Option<i64>,
+    /// Finding rows. `None` when the database has no `findings` table yet
+    /// (unknown, not zero).
+    pub finding_count: Option<i64>,
+}
+
+/// Counts for `session_id`. The caller has already checked visibility.
+pub fn session_counts(conn: &Connection, session_id: i64) -> Result<SessionCounts, QueryError> {
+    let mut counts = conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM processes p WHERE p.session_id = ?1), \
+                    (SELECT COUNT(*) FROM net_flows f WHERE f.session_id = ?1), \
+                    (SELECT COUNT(*) FROM dns d WHERE d.session_id = ?1), \
+                    (SELECT COUNT(*) FROM gaps g WHERE g.session_id = ?1), \
+                    (SELECT SUM(bytes_up) FROM net_flows f WHERE f.session_id = ?1), \
+                    (SELECT SUM(bytes_down) FROM net_flows f WHERE f.session_id = ?1)",
+            rusqlite::params![session_id],
+            |row| {
+                Ok(SessionCounts {
+                    process_count: row.get(0)?,
+                    flow_count: row.get(1)?,
+                    dns_count: row.get(2)?,
+                    gap_count: row.get(3)?,
+                    bytes_up: row.get(4)?,
+                    bytes_down: row.get(5)?,
+                    finding_count: None,
+                })
+            },
+        )
+        .map_err(|err| QueryError::sqlite("session_counts", err))?;
+    let findings_table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'findings'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| QueryError::sqlite("session_counts", err))?;
+    if findings_table > 0 {
+        counts.finding_count = Some(
+            conn.query_row(
+                "SELECT COUNT(*) FROM findings WHERE session_id = ?",
+                rusqlite::params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|err| QueryError::sqlite("session_counts", err))?,
+        );
+    }
+    Ok(counts)
 }
 
 /// Counts for one session. Missing counts stay `None` only when the session
@@ -124,6 +196,8 @@ pub struct SessionSummary {
     pub started_ns: i64,
     /// End, or still running.
     pub ended_ns: Option<i64>,
+    /// Session exit status, or unknown. `None` is not `0`.
+    pub exit_code: Option<i64>,
     /// Process rows.
     pub process_count: i64,
     /// Flow rows.
@@ -136,6 +210,14 @@ pub struct SessionSummary {
     pub bytes_up: Option<i64>,
     /// Sum of `bytes_down`. `None` when every flow left the column NULL.
     pub bytes_down: Option<i64>,
+    /// `launch` or `attach`.
+    pub mode: String,
+    /// `sessions.collectors`: JSON array of collector names, as stored.
+    pub collectors: String,
+    /// Finding rows; see [`SessionCounts::finding_count`].
+    pub finding_count: Option<i64>,
+    /// `sessions.argv` as stored (JSON array, redacted).
+    pub argv: Option<String>,
 }
 
 /// One process in a session tree.
@@ -153,6 +235,9 @@ pub struct ProcessNode {
     pub start_ns: i64,
     /// Exit, or still running.
     pub exit_ns: Option<i64>,
+    /// Exit status, or unknown. `None` is not `0`: the poll sampler does not
+    /// observe a non-child's status, so an unobserved code stays NULL.
+    pub exit_code: Option<i64>,
     /// Evidence label.
     pub evidence: String,
     /// Latest image basename, or unknown.
@@ -232,6 +317,12 @@ pub struct TimelineRow {
     pub proc_uid: Option<i64>,
     /// Evidence label. Gaps are `E1` as stored by the view.
     pub evidence: String,
+    /// `proc` rows only: the process was already running when the session
+    /// began. True only for an attach session's baseline (`how = 'snapshot'`)
+    /// whose start precedes `sessions.started_ns`. A launch session starts its
+    /// own root, so nothing in it is pre-existing, even when the root's start
+    /// time (whole seconds from `/proc`) reads a little before the session row.
+    pub pre_existing: bool,
 }
 
 /// Resume token. The next page is strictly after this pair.
@@ -281,7 +372,7 @@ pub fn list_sessions(
 ) -> Result<Vec<SessionListItem>, QueryError> {
     let pred = compile_optional(filter.expr.as_deref(), Target::Sessions, None, None)?;
     let mut sql = String::from(
-        "SELECT id, public_id, name, mode, agent, started_ns, ended_ns, pinned \
+        "SELECT id, public_id, name, mode, agent, started_ns, ended_ns, pinned, collectors, argv \
          FROM sessions WHERE user_id = ?",
     );
     let mut bind: Vec<Param> = vec![Param::Text(user_id.to_string())];
@@ -330,10 +421,17 @@ pub fn list_sessions(
                 started_ns: row.get(5)?,
                 ended_ns: row.get(6)?,
                 pinned: row.get(7)?,
+                collectors: row.get(8)?,
+                argv: row.get(9)?,
+                counts: SessionCounts::default(),
             })
         })
         .map_err(|err| QueryError::sqlite("list_sessions", err))?;
-    collect_rows(rows)
+    let mut items: Vec<SessionListItem> = collect_rows(rows)?;
+    for item in &mut items {
+        item.counts = session_counts(conn, item.id)?;
+    }
+    Ok(items)
 }
 
 /// Overview counts for one session. `None` when it is not owned by `user_id`.
@@ -345,36 +443,55 @@ pub fn session_summary(
     if !session_visible(conn, user_id, session_id)? {
         return Ok(None);
     }
-    let summary = conn
+    let head = conn
         .query_row(
             "SELECT s.id, s.public_id, s.name, s.agent, s.started_ns, s.ended_ns, \
-                    (SELECT COUNT(*) FROM processes p WHERE p.session_id = s.id), \
-                    (SELECT COUNT(*) FROM net_flows f WHERE f.session_id = s.id), \
-                    (SELECT COUNT(*) FROM dns d WHERE d.session_id = s.id), \
-                    (SELECT COUNT(*) FROM gaps g WHERE g.session_id = s.id), \
-                    (SELECT SUM(bytes_up) FROM net_flows f WHERE f.session_id = s.id), \
-                    (SELECT SUM(bytes_down) FROM net_flows f WHERE f.session_id = s.id) \
+                    s.exit_code, s.mode, s.collectors, s.argv \
              FROM sessions s WHERE s.id = ? AND s.user_id = ?",
             rusqlite::params![session_id, user_id],
             |row| {
-                Ok(SessionSummary {
-                    id: row.get(0)?,
-                    public_id: row.get(1)?,
-                    name: row.get(2)?,
-                    agent: row.get(3)?,
-                    started_ns: row.get(4)?,
-                    ended_ns: row.get(5)?,
-                    process_count: row.get(6)?,
-                    flow_count: row.get(7)?,
-                    dns_count: row.get(8)?,
-                    gap_count: row.get(9)?,
-                    bytes_up: row.get(10)?,
-                    bytes_down: row.get(11)?,
-                })
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
             },
         )
         .optional()
         .map_err(|err| QueryError::sqlite("session_summary", err))?;
+    let Some((id, public_id, name, agent, started_ns, ended_ns, exit_code, mode, collectors, argv)) =
+        head
+    else {
+        return Ok(None);
+    };
+    // Same function as the session list: one source for both pages.
+    let counts = session_counts(conn, id)?;
+    let summary = Some(SessionSummary {
+        id,
+        public_id,
+        name,
+        agent,
+        started_ns,
+        ended_ns,
+        exit_code,
+        process_count: counts.process_count,
+        flow_count: counts.flow_count,
+        dns_count: counts.dns_count,
+        gap_count: counts.gap_count,
+        bytes_up: counts.bytes_up,
+        bytes_down: counts.bytes_down,
+        mode,
+        collectors,
+        finding_count: counts.finding_count,
+        argv,
+    });
     Ok(summary)
 }
 
@@ -392,7 +509,8 @@ pub fn process_tree(
     }
     let mut stmt = conn
         .prepare(
-            "SELECT p.proc_uid, p.pid, p.parent_uid, p.depth, p.start_ns, p.exit_ns, p.evidence, \
+            "SELECT p.proc_uid, p.pid, p.parent_uid, p.depth, p.start_ns, p.exit_ns, p.exit_code, \
+                    p.evidence, \
                     (SELECT CASE \
                         WHEN exe IS NULL THEN NULL \
                         ELSE replace(exe, rtrim(exe, replace(replace(exe, char(92), char(47)), char(47), '')), '') \
@@ -414,8 +532,9 @@ pub fn process_tree(
                 depth: row.get(3)?,
                 start_ns: row.get(4)?,
                 exit_ns: row.get(5)?,
-                evidence: row.get(6)?,
-                exe_name: row.get(7)?,
+                exit_code: row.get(6)?,
+                evidence: row.get(7)?,
+                exe_name: row.get(8)?,
             })
         })
         .map_err(|err| QueryError::sqlite("process_tree", err))?;
@@ -510,7 +629,14 @@ pub fn timeline(
     let pred = compile_optional(query.filter, Target::Timeline, started, None)?;
     let mut sql = String::from(
         "SELECT timeline.session_id, timeline.ts_ns, timeline.cat, timeline.id, \
-                timeline.proc_uid, timeline.evidence \
+                timeline.proc_uid, timeline.evidence, \
+                CASE WHEN timeline.cat = 'proc' AND sessions.mode = 'attach' \
+                          AND timeline.ts_ns < sessions.started_ns \
+                          AND EXISTS (SELECT 1 FROM processes p \
+                                      WHERE p.session_id = timeline.session_id \
+                                        AND p.proc_uid = timeline.proc_uid \
+                                        AND p.how = 'snapshot') \
+                     THEN 1 ELSE 0 END \
          FROM timeline \
          JOIN sessions ON sessions.id = timeline.session_id \
          WHERE timeline.session_id = ? AND sessions.user_id = ? AND (",
@@ -556,6 +682,7 @@ pub fn timeline(
                 id: row.get(3)?,
                 proc_uid: row.get(4)?,
                 evidence: row.get(5)?,
+                pre_existing: row.get::<_, i64>(6)? != 0,
             })
         })
         .map_err(|err| QueryError::sqlite("timeline", err))?;
@@ -825,6 +952,8 @@ pub fn around(
                     id: row.get(3)?,
                     proc_uid: row.get(4)?,
                     evidence: row.get(5)?,
+                    // The window view does not label baseline rows.
+                    pre_existing: false,
                 })
             },
         )
@@ -844,6 +973,17 @@ pub struct SearchHit {
     pub session_id: i64,
     /// Public session id.
     pub public_id: String,
+    /// What the hit is, as stored: the file path, or the executable path
+    /// (argv when the path is unknown). `None` when the row has neither.
+    pub text: Option<String>,
+    /// When: `file_access.first_ns` or `process_images.ts_ns`.
+    pub ts_ns: Option<i64>,
+    /// Record evidence of the source row.
+    pub evidence: Option<String>,
+    /// `sessions.name` of the owning session.
+    pub session_name: Option<String>,
+    /// `sessions.argv` of the owning session (JSON array, redacted).
+    pub session_argv: Option<String>,
 }
 
 /// Substring search across the caller's sessions.
@@ -891,15 +1031,83 @@ pub fn search(
                     src_id: row.get(1)?,
                     session_id: row.get(2)?,
                     public_id: row.get(3)?,
+                    text: None,
+                    ts_ns: None,
+                    evidence: None,
+                    session_name: None,
+                    session_argv: None,
                 })
             },
         )
         .map_err(|err| QueryError::sqlite("search", err))?;
-    let mut hits = collect_rows(rows)?;
+    let mut hits: Vec<SearchHit> = collect_rows(rows)?;
+    // The id alone left the page printing 「记录 #id」; each hit now carries
+    // the text and time of its row.
+    for hit in &mut hits {
+        if let Some((text, ts_ns, evidence)) = hit_detail(conn, hit)? {
+            hit.text = text;
+            hit.ts_ns = ts_ns;
+            hit.evidence = evidence;
+        }
+        // The page grouped hits under the bare public id. Name or command.
+        let (name, argv) = conn
+            .query_row(
+                "SELECT name, argv FROM sessions WHERE id = ?",
+                rusqlite::params![hit.session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|err| QueryError::sqlite("search", err))?
+            .unwrap_or((None, None));
+        hit.session_name = name;
+        hit.session_argv = argv;
+    }
     if let Some(since) = since_ns {
-        hits.retain(|hit| hit_time(conn, hit).unwrap_or(None).unwrap_or(i64::MIN) >= since);
+        hits.retain(|hit| hit.ts_ns.unwrap_or(i64::MIN) >= since);
     }
     Ok(hits)
+}
+
+/// The caller's newest session: the greatest `started_ns`, then the greatest
+/// `id` when two start together.
+///
+/// Only rows with this `user_id` are considered. Another user's session is
+/// never returned, however recently it started. `None` when this user has no
+/// sessions at all.
+pub fn newest_session_for_user(
+    conn: &Connection,
+    user_id: &str,
+) -> Result<Option<(i64, String)>, QueryError> {
+    conn.query_row(
+        "SELECT id, public_id FROM sessions WHERE user_id = ? \
+         ORDER BY started_ns DESC, id DESC LIMIT 1",
+        rusqlite::params![user_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(|err| QueryError::sqlite("newest_session_for_user", err))
+}
+
+/// `sessions.public_id` for an integer id owned by `user_id`.
+///
+/// `None` when the row is absent or belongs to someone else.
+pub fn public_id_by_session_id(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+) -> Result<Option<String>, QueryError> {
+    conn.query_row(
+        "SELECT public_id FROM sessions WHERE id = ? AND user_id = ?",
+        rusqlite::params![session_id, user_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|err| QueryError::sqlite("public_id_by_session_id", err))
 }
 
 /// Integer `sessions.id` for `public_id`, when that session belongs to `user_id`.
@@ -1692,15 +1900,22 @@ fn process_children(
     collect_rows(rows)
 }
 
-fn hit_time(conn: &Connection, hit: &SearchHit) -> Result<Option<i64>, QueryError> {
+/// Text, time and evidence of a hit's source row.
+type HitDetail = (Option<String>, Option<i64>, Option<String>);
+
+fn hit_detail(conn: &Connection, hit: &SearchHit) -> Result<Option<HitDetail>, QueryError> {
     let sql = match hit.src.as_str() {
-        "file_access" => "SELECT first_ns FROM file_access WHERE id = ?",
-        "process_images" => "SELECT ts_ns FROM process_images WHERE id = ?",
+        "file_access" => "SELECT path, first_ns, evidence FROM file_access WHERE id = ?",
+        "process_images" => {
+            "SELECT coalesce(exe, argv), ts_ns, evidence FROM process_images WHERE id = ?"
+        }
         _ => return Ok(None),
     };
-    conn.query_row(sql, rusqlite::params![hit.src_id], |row| row.get(0))
-        .optional()
-        .map_err(|err| QueryError::sqlite("search_time", err))
+    conn.query_row(sql, rusqlite::params![hit.src_id], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })
+    .optional()
+    .map_err(|err| QueryError::sqlite("search_detail", err))
 }
 
 fn clamp_page(limit: Option<i64>) -> Result<i64, QueryError> {
@@ -1967,6 +2182,7 @@ struct FlatProc {
     depth: i64,
     start_ns: i64,
     exit_ns: Option<i64>,
+    exit_code: Option<i64>,
     evidence: String,
     exe_name: Option<String>,
 }
@@ -1983,6 +2199,7 @@ fn build_tree(flat: Vec<FlatProc>) -> Vec<ProcessNode> {
             depth: row.depth,
             start_ns: row.start_ns,
             exit_ns: row.exit_ns,
+            exit_code: row.exit_code,
             evidence: row.evidence,
             exe_name: row.exe_name,
             children: Vec::new(),
@@ -2282,6 +2499,11 @@ mod tests {
         let conn = conn();
         session(&conn, 1, "user-a", 1);
         proc_row(&conn, 1, 1, 10, None, 1);
+        conn.execute(
+            "UPDATE processes SET exit_code = 7 WHERE session_id = 1 AND proc_uid = 1",
+            [],
+        )
+        .unwrap();
         proc_row(&conn, 1, 2, 11, Some(1), 2);
         image(&conn, 1, 2, 2, Some("/usr/bin/node"));
         flow(
@@ -2305,8 +2527,12 @@ mod tests {
         let tree = process_tree(&conn, "user-a", 1).unwrap().unwrap();
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].proc_uid, 1);
+        // The root's status was recorded. The child's was not, and that stays
+        // NULL rather than 0: the poll sampler cannot see a non-child's status.
+        assert_eq!(tree[0].exit_code, Some(7));
         assert_eq!(tree[0].children.len(), 1);
         assert_eq!(tree[0].children[0].exe_name.as_deref(), Some("node"));
+        assert_eq!(tree[0].children[0].exit_code, None);
         let grouped = flows(
             &conn,
             "user-a",
@@ -2475,5 +2701,145 @@ mod tests {
             elapsed.as_millis() < 3_000,
             "20k filtered timeline took {elapsed:?}"
         );
+    }
+
+    /// UI review of #143: a hit carried only its row id, so the search page
+    /// printed 「记录 #id」. It now carries the row's text, time and evidence,
+    /// and the executable path is matched when argv is unknown.
+    #[test]
+    fn search_hit_carries_text_and_time() {
+        let conn = conn();
+        conn.execute_batch(include_str!("../../migrations/0003_file_access.sql"))
+            .unwrap();
+        session(&conn, 1, "u", 10);
+        image(&conn, 1, 7, 1_000, Some("/usr/bin/node"));
+        let hits = search(&conn, "u", "NODE", false, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text.as_deref(), Some("/usr/bin/node"));
+        assert_eq!(hits[0].ts_ns, Some(1_000));
+        assert_eq!(hits[0].evidence.as_deref(), Some("E1"));
+        assert!(search(&conn, "u", "node", false, Some(2_000), None)
+            .unwrap()
+            .is_empty());
+        assert!(search(&conn, "other", "node", false, None, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// UI review of #143, detail 7: the list said 「不可得」 where the
+    /// overview had numbers. Both now read [`session_counts`].
+    #[test]
+    fn session_list_carries_the_overview_counts() {
+        let conn = conn();
+        session(&conn, 1, "u", 10);
+        proc_row(&conn, 1, 7, 70, None, 11);
+        proc_row(&conn, 1, 8, 80, Some(7), 12);
+        let items = list_sessions(&conn, "u", &SessionFilter::default()).unwrap();
+        assert_eq!(items.len(), 1);
+        let summary = session_summary(&conn, "u", 1).unwrap().unwrap();
+        assert_eq!(items[0].counts.process_count, 2);
+        assert_eq!(items[0].counts.process_count, summary.process_count);
+        assert_eq!(items[0].counts.gap_count, summary.gap_count);
+        assert_eq!(items[0].counts.bytes_up, summary.bytes_up);
+        // No findings table in this schema: unknown, not zero.
+        assert_eq!(items[0].counts.finding_count, None);
+        assert_eq!(summary.finding_count, None);
+        assert_eq!(items[0].collectors, "[]");
+    }
+
+    fn proc_how(conn: &Connection, session: i64, uid: i64, start: i64, how: &str) {
+        conn.execute(
+            "INSERT INTO processes (session_id, proc_uid, pid, depth, start_ns, how, evidence, source) \
+             VALUES (?1, ?2, ?2, 0, ?3, ?4, 'S', 'test')",
+            rusqlite::params![session, uid, start, how],
+        )
+        .unwrap();
+    }
+
+    fn pre_existing_by_uid(conn: &Connection, session: i64) -> Vec<(i64, bool)> {
+        let page = timeline(
+            conn,
+            "u",
+            session,
+            TimelineQuery {
+                filter: None,
+                from: None,
+                to: None,
+                cursor: None,
+                limit: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        page.rows
+            .iter()
+            .filter(|row| row.cat == "proc")
+            .map(|row| (row.id, row.pre_existing))
+            .collect()
+    }
+
+    /// UI re-review #144 new-2: a program the session launched was tagged
+    /// 「会话开始前已存在」, because its start time (whole seconds) read just
+    /// before `started_ns`. Only an attach session's baseline is pre-existing.
+    #[test]
+    fn only_processes_running_before_an_attach_session_are_pre_existing() {
+        let conn = conn();
+        // Attach session started at 1000.
+        session(&conn, 1, "u", 1_000);
+        conn.execute("UPDATE sessions SET mode = 'attach' WHERE id = 1", [])
+            .unwrap();
+        proc_how(&conn, 1, 1, 500, "snapshot"); // running before: tagged
+        proc_how(&conn, 1, 2, 1_500, "spawn"); // started after: not tagged
+        proc_how(&conn, 1, 3, 900, "spawn"); // seen starting, clock rounded down: not tagged
+        assert_eq!(
+            pre_existing_by_uid(&conn, 1),
+            vec![(1, true), (3, false), (2, false)]
+        );
+
+        // Launch session started at 1000: its own root reads 400 (rounded
+        // down) and is in the sampler's baseline, but the session started it.
+        session(&conn, 2, "u", 1_000);
+        proc_how(&conn, 2, 10, 400, "snapshot");
+        proc_how(&conn, 2, 11, 1_200, "spawn");
+        assert_eq!(
+            pre_existing_by_uid(&conn, 2),
+            vec![(10, false), (11, false)]
+        );
+    }
+
+    /// UI re-review #144 new-5: the list and search need the command of an
+    /// unnamed session, not just its public id.
+    #[test]
+    fn list_and_summary_carry_the_stored_argv() {
+        let conn = conn();
+        session(&conn, 1, "u", 10);
+        conn.execute(
+            "UPDATE sessions SET argv = '[\"sleep\",\"90\"]' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let items = list_sessions(&conn, "u", &SessionFilter::default()).unwrap();
+        assert_eq!(items[0].argv.as_deref(), Some(r#"["sleep","90"]"#));
+        let summary = session_summary(&conn, "u", 1).unwrap().unwrap();
+        assert_eq!(summary.argv.as_deref(), Some(r#"["sleep","90"]"#));
+    }
+
+    #[test]
+    fn newest_session_is_the_users_own_latest_start() {
+        let conn = conn();
+        // Root's session starts last, and a lower id for the same user starts
+        // later than a higher one. Neither may win for user "1000".
+        session(&conn, 1, "0", 300);
+        session(&conn, 3, "1000", 100);
+        session(&conn, 2, "1000", 200);
+        let (id, public_id) = newest_session_for_user(&conn, "1000").unwrap().unwrap();
+        assert_eq!((id, public_id.as_str()), (2, "s2"));
+        let (root_id, _) = newest_session_for_user(&conn, "0").unwrap().unwrap();
+        assert_eq!(root_id, 1);
+        // Same start: the greater id is the newer row.
+        session(&conn, 4, "1000", 200);
+        let (id, _) = newest_session_for_user(&conn, "1000").unwrap().unwrap();
+        assert_eq!(id, 4);
+        assert!(newest_session_for_user(&conn, "1001").unwrap().is_none());
     }
 }

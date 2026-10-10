@@ -171,19 +171,16 @@ pub enum LaunchError {
 impl std::fmt::Display for LaunchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EmptyCommand => f.write_str("launch command is empty"),
-            Self::CreateFailed { detail } => write!(f, "create suspended failed: {detail}"),
-            Self::JobFailed { detail } => write!(f, "job assignment failed: {detail}"),
+            Self::EmptyCommand => f.write_str("启动命令为空"),
+            Self::CreateFailed { detail } => write!(f, "创建挂起进程失败：{detail}"),
+            Self::JobFailed { detail } => write!(f, "分配 Job 失败：{detail}"),
             Self::HandleHandoffFailed { detail } => {
-                write!(f, "job handle handoff failed: {detail}")
+                write!(f, "移交 Job 句柄失败：{detail}")
             }
-            Self::AdoptTimeout => f.write_str("adopt timed out; the target was terminated"),
-            Self::AdoptFailed { detail } => write!(f, "adopt failed: {detail}"),
-            Self::WaitFailed { detail } => write!(f, "waiting for the target failed: {detail}"),
-            Self::NotVerified { step } => write!(
-                f,
-                "{step} is not verified in this environment; no process was created"
-            ),
+            Self::AdoptTimeout => f.write_str("adopt 超时；目标进程已结束"),
+            Self::AdoptFailed { detail } => write!(f, "adopt 失败：{detail}"),
+            Self::WaitFailed { detail } => write!(f, "等待目标进程失败：{detail}"),
+            Self::NotVerified { step } => write!(f, "步骤 {step} 未在此环境验证；没有创建进程"),
         }
     }
 }
@@ -279,7 +276,7 @@ pub fn run_launch<A: JobApi>(
         // The enum has one variant today. This guard stays so a future variant
         // cannot silently become a SYSTEM launch.
         return Err(LaunchError::CreateFailed {
-            detail: "only the calling user may launch; SYSTEM is not a path".to_owned(),
+            detail: "只能以调用用户身份启动；SYSTEM 不是路径".to_owned(),
         });
     }
 
@@ -418,7 +415,7 @@ impl JobApi for UnverifiedJobApi {
 /// because no Job exists to set it on. Nothing here claims the process is in
 /// a Job.
 #[cfg(target_os = "windows")]
-const JOB_UNAVAILABLE: &str = "Job assignment is unavailable in aw-cli: the windows crate is not a dependency and unsafe Win32 is forbidden, so CreateProcessW(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP), CreateJobObjectW, AssignProcessToJobObject, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, and ResumeThread were not called; no process was created and no process is in a Job";
+const JOB_UNAVAILABLE: &str = "aw-cli 无法分配 Job：没有依赖 windows crate，且禁止 unsafe Win32，因此没有调用 CreateProcessW(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP)、CreateJobObjectW、AssignProcessToJobObject、JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 或 ResumeThread；没有创建进程，也没有进程处于 Job 中";
 
 /// Production [`JobApi`] for Windows.
 ///
@@ -451,7 +448,7 @@ pub fn production() -> CommandJobApi {
 impl CommandJobApi {
     fn child_mut(&mut self) -> Result<&mut std::process::Child, LaunchError> {
         self.child.as_mut().ok_or_else(|| LaunchError::WaitFailed {
-            detail: "no child exists for this step".to_owned(),
+            detail: "此步骤没有子进程".to_owned(),
         })
     }
 }
@@ -461,7 +458,7 @@ impl JobApi for CommandJobApi {
     fn create_suspended(&mut self, request: &LaunchRequest) -> Result<u32, LaunchError> {
         if request.identity != LaunchIdentity::CallingUser {
             return Err(LaunchError::CreateFailed {
-                detail: "only the calling user may launch; SYSTEM is not a path".to_owned(),
+                detail: "只能以调用用户身份启动；SYSTEM 不是路径".to_owned(),
             });
         }
         let Some((program, _args)) = request.command.split_first() else {
@@ -469,7 +466,7 @@ impl JobApi for CommandJobApi {
         };
         if program.is_empty() {
             return Err(LaunchError::CreateFailed {
-                detail: "CreateProcess program name is empty".to_owned(),
+                detail: "CreateProcess 的程序名为空".to_owned(),
             });
         }
         // A path-shaped program that is not a file fails the way CreateProcess
@@ -479,7 +476,7 @@ impl JobApi for CommandJobApi {
         let path = std::path::Path::new(program);
         if path.components().count() > 1 && !path.is_file() {
             return Err(LaunchError::CreateFailed {
-                detail: "CreateProcess program path is not a file".to_owned(),
+                detail: "CreateProcess 的程序路径不是文件".to_owned(),
             });
         }
         // No `Command::spawn`. CREATE_SUSPENDED cannot be set, so a running
@@ -507,7 +504,7 @@ impl JobApi for CommandJobApi {
         let child_pid = self.child_mut()?.id();
         if child_pid != pid {
             return Ok(AdoptWait::Failed {
-                detail: "pid does not match the spawned child".to_owned(),
+                detail: "PID 与已启动的子进程不匹配".to_owned(),
             });
         }
         // Reached only if a future caller skips the job failure. Still not a
@@ -519,16 +516,14 @@ impl JobApi for CommandJobApi {
         let child_pid = self.child_mut()?.id();
         if child_pid != pid {
             return Err(LaunchError::WaitFailed {
-                detail: "pid does not match the spawned child".to_owned(),
+                detail: "PID 与已启动的子进程不匹配".to_owned(),
             });
         }
         // The child was never suspended, so ResumeThread is not called and
         // must not be reported as having run. `run_launch` only calls this
         // after a successful assign, which this type does not return.
         Err(LaunchError::WaitFailed {
-            detail:
-                "ResumeThread was not called; the process was not suspended and is not in a Job"
-                    .to_owned(),
+            detail: "没有调用 ResumeThread；进程未被挂起，也不在 Job 中".to_owned(),
         })
     }
 
@@ -536,11 +531,11 @@ impl JobApi for CommandJobApi {
         let child = self.child_mut()?;
         if child.id() != pid {
             return Err(LaunchError::WaitFailed {
-                detail: "pid does not match the spawned child".to_owned(),
+                detail: "PID 与已启动的子进程不匹配".to_owned(),
             });
         }
         child.kill().map_err(|err| LaunchError::WaitFailed {
-            detail: format!("TerminateProcess via Child::kill failed: {err}"),
+            detail: format!("通过 Child::kill 调用 TerminateProcess 失败：{err}"),
         })?;
         // Reap so the pid does not stay a zombie if the caller then returns
         // the job error. A wait error after a successful kill is still a
@@ -553,13 +548,13 @@ impl JobApi for CommandJobApi {
         let child = self.child_mut()?;
         if child.id() != pid {
             return Err(LaunchError::WaitFailed {
-                detail: "pid does not match the spawned child".to_owned(),
+                detail: "PID 与已启动的子进程不匹配".to_owned(),
             });
         }
         match child.wait() {
             Ok(status) => Ok(status.code().unwrap_or(-1)),
             Err(err) => Err(LaunchError::WaitFailed {
-                detail: format!("WaitForSingleObject via Child::wait failed: {err}"),
+                detail: format!("通过 Child::wait 调用 WaitForSingleObject 失败：{err}"),
             }),
         }
     }

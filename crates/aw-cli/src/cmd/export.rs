@@ -103,9 +103,9 @@ pub(crate) enum FormatError {
 impl FormatError {
     fn message(&self) -> String {
         match self {
-            Self::Markdown => "format `md` is not supported (P3); use jsonl or csv".to_owned(),
+            Self::Markdown => "不支持格式 `md`（P3）；请使用 jsonl 或 csv".to_owned(),
             Self::Unknown(name) => {
-                format!("format `{name}` is not supported; use jsonl or csv")
+                format!("不支持格式 `{name}`；请使用 jsonl 或 csv")
             }
         }
     }
@@ -211,7 +211,7 @@ fn record_json(record: &ExportRecord) -> Value {
 
 fn write_line<W: Write>(out: &mut W, value: &Value) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(value)
-        .map_err(|err| io::Error::other(format!("encode export json: {err}")))?;
+        .map_err(|err| io::Error::other(format!("编码导出 JSON 失败：{err}")))?;
     bytes.push(b'\n');
     out.write_all(&bytes)
 }
@@ -288,7 +288,7 @@ pub(crate) fn run(args: ExportArgs<'_>, source: &mut dyn ExportSource) -> Outcom
             return error_outcome(
                 exit::GENERAL,
                 "not_found",
-                "export has no session source yet (no daemon database in this build)",
+                "export 还没有会话来源（此构建没有后台数据库）",
                 json,
             );
         }
@@ -432,7 +432,7 @@ mod tests {
         assert!(parse_format(Some("md"))
             .unwrap_err()
             .message()
-            .contains("not supported"));
+            .contains("不支持"));
         assert_eq!(parse_format(None), Ok(ExportFormat::Jsonl));
         assert_eq!(parse_format(Some("csv")), Ok(ExportFormat::Csv));
     }

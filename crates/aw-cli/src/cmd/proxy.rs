@@ -73,7 +73,7 @@ pub(crate) trait ProxyApi {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct UnwiredProxy;
 
-const UNWIRED: &str = "daemon proxy API is not connected; aw proxy does not read ca.key. Start it with `aw daemon start`, or pass --no-daemon (polling collectors, all evidence S)";
+const UNWIRED: &str = "后台代理 API 未接通；aw proxy 不会读取 ca.key。请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）";
 
 impl ProxyApi for UnwiredProxy {
     fn ca_info(&mut self) -> Result<CaInfoView, String> {

@@ -77,7 +77,7 @@ export function FindingsPage() {
   if (query.isError) {
     return (
       <ErrorNote
-        message={query.error instanceof Error ? query.error.message : ""}
+        error={query.error}
         onRetry={() => void query.refetch()}
       />
     );

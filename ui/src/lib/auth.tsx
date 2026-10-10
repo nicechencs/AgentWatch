@@ -4,8 +4,37 @@ import { isDesktop } from "@/api/transport";
 import { isApiError } from "@/api/errors";
 import type { Me } from "@/api/types";
 
-/** `unreachable`: desktop app only, the daemon did not answer on the internal channel. */
-type AuthStatus = "checking" | "anonymous" | "signed-in" | "unreachable";
+/**
+ * Desktop app only:
+ * - `unreachable`: nothing answered on the internal channel (service not running).
+ * - `forbidden`: the channel refused this OS user (permission, not a dead service).
+ * - `busy`: every pipe instance stayed busy (Windows); retry shortly.
+ * - `timeout`: the service did not answer in time.
+ * - `broken`: the exchange on the channel broke or did not parse.
+ * - `failed`: the service answered, with an error.
+ */
+export type AuthStatus =
+  | "checking"
+  | "anonymous"
+  | "signed-in"
+  | "unreachable"
+  | "forbidden"
+  | "busy"
+  | "timeout"
+  | "broken"
+  | "failed";
+
+/** Which desktop status a failed first call means. Only `daemon_unreachable` is "not running". */
+export function desktopFailure(caught: unknown): AuthStatus {
+  if (isApiError(caught)) {
+    if (caught.code === "daemon_unreachable") return "unreachable";
+    if (caught.code === "daemon_forbidden" || caught.status === 403) return "forbidden";
+    if (caught.code === "daemon_busy") return "busy";
+    if (caught.code === "daemon_timeout") return "timeout";
+    if (caught.code === "channel_broken" || caught.code === "channel_error") return "broken";
+  }
+  return "failed";
+}
 
 interface AuthValue {
   status: AuthStatus;
@@ -100,6 +129,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const [attempt, setAttempt] = useState(0);
   const retry = useCallback(() => {
+    setError(null);
     setStatus("checking");
     setAttempt((n) => n + 1);
   }, []);
@@ -115,8 +145,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         })
         .catch((caught: unknown) => {
           if (cancelled) return;
-          setError(caught instanceof Error ? caught.message : "daemon_unreachable");
-          setStatus("unreachable");
+          setError(caught instanceof Error ? caught.message : String(caught));
+          setStatus(desktopFailure(caught));
         });
       return () => {
         cancelled = true;

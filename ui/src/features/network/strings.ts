@@ -8,6 +8,7 @@
 import { useI18n, type Lang } from "@/lib/i18n";
 
 const zh = {
+  colon: "：",
   markDirect: "直连",
   markDirectTip: "此连接未经过代理，URL 不可得",
   markQuic: "QUIC",
@@ -36,6 +37,7 @@ const zh = {
 export type NetStrings = { [K in keyof typeof zh]: string };
 
 const en: NetStrings = {
+  colon: ": ",
   markDirect: "direct",
   markDirectTip: "This connection did not go through the proxy; the URL is unavailable",
   markQuic: "QUIC",
@@ -61,7 +63,9 @@ const en: NetStrings = {
   quickDirectTip: "Only connections that did not go through the proxy",
 };
 
-const catalogs: Record<Lang, NetStrings> = { zh, en };
+/** Both catalogs, for the locale tests. */
+export const netCatalogs: Record<Lang, NetStrings> = { zh, en };
+const catalogs = netCatalogs;
 
 export function netStrings(lang: Lang): NetStrings {
   return catalogs[lang] ?? zh;

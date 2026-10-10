@@ -97,6 +97,9 @@ pub struct ProcessRecord {
     pub source: String,
     /// Recognized agent id, or unknown.
     pub agent: Option<String>,
+    /// Executable name (last path segment of the newest `process_images.exe`),
+    /// or unknown. JSONL only; the CSV columns are the table's.
+    pub exe_name: Option<String>,
 }
 
 /// One `net_flows` row.
@@ -435,6 +438,8 @@ fn write_process<W: Write>(
     w.i64(row.proc_uid)?;
     w.key("pid")?;
     w.i64(row.pid)?;
+    w.key("exe_name")?;
+    w.opt_string(row.exe_name.as_deref())?;
     w.key("parent_uid")?;
     w.opt_i64(row.parent_uid)?;
     w.key("ppid")?;

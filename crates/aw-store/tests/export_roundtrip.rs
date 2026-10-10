@@ -358,6 +358,11 @@ fn jsonl_round_trip_matches_the_database() {
         ]
     );
 
+    // Test-bot #144: process rows carry the executable name (basename of the
+    // newest process_images.exe), so a JSONL reader sees "curl.exe", not a pid.
+    assert_eq!(str_field(&json_object(lines[1]), "exe_name"), "node.exe");
+    assert_eq!(str_field(&json_object(lines[4]), "exe_name"), "curl.exe");
+
     let net4 = json_object(lines[5]);
     assert!(is_null(&net4, "bytes_up"));
     assert!(is_null(&net4, "bytes_down"));

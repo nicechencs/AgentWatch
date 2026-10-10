@@ -59,7 +59,7 @@ pub(crate) fn export_markdown(
         redact_paths,
         redact_hosts,
     ) {
-        Ok(markdown) => markdown_response(markdown),
+        Ok(markdown) => markdown_response(markdown, sid),
         Err(ReportError::Store(message)) => error_response(500, "store", &message),
         Err(ReportError::Lint(violations)) => lint_response(&violations),
     }
@@ -695,7 +695,9 @@ fn opt_num(value: Option<i64>, lang: Lang) -> String {
     }
 }
 
-fn markdown_response(body: String) -> ApiResponse {
+/// Named like the JSONL/CSV exports (`agentwatch-<sid>.md`), not a fixed
+/// `session.md` that every export overwrote.
+fn markdown_response(body: String, sid: &str) -> ApiResponse {
     let mut headers = BTreeMap::new();
     headers.insert(
         "content-type".to_owned(),
@@ -703,7 +705,10 @@ fn markdown_response(body: String) -> ApiResponse {
     );
     headers.insert(
         "content-disposition".to_owned(),
-        "attachment; filename=\"session.md\"".to_owned(),
+        format!(
+            "attachment; filename=\"agentwatch-{}.md\"",
+            super::data::safe_name(sid)
+        ),
     );
     ApiResponse {
         status: 200,
@@ -752,7 +757,19 @@ fn rule_name(rule: RuleId) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::load_gaps;
+    use super::{load_gaps, markdown_response};
+
+    #[test]
+    fn markdown_file_is_named_after_the_session() {
+        let response = markdown_response("# x".to_owned(), "s-1/../x");
+        assert_eq!(
+            response
+                .headers
+                .get("content-disposition")
+                .map(String::as_str),
+            Some("attachment; filename=\"agentwatch-s-1____x.md\"")
+        );
+    }
 
     #[test]
     fn gap_query_matches_the_migrated_schema() {

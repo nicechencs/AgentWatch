@@ -410,7 +410,12 @@ fn load_processes(
     }
     let sql = in_clause(
         "SELECT session_id, proc_uid, pid, parent_uid, ppid, depth, start_ns, exit_ns, \
-         exit_code, exit_signal, how, user_id, signer, evidence, field_evidence, source, agent \
+         exit_code, exit_signal, how, user_id, signer, evidence, field_evidence, source, agent, \
+         (SELECT CASE WHEN i.exe IS NULL THEN NULL \
+                 ELSE replace(i.exe, rtrim(i.exe, replace(replace(i.exe, char(92), char(47)), char(47), '')), '') END \
+          FROM process_images i \
+          WHERE i.session_id = processes.session_id AND i.proc_uid = processes.proc_uid \
+          ORDER BY i.ts_ns DESC LIMIT 1) \
          FROM processes WHERE session_id = ? AND proc_uid IN ",
         ids.len(),
     );
@@ -447,6 +452,7 @@ fn read_process(row: &Row<'_>) -> rusqlite::Result<ProcessRecord> {
         field_evidence: row.get(14)?,
         source: row.get(15)?,
         agent: row.get(16)?,
+        exe_name: row.get(17)?,
     })
 }
 

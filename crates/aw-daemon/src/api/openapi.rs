@@ -81,7 +81,7 @@ fn paths() -> Value {
         "/sessions/{sid}/dns": op("get", "DNS rows.", true, "implemented"),
         "/sessions/{sid}/gaps": op("get", "Gaps for this session.", true, "implemented"),
         "/sessions/{sid}/around": op("get", "Window around one record.", true, "implemented"),
-        "/sessions/{sid}/export": op("get", "format=md | jsonl | csv (zip of CSVs). Other formats are 400/501.", true, "implemented"),
+        "/sessions/{sid}/export": op("get", "format=md | jsonl | csv (zip of CSVs). File name agentwatch-<sid>.md|jsonl|csv.zip; jsonl process rows carry exe_name. Other formats are 400/501.", true, "implemented"),
         "/sessions/{sid}/live": op("get", "SSE of new attributed records. Filter is evaluated in memory.", true, "implemented"),
         "/sessions/{sid}/http": op("get", "Proxy-mode HTTP rows. A session without the proxy is 200 with reason no_proxy.", true, "implemented"),
         "/sessions/{sid}/findings": op("get", "Findings with rendered wording.", true, "implemented"),

@@ -13,6 +13,7 @@
 
 mod agent;
 mod auth;
+mod control;
 mod findings;
 mod http;
 mod http_events;
@@ -26,6 +27,7 @@ mod timeline_rows;
 pub(crate) use agent::OtlpRegistry;
 pub(crate) use findings::share;
 
+pub(crate) use control::Control;
 pub(crate) use http::HttpServer;
 pub(crate) use ipc::{socket_path, IpcServer};
 pub(crate) use query::StoreQuery;

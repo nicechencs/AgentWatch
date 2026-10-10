@@ -8,17 +8,22 @@
 //! can reach a filesystem socket.
 //!
 //! Peer identity:
-//! - Linux: `SO_PEERCRED` through `rustix` (no `unsafe` in this crate). uid 0
-//!   is an administrator.
-//! - macOS: `LOCAL_PEERCRED` is not exposed by a safe API this crate links.
-//!   The socket mode (0660) is the only gate, and the caller is recorded as
-//!   [`UNVERIFIED_PEER`], never as an administrator.
-//! - Windows: named pipe `\\.\pipe\agentwatch-api` (tokio). The pipe keeps the
-//!   default DACL, so only LocalSystem, Administrators, and the daemon's own
-//!   account can open it for writing; a client is recorded as an
-//!   administrator. The `AgentWatch Users` DACL and the client SID
-//!   (`GetNamedPipeClientProcessId`) are not applied yet, so an ordinary
-//!   Windows user cannot open the pipe.
+//! - Linux: `SO_PEERCRED` through `rustix`; macOS: `getpeereid` (the
+//!   `LOCAL_PEERCRED` uid) through `nix`. No `unsafe` in this crate. uid 0 is
+//!   an administrator. A peer whose uid cannot be read is [`UNVERIFIED_PEER`],
+//!   never an administrator.
+//! - The socket is mode 0660. When a group named [`SOCKET_GROUP`] exists, the
+//!   socket's group is set to it, so members can connect without root.
+//! - Windows: named pipe `\\.\pipe\agentwatch-api` (tokio). The pipe carries an
+//!   explicit DACL (`aw_collector_windows::pipe`): LocalSystem and
+//!   Administrators full control; `AgentWatch Users` when that group exists,
+//!   otherwise interactive users, read/write without create-instance. The
+//!   client is identified from its process token (SID; elevated or
+//!   LocalSystem = administrator). A client that cannot be identified is
+//!   refused with 403.
+//!
+//! Daemon control (`stop`, `logs`) is answered here before the normal routes,
+//! see [`super::control`].
 //!
 //! The socket path comes from [`AW_SOCKET`] when set (tests and unprivileged
 //! development runs), otherwise the documented platform path. A stale socket
@@ -27,6 +32,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use super::control::Control;
 use super::routes::ApiState;
 
 /// Environment variable that overrides the socket path for both `agentwatchd`
@@ -74,6 +80,26 @@ fn socket_path_from(env: Option<String>) -> Option<PathBuf> {
 /// ticket issued here can be redeemed there.
 pub type SharedState = Arc<Mutex<ApiState>>;
 
+/// Group that owns the socket when it exists (Linux and macOS).
+pub const SOCKET_GROUP: &str = "agentwatch";
+
+/// Control routes first, then the normal routes as `caller`.
+fn answer(
+    state: &SharedState,
+    control: &Control,
+    request: &super::routes::HttpRequest,
+    caller: &super::auth::Caller,
+) -> super::routes::ApiResponse {
+    if let Some(reply) = super::control::handle(control, request, caller) {
+        return reply;
+    }
+    let mut guard = match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    super::routes::dispatch_peer(&mut guard, request, caller)
+}
+
 #[cfg(unix)]
 pub use unix::IpcServer;
 
@@ -91,8 +117,8 @@ mod unix {
 
     use super::super::auth::Caller;
     use super::super::http::{parse_request, write_response};
-    use super::super::routes::{dispatch_peer, error_response};
-    use super::{SharedState, SOCKET_MODE, UNVERIFIED_PEER};
+    use super::super::routes::error_response;
+    use super::{answer, Control, SharedState, SOCKET_GROUP, SOCKET_MODE, UNVERIFIED_PEER};
 
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const MAX_REQUEST: usize = 80 * 1024;
@@ -106,13 +132,14 @@ mod unix {
     }
 
     impl IpcServer {
-        /// Bind `path`, set mode 0660, and serve `state` until shutdown.
+        /// Bind `path`, set mode 0660 (group [`SOCKET_GROUP`] when it
+        /// exists), and serve `state` until shutdown.
         ///
         /// # Errors
         ///
         /// Parent directory creation, a live daemon already on `path`
         /// (`AddrInUse`), bind, or chmod failure.
-        pub fn bind(path: &Path, state: SharedState) -> io::Result<Self> {
+        pub fn bind(path: &Path, state: SharedState, control: Arc<Control>) -> io::Result<Self> {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     fs::create_dir_all(parent)?;
@@ -129,12 +156,13 @@ mod unix {
             }
             let listener = UnixListener::bind(path)?;
             fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))?;
+            set_group(path);
             listener.set_nonblocking(true)?;
             let stop = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&stop);
             let thread = thread::Builder::new()
                 .name("aw-ipc".to_owned())
-                .spawn(move || accept_loop(&listener, &state, &flag))?;
+                .spawn(move || accept_loop(&listener, &state, &control, &flag))?;
             Ok(Self {
                 path: path.to_path_buf(),
                 stop,
@@ -158,15 +186,38 @@ mod unix {
         }
     }
 
-    fn accept_loop(listener: &UnixListener, state: &SharedState, stop: &AtomicBool) {
+    /// Give the socket to [`SOCKET_GROUP`] when that group exists. Failure
+    /// (an unprivileged daemon cannot chown to a group it is not in) is logged;
+    /// the socket stays usable by its owner.
+    fn set_group(path: &Path) {
+        let gid = match nix::unistd::Group::from_name(SOCKET_GROUP) {
+            Ok(Some(group)) => group.gid.as_raw(),
+            Ok(None) => return,
+            Err(err) => {
+                tracing::debug!(target: "aw_daemon::ipc", error = %err, "group lookup failed");
+                return;
+            }
+        };
+        if let Err(err) = std::os::unix::fs::chown(path, None, Some(gid)) {
+            tracing::warn!(target: "aw_daemon::ipc", error = %err, gid, "socket group not set");
+        }
+    }
+
+    fn accept_loop(
+        listener: &UnixListener,
+        state: &SharedState,
+        control: &Arc<Control>,
+        stop: &AtomicBool,
+    ) {
         while !stop.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let state = Arc::clone(state);
+                    let control = Arc::clone(control);
                     let spawned = thread::Builder::new()
                         .name("aw-ipc-conn".to_owned())
                         .spawn(move || {
-                            if let Err(err) = serve(stream, &state) {
+                            if let Err(err) = serve(stream, &state, &control) {
                                 tracing::debug!(target: "aw_daemon::ipc", error = %err, "connection closed");
                             }
                         });
@@ -206,12 +257,19 @@ mod unix {
             .map(|cred| cred.uid.as_raw())
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    fn peer_uid(stream: &UnixStream) -> Option<u32> {
+        nix::unistd::getpeereid(stream)
+            .ok()
+            .map(|(uid, _gid)| uid.as_raw())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn peer_uid(_stream: &UnixStream) -> Option<u32> {
         None
     }
 
-    fn serve(mut stream: UnixStream, state: &SharedState) -> io::Result<()> {
+    fn serve(mut stream: UnixStream, state: &SharedState, control: &Control) -> io::Result<()> {
         stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
@@ -237,13 +295,7 @@ mod unix {
                 break req;
             }
         };
-        let response = {
-            let mut guard = match state.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            dispatch_peer(&mut guard, &request, &caller)
-        };
+        let response = answer(state, control, &request, &caller);
         let route = super::super::http::log_route(&request.path);
         tracing::debug!(
             target: "aw_daemon::ipc",
@@ -259,6 +311,7 @@ mod unix {
 
 #[cfg(windows)]
 mod pipe {
+    use std::ffi::OsString;
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -266,20 +319,15 @@ mod pipe {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
-    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+    use aw_collector_windows::pipe::{client_identity, create_server, pipe_sddl};
+    use tokio::net::windows::named_pipe::NamedPipeServer;
 
     use super::super::auth::Caller;
     use super::super::http::{parse_request, response_bytes};
-    use super::super::routes::{dispatch_peer, error_response};
-    use super::SharedState;
+    use super::super::routes::error_response;
+    use super::{answer, Control, SharedState};
 
     const MAX_REQUEST: usize = 80 * 1024;
-
-    /// `user_id` for a pipe client. The pipe keeps the default DACL, which
-    /// lets only LocalSystem, Administrators, and the daemon's own account
-    /// open it for writing, so a connected client is an administrator. The
-    /// client SID is not read yet.
-    pub const PIPE_ADMIN: &str = "pipe-admin";
 
     /// A running named-pipe listener.
     pub struct IpcServer {
@@ -290,24 +338,28 @@ mod pipe {
     }
 
     impl IpcServer {
-        /// Create the first pipe instance on `path` and serve `state`.
+        /// Create the first pipe instance on `path` with the AgentWatch DACL
+        /// and serve `state`.
         ///
         /// # Errors
         ///
         /// Runtime creation or pipe creation failure (another daemon holding
         /// the first instance is `PermissionDenied` / `AccessDenied`).
-        pub fn bind(path: &Path, state: SharedState) -> io::Result<Self> {
+        pub fn bind(path: &Path, state: SharedState, control: Arc<Control>) -> io::Result<Self> {
             let name = path.as_os_str().to_owned();
+            let sddl = pipe_sddl();
+            tracing::info!(target: "aw_daemon::ipc", sddl = %sddl, "pipe DACL");
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let first = runtime
-                .block_on(async { ServerOptions::new().first_pipe_instance(true).create(&name) })?;
+            let first = runtime.block_on(async { create_server(&name, true, &sddl) })?;
             let stop = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&stop);
             let thread = thread::Builder::new()
                 .name("aw-ipc".to_owned())
-                .spawn(move || runtime.block_on(accept_loop(name, first, state, flag)))?;
+                .spawn(move || {
+                    runtime.block_on(accept_loop(name, sddl, first, state, control, flag));
+                })?;
             Ok(Self {
                 path: path.to_path_buf(),
                 stop,
@@ -331,9 +383,11 @@ mod pipe {
     }
 
     async fn accept_loop(
-        name: std::ffi::OsString,
+        name: OsString,
+        sddl: String,
         mut server: NamedPipeServer,
         state: SharedState,
+        control: Arc<Control>,
         stop: Arc<AtomicBool>,
     ) {
         while !stop.load(Ordering::Relaxed) {
@@ -345,7 +399,7 @@ mod pipe {
                 tracing::warn!(target: "aw_daemon::ipc", error = %err, "pipe connect failed");
                 continue;
             }
-            let next = match ServerOptions::new().create(&name) {
+            let next = match create_server(&name, false, &sddl) {
                 Ok(next) => next,
                 Err(err) => {
                     tracing::warn!(target: "aw_daemon::ipc", error = %err, "next pipe instance not created");
@@ -354,18 +408,35 @@ mod pipe {
             };
             let client = std::mem::replace(&mut server, next);
             let state = Arc::clone(&state);
+            let control = Arc::clone(&control);
             tokio::spawn(async move {
-                if let Err(err) = serve(client, &state).await {
+                if let Err(err) = serve(client, &state, &control).await {
                     tracing::debug!(target: "aw_daemon::ipc", error = %err, "pipe connection closed");
                 }
             });
         }
     }
 
-    async fn serve(pipe: NamedPipeServer, state: &SharedState) -> io::Result<()> {
-        let caller = Caller {
-            user_id: PIPE_ADMIN.to_owned(),
-            admin: true,
+    async fn serve(
+        pipe: NamedPipeServer,
+        state: &SharedState,
+        control: &Control,
+    ) -> io::Result<()> {
+        let caller = match client_identity(&pipe) {
+            Ok(client) => Caller {
+                user_id: client.sid,
+                admin: client.admin,
+            },
+            Err(err) => {
+                tracing::warn!(target: "aw_daemon::ipc", error = %err, "pipe client not identified");
+                let response = error_response(
+                    403,
+                    "unidentified_peer",
+                    "pipe client could not be identified",
+                );
+                write_all(&pipe, &response_bytes(&response)).await?;
+                return pipe.disconnect();
+            }
         };
         let mut collected = Vec::new();
         let mut buf = vec![0_u8; 8 * 1024];
@@ -391,13 +462,7 @@ mod pipe {
                 Err(err) => return Err(err),
             }
         };
-        let response = {
-            let mut guard = match state.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            dispatch_peer(&mut guard, &request, &caller)
-        };
+        let response = answer(state, control, &request, &caller);
         write_all(&pipe, &response_bytes(&response)).await?;
         pipe.disconnect()
     }
@@ -440,7 +505,11 @@ mod other {
         /// # Errors
         ///
         /// Always.
-        pub fn bind(_path: &Path, _state: SharedState) -> io::Result<Self> {
+        pub fn bind(
+            _path: &Path,
+            _state: SharedState,
+            _control: std::sync::Arc<super::Control>,
+        ) -> io::Result<Self> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "no internal channel on this platform",
@@ -462,7 +531,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::super::routes::{dispatch, ApiState, HttpRequest};
-    use super::{socket_path_from, IpcServer, SOCKET_MODE};
+    use super::{socket_path_from, Control, IpcServer, SOCKET_MODE};
 
     fn temp_socket(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("aw-ipc-{}-{name}", std::process::id()));
@@ -503,7 +572,7 @@ mod tests {
     fn socket_serves_health_and_mode_is_0660() {
         let path = temp_socket("health");
         let state = Arc::new(Mutex::new(ApiState::default()));
-        let mut server = IpcServer::bind(&path, state).expect("bind");
+        let mut server = IpcServer::bind(&path, state, Control::new(None)).expect("bind");
         let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
         assert_eq!(mode, SOCKET_MODE);
         let (status, body) = exchange(&path, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -520,7 +589,7 @@ mod tests {
     fn ticket_from_socket_redeems_over_http_state() {
         let path = temp_socket("ticket");
         let state = Arc::new(Mutex::new(ApiState::default()));
-        let _server = IpcServer::bind(&path, Arc::clone(&state)).expect("bind");
+        let _server = IpcServer::bind(&path, Arc::clone(&state), Control::new(None)).expect("bind");
         let (status, body) = exchange(
             &path,
             "POST /api/v1/auth/ui-ticket HTTP/1.1\r\nAuthorization: Bearer forged\r\nContent-Length: 0\r\n\r\n",
@@ -545,32 +614,49 @@ mod tests {
     }
 
     #[test]
-    fn peer_is_the_current_uid_on_linux() {
+    fn peer_is_the_current_uid() {
         let path = temp_socket("peer");
         let state = Arc::new(Mutex::new(ApiState::default()));
-        let _server = IpcServer::bind(&path, state).expect("bind");
+        let _server = IpcServer::bind(&path, state, Control::new(None)).expect("bind");
         let (status, body) = exchange(&path, "GET /api/v1/me HTTP/1.1\r\n\r\n");
         assert_eq!(status, 200, "{body}");
-        if cfg!(target_os = "linux") {
-            let uid = std::fs::metadata("/proc/self")
-                .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
-                .expect("uid");
-            assert_eq!(body["user_id"], uid.to_string());
-            assert_eq!(body["admin"], uid == 0);
-        } else {
-            assert_eq!(body["user_id"], super::UNVERIFIED_PEER);
-            assert_eq!(body["admin"], false);
-        }
+        // Linux (SO_PEERCRED) and macOS (getpeereid) both report the uid.
+        let uid = nix::unistd::geteuid().as_raw();
+        assert_eq!(body["user_id"], uid.to_string());
+        assert_eq!(body["admin"], uid == 0);
     }
 
     #[test]
     fn live_socket_is_not_stolen_and_assets_are_not_served() {
         let path = temp_socket("busy");
         let state = Arc::new(Mutex::new(ApiState::default()));
-        let _server = IpcServer::bind(&path, Arc::clone(&state)).expect("bind");
-        let second = IpcServer::bind(&path, state);
+        let _server = IpcServer::bind(&path, Arc::clone(&state), Control::new(None)).expect("bind");
+        let second = IpcServer::bind(&path, state, Control::new(None));
         assert!(second.is_err());
         let (status, _) = exchange(&path, "GET / HTTP/1.1\r\n\r\n");
         assert_eq!(status, 404);
+    }
+
+    /// `aw daemon stop` path: the daemon's own uid may stop it over the
+    /// socket; the control flag is what the runtime loop polls.
+    #[test]
+    fn owner_can_stop_and_read_logs_over_the_socket() {
+        let path = temp_socket("stop");
+        let log = path.with_file_name("agentwatchd.log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "line one\nline two\n").unwrap();
+        let state = Arc::new(Mutex::new(ApiState::default()));
+        let control = Control::new(Some(log));
+        let _server = IpcServer::bind(&path, state, Arc::clone(&control)).expect("bind");
+        let (status, body) = exchange(&path, "GET /api/v1/daemon/logs?tail=1 HTTP/1.1\r\n\r\n");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["text"], "line two\n");
+        assert!(!control.stop_requested());
+        let (status, body) = exchange(
+            &path,
+            "POST /api/v1/daemon/stop HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert_eq!(status, 202, "{body}");
+        assert!(control.stop_requested());
     }
 }

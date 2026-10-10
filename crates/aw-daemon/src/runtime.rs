@@ -35,7 +35,7 @@ use tracing::{Event, Level, Subscriber};
 use tracing_core::span::{Attributes, Id, Record};
 use tracing_core::Metadata;
 
-use crate::api::{socket_path, ApiState, HttpServer, IpcServer, OtlpRegistry, StoreQuery};
+use crate::api::{socket_path, ApiState, Control, HttpServer, IpcServer, OtlpRegistry, StoreQuery};
 use crate::config::{resolve_data_dir, ConfigWarning, DaemonConfig};
 use crate::paths::ensure_data_dir;
 use crate::sample::HostSampler;
@@ -554,7 +554,9 @@ pub fn run_foreground(
     // One state for both listeners: a ticket issued on the internal channel
     // (`aw ui`, the desktop app) must be redeemable on loopback HTTP.
     let shared = Arc::new(Mutex::new(foreground_api(config, &data_dir)));
-    let mut ipc = start_ipc(&shared);
+    // `aw daemon stop` / `logs` arrive on the internal channel (api/control.rs).
+    let control = Control::new(Some(data_dir.join(LOG_FILE_NAME)));
+    let mut ipc = start_ipc(&shared, &control);
     let mut http = if http_port == 0 {
         tracing::info!("http listener disabled (api.http_port = 0)");
         None
@@ -580,7 +582,7 @@ pub fn run_foreground(
     let mut polls_until_sample: u32 = SAMPLE_EVERY_POLLS;
 
     while !stop.is_set() {
-        if stop_path.is_file() {
+        if stop_path.is_file() || control.stop_requested() {
             stop.request();
             break;
         }
@@ -620,12 +622,12 @@ pub fn run_foreground(
 
 /// Open the internal channel. A failure is a warning, not an exit: the daemon
 /// keeps collecting, and `aw` reports the socket as unreachable (exit 3).
-fn start_ipc(state: &Arc<Mutex<ApiState>>) -> Option<IpcServer> {
+fn start_ipc(state: &Arc<Mutex<ApiState>>, control: &Arc<Control>) -> Option<IpcServer> {
     let Some(path) = socket_path() else {
         tracing::warn!("internal channel not started: no socket path on this platform");
         return None;
     };
-    match IpcServer::bind(&path, Arc::clone(state)) {
+    match IpcServer::bind(&path, Arc::clone(state), Arc::clone(control)) {
         Ok(server) => {
             tracing::info!(socket = %server.path.display(), "internal channel started");
             Some(server)

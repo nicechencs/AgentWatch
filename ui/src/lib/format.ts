@@ -88,3 +88,28 @@ export async function copyText(text: string): Promise<boolean> {
     return false;
   }
 }
+
+/** Calendar day key of `ns` in local time or UTC. */
+export function dayKey(ns: number, utc: boolean): string {
+  const date = nsToDate(ns);
+  return utc
+    ? `${date.getUTCFullYear()}-${date.getUTCMonth()}-${date.getUTCDate()}`
+    : `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+}
+
+/** `MM/DD` (zh) or `DD/MM` (en) for a row whose day is not the reference day. */
+export function formatDay(ns: number, lang: Lang, utc: boolean): string {
+  return new Intl.DateTimeFormat(lang === "zh" ? "zh-CN" : "en-GB", {
+    month: "2-digit",
+    day: "2-digit",
+    timeZone: utc ? "UTC" : undefined,
+  }).format(nsToDate(ns));
+}
+
+/**
+ * Whether `ns` reads as a real unix time (after 2001-01-01). A monotonic tick
+ * or a zero stored where wall time belongs showed as 「01/01 08:00」 (1970).
+ */
+export function isWallTime(ns: number | null | undefined): ns is number {
+  return typeof ns === "number" && ns >= 978_307_200_000_000_000;
+}

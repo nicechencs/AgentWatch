@@ -1,3 +1,4 @@
+import { describeError } from "@/api/errors";
 import { useI18n } from "@/lib/i18n";
 
 export function Loading() {
@@ -5,11 +6,13 @@ export function Loading() {
   return <p className="px-4 py-6 text-sm text-ink-faint">{t("common.loading")}</p>;
 }
 
-export function ErrorNote({ message, onRetry }: { message: string; onRetry?: () => void }) {
+/** Pass `error` (the caught value) so common daemon errors read as a sentence. */
+export function ErrorNote({ message, error, onRetry }: { message?: string; error?: unknown; onRetry?: () => void }) {
   const { t } = useI18n();
+  const text = error !== undefined && error !== null ? describeError(error, t) : message || t("error.unknown");
   return (
     <p className="px-4 py-6 text-sm text-ink-soft">
-      {t("common.error")}：{message}{" "}
+      {t("common.error")}：{text}{" "}
       {onRetry ? (
         <button type="button" className="underline" onClick={onRetry}>
           {t("common.retry")}

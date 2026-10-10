@@ -16,6 +16,7 @@ import { SettingsPage } from "@/features/settings/SettingsPage";
 import { SearchPage } from "@/features/search/SearchPage";
 import { SelfReportPage } from "@/features/self-report/SelfReportPage";
 import { ComparePage } from "@/features/compare/ComparePage";
+import { AppError, NotFoundPage } from "@/components/AppError";
 
 const text = (value: unknown) => (typeof value === "string" ? value : undefined);
 
@@ -172,6 +173,8 @@ const routeTree = RootRoute.addChildren([
 export const router = createRouter({
   routeTree,
   defaultPreload: "intent",
+  defaultErrorComponent: AppError,
+  defaultNotFoundComponent: NotFoundPage,
 });
 
 declare module "@tanstack/react-router" {

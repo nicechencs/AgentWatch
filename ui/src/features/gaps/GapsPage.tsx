@@ -6,6 +6,7 @@ import { Count } from "@/components/Count";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { EmptyNote, ErrorNote, Loading } from "@/components/QueryState";
 import { formatClockRange, nsToRfc3339 } from "@/lib/format";
+import { kindLabel } from "@/lib/capabilities";
 import { useI18n } from "@/lib/i18n";
 import { usePrefs } from "@/lib/prefs";
 
@@ -19,7 +20,7 @@ export function GapsPage() {
 
   if (session.isLoading || gaps.isLoading) return <Loading />;
   if (session.isError || gaps.isError || !session.data || !gaps.data) {
-    return <ErrorNote message="" onRetry={() => { void session.refetch(); void gaps.refetch(); }} />;
+    return <ErrorNote error={session.error ?? gaps.error} onRetry={() => { void session.refetch(); void gaps.refetch(); }} />;
   }
 
   const jump = (gap: Gap) => {
@@ -33,6 +34,9 @@ export function GapsPage() {
   return (
     <div className="h-full overflow-auto px-4 py-3">
       <h2 className="text-sm font-medium">{t("gaps.collectors")}</h2>
+      {session.data.collectors.length === 0 ? (
+        <p className="mt-2 text-xs text-ink-faint" data-empty="collectors">{t("gaps.noCollectors")}</p>
+      ) : null}
       <div className="mt-2 grid gap-3 lg:grid-cols-2">
         {session.data.collectors.map((collector) => {
           const available = collector.capabilities.filter((item) => item.evidence !== "NA");
@@ -41,6 +45,7 @@ export function GapsPage() {
             <section key={collector.name} className="rounded border border-line p-3 text-xs">
               <h3 className="font-mono text-sm">{collector.name}</h3>
               {collector.mode ? <p className="text-ink-faint">{collector.mode}</p> : null}
+              {collector.capabilities.length === 0 ? <p className="mt-2 text-ink-faint">{t("gaps.capsNotDescribed")}</p> : null}
               <CapabilityList title={t("gaps.provides")} items={available} />
               <CapabilityList title={t("gaps.unavailable")} items={missing} />
             </section>
@@ -93,7 +98,7 @@ function CapabilityList({ title, items }: { title: string; items: CollectorCapab
       <ul className="mt-1 space-y-1">
         {items.map((item) => (
           <li key={item.kind} className="flex items-center gap-2">
-            <span>{item.kind}</span>
+            <span>{kindLabel(t, item.kind)}</span>
             <EvidenceBadge level={item.evidence} naReason={item.na_reason} />
             {item.na_reason ? <span className="text-ink-faint">{t(`na.${item.na_reason}`)}</span> : null}
           </li>

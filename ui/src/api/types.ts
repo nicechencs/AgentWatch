@@ -148,6 +148,8 @@ export interface SessionSummary {
   top_dirs: TopEntry[];
   top_domains: TopEntry[];
   top_commands: TopEntry[];
+  /** False for a top list the daemon did not send. Optional for older test fixtures. */
+  top_available?: { domains: boolean; dirs: boolean; commands: boolean };
   direct_count: number;
   gap_count: number;
   finding_count: number;
@@ -215,6 +217,8 @@ export interface ProcessNode {
   source: string;
   agent: string | null;
   images: ProcessImage[];
+  /** Base name of the latest image's executable, as the daemon sends it. */
+  exe_name?: string | null;
   children: ProcessNode[];
   /** Own counters; subtree counters cover descendants. */
   files: number;
@@ -334,6 +338,11 @@ export interface DoctorReport {
   mode: string | null;
   capabilities: DoctorCapability[];
   collectors: { name: string; status: string; note: string | null }[];
+  /** False when the daemon did not probe collectors (capabilities is then empty). */
+  probed: boolean;
+  reason: string | null;
+  privileged: boolean | null;
+  privileged_note: string | null;
 }
 
 export interface SystemProcess {
@@ -348,11 +357,13 @@ export interface SystemProcess {
 export interface SearchHit {
   session_id: string;
   session_name: string | null;
+  /** UI category: `file`, `proc`, `url`, or the source table when unknown. */
   kind: string;
   id: number;
-  ts_ns: number;
-  summary: string;
-  evidence: EvidenceLevel;
+  /** The daemon's search answer names the row only; time, text and evidence stay null. */
+  ts_ns: number | null;
+  summary: string | null;
+  evidence: EvidenceLevel | null;
 }
 
 export interface SearchGroup {
@@ -389,6 +400,9 @@ export interface ConfigView {
 }
 
 export interface DbStats {
+  /** False when the daemon did not report sizes; the numbers are then absent. */
+  available?: boolean;
+  reason?: string | null;
   db_bytes: number;
   wal_bytes: number;
   max_db_bytes: number;

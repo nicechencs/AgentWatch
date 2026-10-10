@@ -8,7 +8,9 @@ import type { Finding } from "@/features/findings/types";
 import { Bytes } from "@/components/Bytes";
 import { Count } from "@/components/Count";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
+import { NotCollected } from "@/components/NotCollected";
 import { ErrorNote, Loading } from "@/components/QueryState";
+import { capabilitiesUnknown, coverage, kindLabel, uncollectedKinds } from "@/lib/capabilities";
 import { useI18n } from "@/lib/i18n";
 import { usePrefs } from "@/lib/prefs";
 import { useSessionQuery } from "@/lib/session-query";
@@ -23,7 +25,7 @@ export function OverviewPage() {
 
   if (summary.isLoading) return <Loading />;
   if (summary.isError || !summary.data) {
-    return <ErrorNote message={summary.error instanceof Error ? summary.error.message : ""} onRetry={() => void summary.refetch()} />;
+    return <ErrorNote error={summary.error} onRetry={() => void summary.refetch()} />;
   }
   return <Overview summary={summary.data} filter={query.f} />;
 }
@@ -43,22 +45,39 @@ function Overview({ summary, filter }: { summary: SessionSummary; filter: string
     void navigate({ to: page === "files" ? "/s/$sid/files" : "/s/$sid/network", params: { sid: session.public_id }, search: { f } });
   };
 
+  // A category the collectors do not observe reads 「没采」, not 「不可得」 or 0.
+  const files = coverage(session, "file") === "not_collected";
+  const net = coverage(session, "net") === "not_collected";
+  const missing = uncollectedKinds(session);
+  const unknownCaps = capabilitiesUnknown(session);
+
   const kpis: { label: string; value: ReactNode }[] = [
     { label: t("overview.procs"), value: <Count value={stats?.proc_count} approximate={approx} approximateReason={reason} /> },
-    { label: t("overview.commands"), value: <Count value={summary.top_commands.reduce((sum, item) => sum + item.count, 0)} approximate={approx} approximateReason={reason} /> },
-    { label: t("overview.files"), value: <Count value={stats?.file_count} approximate={approx} approximateReason={reason} /> },
+    {
+      label: t("overview.commands"),
+      value: (
+        <Count
+          value={summary.top_available?.commands === false ? null : summary.top_commands.reduce((sum, item) => sum + item.count, 0)}
+          approximate={approx}
+          approximateReason={reason}
+        />
+      ),
+    },
+    { label: t("overview.files"), value: files ? <NotCollected kind="file" /> : <Count value={stats?.file_count} approximate={approx} approximateReason={reason} /> },
     {
       label: t("overview.writeDelete"),
-      value: (
+      value: files ? (
+        <NotCollected kind="file" />
+      ) : (
         <span>
           <Count value={stats?.write_count} approximate={approx} approximateReason={reason} /> /{" "}
           <Count value={stats?.delete_count} approximate={approx} approximateReason={reason} />
         </span>
       ),
     },
-    { label: t("overview.domains"), value: <Count value={stats?.domain_count} approximate={approx} approximateReason={reason} /> },
-    { label: t("overview.up"), value: <Bytes value={stats?.bytes_up} approximate={approx} approximateReason={reason} /> },
-    { label: t("overview.down"), value: <Bytes value={stats?.bytes_down} approximate={approx} approximateReason={reason} /> },
+    { label: t("overview.domains"), value: net ? <NotCollected kind="net" /> : <Count value={stats?.domain_count} approximate={approx} approximateReason={reason} /> },
+    { label: t("overview.up"), value: net ? <NotCollected kind="net" /> : <Bytes value={stats?.bytes_up} approximate={approx} approximateReason={reason} /> },
+    { label: t("overview.down"), value: net ? <NotCollected kind="net" /> : <Bytes value={stats?.bytes_down} approximate={approx} approximateReason={reason} /> },
   ];
 
   return (
@@ -72,23 +91,37 @@ function Overview({ summary, filter }: { summary: SessionSummary; filter: string
         ))}
       </div>
 
-      <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+      <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs" data-capabilities="">
         <span className="text-ink-faint">{t("overview.capabilities")}</span>
-        {session.collectors.flatMap((collector) =>
-          collector.capabilities.map((capability) => (
-            <span key={`${collector.name}-${capability.kind}`} className="flex items-center gap-1">
-              {capability.kind}
-              <EvidenceBadge level={capability.evidence} source={collector.name} naReason={capability.na_reason} />
-            </span>
-          )),
+        {unknownCaps ? (
+          <span className="flex items-center gap-1 text-ink-faint">
+            <EvidenceBadge level="NA" /> {t("overview.capabilitiesUnknown")}
+          </span>
+        ) : (
+          session.collectors.flatMap((collector) =>
+            collector.capabilities.map((capability) => (
+              <span key={`${collector.name}-${capability.kind}`} className="flex items-center gap-1">
+                {kindLabel(t, capability.kind)}
+                <EvidenceBadge level={capability.evidence} source={collector.name} naReason={capability.na_reason} />
+              </span>
+            )),
+          )
         )}
       </div>
-      <p className="mt-1 text-xs text-ink-soft">
+      <p className="mt-1 text-xs text-ink-soft" data-gaps-line="">
         {summary.gap_count > 0 ? (
           <span className="text-gap">{t("overview.gaps", { count: summary.gap_count })}</span>
+        ) : missing.length > 0 || unknownCaps ? (
+          // 「缺口：无」 next to categories that were never collected read as
+          // "complete". Zero recorded gaps is all that can be said.
+          t("overview.noRecordedGaps")
         ) : (
           t("overview.noGaps")
         )}
+        {missing.length > 0 ? (
+          <span> · {t("overview.notCollected", { kinds: missing.map((kind) => kindLabel(t, kind)).join("、") })}</span>
+        ) : null}
+        {unknownCaps ? <span> · {t("overview.coverageUnknown")}</span> : null}
         {summary.direct_count > 0 ? <span> · {t("overview.direct", { count: summary.direct_count })}</span> : null}
       </p>
 
@@ -98,7 +131,7 @@ function Overview({ summary, filter }: { summary: SessionSummary; filter: string
           <FindingsPreview
             loading={findings.isLoading}
             failed={findings.isError}
-            message={findings.error instanceof Error ? findings.error.message : ""}
+            error={findings.error}
             onRetry={() => void findings.refetch()}
             items={allFindings(findings.data?.pages)}
             sid={session.public_id}
@@ -109,6 +142,7 @@ function Overview({ summary, filter }: { summary: SessionSummary; filter: string
         <TopTable
           title={t("overview.topDomains")}
           rows={summary.top_domains}
+          empty={net ? t("coverage.notCollectedShort") : summary.top_available?.domains === false ? t("overview.topNotSummarised") : undefined}
           onPick={(row) => jump("network", `domain:${quote(row.label)}`)}
           render={(row) => (
             <span className="tabular-nums">
@@ -119,12 +153,14 @@ function Overview({ summary, filter }: { summary: SessionSummary; filter: string
         <TopTable
           title={t("overview.topDirs")}
           rows={summary.top_dirs}
+          empty={files ? t("coverage.notCollectedShort") : summary.top_available?.dirs === false ? t("overview.topNotSummarised") : undefined}
           onPick={(row) => jump("files", `dir:${quote(row.label)}`)}
           render={(row) => <span className="text-ink-faint">{t("overview.writes", { count: row.writes ?? 0 })}</span>}
         />
         <TopTable
           title={t("overview.topCommands")}
           rows={summary.top_commands}
+          empty={summary.top_available?.commands === false ? t("overview.topNotSummarised") : undefined}
           onPick={(row) => jump("files", `proc:${quote(row.label)}`)}
           render={(row) => <Count value={row.count} />}
         />
@@ -136,11 +172,11 @@ function Overview({ summary, filter }: { summary: SessionSummary; filter: string
 const PREVIEW = 5;
 
 function FindingsPreview({
-  loading, failed, message, onRetry, items, sid, gapCount,
+  loading, failed, error, onRetry, items, sid, gapCount,
 }: {
   loading: boolean;
   failed: boolean;
-  message: string;
+  error: unknown;
   onRetry: () => void;
   items: Finding[];
   sid: string;
@@ -148,7 +184,7 @@ function FindingsPreview({
 }) {
   const { t } = useI18n();
   if (loading) return <p className="mt-2 text-xs text-ink-faint">{t("common.loading")}</p>;
-  if (failed) return <ErrorNote message={message} onRetry={onRetry} />;
+  if (failed) return <ErrorNote error={error} onRetry={onRetry} />;
   if (items.length === 0) {
     return (
       <p className="mt-2 text-xs">
@@ -176,10 +212,12 @@ function FindingsPreview({
 }
 
 function TopTable({
-  title, rows, onPick, render,
+  title, rows, empty, onPick, render,
 }: {
   title: string;
   rows: TopEntry[];
+  /** Text for an empty list when the reason is known (not collected / not summarised). */
+  empty?: string;
   onPick: (row: TopEntry) => void;
   render: (row: TopEntry) => ReactNode;
 }) {
@@ -187,7 +225,7 @@ function TopTable({
   return (
     <section className="rounded border border-line p-3">
       <h2 className="text-sm font-medium">{title}</h2>
-      {rows.length === 0 ? <p className="mt-2 text-xs text-ink-faint">{t("common.empty")}</p> : null}
+      {rows.length === 0 ? <p className="mt-2 text-xs text-ink-faint">{empty ?? t("common.empty")}</p> : null}
       <ul className="mt-2 text-xs">
         {rows.map((row) => (
           <li key={row.label} className="flex items-center justify-between gap-2 border-b border-line/60 py-1">

@@ -1,5 +1,5 @@
 import { useParams } from "@tanstack/react-router";
-import { useInfiniteQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, subscribeLive } from "@/api/client";
@@ -7,11 +7,13 @@ import type { TimelineItem, TimelineKind } from "@/api/types";
 import { DetailPanel, type DetailRecord } from "@/components/DetailPanel/DetailPanel";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { ProcLabel } from "@/components/ProcLabel";
-import { RelTime } from "@/components/RelTime";
 import { EmptyNote, ErrorNote } from "@/components/QueryState";
 import { useListKeys } from "@/components/useListKeys";
+import { describeError } from "@/api/errors";
 import { formatClockRange } from "@/lib/format";
+import { kindLabel } from "@/lib/capabilities";
 import { useI18n } from "@/lib/i18n";
+import { TimelineTime } from "./TimelineTime";
 import { usePrefs } from "@/lib/prefs";
 import { composedFilter, useSessionQuery } from "@/lib/session-query";
 
@@ -20,8 +22,9 @@ const DEFAULT_ON = new Set<TimelineKind>(["proc", "file", "net", "dns", "http", 
 const PAGE = 500;
 const MAX_ROWS = 2000;
 
+// `proc` used ▶, which reads as a play button. A gear is a process.
 const GLYPH: Record<TimelineKind, string> = {
-  proc: "▶", file: "📄", net: "🔗", dns: "🌐", http: "↔",
+  proc: "⚙", file: "📄", net: "🔗", dns: "🌐", http: "↔",
   agent: "◎", ipc: "⇄", rpc: "⇢", finding: "∴", gap: "░",
 };
 
@@ -35,11 +38,15 @@ export function TimelinePage() {
   const [merge, setMerge] = useState(true);
   const [follow, setFollow] = useState(false);
   const [lagged, setLagged] = useState(0);
+  const [laggedUnknown, setLaggedUnknown] = useState(false);
+  const [followError, setFollowError] = useState<unknown>(null);
   const [live, setLive] = useState<TimelineItem[]>([]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [cursor, setCursor] = useState(0);
   const [open, setOpen] = useState(false);
   const scroller = useRef<HTMLDivElement>(null);
+  const session = useQuery({ queryKey: ["session", sid], queryFn: () => api.session(sid) });
+  const sessionStart = session.data?.started_ns ?? null;
 
   const filter = composedFilter(query);
   const catList = CATS.filter((cat) => cats.has(cat));
@@ -58,12 +65,17 @@ export function TimelinePage() {
         limit: PAGE,
       }),
     getNextPageParam: (page) => page.next_cursor,
+    // Following also re-reads stored rows: the sampler writes to the database,
+    // not to the live hub, so new process rows only show up this way.
+    refetchInterval: follow ? 2_000 : false,
   });
 
   const rows = useMemo(() => {
     const history = (pages.data?.pages ?? []).flatMap((page) => page.items);
-    const merged = follow ? [...live, ...history] : history;
-    return merged.slice(0, MAX_ROWS);
+    if (!follow) return history.slice(0, MAX_ROWS);
+    const seen = new Set(history.map(rowKey));
+    const fresh = live.filter((item) => !seen.has(rowKey(item)));
+    return [...fresh, ...history].slice(0, MAX_ROWS);
   }, [pages.data, live, follow]);
 
   const virtualizer = useVirtualizer({
@@ -82,15 +94,24 @@ export function TimelinePage() {
   }, [virtualItems, rows.length, pages]);
 
   useEffect(() => {
-    if (!follow) return;
+    if (!follow) {
+      setFollowError(null);
+      return;
+    }
+    // A failed poll is shown next to the checkbox and retried. It used to
+    // untick "跟随最新" silently on the first error.
     const close = subscribeLive(sid, filter, {
       onRecord: (item) => {
         if (!cats.has(item.kind)) return;
         setLive((current) => [item, ...current].slice(0, PAGE));
         scroller.current?.scrollTo({ top: 0 });
       },
-      onLagged: (dropped) => setLagged((current) => current + dropped),
-      onError: () => setFollow(false),
+      onLagged: (dropped) => {
+        if (dropped === null) setLaggedUnknown(true);
+        else setLagged((current) => current + dropped);
+      },
+      onError: (error) => setFollowError(error),
+      onOk: () => setFollowError(null),
     });
     return close;
   }, [follow, sid, filter, cats]);
@@ -142,10 +163,19 @@ export function TimelinePage() {
             <input type="checkbox" checked={follow} onChange={(event) => setFollow(event.target.checked)} />
             {t("timeline.follow")}
           </label>
+          {follow && followError ? (
+            <span className="text-amber-700 dark:text-amber-400" role="status" data-follow-error="">
+              {t("timeline.followFailed", { reason: describeError(followError, t) })}
+            </span>
+          ) : null}
         </div>
         {lagged > 0 ? <p className="bg-gap/10 px-3 py-1 text-[11px] text-gap">{t("timeline.lagged", { count: lagged })}</p> : null}
+        {laggedUnknown && lagged === 0 ? <p className="bg-gap/10 px-3 py-1 text-[11px] text-gap">{t("timeline.laggedUnknown")}</p> : null}
+        {rows.length > 0 && rows.every((item) => item.kind === "gap" || !item.summary) ? (
+          <p className="px-3 py-1 text-[11px] text-ink-faint" data-summary-na="">{t("timeline.summaryNaAll")}</p>
+        ) : null}
 
-        {pages.isError ? <ErrorNote message={pages.error instanceof Error ? pages.error.message : ""} onRetry={() => void pages.refetch()} /> : null}
+        {pages.isError ? <ErrorNote error={pages.error} onRetry={() => void pages.refetch()} /> : null}
         {!pages.isLoading && rows.length === 0 ? <EmptyNote>{t("timeline.empty")}</EmptyNote> : null}
 
         <div ref={scroller} className="scroll-thin min-h-0 flex-1 overflow-auto">
@@ -163,6 +193,7 @@ export function TimelinePage() {
                     item={item}
                     active={virtual.index === cursor}
                     utc={utc}
+                    sessionStart={sessionStart}
                     expanded={expanded.has(rowKey(item))}
                     onToggle={() =>
                       setExpanded((current) => {
@@ -190,11 +221,12 @@ export function TimelinePage() {
 }
 
 function TimelineRow({
-  item, active, utc, expanded, onToggle, onSelect,
+  item, active, utc, sessionStart, expanded, onToggle, onSelect,
 }: {
   item: TimelineItem;
   active: boolean;
   utc: boolean;
+  sessionStart: number | null;
   expanded: boolean;
   onToggle: () => void;
   onSelect: () => void;
@@ -219,12 +251,18 @@ function TimelineRow({
       onClick={onSelect}
       className={`flex w-full items-baseline gap-3 px-3 py-1 text-left text-xs ${active ? "bg-paper-sunken" : "hover:bg-paper-sunken/60"}`}
     >
-      <RelTime ns={item.ts_ns} precise />
+      <TimelineTime ns={item.ts_ns} sessionStart={sessionStart} />
       <EvidenceBadge level={item.evidence} source={item.source} naReason={item.na_reason} />
       <span aria-hidden="true">{GLYPH[item.kind]}</span>
-      <span className="w-10 shrink-0 text-ink-faint">{item.kind}</span>
+      <span className="w-10 shrink-0 text-ink-faint">{kindLabel(t, item.kind)}</span>
       <ProcLabel pid={item.proc?.pid} exe={item.proc?.exe_name} />
-      <span className="min-w-0 flex-1 truncate">{item.summary}</span>
+      {item.summary && redundantSummary(item) ? (
+        <span className="min-w-0 flex-1" />
+      ) : item.summary ? (
+        <span className="min-w-0 flex-1 truncate">{item.summary}</span>
+      ) : (
+        <span className="min-w-0 flex-1 truncate text-ink-faint">{t("timeline.summaryNa")}</span>
+      )}
       {item.collapsed ? (
         <span
           role="button"
@@ -288,4 +326,15 @@ function toRecord(item: TimelineItem): DetailRecord {
     fields: item.fields,
     fieldEvidence: item.field_evidence,
   };
+}
+
+/**
+ * The daemon's process summary is `name(pid)` or `pid N`, which the process
+ * label beside it already shows; printing it twice read as two processes.
+ */
+export function redundantSummary(item: Pick<TimelineItem, "summary" | "proc">): boolean {
+  const pid = item.proc?.pid;
+  if (!item.summary || pid === undefined || pid === null) return false;
+  const name = item.proc?.exe_name?.split(/[/\\]/u).pop();
+  return item.summary === `pid ${pid}` || (name !== undefined && item.summary === `${name}(${pid})`);
 }

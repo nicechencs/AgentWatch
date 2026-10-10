@@ -62,7 +62,7 @@ export function ComparePage({ initialA, initialB }: { initialA?: string; initial
 
       {pair.isLoading ? <Loading /> : null}
       {pair.isError ? (
-        <ErrorNote message={pair.error instanceof Error ? pair.error.message : ""} onRetry={() => void pair.refetch()} />
+        <ErrorNote error={pair.error} onRetry={() => void pair.refetch()} />
       ) : null}
 
       {pair.data ? <PairView left={pair.data[0]} right={pair.data[1]} dimension={dimension} onDimension={setDimension} /> : null}

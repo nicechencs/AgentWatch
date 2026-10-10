@@ -1,6 +1,7 @@
+import { isWallTime } from "@/lib/format";
 import { Link, Outlet, useParams } from "@tanstack/react-router";
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { api } from "@/api/client";
 import { DensityBar } from "@/components/DensityBar";
@@ -27,6 +28,8 @@ export function SessionLayout() {
   const { sid } = useParams({ strict: false }) as { sid: string };
   const { query, patch } = useSessionQuery();
   const [stopping, setStopping] = useState(false);
+  const [stopError, setStopError] = useState<unknown>(null);
+  const client = useQueryClient();
   const session = useQuery({ queryKey: ["session", sid], queryFn: () => api.session(sid) });
   const histogram = useQuery({
     queryKey: ["histogram", sid, query.f, query.ev, query.subtree, query.proc],
@@ -35,16 +38,35 @@ export function SessionLayout() {
 
   if (session.isLoading) return <Loading />;
   if (session.isError || !session.data) {
-    return <ErrorNote message={session.error instanceof Error ? session.error.message : ""} />;
+    // Keep a way back: this page used to be a lone error line with no header.
+    return (
+      <div className="flex h-screen flex-col">
+        <header className="flex items-center gap-3 border-b border-line px-3 py-2">
+          <Link to="/" className="text-sm font-semibold">
+            {t("app.name")}
+          </Link>
+          <Link to="/" className="text-xs text-ink-soft underline" data-back="">
+            ← {t("session.backToList")}
+          </Link>
+        </header>
+        <ErrorNote error={session.error} onRetry={() => void session.refetch()} />
+      </div>
+    );
   }
   const data = session.data;
   const active = data.ended_ns === null && !data.purged;
 
   const stop = async () => {
     setStopping(true);
+    setStopError(null);
     try {
       await api.stopSession(sid);
       await session.refetch();
+      // Counts on the other tabs were read while recording.
+      void client.invalidateQueries({ queryKey: ["summary", sid] });
+      void client.invalidateQueries({ queryKey: ["processes", sid] });
+    } catch (caught) {
+      setStopError(caught);
     } finally {
       setStopping(false);
     }
@@ -63,7 +85,7 @@ export function SessionLayout() {
           {active ? `● ${t("session.recording")}` : `○ ${t("session.stopped")}`}
         </span>
         <span className="text-xs text-ink-faint">
-          <RelTime ns={data.started_ns} />
+          {isWallTime(data.started_ns) ? <RelTime ns={data.started_ns} /> : "–"}
         </span>
         <div className="ml-auto flex gap-2">
           {active ? (
@@ -89,6 +111,7 @@ export function SessionLayout() {
           </Dropdown.Root>
         </div>
       </header>
+      {stopError ? <ErrorNote error={stopError} /> : null}
       <nav className="flex gap-1 border-b border-line px-3">
         {TABS.map((tab) => (
           <Link

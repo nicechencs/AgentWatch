@@ -10,7 +10,9 @@ import { DetailPanel, type DetailRecord } from "@/components/DetailPanel/DetailP
 import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { ProcLabel } from "@/components/ProcLabel";
 import { RelTime } from "@/components/RelTime";
-import { EmptyNote, ErrorNote } from "@/components/QueryState";
+import { CoverageNote } from "@/components/NotCollected";
+import { EmptyNote, ErrorNote, Loading } from "@/components/QueryState";
+import { coverage } from "@/lib/capabilities";
 import { useListKeys } from "@/components/useListKeys";
 import { useI18n } from "@/lib/i18n";
 import { composedFilter, useSessionQuery } from "@/lib/session-query";
@@ -34,6 +36,8 @@ export function FilesPage() {
   const [open, setOpen] = useState(false);
   const scroller = useRef<HTMLDivElement>(null);
   const filter = composedFilter(query);
+  const session = useQuery({ queryKey: ["session", sid], queryFn: () => api.session(sid) });
+  const fileCoverage = coverage(session.data, "file");
 
   const pages = useInfiniteQuery({
     queryKey: ["files", sid, filter, query.from, query.to],
@@ -64,6 +68,16 @@ export function FilesPage() {
 
   const record = rows[cursor] ? toRecord(rows[cursor]) : null;
 
+  if (fileCoverage === "not_collected") {
+    // This build has no file collector: 「没有文件记录」 would read as "the
+    // agent touched no files". Say it was not collected instead.
+    return (
+      <div className="h-full overflow-auto" data-coverage-page="file">
+        <CoverageNote kind="file" coverage={fileCoverage} />
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full">
       <div className="flex min-w-0 flex-1 flex-col">
@@ -90,8 +104,10 @@ export function FilesPage() {
 
         {view === "list" ? (
           <>
-            {pages.isError ? <ErrorNote message={pages.error instanceof Error ? pages.error.message : ""} onRetry={() => void pages.refetch()} /> : null}
-            {!pages.isLoading && rows.length === 0 ? <EmptyNote>{t("files.empty")}</EmptyNote> : null}
+            {pages.isError ? <ErrorNote error={pages.error} onRetry={() => void pages.refetch()} /> : null}
+            {!pages.isLoading && !pages.isError && rows.length === 0 ? (
+              fileCoverage === "unknown" ? <CoverageNote kind="file" coverage={fileCoverage} /> : <EmptyNote>{t("files.empty")}</EmptyNote>
+            ) : null}
             <div ref={scroller} className="scroll-thin min-h-0 flex-1 overflow-auto">
               <table className="w-full border-collapse text-xs">
                 <thead className="sticky top-0 bg-paper text-left text-ink-faint">
@@ -111,6 +127,13 @@ export function FilesPage() {
               </div>
             </div>
           </>
+        ) : tree.isLoading ? (
+          <Loading />
+        ) : tree.isError ? (
+          <ErrorNote error={tree.error} onRetry={() => void tree.refetch()} />
+        ) : (tree.data?.roots ?? []).length === 0 ? (
+          // The tree view used to be blank with no text at all.
+          fileCoverage === "unknown" ? <CoverageNote kind="file" coverage={fileCoverage} /> : <EmptyNote>{t("files.empty")}</EmptyNote>
         ) : (
           <DirTree nodes={nest(tree.data?.roots ?? [])} />
         )}

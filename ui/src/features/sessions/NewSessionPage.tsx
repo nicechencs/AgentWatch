@@ -5,6 +5,7 @@ import { api } from "@/api/client";
 import type { SystemProcess } from "@/api/types";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { ErrorNote } from "@/components/QueryState";
+import { kindLabel } from "@/lib/capabilities";
 import { useI18n } from "@/lib/i18n";
 
 const AGENTS = ["auto", "claude", "codex", "cursor", "other"];
@@ -39,25 +40,33 @@ export function NewSessionPage() {
       {error ? <ErrorNote message={error} /> : null}
       <section className="mt-4">
         <h2 className="text-sm font-medium">{t("new.capabilities")}</h2>
-        {doctor.data ? (
+        {doctor.isError ? <ErrorNote error={doctor.error} onRetry={() => void doctor.refetch()} /> : null}
+        {doctor.isLoading ? <p className="mt-2 text-xs text-ink-faint">{t("common.loading")}</p> : null}
+        {doctor.data && doctor.data.capabilities.length === 0 ? (
+          // The daemon may answer without probing collectors. That is "unknown",
+          // not "nothing available", and the forms above still work.
+          <p className="mt-2 flex items-center gap-1 text-xs text-ink-faint" data-capabilities="unknown">
+            <EvidenceBadge level="NA" /> {doctor.data.probed ? t("new.capNone") : t("new.capNotProbed")}
+            {doctor.data.privileged_note ? <span title={doctor.data.privileged_note}>ⓘ</span> : null}
+          </p>
+        ) : null}
+        {doctor.data && doctor.data.capabilities.length > 0 ? (
           <ul className="mt-2 flex flex-wrap gap-2 text-xs">
             {doctor.data.capabilities.map((capability) => (
               <li key={capability.kind} className="flex items-center gap-1 rounded border border-line px-2 py-1">
-                <span>{capability.kind}</span>
+                <span>{kindLabel(t, capability.kind)}</span>
                 {capability.available && capability.evidence ? (
                   <EvidenceBadge level={capability.evidence} />
                 ) : (
-                  <span className="text-ink-faint" title={capability.na_reason ? t(`na.${capability.na_reason}`) : capability.note ?? ""}>
+                  <span className="text-ink-faint">
                     {t("new.capMissing")}
-                    {capability.na_reason ? ` (${capability.na_reason})` : ""}
+                    {capability.na_reason ? `：${t(`na.${capability.na_reason}`)}` : capability.note ? `：${capability.note}` : ""}
                   </span>
                 )}
               </li>
             ))}
           </ul>
-        ) : (
-          <p className="mt-2 text-xs text-ink-faint">{t("common.loading")}</p>
-        )}
+        ) : null}
       </section>
     </main>
   );

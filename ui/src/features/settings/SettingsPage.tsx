@@ -7,6 +7,7 @@ import { Bytes } from "@/components/Bytes";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ErrorNote, Loading } from "@/components/QueryState";
 import { useAuth } from "@/lib/auth";
+import { diskUnavailableText, diskUsed } from "@/lib/disk";
 import { useI18n } from "@/lib/i18n";
 import { usePrefs, type Theme, type TimeFormat } from "@/lib/prefs";
 import type { Lang } from "@/lib/i18n";
@@ -21,13 +22,13 @@ export function SettingsPage() {
 
   if (config.isLoading) return <Loading />;
   if (config.isError || !config.data) {
-    return <ErrorNote message={config.error instanceof Error ? config.error.message : ""} onRetry={() => void config.refetch()} />;
+    return <ErrorNote error={config.error} onRetry={() => void config.refetch()} />;
   }
 
   return (
     <main className="mx-auto max-w-3xl px-4 py-3">
       <h1 className="text-base font-semibold">{t("settings.title")}</h1>
-      <Storage config={config.data} used={stats.data ? stats.data.db_bytes + stats.data.wal_bytes : null} admin={admin} />
+      <Storage config={config.data} used={diskUsed(stats.data)} usedNa={diskUnavailableText(stats.data, t)} admin={admin} />
       <Privacy config={config.data} admin={admin} />
       <ProxySection config={config.data} admin={admin} />
       <Collectors config={config.data} />
@@ -52,7 +53,7 @@ function Locked({ admin }: { admin: boolean }) {
   return <p className="text-ink-faint">{t("common.adminOnly")}</p>;
 }
 
-function Storage({ config, used, admin }: { config: ConfigView; used: number | null; admin: boolean }) {
+function Storage({ config, used, usedNa, admin }: { config: ConfigView; used: number | null; usedNa: string; admin: boolean }) {
   const { t } = useI18n();
   const client = useQueryClient();
   const [days, setDays] = useState(String(config.retention.max_age_days));
@@ -68,7 +69,9 @@ function Storage({ config, used, admin }: { config: ConfigView; used: number | n
     onError: (caught) => setNotice(isApiError(caught) && caught.status === 403 ? t("settings.forbidden") : caught.message),
   });
   const purge = useMutation({
-    mutationFn: () => api.purge({}),
+    // The daemon refuses a purge without `older_than` or `all` (400). "按当前
+    // 保留策略" means older than the configured days.
+    mutationFn: () => api.purge({ older_than: `${config.retention.max_age_days}d` }),
     onSuccess: () => void client.invalidateQueries({ queryKey: ["db-stats"] }),
     onError: (caught) => setNotice(isApiError(caught) && caught.status === 403 ? t("settings.forbidden") : caught.message),
   });
@@ -76,7 +79,7 @@ function Storage({ config, used, admin }: { config: ConfigView; used: number | n
   return (
     <Section title={t("settings.storage")}>
       <Locked admin={admin} />
-      <p>{t("settings.used")}：<Bytes value={used} /></p>
+      <p>{t("settings.used")}：{used === null ? <span className="text-ink-faint">{usedNa}</span> : <Bytes value={used} />}</p>
       <label className="flex items-center gap-2">
         {t("settings.maxBytes")}
         <span className="font-mono"><Bytes value={config.retention.max_db_bytes} /></span>
@@ -138,12 +141,13 @@ function Privacy({ config, admin }: { config: ConfigView; admin: boolean }) {
   return (
     <Section title={t("settings.privacy")}>
       <p className="text-ink-faint">{t("settings.builtinReadonly")}</p>
+      {config.redaction.rules.length === 0 ? <p className="text-ink-faint" data-empty="redaction">{t("settings.rulesNotListed")}</p> : null}
       <ul>
         {config.redaction.rules.map((rule) => (
           <li key={rule.id} className="flex items-baseline gap-2 border-b border-line/60 py-1">
             <span className="font-mono">{rule.id}</span>
             <span className="truncate text-ink-faint">{rule.builtin ? rule.description : rule.pattern}</span>
-            {rule.builtin ? null : <span className="text-ink-faint">{t("settings.addRule")}</span>}
+            {rule.builtin ? null : <span className="text-ink-faint">{t("settings.customRule")}</span>}
           </li>
         ))}
       </ul>
@@ -174,6 +178,7 @@ function Collectors({ config }: { config: ConfigView }) {
   const { t } = useI18n();
   return (
     <Section title={t("settings.collectors")}>
+      {config.collectors.length === 0 ? <p className="text-ink-faint" data-empty="collectors">{t("settings.collectorsNotListed")}</p> : null}
       <ul>
         {config.collectors.map((collector) => (
           <li key={collector.name} className="flex items-baseline gap-2 border-b border-line/60 py-1">
@@ -192,6 +197,7 @@ function Rules({ config }: { config: ConfigView }) {
   return (
     <Section title={t("settings.rules")}>
       <p className="text-ink-faint">{t("settings.rulesReadonly")}</p>
+      {config.rules.length === 0 ? <p className="text-ink-faint" data-empty="rules">{t("settings.detectRulesNotListed")}</p> : null}
       <ul>
         {config.rules.map((rule) => (
           <li key={rule.id} className="flex items-center gap-2 border-b border-line/60 py-1">

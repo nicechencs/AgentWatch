@@ -130,10 +130,79 @@ export function toSession(raw: unknown): Session {
     proxy_port: numOrNull(r.proxy_port),
     platform: typeof r.platform === "string" ? r.platform : "",
     os_version: strOrNull(r.os_version),
-    collectors: arr(r.collectors).filter(isObj) as unknown as Session["collectors"],
+    collectors: arr(r.collectors).map(toCollector).filter((c): c is Session["collectors"][number] => c !== null),
     pinned: Boolean(r.pinned),
     stats: stats ? { ...(stats as object), proc_count: numOrNull(stats.proc_count ?? stats.process_count) } : null,
   } as Session;
+}
+
+/**
+ * One collector on a session. The daemon sends `{name, mode, capabilities}`;
+ * an older answer sent the stored name only, which has no capability list
+ * (the pages then say capability is unknown, not that nothing happened).
+ */
+function toCollector(raw: unknown): Session["collectors"][number] | null {
+  if (typeof raw === "string") return { name: raw, mode: null, capabilities: [] };
+  if (!isObj(raw) || typeof raw.name !== "string") return null;
+  return {
+    ...(raw as object),
+    name: raw.name,
+    mode: strOrNull(raw.mode),
+    capabilities: arr(raw.capabilities).filter(isObj) as unknown as Session["collectors"][number]["capabilities"],
+  } as Session["collectors"][number];
+}
+
+const SEARCH_KIND: Record<string, string> = { file_access: "file", process_images: "proc", http: "url" };
+
+/**
+ * Search: the daemon answers `{hits: [{src, src_id, session_id, public_id}]}`.
+ * The page reads groups per session. A hit names its row only: time, text and
+ * evidence are not in the answer and stay null (never invented).
+ */
+export function toSearchResult(raw: unknown): SearchResult {
+  const r = isObj(raw) ? raw : {};
+  if (Array.isArray(r.groups)) return { groups: r.groups as SearchResult["groups"], fts_enabled: Boolean(r.fts_enabled) };
+  const groups = new Map<string, SearchResult["groups"][number]>();
+  for (const hit of arr(r.hits).filter(isObj)) {
+    const sid = typeof hit.public_id === "string" ? hit.public_id : typeof hit.session_id === "string" ? hit.session_id : String(hit.session_id ?? "");
+    const src = typeof hit.src === "string" ? hit.src : "";
+    const group = groups.get(sid) ?? { session_id: sid, session_name: strOrNull(hit.session_name), count: 0, hits: [] };
+    group.count += 1;
+    group.hits.push({
+      session_id: sid,
+      session_name: group.session_name,
+      kind: SEARCH_KIND[src] ?? (typeof hit.kind === "string" ? hit.kind : src),
+      id: typeof hit.src_id === "number" ? hit.src_id : typeof hit.id === "number" ? hit.id : 0,
+      ts_ns: numOrNull(hit.ts_ns),
+      summary: strOrNull(hit.summary),
+      evidence: (strOrNull(hit.evidence) as SearchResult["groups"][number]["hits"][number]["evidence"]) ?? null,
+    });
+    groups.set(sid, group);
+  }
+  return { groups: [...groups.values()], fts_enabled: Boolean(r.fts_enabled) };
+}
+
+/**
+ * Doctor: the daemon may answer `probed: false` with no capability list. The
+ * page must still render its forms, so the list defaults to empty and the
+ * reason is kept for the "不可得" note.
+ */
+export function toDoctor(raw: unknown): DoctorReport {
+  const r = isObj(raw) ? raw : {};
+  const host = isObj(r.host) ? r.host : {};
+  const caps = arr(r.capabilities).filter(isObj) as unknown as DoctorReport["capabilities"];
+  return {
+    ...(r as object),
+    platform: typeof r.platform === "string" ? r.platform : typeof host.os === "string" ? host.os : "",
+    os_version: strOrNull(r.os_version),
+    mode: strOrNull(r.mode),
+    capabilities: caps,
+    collectors: arr(r.collectors).filter(isObj) as unknown as DoctorReport["collectors"],
+    probed: typeof r.probed === "boolean" ? r.probed : caps.length > 0,
+    reason: strOrNull(r.reason),
+    privileged: typeof host.privileged === "boolean" ? host.privileged : null,
+    privileged_note: strOrNull(host.privileged_note),
+  } as DoctorReport;
 }
 
 /** `{items}` from whichever array key the daemon used. */
@@ -172,6 +241,13 @@ export function toSummary(raw: unknown): SessionSummary {
     top_dirs: list(r.top_dirs),
     top_domains: list(r.top_domains),
     top_commands: list(r.top_commands),
+    // Whether the daemon sent each top list at all. An absent list is "not
+    // summarised", not an empty one.
+    top_available: {
+      domains: Array.isArray(r.top_domains),
+      dirs: Array.isArray(r.top_dirs),
+      commands: Array.isArray(r.top_commands),
+    },
     direct_count: typeof r.direct_count === "number" ? r.direct_count : 0,
     gap_count: typeof r.gap_count === "number" ? r.gap_count : typeof stats.gap_count === "number" ? stats.gap_count : 0,
     finding_count: typeof r.finding_count === "number" ? r.finding_count : 0,
@@ -228,10 +304,29 @@ export function toConfigView(raw: unknown): ConfigView {
       max_db_bytes: numOrNull(retention.max_db_bytes) ?? (mb === null ? undefined : mb * 1024 * 1024),
     },
     redaction: { ...(redaction as object), rules: arr(redaction.rules) },
-    collectors: arr(r.collectors),
+    collectors: configCollectors(r.collectors),
     proxy: { ca_fingerprint: null, ca_created_ns: null, ...(proxy as object) },
     rules: arr(r.rules),
   } as unknown as ConfigView;
+}
+
+/**
+ * `[collectors]` in the daemon config is a table per platform
+ * (`{linux: {tls_uprobe: false, ...}}`), not a list. Each platform becomes one
+ * row whose note lists its switches, so the section is not an empty title.
+ */
+function configCollectors(raw: unknown): ConfigView["collectors"] {
+  if (Array.isArray(raw)) return raw.filter(isObj) as unknown as ConfigView["collectors"];
+  if (!isObj(raw)) return [];
+  return Object.entries(raw).map(([name, value]) => {
+    const switches = isObj(value)
+      ? Object.entries(value)
+          .filter(([, flag]) => typeof flag === "boolean")
+          .map(([key, flag]) => `${key}=${flag ? "on" : "off"}`)
+      : [];
+    const enabled = isObj(value) && Object.values(value).some((flag) => flag === true);
+    return { name, enabled, note: switches.length ? switches.join(" · ") : null };
+  });
 }
 
 /** A flow row as the page reads it. Fields the daemon does not send stay null/false. */
@@ -321,10 +416,12 @@ export function groupFlows(flows: NetFlow[], by: string): FlowGroup[] {
   return out.sort((a, b) => total(b) - total(a));
 }
 
-function toProcessNode(raw: unknown): ProcessNode {
+export function toProcessNode(raw: unknown): ProcessNode {
   const r = isObj(raw) ? raw : {};
+  const proc = isObj(r.proc) ? r.proc : {};
   return {
     ...(r as object),
+    exe_name: strOrNull(r.exe_name) ?? strOrNull(proc.exe_name),
     images: arr(r.images),
     children: arr(r.children).map(toProcessNode),
   } as ProcessNode;
@@ -363,8 +460,10 @@ export const api = {
     const raw = await get<{ roots?: unknown[]; processes?: unknown[] }>(`/sessions/${sid}/processes${qs({ tree: tree ? 1 : 0 })}`);
     return { roots: arr(raw.roots ?? raw.processes).map(toProcessNode) };
   },
-  processChildren: (sid: string, procUid: string) =>
-    get<{ children: ProcessNode[] }>(`/sessions/${sid}/processes/${procUid}`),
+  processChildren: async (sid: string, procUid: string) => {
+    const raw = await get<{ children?: unknown[] }>(`/sessions/${sid}/processes/${procUid}`);
+    return { children: arr(raw.children).map(toProcessNode) };
+  },
 
   files: async (sid: string, query: Record<string, unknown>) =>
     toPage<FileAccess>(await get<unknown>(`/sessions/${sid}/files${qs(query)}`), ["files", "rows"]),
@@ -384,14 +483,20 @@ export const api = {
   traffic: (sid: string, query: Record<string, unknown>) =>
     get<TrafficSeries>(`/sessions/${sid}/traffic${qs(query)}`),
 
+  /** E3 self-reports (`GET /sessions/{sid}/agent-events`). */
+  agentEvents: async (sid: string) => {
+    const raw = await get<{ events?: unknown[]; reason?: string }>(`/sessions/${sid}/agent-events?limit=500`);
+    return { events: arr(raw.events).filter(isObj), reason: strOrNull(raw.reason) };
+  },
+
   gaps: async (sid: string) => {
     const raw = await get<{ gaps?: unknown[] }>(`/sessions/${sid}/gaps`);
     return { gaps: arr(raw.gaps).map(toGap) };
   },
 
-  search: (query: Record<string, unknown>) => get<SearchResult>(`/search${qs(query)}`),
+  search: async (query: Record<string, unknown>) => toSearchResult(await get<unknown>(`/search${qs(query)}`)),
 
-  doctor: () => get<DoctorReport>("/doctor"),
+  doctor: async () => toDoctor(await get<unknown>("/doctor")),
   systemProcesses: (query: { agents_only?: boolean; q?: string }) =>
     get<{ roots: SystemProcess[] }>(`/processes${qs({ ...query })}`),
 
@@ -407,23 +512,95 @@ export const api = {
 
 export interface LiveHandlers {
   onRecord: (item: TimelineItem) => void;
-  onLagged: (dropped: number) => void;
-  onError: () => void;
+  /** `dropped` is null when the daemon only says that records were dropped. */
+  onLagged: (dropped: number | null) => void;
+  /** A poll failed. Polling continues; the caller shows the reason. */
+  onError: (error: unknown) => void;
+  /** A poll succeeded (clears a previous error). */
+  onOk?: () => void;
 }
 
-/** SSE subscription to /live. Returns a close function. */
-export function subscribeLive(sid: string, filter: string, handlers: LiveHandlers): () => void {
-  const params = new URLSearchParams();
-  if (filter) params.set("filter", filter);
-  if (token) params.set("access_token", token);
-  const source = new EventSource(`${API}/sessions/${sid}/live?${params.toString()}`);
-  source.addEventListener("record", (event) => {
-    handlers.onRecord(JSON.parse((event as MessageEvent).data) as TimelineItem);
-  });
-  source.addEventListener("lagged", (event) => {
-    const data = JSON.parse((event as MessageEvent).data) as { dropped?: number };
-    handlers.onLagged(data.dropped ?? 0);
-  });
-  source.onerror = () => handlers.onError();
-  return () => source.close();
+interface SseEvent {
+  id: number | null;
+  event: string;
+  data: string;
+}
+
+/** Parse a `text/event-stream` body into events. Comments are skipped. */
+export function parseSse(text: string): SseEvent[] {
+  const events: SseEvent[] = [];
+  for (const block of text.split(/\r?\n\r?\n/u)) {
+    let id: number | null = null;
+    let event = "message";
+    const data: string[] = [];
+    for (const line of block.split(/\r?\n/u)) {
+      if (line === "" || line.startsWith(":")) continue;
+      const colon = line.indexOf(":");
+      const field = colon === -1 ? line : line.slice(0, colon);
+      const value = colon === -1 ? "" : line.slice(colon + 1).replace(/^ /u, "");
+      if (field === "id") id = Number.isFinite(Number(value)) ? Number(value) : null;
+      else if (field === "event") event = value;
+      else if (field === "data") data.push(value);
+    }
+    if (data.length > 0) events.push({ id, event, data: data.join("\n") });
+  }
+  return events;
+}
+
+/**
+ * Follow `/sessions/{sid}/live`. The daemon answers each request with the
+ * records after `cursor` and closes, so this polls through the same request
+ * path as every other call: the bearer header in a browser, the internal
+ * channel in the desktop app. `EventSource` could do neither (no header, no
+ * channel), got 401, and the page unticked "跟随最新" on the first error.
+ * Returns a stop function.
+ */
+export function subscribeLive(sid: string, filter: string, handlers: LiveHandlers, intervalMs = 1000): () => void {
+  let closed = false;
+  let cursor = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const tick = async () => {
+    try {
+      const headers = new Headers({ accept: "text/event-stream" });
+      if (token) headers.set("authorization", `Bearer ${token}`);
+      const response = await transportSend(
+        `${API}/sessions/${sid}/live${qs({ filter: filter || undefined, cursor: cursor || undefined })}`,
+        { method: "GET", headers },
+      );
+      const text = await response.text();
+      if (!response.ok) {
+        let body: ApiErrorBody | null = null;
+        try {
+          body = text ? (JSON.parse(text) as ApiErrorBody) : null;
+        } catch {
+          body = null;
+        }
+        throw new ApiError(response.status, body, response.statusText);
+      }
+      if (closed) return;
+      for (const event of parseSse(text)) {
+        if (event.id !== null && event.id > cursor) cursor = event.id;
+        if (event.event === "record") {
+          try {
+            handlers.onRecord(toTimelineItem(JSON.parse(event.data)));
+          } catch {
+            // A record that is not JSON is skipped, not shown as an empty row.
+          }
+        } else if (event.event === "lagged") {
+          const data = JSON.parse(event.data) as { dropped?: unknown };
+          handlers.onLagged(typeof data.dropped === "number" ? data.dropped : null);
+        }
+      }
+      handlers.onOk?.();
+    } catch (caught) {
+      if (!closed) handlers.onError(caught);
+    } finally {
+      if (!closed) timer = setTimeout(() => void tick(), intervalMs);
+    }
+  };
+  void tick();
+  return () => {
+    closed = true;
+    if (timer) clearTimeout(timer);
+  };
 }

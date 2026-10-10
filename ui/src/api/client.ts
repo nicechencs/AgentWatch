@@ -1,6 +1,8 @@
 /**
  * API client for the local daemon (docs/01-architecture/api-and-cli.md §3).
- * The bearer token lives in memory only; nothing here touches localStorage.
+ * The bearer token lives in memory, mirrored to this tab's sessionStorage so a
+ * reload keeps the session. Nothing here touches localStorage: another tab or
+ * a later browser start does not inherit the token.
  */
 import { ApiError } from "./errors";
 import type {
@@ -27,7 +29,17 @@ import type {
 
 const API = "/api/v1";
 
-let token: string | null = null;
+const TOKEN_KEY = "aw.ui_token";
+
+function storage(): Storage | null {
+  try {
+    return typeof window === "undefined" ? null : window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+let token: string | null = storage()?.getItem(TOKEN_KEY) ?? null;
 
 export function getToken(): string | null {
   return token;
@@ -35,6 +47,10 @@ export function getToken(): string | null {
 
 export function setToken(next: string | null): void {
   token = next;
+  const store = storage();
+  if (!store) return;
+  if (next) store.setItem(TOKEN_KEY, next);
+  else store.removeItem(TOKEN_KEY);
 }
 
 function qs(params: Record<string, unknown> | undefined): string {

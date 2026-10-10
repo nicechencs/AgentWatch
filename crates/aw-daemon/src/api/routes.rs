@@ -180,7 +180,7 @@ pub struct ApiState {
     pub live: LiveHub,
     /// `AW_UI_DEV_URL`, captured at construction. Empty means embedded assets.
     pub ui_dev_url: Option<String>,
-    /// `debug.preview_ui`. When true, `GET /` redirects to `/#ticket=` so a
+    /// `debug.preview_ui`. When true, `GET /` redirects to `/index.html#ticket=` so a
     /// browser opened by hand reaches the UI. Default false: a normal daemon
     /// never hands out a ticket over HTTP.
     pub preview_ui: bool,
@@ -1451,8 +1451,11 @@ fn session_name_from_body(body: &[u8]) -> String {
 /// `GET /` while `debug.preview_ui` is on.
 ///
 /// Issues one ticket for a fixed local-preview identity and redirects to
-/// `/#ticket=...`. The fragment is not sent back to the server, and the page
-/// strips it after redeeming. A non-loopback Host is refused like every other
+/// [`PREVIEW_LANDING`]`#ticket=...`. The fragment is not sent back to the
+/// server, so the target must be a path that does not reach this function
+/// again: redirecting to `/#ticket=` came back as `GET /` and looped, issuing a
+/// fresh ticket on every hop. The page strips the fragment after redeeming and
+/// rewrites the landing path to `/`. A non-loopback Host is refused like every other
 /// ticket path. The ticket secret is the redirect target, never a log line.
 fn preview_ticket_redirect(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     if req_host_bad(&req.headers.get("host").cloned(), req.listen_port) {
@@ -1462,7 +1465,10 @@ fn preview_ticket_redirect(state: &mut ApiState, req: &HttpRequest) -> ApiRespon
         .tickets
         .issue_ui_ticket(PREVIEW_UI_USER, false, clock(state));
     let mut headers = BTreeMap::new();
-    headers.insert("location".to_owned(), format!("/#ticket={secret}"));
+    headers.insert(
+        "location".to_owned(),
+        format!("{PREVIEW_LANDING}#ticket={secret}"),
+    );
     headers.insert(
         "content-type".to_owned(),
         "text/plain; charset=utf-8".to_owned(),
@@ -1475,6 +1481,10 @@ fn preview_ticket_redirect(state: &mut ApiState, req: &HttpRequest) -> ApiRespon
         body: b"preview ticket issued".to_vec(),
     }
 }
+
+/// Page the preview redirect lands on. Served by [`static_asset`] as the
+/// embedded `index.html`, never by [`preview_ticket_redirect`].
+pub const PREVIEW_LANDING: &str = "/index.html";
 
 /// Identity the preview redirect binds its ticket to. Not a real account: the
 /// preview switch is a local convenience, and this name only scopes the
@@ -2194,6 +2204,46 @@ mod tests {
             ),
         );
         assert_eq!(response.status, 401);
+    }
+
+    #[test]
+    fn preview_redirect_target_does_not_redirect_again() {
+        let mut state = ApiState::new(1_000);
+        state.preview_ui = true;
+        let first = dispatch(
+            &mut state,
+            &req("GET", "/", Some("127.0.0.1:7456"), None, b""),
+        );
+        assert_eq!(first.status, 302);
+        let location = first.header("location").unwrap_or_default().to_owned();
+        let (path, fragment) = location.split_once('#').unwrap_or((location.as_str(), ""));
+        assert!(fragment.starts_with("ticket="));
+        // A browser follows the Location without the fragment. That request
+        // must reach the page, not another redirect with another ticket.
+        let follow = dispatch(
+            &mut state,
+            &req("GET", path, Some("127.0.0.1:7456"), None, b""),
+        );
+        assert_ne!(follow.status, 302);
+        assert!(follow.header("location").is_none());
+        // The ticket from the first hop still redeems exactly once.
+        let ticket = fragment.trim_start_matches("ticket=");
+        let body = format!(r#"{{"ticket":"{ticket}"}}"#);
+        let redeem = |state: &mut ApiState| {
+            dispatch(
+                state,
+                &req(
+                    "POST",
+                    "/api/v1/auth/ui-token",
+                    Some("127.0.0.1:7456"),
+                    None,
+                    body.as_bytes(),
+                ),
+            )
+            .status
+        };
+        assert_eq!(redeem(&mut state), 200);
+        assert_eq!(redeem(&mut state), 401);
     }
 
     #[test]

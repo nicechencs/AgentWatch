@@ -17,10 +17,65 @@ export function useAuth(): AuthValue {
   return useContext(AuthContext);
 }
 
+/** Paths that only exist as files. The router knows them as `/`. */
+const LANDING_PATHS = new Set(["/index.html"]);
+
 /**
- * Reads the one-time ticket from the URL fragment (#ticket=...), swaps it for a
- * token kept in memory, then strips the fragment. A reload has no ticket and no
- * stored token, so it returns to the signed-out state (P2-UI-01).
+ * Take the one-time ticket out of the URL fragment (#ticket=...) and clean the
+ * address bar in the same step: the fragment is dropped, and a file landing
+ * path such as `/index.html` (where the preview redirect lands) becomes `/`,
+ * so the router renders the app instead of Not Found.
+ *
+ * Returns the ticket, or null when the URL has none. Call it once per page
+ * load; the second call sees a clean URL and returns null.
+ */
+export function takeTicketFromLocation(): string | null {
+  const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+  const ticket = fragment.get("ticket");
+  const url = new URL(window.location.href);
+  const landing = LANDING_PATHS.has(url.pathname);
+  if (!ticket && !landing) return null;
+  if (landing) url.pathname = "/";
+  if (ticket) url.hash = "";
+  window.history.replaceState(null, "", url);
+  return ticket || null;
+}
+
+/**
+ * One exchange per page load, shared by every mount. React StrictMode runs an
+ * effect, cleans it up and runs it again; reading the fragment inside the
+ * effect let the first run spend the ticket and the second run find nothing,
+ * which showed "invalid or expired" for a ticket that had just worked.
+ */
+let pending: Promise<string> | null = null;
+
+/**
+ * Read at module load, before the router is created: the router would
+ * otherwise see `/index.html`, redirect to `/`, and drop the fragment before
+ * any effect could read the ticket.
+ */
+let startupTicket: string | null = takeTicketFromLocation();
+
+function exchangeOnce(ticket: string): Promise<string> {
+  if (!pending) {
+    pending = api.exchangeTicket(ticket).then(({ token }) => {
+      setToken(token);
+      return token;
+    });
+  }
+  return pending;
+}
+
+/** Tests only: forget the shared exchange between cases. */
+export function resetAuthForTests(): void {
+  pending = null;
+  startupTicket = null;
+}
+
+/**
+ * Reads the ticket, swaps it for a token, then keeps that token for this tab
+ * (see `setToken`). A reload in the same tab reuses the token instead of
+ * asking for a ticket that was already spent (P2-UI-01).
  */
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>(getToken() ? "signed-in" : "checking");
@@ -41,17 +96,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let cancelled = false;
-    const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ""));
-    const ticket = fragment.get("ticket");
-    if (ticket) {
-      const url = new URL(window.location.href);
-      url.hash = "";
-      window.history.replaceState(null, "", url);
-      api
-        .exchangeTicket(ticket)
-        .then(async ({ token }) => {
+    const ticket = startupTicket ?? takeTicketFromLocation();
+    startupTicket = null;
+    const ready: Promise<unknown> | null = ticket ? exchangeOnce(ticket) : pending;
+    if (ready) {
+      ready
+        .then(async () => {
           if (cancelled) return;
-          setToken(token);
           await loadMe();
           if (!cancelled) setStatus("signed-in");
         })

@@ -206,7 +206,7 @@ pub struct DebugConfig {
     /// `debug.preview_ui`, default false.
     ///
     /// Local preview only. When true, `GET /` answers a redirect to
-    /// `/#ticket=<one-time ticket>` so a browser opened by hand reaches the UI
+    /// `/index.html#ticket=<one-time ticket>` so a browser opened by hand reaches the UI
     /// without the `aw ui` launcher (that command is not wired yet). The ticket
     /// is the same one-time, 60-second ticket the socket path issues, and it is
     /// redeemed by the page, not logged. Leave this off outside a local preview:
@@ -437,7 +437,7 @@ pub fn config_schema_json() -> Value {
                 "additionalProperties": false,
                 "properties": {
                     "keep_raw_events": { "type": "boolean", "default": false },
-                    "preview_ui": { "type": "boolean", "default": false, "description": "Local preview only. GET / redirects to /#ticket= so a browser reaches the UI without the aw ui launcher. Off by default." }
+                    "preview_ui": { "type": "boolean", "default": false, "description": "Local preview only. GET / redirects to /index.html#ticket= so a browser reaches the UI without the aw ui launcher. Off by default." }
                 }
             }
         }

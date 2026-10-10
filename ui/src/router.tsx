@@ -142,7 +142,19 @@ const laterRoute = createRoute({
   component: () => null,
 });
 
+// `/index.html` is a file, not a page. The preview redirect lands there so the
+// daemon does not loop; the app itself lives at `/`.
+const landingRoute = createRoute({
+  getParentRoute: () => RootRoute,
+  path: "/index.html",
+  beforeLoad: () => {
+    throw redirect({ to: "/", replace: true });
+  },
+  component: () => null,
+});
+
 const routeTree = RootRoute.addChildren([
+    landingRoute,
     shellRoute.addChildren([indexRoute, newRoute, searchRoute, settingsRoute, compareRoute]),
     sessionRoute.addChildren([
       overviewRoute,

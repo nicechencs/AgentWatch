@@ -17,7 +17,9 @@ CLI 和 UI 请求到达后走同一套 axum 路由。传输层不同，但请求
 **会话令牌（UI）**
 1. `aw ui` 经由 socket 或管道向 daemon 申请一个一次性 `ui_ticket`，60 秒有效。
 2. 用 `http://127.0.0.1:7456/#ticket=<t>` 打开浏览器。
-3. 前端用 ticket 换取 `ui_token`（12 小时，只存在内存中，不写 localStorage）。之后的请求都带 `Authorization: Bearer <ui_token>`。
+3. 前端用 ticket 换取 `ui_token`（12 小时）。token 存在内存，并镜像到本标签页的 sessionStorage，同一标签页刷新仍保持登录，不需要再用一次 ticket；不写 localStorage，新标签页或重开浏览器不会继承。之后的请求都带 `Authorization: Bearer <ui_token>`。
+   - 本机预览（`debug.preview_ui = true`）：`GET /` 签一张票并 302 到 `/index.html#ticket=<t>`。片段不会发回服务端，所以落点必须是不会再触发签票的路径，否则会无限跳转；前端换票后把地址改回 `/`。
+   - `Content-Security-Policy`（含 `frame-ancestors 'none'`）只由 daemon 在响应头下发，`index.html` 不带 CSP meta：浏览器会忽略 meta 里的 `frame-ancestors` 并在控制台报错。
 4. token 与申请者的用户身份绑定。
 
 **授权模型**

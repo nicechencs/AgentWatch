@@ -290,7 +290,38 @@ fn parse_request(buf: &[u8], listen_port: u16) -> Option<HttpRequest> {
     })
 }
 
+/// Content-Security-Policy for every response, including the UI page.
+///
+/// `frame-ancestors` only takes effect as a response header; browsers ignore
+/// it in a `<meta>` tag and log an error on every load. `ui/index.html`
+/// therefore carries no CSP of its own, and this is the single policy. Inline
+/// styles are allowed because the UI's chart and virtual-list libraries set
+/// `style` attributes; scripts stay `'self'` only.
+pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; style-src 'self' 'unsafe-inline'; \
+script-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; \
+object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// Security headers written before the route's own headers. A route header
+/// with the same name replaces the default instead of repeating it.
+const DEFAULT_HEADERS: &[(&str, &str)] = &[
+    ("content-security-policy", CONTENT_SECURITY_POLICY),
+    ("x-frame-options", "DENY"),
+    ("x-content-type-options", "nosniff"),
+    ("referrer-policy", "no-referrer"),
+    ("cache-control", "no-store"),
+];
+
 fn write_response(stream: &mut TcpStream, response: &ApiResponse) -> std::io::Result<()> {
+    let body = maybe_gzip(&response.headers, &response.body);
+    let gzipped = body.len() != response.body.len();
+    let head = response_head(response, body.len(), gzipped);
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()
+}
+
+/// Status line and headers, ending with the blank line.
+pub(crate) fn response_head(response: &ApiResponse, body_len: usize, gzipped: bool) -> String {
     let mut head = format!(
         "HTTP/1.1 {} {}\r\n",
         response.status,
@@ -298,13 +329,8 @@ fn write_response(stream: &mut TcpStream, response: &ApiResponse) -> std::io::Re
     );
     head.push_str("connection: close\r\n");
     // Security headers. No CORS header is ever added.
-    head.push_str("content-security-policy: default-src 'self'\r\n");
-    head.push_str("x-frame-options: DENY\r\n");
-    head.push_str("x-content-type-options: nosniff\r\n");
-    head.push_str("referrer-policy: no-referrer\r\n");
-    head.push_str("cache-control: no-store\r\n");
-    for (name, value) in &response.headers {
-        if name.eq_ignore_ascii_case("access-control-allow-origin") {
+    for (name, value) in DEFAULT_HEADERS {
+        if response.headers.contains_key(*name) {
             continue;
         }
         head.push_str(name);
@@ -312,14 +338,22 @@ fn write_response(stream: &mut TcpStream, response: &ApiResponse) -> std::io::Re
         head.push_str(value);
         head.push_str("\r\n");
     }
-    let body = maybe_gzip(&response.headers, &response.body);
-    if body.len() != response.body.len() {
+    for (name, value) in &response.headers {
+        if name.eq_ignore_ascii_case("access-control-allow-origin")
+            || name.eq_ignore_ascii_case("x-aw-gzip")
+        {
+            continue;
+        }
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    if gzipped {
         head.push_str("content-encoding: gzip\r\n");
     }
-    head.push_str(&format!("content-length: {}\r\n\r\n", body.len()));
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(&body)?;
-    stream.flush()
+    head.push_str(&format!("content-length: {body_len}\r\n\r\n"));
+    head
 }
 
 fn maybe_gzip(headers: &std::collections::BTreeMap<String, String>, body: &[u8]) -> Vec<u8> {
@@ -349,12 +383,14 @@ fn reason(status: u16) -> &'static str {
         200 => "OK",
         201 => "Created",
         204 => "No Content",
+        302 => "Found",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         413 => "Payload Too Large",
         421 => "Misdirected Request",
+        500 => "Internal Server Error",
         501 => "Not Implemented",
         502 => "Bad Gateway",
         _ => "Error",
@@ -365,4 +401,41 @@ fn reason(status: u16) -> &'static str {
 #[must_use]
 pub fn is_loopback(ip: IpAddr) -> bool {
     ip.is_loopback()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{response_head, CONTENT_SECURITY_POLICY};
+    use crate::api::routes::ApiResponse;
+    use std::collections::BTreeMap;
+
+    fn head_for(status: u16, headers: &[(&str, &str)]) -> String {
+        let headers: BTreeMap<String, String> = headers
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        let response = ApiResponse {
+            status,
+            headers,
+            body: Vec::new(),
+        };
+        response_head(&response, 0, false)
+    }
+
+    #[test]
+    fn frame_ancestors_is_sent_as_a_header() {
+        let head = head_for(200, &[("content-type", "text/html; charset=utf-8")]);
+        assert!(CONTENT_SECURITY_POLICY.contains("frame-ancestors 'none'"));
+        assert!(head.contains(&format!(
+            "content-security-policy: {CONTENT_SECURITY_POLICY}\r\n"
+        )));
+    }
+
+    #[test]
+    fn route_header_replaces_default_instead_of_repeating() {
+        let head = head_for(302, &[("cache-control", "no-store"), ("location", "/x")]);
+        assert!(head.starts_with("HTTP/1.1 302 Found\r\n"));
+        assert_eq!(head.matches("cache-control:").count(), 1);
+        assert!(!head.contains("x-aw-gzip"));
+    }
 }

@@ -381,22 +381,7 @@ impl<'a> Retention<'a> {
             PurgeScope::OlderThan { .. } => PurgeReason::OlderThan,
             PurgeScope::All => PurgeReason::All,
         };
-        let victims = match scope {
-            PurgeScope::OlderThan { ended_before_ns } => select_ended_unpinned(
-                self.conn,
-                "SELECT id, public_id FROM sessions
-                 WHERE pinned = 0 AND ended_ns IS NOT NULL AND ended_ns < ?1
-                 ORDER BY ended_ns ASC, id ASC",
-                [ended_before_ns],
-            )?,
-            PurgeScope::All => select_ended_unpinned(
-                self.conn,
-                "SELECT id, public_id FROM sessions
-                 WHERE pinned = 0 AND ended_ns IS NOT NULL
-                 ORDER BY started_ns ASC, id ASC",
-                [],
-            )?,
-        };
+        let victims = self.purge_candidates(scope)?;
         let mut purged = Vec::with_capacity(victims.len());
         for (id, public_id) in victims {
             let deleted_ns = purge_session(self.conn, id, &public_id, reason)?;
@@ -410,6 +395,29 @@ impl<'a> Retention<'a> {
         incremental_vacuum(self.conn)?;
         checkpoint_truncate(self.conn)?;
         Ok(purged)
+    }
+
+    /// `(sessions.id, public_id)` that [`Self::purge`] would delete for
+    /// `scope`, in deletion order. Deletes nothing: this is the dry run a
+    /// caller shows before asking for confirmation. Same rule as `purge`:
+    /// pinned and still-active sessions are never candidates.
+    pub fn purge_candidates(&self, scope: PurgeScope) -> Result<Vec<(i64, String)>, StoreError> {
+        match scope {
+            PurgeScope::OlderThan { ended_before_ns } => select_ended_unpinned(
+                self.conn,
+                "SELECT id, public_id FROM sessions
+                 WHERE pinned = 0 AND ended_ns IS NOT NULL AND ended_ns < ?1
+                 ORDER BY ended_ns ASC, id ASC",
+                [ended_before_ns],
+            ),
+            PurgeScope::All => select_ended_unpinned(
+                self.conn,
+                "SELECT id, public_id FROM sessions
+                 WHERE pinned = 0 AND ended_ns IS NOT NULL
+                 ORDER BY started_ns ASC, id ASC",
+                [],
+            ),
+        }
     }
 
     /// Return free pages to the OS and truncate the WAL. Deletes nothing.

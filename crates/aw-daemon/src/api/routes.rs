@@ -1171,11 +1171,17 @@ enum StoreOp {
     Migrate,
 }
 
-/// `POST /db/purge`. A non-admin is 403. An admin purges.
+/// `POST /db/purge`. A non-admin is 403.
 ///
-/// The body is `{ "older_than"?: "<duration>", "all"?: bool }`. `older_than`
-/// is a duration (`30d`, `12h`, `30m`, or the `<n>s` / `<n>ms` / `<n>ns` forms),
-/// measured back from now. A body that names neither field is a 400.
+/// The body is `{ "older_than"?: "<duration>", "all"?: bool, "dry_run"?: bool,
+/// "confirm"?: bool }`. `older_than` is a duration (`30d`, `12h`, `30m`, or the
+/// `<n>s` / `<n>ms` / `<n>ns` forms), measured back from now. A body that names
+/// neither scope is a 400.
+///
+/// Deleting is two-step: `dry_run: true` lists what would go and deletes
+/// nothing; the deletion itself needs `confirm: true`, otherwise 400
+/// `confirm_required`. Pinned and active sessions are never deleted, and each
+/// deletion leaves a `purged:<public_id>` audit row (storage §5).
 fn db_purge(state: &ApiState, caller: &Caller, body: &[u8]) -> ApiResponse {
     if !caller_is_admin(caller) {
         return forbidden();
@@ -1193,6 +1199,15 @@ fn db_purge(state: &ApiState, caller: &Caller, body: &[u8]) -> ApiResponse {
     if all.is_none() && older.is_none() {
         return error_response(400, "bad_argument", "body: expected older_than or all");
     }
+    let flag = |key: &str| value.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+    let dry_run = flag("dry_run");
+    if !dry_run && !flag("confirm") {
+        return error_response(
+            400,
+            "confirm_required",
+            "purge deletes sessions: send dry_run=true to list them, then confirm=true to delete",
+        );
+    }
     let older_than_ns = match older {
         None => None,
         Some(text) => match older_than_cutoff_ns(text) {
@@ -1200,10 +1215,13 @@ fn db_purge(state: &ApiState, caller: &Caller, body: &[u8]) -> ApiResponse {
             Err(response) => return response,
         },
     };
-    match state
-        .query
-        .db_purge(&caller.user_id, true, older_than_ns, all.unwrap_or(false))
-    {
+    match state.query.db_purge(
+        &caller.user_id,
+        true,
+        older_than_ns,
+        all.unwrap_or(false),
+        dry_run,
+    ) {
         Ok(value) => ApiResponse::json(200, &value),
         Err(err) => from_backend(err),
     }
@@ -2478,6 +2496,59 @@ mod tests {
         });
         assert!(seeded.is_ok());
         (dir, db)
+    }
+
+    #[test]
+    fn db_purge_is_admin_only_dry_run_first_and_needs_confirm() {
+        let (dir, db) = seeded_db(
+            "purge",
+            "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, ended_ns, platform, collectors, pinned) VALUES \
+               (1, 'old', 'attach', 'alice', 1, 2, 'linux', '[]', 0), \
+               (2, 'kept', 'attach', 'alice', 1, 2, 'linux', '[]', 1), \
+               (3, 'live', 'attach', 'alice', 1, NULL, 'linux', '[]', 0);",
+        );
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let user = token_for(&mut state, "alice", false);
+        let admin = token_for(&mut state, "root", true);
+        let mut purge = |token: &str, body: &str| {
+            let response = dispatch(
+                &mut state,
+                &req(
+                    "POST",
+                    "/api/v1/db/purge",
+                    Some("127.0.0.1:7456"),
+                    Some(token),
+                    body.as_bytes(),
+                ),
+            );
+            (response.status, json_body(&response))
+        };
+        let count = || {
+            rusqlite::Connection::open(&db)
+                .and_then(|c| {
+                    c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+                })
+                .unwrap_or(-1)
+        };
+        assert_eq!(purge(&user, r#"{"all":true,"confirm":true}"#).0, 403);
+        let (status, body) = purge(&admin, r#"{"all":true}"#);
+        assert_eq!(
+            (status, body["error"]["code"].as_str()),
+            (400, Some("confirm_required"))
+        );
+        assert_eq!(count(), 3);
+        let (status, body) = purge(&admin, r#"{"all":true,"dry_run":true}"#);
+        assert_eq!(status, 200);
+        assert_eq!(body["would_purge"][0]["public_id"], "old");
+        assert_eq!(body["would_purge"].as_array().map(Vec::len), Some(1));
+        assert_eq!(count(), 3, "dry run deletes nothing");
+        let (status, body) = purge(&admin, r#"{"all":true,"confirm":true}"#);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["purged"][0]["public_id"], "old");
+        // Pinned and active sessions stay.
+        assert_eq!(count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -89,7 +89,7 @@ fn paths() -> Value {
             "put": op_body("Replace config. Administrator only.", true, "implemented")
         },
         "/db/stats": op("get", "Database size and table counts. Non-admins see only their own session count.", true, "implemented"),
-        "/db/purge": op("post", "Administrator only. Not executed by this card (501 after the admin check).", true, "not_implemented"),
+        "/db/purge": op("post", "Administrator only. dry_run=true lists, confirm=true deletes; otherwise 400 confirm_required. Pinned and active sessions are kept.", true, "implemented"),
         "/openapi.json": op("get", "This document.", true, "implemented")
     })
 }

@@ -398,7 +398,11 @@ export const api = {
   config: async () => toConfigView(await get<unknown>("/config")),
   putConfig: (body: unknown) => send<ConfigView>("PUT", "/config", body),
   dbStats: () => get<DbStats>("/db/stats"),
-  purge: (body: { older_than?: string; all?: boolean }) => send<void>("POST", "/db/purge", body),
+  /** Lists what a purge would delete; deletes nothing. */
+  purgePreview: (body: { older_than?: string; all?: boolean }) =>
+    send<{ would_purge: { public_id: string; session_id: number }[] }>("POST", "/db/purge", { ...body, dry_run: true }),
+  /** Call only after the user confirmed: the daemon refuses a purge without `confirm`. */
+  purge: (body: { older_than?: string; all?: boolean }) => send<void>("POST", "/db/purge", { ...body, confirm: true }),
 };
 
 export interface LiveHandlers {

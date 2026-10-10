@@ -194,6 +194,7 @@ $ aw run --proxy -- claude
 | GET/PUT | `/config` | 读取/修改配置（PUT 仅管理员） |
 | GET | `/rules` | 已加载的规则 |
 | GET | `/db/stats` | |
+| POST | `/db/purge` | 仅管理员（非管理员 403）。body：`{older_than?: "30d", all?: bool, dry_run?: bool, confirm?: bool}`，`older_than` 与 `all` 至少一个。两步：`dry_run: true` 只列出将删除的会话 `{"dry_run":true,"would_purge":[{public_id,session_id}]}`，不删；真正删除必须带 `confirm: true`，否则 400 `confirm_required`。固定（pinned）和未结束的会话永不删除；每删一个在 `schema_meta` 留 `purged:<public_id>` 审计记录（storage §5）。返回 `{"purged":[{public_id,session_id,reason,deleted_ns}]}`。CLI `aw db purge` 在 `--yes` 或交互确认后才发 `confirm: true`。 |
 
 记录的 JSON 字段与 [storage](storage.md) 中的表字段同名，另外有两点增强：
 - `proc_uid` 序列化为十六进制字符串；

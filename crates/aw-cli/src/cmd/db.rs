@@ -7,7 +7,7 @@
 //! - `GET /api/v1/db/stats`
 //! - `POST /api/v1/db/vacuum`
 //! - `POST /api/v1/db/migrate` with `{ "dry_run": bool }`
-//! - `POST /api/v1/db/purge` with `{ "older_than"?, "all" }`
+//! - `POST /api/v1/db/purge` with `{ "older_than"?, "all", "confirm": true }`
 //!
 //! [`DbApi`] is that boundary. [`UnwiredApi`] is what production uses until the
 //! daemon serves the routes: every call is exit 3, not an empty success that
@@ -477,9 +477,12 @@ impl DbApi for HttpDbApi {
     }
 
     fn purge(&mut self, body: &PurgeBody) -> Result<PurgeResult, DbApiError> {
+        // The CLI has already confirmed (`--yes` or the prompt); the daemon
+        // refuses a purge without `confirm: true`.
         let payload = json!({
             "older_than": body.older_than,
             "all": body.all,
+            "confirm": true,
         });
         let value = self.call(&crate::client::ApiRequest::post_json(
             "/api/v1/db/purge",

@@ -641,7 +641,15 @@ fn ops_command(
     lang: Option<&str>,
     endpoint: Option<&Endpoint>,
 ) -> Option<Outcome> {
-    let privilege = daemon::NotAdmin;
+    // The production path (an endpoint) asks the OS. The test path keeps the
+    // fixed "not admin" so a test run as root or elevated stays deterministic.
+    let host_privilege = daemon::HostPrivilege;
+    let not_admin = daemon::NotAdmin;
+    let privilege: &dyn daemon::Privilege = if endpoint.is_some() {
+        &host_privilege
+    } else {
+        &not_admin
+    };
     match command {
         Command::Export {
             session,
@@ -690,7 +698,7 @@ fn ops_command(
             Some(daemon::run(
                 op,
                 json,
-                &privilege,
+                privilege,
                 &mut daemon::PlannedControl,
             ))
         }
@@ -715,7 +723,7 @@ fn ops_command(
                 Some(db::run(
                     op,
                     json,
-                    &privilege,
+                    privilege,
                     &db::FixedClock(0),
                     &mut db::HttpDbApi::new(endpoint.clone()),
                     &mut db::NotInteractive,
@@ -724,7 +732,7 @@ fn ops_command(
                 Some(db::run(
                     op,
                     json,
-                    &privilege,
+                    privilege,
                     &db::FixedClock(0),
                     &mut db::UnwiredApi,
                     &mut db::NotInteractive,

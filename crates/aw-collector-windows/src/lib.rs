@@ -24,6 +24,7 @@ pub mod etw;
 pub mod file_map;
 #[cfg(target_os = "windows")]
 pub mod peb;
+pub mod privilege;
 pub mod scope;
 /// Pktmon SNI skeleton (P3-WIN-01). Pure classification plus a capture handle
 /// that refuses to start: pktmon's real-time payload is still 【待验证】.

@@ -20,6 +20,7 @@ mod loader;
 mod lost;
 mod maps;
 mod netdecode;
+pub mod privilege;
 mod probe;
 mod scope;
 mod sni;

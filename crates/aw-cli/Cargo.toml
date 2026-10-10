@@ -27,6 +27,12 @@ aw-proxy = { workspace = true }
 # Path crate already in the workspace. Not a new third-party dependency.
 # Root Cargo.toml is not edited; this edge lets `aw hook` call `parse_hook`.
 aw-agent-adapters = { workspace = true }
+# Path crates already in the workspace. `aw daemon install` / `aw db purge --all`
+# need to know whether the caller is an administrator; each platform crate owns
+# that check (`privilege::is_privileged`), so this crate holds no platform code.
+aw-collector-linux = { workspace = true }
+aw-collector-macos = { workspace = true }
+aw-collector-windows = { workspace = true }
 # Pinned in this crate (not workspace.dependencies): root Cargo.toml is out of
 # scope for P1-CLI-01. Versions match crates that already use them.
 # clap is MIT. serde and serde_json are MIT OR Apache-2.0.

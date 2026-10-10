@@ -1965,13 +1965,20 @@ fn filter_mentions_body(filter: &str, json_body: &str) -> bool {
 
 fn doctor(state: &ApiState) -> ApiResponse {
     let _ = state;
-    // No collector is probed on the HTTP thread. The report says so.
+    // No collector is probed on the HTTP thread. The report says so. The host
+    // block is the daemon's own privilege, read from the OS (BUGS B5); `null`
+    // means the check failed, not "not privileged".
     ApiResponse::json(
         200,
         &json!({
             "probed": false,
             "reason": "collector probe is not run on the request path",
             "collectors": [],
+            "host": {
+                "os": std::env::consts::OS,
+                "privileged": crate::privilege::current(),
+                "privileged_note": "poll collector only in this build; eBPF, ETW, and eslogger are not attached even when privileged",
+            },
         }),
     )
 }
@@ -2532,6 +2539,14 @@ mod tests {
         assert_eq!(
             json_body(&doctor).get("probed").and_then(Value::as_bool),
             Some(false)
+        );
+        // B5: the daemon's own privilege comes from the OS, not a constant.
+        assert_eq!(
+            json_body(&doctor)
+                .get("host")
+                .and_then(|host| host.get("privileged"))
+                .and_then(Value::as_bool),
+            crate::privilege::current()
         );
         let processes = dispatch(
             &mut state,

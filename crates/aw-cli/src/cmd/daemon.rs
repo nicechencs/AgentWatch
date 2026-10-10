@@ -17,15 +17,49 @@ pub(crate) trait Privilege {
     fn is_admin(&self) -> bool;
 }
 
-/// Production check. This card does not query the OS token: a real install is
-/// out of scope, and tests inject the answer. Treated as not privileged so a
-/// live `install` cannot proceed by accident.
+/// Fixed "not an administrator". Used on the test path of `execute_args_with`
+/// so a test run as root or elevated does not change behaviour.
 #[derive(Debug, Default)]
 pub(crate) struct NotAdmin;
 
 impl Privilege for NotAdmin {
     fn is_admin(&self) -> bool {
         false
+    }
+}
+
+/// Production check: asks the OS through the platform crate (BUGS B5).
+///
+/// The platform logic is not in this crate (AGENTS.md §6): each
+/// `aw-collector-*` crate owns `privilege::is_privileged` and its parser tests.
+/// This is the one `cfg` switch that picks the crate for the target. A check
+/// that fails (`None`) is treated as not an administrator, so `install` cannot
+/// proceed on a guess.
+#[derive(Debug, Default)]
+pub(crate) struct HostPrivilege;
+
+impl Privilege for HostPrivilege {
+    fn is_admin(&self) -> bool {
+        host_privileged().unwrap_or(false)
+    }
+}
+
+fn host_privileged() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        aw_collector_linux::privilege::is_privileged()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        aw_collector_macos::privilege::is_privileged()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        aw_collector_windows::privilege::is_privileged()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        None
     }
 }
 
@@ -372,6 +406,34 @@ fn ok_outcome(effect: &DaemonEffect, json: bool) -> Outcome {
 mod tests {
     use super::{run, DaemonControl, DaemonEffect, DaemonOp, PlannedControl, Privilege};
     use crate::exit;
+
+    /// BUGS B5: production used a constant "not admin", so `sudo aw daemon
+    /// install` was refused. On Linux the answer must follow the effective uid
+    /// this test runs with; on macOS and Windows it must at least be known.
+    #[test]
+    fn host_privilege_asks_the_os() {
+        let known = super::host_privileged();
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) {
+            assert!(known.is_some(), "privilege check must answer");
+        }
+        assert_eq!(super::HostPrivilege.is_admin(), known.unwrap_or(false));
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let euid_root = status
+                .lines()
+                .find(|line| line.starts_with("Uid:"))
+                .and_then(|line| line.split_whitespace().nth(2))
+                == Some("0");
+            if euid_root {
+                assert!(super::HostPrivilege.is_admin(), "root must be admin");
+            }
+        }
+    }
 
     struct Admin(bool);
 

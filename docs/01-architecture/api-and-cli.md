@@ -148,7 +148,7 @@ $ aw run --proxy -- claude
 | POST | `/auth/ui-ticket` | 仅限 socket/管道：申请 UI ticket |
 | POST | `/auth/ui-token` | 用 ticket 换 token |
 | GET | `/compare?a=<SESSION>&b=<SESSION>` | 两个会话对比：进程/文件/域名/流量差异（P5） |
-| GET | `/doctor` | 自检报告（采集器 `probe()` 与 `capabilities()`） |
+| GET | `/doctor` | 自检报告（采集器 `probe()` 与 `capabilities()`）。`host.privileged` 是 daemon 进程自身的特权，向操作系统查询：Linux 看有效 uid 为 0 或持有 `CAP_SYS_ADMIN`，macOS 看有效 uid 为 0，Windows 看令牌完整性级别为 High 或 System（未提权的管理员账户算否）。查询失败时为 `null`，不写成 `false` |
 | GET | `/processes` | 当前系统进程树（进程选择器）。参数：`?agents_only&q=` |
 | POST | `/sessions` | 创建会话。body：`{mode:"launch"\|"attach", argv?, cwd?, env?, pid?, follow_children, proxy, agent, name, include_procs, self_report, pin, group?, mcp_tap?}` |
 | GET | `/sessions` | 列表。参数：`?since&until&agent&active&q&cursor&limit` |

@@ -43,8 +43,11 @@ pub struct Reply {
 pub struct Failure {
     /// Stable machine code.
     pub code: String,
-    /// One plain sentence for a person.
+    /// One plain Chinese sentence for a person. No paths, no OS error text.
     pub message: String,
+    /// Technical detail (paths tried, OS error kinds) for a collapsible
+    /// "details" field. Not meant as the main text.
+    pub detail: String,
 }
 
 impl Failure {
@@ -53,7 +56,18 @@ impl Failure {
     pub fn refused(detail: &str) -> Self {
         Self {
             code: "refused".to_owned(),
-            message: format!("request refused by the app: {detail}"),
+            message: "应用拒绝发送这个请求。".to_owned(),
+            detail: detail.to_owned(),
+        }
+    }
+
+    /// The exchange broke inside the app.
+    #[must_use]
+    pub fn broken(detail: &str) -> Self {
+        Self {
+            code: "channel_broken".to_owned(),
+            message: "与 AgentWatch 服务的连接中断了，请重试。".to_owned(),
+            detail: detail.to_owned(),
         }
     }
 }
@@ -63,6 +77,7 @@ impl From<DialError> for Failure {
         Self {
             code: err.code().to_owned(),
             message: err.plain(),
+            detail: err.detail().to_owned(),
         }
     }
 }
@@ -118,17 +133,33 @@ pub fn reply_of(response: aw_channel::Response) -> Reply {
 ///
 /// See [`Failure`].
 pub fn exchange(path: &Path, method: &str, target: &str, body: &str) -> Result<Reply, Failure> {
+    exchange_in(path, method, target, body, &|key| std::env::var(key).ok())
+}
+
+/// [`exchange`] with an explicit environment. A default `path` is dialled in
+/// the documented order (system socket, then per-user); a stale system socket
+/// falls through. Each call re-runs the lookup, so the page's Retry finds a
+/// daemon that came up meanwhile.
+///
+/// # Errors
+///
+/// See [`Failure`].
+pub fn exchange_in(
+    path: &Path,
+    method: &str,
+    target: &str,
+    body: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Reply, Failure> {
     check(method, target, body)?;
-    let response = aw_channel::exchange(path, &encode(method, target, body), TIMEOUT)?;
+    let order = aw_channel::dial_order(path, env);
+    let (_, response) = aw_channel::exchange_first(&order, &encode(method, target, body), TIMEOUT)?;
     if response
         .header("content-encoding")
         .is_some_and(|v| v.to_ascii_lowercase().contains("gzip"))
     {
         // The daemon gzips only when asked; this client never asks.
-        return Err(Failure {
-            code: "channel_broken".to_owned(),
-            message: "unexpected gzip body".to_owned(),
-        });
+        return Err(Failure::broken("unexpected gzip body"));
     }
     Ok(reply_of(response))
 }
@@ -232,6 +263,55 @@ mod tests {
         );
         let missing = super::exchange(&dir.join("nope.sock"), "GET", "/health", "").unwrap_err();
         assert_eq!(missing.code, "daemon_unreachable");
+        assert_eq!(missing.message, "AgentWatch 服务没有运行。");
+        assert!(missing.detail.contains("nope.sock"), "{missing:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The window's Retry: one request with the system socket stale, then
+    /// the same request again after a daemon came up on the per-user path.
+    #[cfg(unix)]
+    #[test]
+    fn retry_falls_back_from_a_stale_system_socket_to_the_user_socket() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("aw-desktop-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = dir.join("system.sock");
+        drop(UnixListener::bind(&system).unwrap()); // stale socket file
+        let (sys, run) = (system.display().to_string(), dir.display().to_string());
+        let env = move |key: &str| match key {
+            "AW_SYSTEM_SOCKET" => Some(sys.clone()),
+            "XDG_RUNTIME_DIR" | "HOME" => Some(run.clone()),
+            _ => None,
+        };
+        let path = channel_path(&env);
+        assert_eq!(
+            path, system,
+            "the stale system socket exists, so it is resolved first"
+        );
+        let first = super::exchange_in(&path, "GET", "/health", "", &env).unwrap_err();
+        assert_eq!(first.code, "daemon_unreachable");
+
+        let user = dir.join("agentwatch").join("api.sock");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&user).unwrap();
+        let server = std::thread::spawn(move || loop {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 512];
+            if s.read(&mut buf).unwrap_or(0) == 0 {
+                continue; // the resolve probe
+            }
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .unwrap();
+            return;
+        });
+        let path = channel_path(&env);
+        assert_eq!(path, user, "Retry re-resolves to the live per-user socket");
+        let reply = super::exchange_in(&path, "GET", "/health", "", &env).unwrap();
+        server.join().unwrap();
+        assert_eq!(reply.status, 200);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

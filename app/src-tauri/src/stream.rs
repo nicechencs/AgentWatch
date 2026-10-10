@@ -37,8 +37,10 @@ pub enum StreamEvent {
     Error {
         /// [`Failure::code`].
         code: String,
-        /// [`Failure::message`].
+        /// [`Failure::message`] (plain Chinese).
         message: String,
+        /// [`Failure::detail`]: technical detail for a "details" field.
+        detail: String,
         /// HTTP status when the daemon answered with an error.
         status: Option<u16>,
     },
@@ -153,7 +155,8 @@ pub fn run(
                 let gone = reply.status == 404 || reply.status == 403;
                 let ok = send(StreamEvent::Error {
                     code: format!("http_{}", reply.status),
-                    message: reply.body,
+                    message: "实时流请求被服务拒绝。".to_owned(),
+                    detail: reply.body,
                     status: Some(reply.status),
                 });
                 if !ok || gone {
@@ -165,6 +168,7 @@ pub fn run(
                 if !send(StreamEvent::Error {
                     code: failure.code,
                     message: failure.message,
+                    detail: failure.detail,
                     status: None,
                 }) {
                     return;

@@ -356,15 +356,17 @@ fn local_exchange(
     request: &ApiRequest,
 ) -> Result<ApiReply, ClientError> {
     use aw_channel::DialError;
-    let reply = aw_channel::exchange(path, &encode_local_request(request), timeout).map_err(
-        |err| match err {
+    // A default path expands to the documented order (system, then per-user):
+    // a stale system socket must not hide a live per-user daemon.
+    let order = aw_channel::dial_order(path, &|key| std::env::var(key).ok());
+    let (_, reply) = aw_channel::exchange_first(&order, &encode_local_request(request), timeout)
+        .map_err(|err| match err {
             DialError::Unreachable(detail) => ClientError::Unreachable { detail },
             DialError::Forbidden(detail) => ClientError::Forbidden { detail },
             other => ClientError::Transport {
                 detail: other.to_string(),
             },
-        },
-    )?;
+        })?;
     Ok(ApiReply {
         status: reply.status,
         body: reply.body,

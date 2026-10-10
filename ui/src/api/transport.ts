@@ -15,7 +15,8 @@
  * - `aw_request {method, target, body?}` → `{status, headers, body, body_base64}`.
  *   `body` for JSON, `body_base64` for exact bytes (the CSV export is a zip).
  * - `aw_stream_open {target, onEvent: Channel}` → id, `aw_stream_close {id}`: `/live`.
- * A rejected command gives `{code, message}`. Only `daemon_unreachable` means
+ * A rejected command gives `{code, message, detail}` (`message` is plain
+ * Chinese for the page; `detail` is technical, for a details field). Only `daemon_unreachable` means
  * the service is not running; `daemon_forbidden` is a permission problem.
  */
 
@@ -76,11 +77,16 @@ export async function send(url: string, init: RequestInit & { method: string }):
  * only case the page calls "service not running"; a refused socket is
  * `daemon_forbidden` (403); anything else is `channel_error` (502).
  */
-/** `{code, message}` from a rejected command (older shells sent `"code: text"`). */
-export function channelError(err: unknown): { code: string; message: string } {
+/** `{code, message, detail?}` from a rejected command (older shells sent `"code: text"`). */
+export function channelError(err: unknown): { code: string; message: string; detail?: string } {
   if (typeof err === "object" && err !== null && "code" in err) {
-    const e = err as { code?: unknown; message?: unknown };
-    return { code: String(e.code), message: typeof e.message === "string" ? e.message : String(e.code) };
+    const e = err as { code?: unknown; message?: unknown; detail?: unknown };
+    const out: { code: string; message: string; detail?: string } = {
+      code: String(e.code),
+      message: typeof e.message === "string" ? e.message : String(e.code),
+    };
+    if (typeof e.detail === "string" && e.detail !== "") out.detail = e.detail;
+    return out;
   }
   const message = err instanceof Error ? err.message : String(err);
   const prefix = /^([a-z_]+):/u.exec(message)?.[1];
@@ -97,9 +103,9 @@ const CHANNEL_STATUS: Record<string, number> = {
 };
 
 export function channelFailure(err: unknown): Response {
-  const { code, message } = channelError(err);
-  const status = CHANNEL_STATUS[code] ?? 502;
-  return new Response(JSON.stringify({ error: { code, message } }), {
+  const error = channelError(err);
+  const status = CHANNEL_STATUS[error.code] ?? 502;
+  return new Response(JSON.stringify({ error }), {
     status,
     headers: { "content-type": "application/json" },
   });

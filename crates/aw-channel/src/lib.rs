@@ -35,6 +35,10 @@ pub const LINUX_SOCKET: &str = "/run/agentwatch/api.sock";
 pub const MACOS_SOCKET: &str = "/var/run/agentwatch/api.sock";
 /// Windows pipe.
 pub const WINDOWS_PIPE: &str = r"\\.\pipe\agentwatch-api";
+/// Testing / development only: stands in for the system socket path, so the
+/// "system path is stale, fall back to the per-user socket" order can be run
+/// without touching `/run/agentwatch`. Read by the daemon and both clients.
+pub const AW_SYSTEM_SOCKET: &str = "AW_SYSTEM_SOCKET";
 /// Socket file name inside the per-user directory.
 pub const SOCKET_FILE: &str = "api.sock";
 
@@ -91,11 +95,68 @@ pub fn candidates(env: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> {
     if let Some(value) = env(AW_SOCKET).filter(|v| !v.trim().is_empty()) {
         return vec![PathBuf::from(value.trim())];
     }
-    system_path().into_iter().chain(user_path(env)).collect()
+    system_path_from(env)
+        .into_iter()
+        .chain(user_path(env))
+        .collect()
 }
 
-/// The path a client should dial: the first candidate that exists, else the
-/// first candidate (so "not running" names the system path). On Windows the
+/// [`system_path`], or [`AW_SYSTEM_SOCKET`] when set (not on Windows).
+#[must_use]
+pub fn system_path_from(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if !cfg!(windows) {
+        if let Some(value) = env(AW_SYSTEM_SOCKET).filter(|v| !v.trim().is_empty()) {
+            return Some(PathBuf::from(value.trim()));
+        }
+    }
+    system_path()
+}
+
+/// Paths to dial for `path`: when `path` is one of the default
+/// [`candidates`], all of them in order (so a stale system socket falls
+/// through to a live per-user one); otherwise `path` alone (`--socket`).
+#[must_use]
+pub fn dial_order(path: &Path, env: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> {
+    let all = candidates(env);
+    if all.iter().any(|candidate| candidate == path) {
+        all
+    } else {
+        vec![path.to_path_buf()]
+    }
+}
+
+/// Exchange on the first candidate that answers. Only
+/// [`DialError::Unreachable`] (not found, connection refused) moves on to the
+/// next candidate; permission denied, busy, timeout, and a broken exchange are
+/// returned as they are, because a daemon is there. Every call re-runs the
+/// whole lookup, so a "retry" after the daemon starts finds it.
+///
+/// # Errors
+///
+/// The first non-`Unreachable` error, or `Unreachable` naming every path tried.
+pub fn exchange_first(
+    paths: &[PathBuf],
+    request: &[u8],
+    timeout: Duration,
+) -> Result<(PathBuf, Response), DialError> {
+    let mut tried = Vec::new();
+    for path in paths {
+        match exchange(path, request, timeout) {
+            Ok(response) => return Ok((path.clone(), response)),
+            Err(DialError::Unreachable(detail)) => tried.push(detail),
+            Err(other) => return Err(other),
+        }
+    }
+    if tried.is_empty() {
+        tried.push("no channel path on this OS".to_owned());
+    }
+    Err(DialError::Unreachable(tried.join("; ")))
+}
+
+/// The path a client should dial and name in messages: the first candidate
+/// that exists and does not refuse a connection (a stale socket file is
+/// skipped), else the first that exists, else the first candidate (so "not
+/// running" names the system path). Exchanges still walk [`dial_order`]. On Windows the
 /// pipe is always the answer.
 #[must_use]
 pub fn resolve(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
@@ -104,9 +165,24 @@ pub fn resolve(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
         return all.into_iter().next();
     }
     all.iter()
-        .find(|path| path.exists())
+        .find(|path| path.exists() && !refused(path))
+        .or_else(|| all.iter().find(|path| path.exists()))
         .cloned()
         .or_else(|| all.into_iter().next())
+}
+
+/// A socket file is there but nobody listens (stale).
+#[cfg(unix)]
+fn refused(path: &Path) -> bool {
+    matches!(
+        std::os::unix::net::UnixStream::connect(path),
+        Err(err) if err.kind() == io::ErrorKind::ConnectionRefused
+    )
+}
+
+#[cfg(not(unix))]
+fn refused(_: &Path) -> bool {
+    false
 }
 
 /// [`resolve`] over the process environment.
@@ -155,17 +231,18 @@ impl DialError {
         }
     }
 
-    /// One plain sentence for a person.
+    /// One plain Chinese sentence for a person. No paths, no OS error text:
+    /// those are in [`Self::detail`] for a "details" field.
     #[must_use]
     pub fn plain(&self) -> String {
         match self {
-            Self::Unreachable(d) => format!("AgentWatch service is not running ({d})"),
-            Self::Forbidden(d) => format!(
-                "AgentWatch service is running, but this account may not connect to it ({d}). Ask an administrator to add you to the agentwatch / AgentWatch Users group"
-            ),
-            Self::Busy(d) => format!("AgentWatch service is busy, try again ({d})"),
-            Self::Timeout(d) => format!("AgentWatch service did not answer in time ({d})"),
-            Self::Broken(d) => format!("AgentWatch channel error ({d})"),
+            Self::Unreachable(_) => "AgentWatch 服务没有运行。".to_owned(),
+            Self::Forbidden(_) => {
+                "AgentWatch 服务在运行，但当前账户没有连接权限。请让管理员把你加入 agentwatch 组（Windows 为 AgentWatch Users 组）。".to_owned()
+            }
+            Self::Busy(_) => "AgentWatch 服务正忙，请稍后重试。".to_owned(),
+            Self::Timeout(_) => "AgentWatch 服务没有及时响应，请重试。".to_owned(),
+            Self::Broken(_) => "与 AgentWatch 服务的连接中断了，请重试。".to_owned(),
         }
     }
 }
@@ -626,4 +703,150 @@ mod tests {
         let _ = std::fs::remove_file(&probe);
         root
     }
+}
+
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod fallback_tests {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+
+    use super::{dial_order, exchange_first, DialError, AW_SOCKET, AW_SYSTEM_SOCKET, TIMEOUT};
+
+    fn dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("aw-chan-fb-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn serve_once(listener: UnixListener) -> std::thread::JoinHandle<()> {
+        // Answers the first connection that sends a request; a bare
+        // connect-and-close (the `resolve` probe) is skipped.
+        std::thread::spawn(move || loop {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 512];
+            if s.read(&mut buf).unwrap_or(0) == 0 {
+                continue;
+            }
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            return;
+        })
+    }
+
+    fn env_for(system: &str, runtime: &str) -> impl Fn(&str) -> Option<String> {
+        let (system, runtime) = (system.to_owned(), runtime.to_owned());
+        move |key| match key {
+            AW_SYSTEM_SOCKET => Some(system.clone()),
+            "XDG_RUNTIME_DIR" => Some(runtime.clone()),
+            "HOME" => Some(runtime.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn refused_system_socket_falls_back_to_a_live_user_socket() {
+        let d = dir("refused");
+        let system = d.join("system.sock");
+        drop(UnixListener::bind(&system).unwrap()); // stale: file left, nobody listens
+        let env = env_for(&system.display().to_string(), &d.display().to_string());
+        let order = dial_order(&system, &env);
+        assert_eq!(order[0], system);
+        let user = order[1].clone();
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        let server = serve_once(UnixListener::bind(&user).unwrap());
+        assert_eq!(
+            super::resolve(&env),
+            Some(user.clone()),
+            "stale system socket is skipped"
+        );
+        let (used, reply) =
+            exchange_first(&order, b"GET /health HTTP/1.1\r\n\r\n", TIMEOUT).unwrap();
+        server.join().unwrap();
+        assert_eq!(used, user);
+        assert_eq!(reply.body, b"ok");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn nothing_anywhere_is_unreachable_naming_every_path() {
+        let d = dir("none");
+        let system = d.join("system.sock");
+        let env = env_for(&system.display().to_string(), &d.display().to_string());
+        let err = exchange_first(&dial_order(&system, &env), b"", TIMEOUT).unwrap_err();
+        assert_eq!(err.code(), "daemon_unreachable");
+        assert!(err.detail().contains("system.sock"), "{err}");
+        assert!(err.detail().contains("agentwatch/api.sock"), "{err}");
+        assert_eq!(err.plain(), "AgentWatch 服务没有运行。");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn retry_re_resolves_and_finds_a_daemon_started_later() {
+        let d = dir("retry");
+        let system = d.join("system.sock");
+        let env = env_for(&system.display().to_string(), &d.display().to_string());
+        let first = exchange_first(&dial_order(&system, &env), b"", TIMEOUT);
+        assert!(matches!(first, Err(DialError::Unreachable(_))));
+        // The daemon comes up on the per-user path; the same call now works.
+        let user = dial_order(&system, &env)[1].clone();
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        let server = serve_once(UnixListener::bind(&user).unwrap());
+        let (used, _) = exchange_first(
+            &dial_order(&system, &env),
+            b"GET / HTTP/1.1\r\n\r\n",
+            TIMEOUT,
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(used, user);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn permission_denied_is_reported_without_falling_back() {
+        use std::os::unix::fs::PermissionsExt;
+        if super::tests_is_root() {
+            return;
+        }
+        let d = dir("denied");
+        let system = d.join("system.sock");
+        let _live = UnixListener::bind(&system).unwrap();
+        std::fs::set_permissions(&system, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let env = env_for(&system.display().to_string(), &d.display().to_string());
+        let order = dial_order(&system, &env);
+        // A live user socket exists too; it must not be used.
+        std::fs::create_dir_all(order[1].parent().unwrap()).unwrap();
+        let _user = UnixListener::bind(&order[1]).unwrap();
+        let err = exchange_first(&order, b"", TIMEOUT).unwrap_err();
+        assert_eq!(err.code(), "daemon_forbidden", "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn explicit_path_is_dialled_alone() {
+        let env = |key: &str| (key == AW_SOCKET).then(|| "/tmp/only.sock".to_owned());
+        assert_eq!(
+            dial_order(std::path::Path::new("/tmp/only.sock"), &env).len(),
+            1
+        );
+        assert_eq!(
+            dial_order(std::path::Path::new("/tmp/other.sock"), &|_| None).len(),
+            1
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+fn tests_is_root() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let probe = std::env::temp_dir().join(format!("aw-chan-root-{}", std::process::id()));
+    let _ = std::fs::write(&probe, b"");
+    let root = std::fs::metadata(&probe)
+        .map(|m| m.uid() == 0)
+        .unwrap_or(true);
+    let _ = std::fs::remove_file(&probe);
+    root
 }

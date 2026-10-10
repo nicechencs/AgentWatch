@@ -47,7 +47,12 @@ invoke('aw_request', { method: 'GET', target: '/api/v1/sessions?limit=50', body?
      }>
 ```
 
-Rejects with `{ code, message }` (`message` is a plain sentence for a person):
+Rejects with `{ code, message, detail }`: `message` is one plain Chinese
+sentence for a person (no paths, no OS error text; show it as is), `detail`
+is the technical part (paths tried, OS error kind) for a collapsible
+"details" field. Every call re-runs the socket lookup (system path, then
+per-user; only not-found / refused falls through), so Retry is just calling
+again:
 
 | `code` | meaning | suggested UI |
 |---|---|---|
@@ -78,7 +83,7 @@ await invoke('aw_stream_close', { id })
 type StreamEvent =
   | { kind: 'event', id: string | null, event: string, data: string }
       // event = SSE event name: 'record' (data = record JSON), 'lagged', ...
-  | { kind: 'error', code: string, message: string, status: number | null }
+  | { kind: 'error', code: string, message: string, detail: string, status: number | null }
       // code as in the table above, or 'http_<status>'. On 403/404 the stream
       // ends; otherwise it retries after 2 s.
 ```

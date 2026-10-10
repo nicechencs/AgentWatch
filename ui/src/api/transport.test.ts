@@ -48,4 +48,21 @@ describe("transport", () => {
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("daemon_unreachable");
   });
+
+  it("keeps the plain message and the technical detail apart", async () => {
+    (window as unknown as W).__TAURI_INTERNALS__ = {
+      invoke: async () => {
+        throw {
+          code: "daemon_unreachable",
+          message: "AgentWatch 服务没有运行。",
+          detail: "/run/agentwatch/api.sock: connection refused",
+        };
+      },
+    };
+    const res = await send("/api/v1/me", { method: "GET" });
+    const body = (await res.json()) as { error: { code: string; message: string; detail?: string } };
+    expect(body.error.message).toBe("AgentWatch 服务没有运行。");
+    expect(body.error.message).not.toContain("/run/");
+    expect(body.error.detail).toContain("connection refused");
+  });
 });

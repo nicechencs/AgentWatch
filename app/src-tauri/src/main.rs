@@ -46,10 +46,7 @@ async fn aw_request(
     let body = body.unwrap_or_default();
     tauri::async_runtime::spawn_blocking(move || channel::exchange(&path, &method, &target, &body))
         .await
-        .map_err(|err| Failure {
-            code: "channel_broken".to_owned(),
-            message: format!("request task failed: {err}"),
-        })?
+        .map_err(|err| Failure::broken(&format!("request task failed: {err}")))?
 }
 
 /// Open streams, by id. Only the registry is locked, never a request.
@@ -80,10 +77,7 @@ fn aw_stream_open(
             let mut send = |event| on_event.send(event).is_ok();
             stream::run(&path, &target, &closed, &mut send, std::thread::sleep);
         })
-        .map_err(|err| Failure {
-            code: "channel_broken".to_owned(),
-            message: format!("stream thread: {err}"),
-        })?;
+        .map_err(|err| Failure::broken(&format!("stream thread: {err}")))?;
     Ok(id)
 }
 

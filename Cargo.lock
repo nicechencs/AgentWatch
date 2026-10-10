@@ -65,10 +65,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-channel"
+version = "0.1.0"
+
+[[package]]
 name = "aw-cli"
 version = "0.1.0"
 dependencies = [
  "aw-agent-adapters",
+ "aw-channel",
  "aw-collector-linux",
  "aw-collector-macos",
  "aw-collector-windows",
@@ -136,6 +141,7 @@ name = "aw-daemon"
 version = "0.1.0"
 dependencies = [
  "aw-agent-adapters",
+ "aw-channel",
  "aw-collector-linux",
  "aw-collector-macos",
  "aw-collector-poll",

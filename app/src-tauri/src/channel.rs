@@ -208,8 +208,15 @@ pub fn pinned_path(fallback: PathBuf) -> PathBuf {
     pin().current().unwrap_or(fallback)
 }
 
-/// One exchange through `pin`: the pinned path alone while it answers,
-/// otherwise the first of `order` that answers (which becomes the pin).
+/// One exchange through `pin`.
+///
+/// - Pinned: dial only the pinned path. Not found / refused unpins and falls
+///   through to the walk below; any other result (including permission
+///   denied, busy, timeout) is returned and the pin is kept.
+/// - Not pinned: walk `order` (system socket, then per-user) one candidate at
+///   a time, never in parallel. Only not found / refused moves on; the first
+///   other error is returned and nothing is pinned. The first candidate that
+///   answers becomes the pin.
 fn pinned_exchange(
     pin: &Pin,
     order: &[PathBuf],
@@ -292,6 +299,143 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
+
+    /// A fake channel: each path answers with a fixed outcome; every dial is
+    /// recorded in order.
+    struct Fake {
+        outcomes: RefCell<Vec<(PathBuf, &'static str)>>,
+        dialed: RefCell<Vec<PathBuf>>,
+    }
+
+    impl Fake {
+        fn new(outcomes: &[(&PathBuf, &'static str)]) -> Self {
+            Self {
+                outcomes: RefCell::new(outcomes.iter().map(|(p, o)| ((*p).clone(), *o)).collect()),
+                dialed: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn set(&self, path: &PathBuf, outcome: &'static str) {
+            let mut all = self.outcomes.borrow_mut();
+            all.retain(|(p, _)| p != path);
+            all.push((path.clone(), outcome));
+        }
+
+        fn dial(&self, path: &Path) -> Result<Response, DialError> {
+            self.dialed.borrow_mut().push(path.to_path_buf());
+            let outcome = self
+                .outcomes
+                .borrow()
+                .iter()
+                .find(|(p, _)| p == path)
+                .map_or("down", |(_, o)| *o);
+            let detail = path.display().to_string();
+            match outcome {
+                "up" => Ok(Response {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                }),
+                "forbidden" => Err(DialError::Forbidden(detail)),
+                "busy" => Err(DialError::Busy(detail)),
+                "timeout" => Err(DialError::Timeout(detail)),
+                _ => Err(DialError::Unreachable(detail)),
+            }
+        }
+
+        fn take(&self) -> Vec<PathBuf> {
+            std::mem::take(&mut *self.dialed.borrow_mut())
+        }
+    }
+
+    fn paths() -> (PathBuf, PathBuf) {
+        (
+            PathBuf::from("/run/agentwatch/api.sock"),
+            PathBuf::from("/run/user/1000/agentwatch/api.sock"),
+        )
+    }
+
+    /// (a) The pin is chosen by the documented order, walked one candidate at
+    /// a time: with both daemons up the system one is pinned, and the per-user
+    /// one is never dialled.
+    #[test]
+    fn pin_follows_the_dial_order_system_first() {
+        let (system, user) = paths();
+        let order = vec![system.clone(), user.clone()];
+        let fake = Fake::new(&[(&system, "up"), (&user, "up")]);
+        let pin = Pin::default();
+        assert!(pinned_exchange(&pin, &order, &|p| fake.dial(p)).is_ok());
+        assert_eq!(fake.take(), vec![system.clone()]);
+        assert_eq!(pin.current(), Some(system.clone()));
+        // System not running: the per-user daemon, only after system was tried.
+        let fake = Fake::new(&[(&user, "up")]);
+        let pin = Pin::default();
+        assert!(pinned_exchange(&pin, &order, &|p| fake.dial(p)).is_ok());
+        assert_eq!(fake.take(), vec![system, user.clone()]);
+        assert_eq!(pin.current(), Some(user));
+    }
+
+    /// (b) When the pinned daemon stops answering (not found / refused), the
+    /// order is walked again from its start, system socket first.
+    #[test]
+    fn a_pinned_daemon_that_stops_answering_re_resolves_from_the_start() {
+        let (system, user) = paths();
+        let order = vec![system.clone(), user.clone()];
+        let fake = Fake::new(&[(&user, "up")]);
+        let pin = Pin::default();
+        assert!(pinned_exchange(&pin, &order, &|p| fake.dial(p)).is_ok());
+        assert_eq!(pin.current(), Some(user.clone()));
+        fake.take();
+        // The per-user daemon goes away; a system daemon is up now.
+        fake.set(&user, "down");
+        fake.set(&system, "up");
+        assert!(pinned_exchange(&pin, &order, &|p| fake.dial(p)).is_ok());
+        assert_eq!(fake.take(), vec![user.clone(), system.clone()]);
+        assert_eq!(pin.current(), Some(system.clone()));
+        // Pinned system goes away, per-user is back: walk again from system.
+        fake.set(&system, "down");
+        fake.set(&user, "up");
+        assert!(pinned_exchange(&pin, &order, &|p| fake.dial(p)).is_ok());
+        assert_eq!(fake.take(), vec![system.clone(), system, user.clone()]);
+        assert_eq!(pin.current(), Some(user));
+    }
+
+    /// (c) Permission denied, busy, or timeout on an earlier candidate is the
+    /// answer: reported as is, the later candidate is not dialled, nothing is
+    /// pinned. The same errors on the pinned daemon are reported and keep the
+    /// pin (a daemon is there).
+    #[test]
+    fn real_errors_on_an_earlier_candidate_are_reported_not_skipped() {
+        let (system, user) = paths();
+        let order = vec![system.clone(), user.clone()];
+        for (outcome, code) in [
+            ("forbidden", "daemon_forbidden"),
+            ("busy", "daemon_busy"),
+            ("timeout", "daemon_timeout"),
+        ] {
+            let fake = Fake::new(&[(&system, outcome), (&user, "up")]);
+            let pin = Pin::default();
+            let err = pinned_exchange(&pin, &order, &|p| fake.dial(p)).err();
+            assert_eq!(err.as_ref().map(DialError::code), Some(code), "{outcome}");
+            assert_eq!(fake.take(), vec![system.clone()], "{outcome}");
+            assert_eq!(pin.current(), None, "{outcome}");
+
+            let fake = Fake::new(&[(&user, "up")]);
+            let pin = Pin::default();
+            assert!(pinned_exchange(&pin, &order, &|p| fake.dial(p)).is_ok());
+            fake.take();
+            fake.set(&user, outcome);
+            fake.set(&system, "up");
+            let err = pinned_exchange(&pin, &order, &|p| fake.dial(p)).err();
+            assert_eq!(
+                err.as_ref().map(DialError::code),
+                Some(code),
+                "pinned {outcome}"
+            );
+            assert_eq!(fake.take(), vec![user.clone()], "pinned {outcome}");
+            assert_eq!(pin.current(), Some(user.clone()), "pinned {outcome}");
+        }
+    }
 
     /// Test-bot #144: Markdown export and the timeline said "session not found"
     /// with nothing in the user's daemon log. A window keeps talking to the

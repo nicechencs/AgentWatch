@@ -16,6 +16,7 @@ import { useI18n } from "@/lib/i18n";
 import { TimelineTime } from "./TimelineTime";
 import { usePrefs } from "@/lib/prefs";
 import { composedFilter, useSessionQuery } from "@/lib/session-query";
+import { sessionQueryOptions } from "@/lib/live-session";
 
 const CATS: TimelineKind[] = ["proc", "file", "net", "dns", "http", "agent", "ipc", "rpc", "finding", "gap"];
 const DEFAULT_ON = new Set<TimelineKind>(["proc", "file", "net", "dns", "http", "finding", "gap"]);
@@ -45,7 +46,7 @@ export function TimelinePage() {
   const [cursor, setCursor] = useState(0);
   const [open, setOpen] = useState(false);
   const scroller = useRef<HTMLDivElement>(null);
-  const session = useQuery({ queryKey: ["session", sid], queryFn: () => api.session(sid) });
+  const session = useQuery(sessionQueryOptions(sid));
   const sessionStart = session.data?.started_ns ?? null;
 
   const filter = composedFilter(query);

@@ -55,6 +55,7 @@ const CODE_TEXT: Record<string, string> = {
   no_database: "error.noDatabase",
   store_unavailable: "error.noDatabase",
   session_ended: "error.sessionEnded",
+  write_failed: "error.writeFailed",
 };
 
 export function describeError(error: unknown, t: T): string {

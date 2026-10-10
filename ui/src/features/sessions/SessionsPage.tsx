@@ -271,6 +271,7 @@ function SessionRow({
               {t("session.export")}
             </button>
             {exporter.error ? <span role="alert" className="text-gap">{exporter.error}</span> : null}
+            {exporter.notice ? <span role="status" className="text-ink-soft">{exporter.notice}</span> : null}
           </span>
         )}
       </td>

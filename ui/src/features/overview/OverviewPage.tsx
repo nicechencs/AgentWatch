@@ -1,7 +1,6 @@
 import type { ReactNode } from "react";
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
-import { api } from "@/api/client";
 import type { SessionSummary, TopEntry } from "@/api/types";
 import { allFindings, findingsQueryOptions } from "@/features/findings/api";
 import type { Finding } from "@/features/findings/types";
@@ -13,15 +12,13 @@ import { ErrorNote, Loading } from "@/components/QueryState";
 import { capabilitiesUnknown, coverage, kindInSentence, kindLabel, uncollectedKinds } from "@/lib/capabilities";
 import { useI18n } from "@/lib/i18n";
 import { usePrefs } from "@/lib/prefs";
+import { summaryQueryOptions } from "@/lib/live-session";
 import { useSessionQuery } from "@/lib/session-query";
 
 export function OverviewPage() {
   const { sid } = useParams({ strict: false }) as { sid: string };
   const { query } = useSessionQuery();
-  const summary = useQuery({
-    queryKey: ["summary", sid],
-    queryFn: () => api.summary(sid),
-  });
+  const summary = useQuery(summaryQueryOptions(sid));
 
   if (summary.isLoading) return <Loading />;
   if (summary.isError || !summary.data) {
@@ -30,7 +27,7 @@ export function OverviewPage() {
   return <Overview summary={summary.data} filter={query.f} />;
 }
 
-function Overview({ summary, filter }: { summary: SessionSummary; filter: string }) {
+export function Overview({ summary, filter }: { summary: SessionSummary; filter: string }) {
   const { t } = useI18n();
   const { lang } = usePrefs();
   const navigate = useNavigate();
@@ -39,6 +36,10 @@ function Overview({ summary, filter }: { summary: SessionSummary; filter: string
   const approx = summary.approximate;
   const reason = summary.approximate_reason;
   const stats = session.stats;
+  const recording = session.ended_ns == null && !session.purged;
+  // Right after 「开始」 the first sample is not written yet: 「0 进程」 next to
+  // 「没有记录到采集缺口」 read as "nothing is running". Say it is waiting.
+  const waitingFirstSample = recording && (stats?.proc_count ?? 0) === 0;
 
   const jump = (page: "files" | "network", expression: string) => {
     const f = [filter, expression].filter(Boolean).join(" ");
@@ -52,7 +53,14 @@ function Overview({ summary, filter }: { summary: SessionSummary; filter: string
   const unknownCaps = capabilitiesUnknown(session);
 
   const kpis: { label: string; value: ReactNode }[] = [
-    { label: t("overview.procs"), value: <Count value={stats?.proc_count} approximate={approx} approximateReason={reason} /> },
+    {
+      label: t("overview.procs"),
+      value: waitingFirstSample ? (
+        <span className="text-sm text-ink-faint" data-waiting-sample="">{t("overview.procsWaiting")}</span>
+      ) : (
+        <Count value={stats?.proc_count} approximate={approx} approximateReason={reason} />
+      ),
+    },
     {
       label: t("overview.commands"),
       value: (
@@ -114,7 +122,7 @@ function Overview({ summary, filter }: { summary: SessionSummary; filter: string
         ) : missing.length > 0 || unknownCaps ? (
           // 「缺口：无」 next to categories that were never collected read as
           // "complete". Zero recorded gaps is all that can be said.
-          t("overview.noRecordedGaps")
+          t(recording ? "overview.noRecordedGapsYet" : "overview.noRecordedGaps")
         ) : (
           t("overview.noGaps")
         )}

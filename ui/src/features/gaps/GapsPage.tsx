@@ -9,13 +9,14 @@ import { formatClockRange, nsToRfc3339 } from "@/lib/format";
 import { kindLabel } from "@/lib/capabilities";
 import { useI18n } from "@/lib/i18n";
 import { usePrefs } from "@/lib/prefs";
+import { sessionQueryOptions } from "@/lib/live-session";
 
 export function GapsPage() {
   const { t } = useI18n();
   const { timeFormat } = usePrefs();
   const { sid } = useParams({ strict: false }) as { sid: string };
   const navigate = useNavigate();
-  const session = useQuery({ queryKey: ["session", sid], queryFn: () => api.session(sid) });
+  const session = useQuery(sessionQueryOptions(sid));
   const gaps = useQuery({ queryKey: ["gaps", sid], queryFn: () => api.gaps(sid) });
 
   if (session.isLoading || gaps.isLoading) return <Loading />;

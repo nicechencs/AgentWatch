@@ -16,6 +16,7 @@ import { coverage } from "@/lib/capabilities";
 import { useListKeys } from "@/components/useListKeys";
 import { useI18n } from "@/lib/i18n";
 import { composedFilter, useSessionQuery } from "@/lib/session-query";
+import { sessionQueryOptions } from "@/lib/live-session";
 
 const QUICK: { key: string; expr: string }[] = [
   { key: "sensitive", expr: "tag:sensitive" },
@@ -36,7 +37,7 @@ export function FilesPage() {
   const [open, setOpen] = useState(false);
   const scroller = useRef<HTMLDivElement>(null);
   const filter = composedFilter(query);
-  const session = useQuery({ queryKey: ["session", sid], queryFn: () => api.session(sid) });
+  const session = useQuery(sessionQueryOptions(sid));
   const fileCoverage = coverage(session.data, "file");
 
   const pages = useInfiniteQuery({

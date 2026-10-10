@@ -2,7 +2,7 @@ import { isWallTime } from "@/lib/format";
 import { Link, Outlet, useParams } from "@tanstack/react-router";
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "@/api/client";
 import { DensityBar } from "@/components/DensityBar";
 import { FilterBar } from "@/components/FilterBar";
@@ -10,6 +10,7 @@ import { RelTime } from "@/components/RelTime";
 import { ErrorNote, Loading } from "@/components/QueryState";
 import { composedFilter, useSessionQuery } from "@/lib/session-query";
 import { useExport } from "@/lib/use-export";
+import { sessionQueryOptions } from "@/lib/live-session";
 import { sessionTitle } from "@/lib/session-title";
 import { useI18n } from "@/lib/i18n";
 
@@ -33,7 +34,20 @@ export function SessionLayout() {
   const [stopping, setStopping] = useState(false);
   const [stopError, setStopError] = useState<unknown>(null);
   const client = useQueryClient();
-  const session = useQuery({ queryKey: ["session", sid], queryFn: () => api.session(sid) });
+  const session = useQuery(sessionQueryOptions(sid));
+  const ended = session.data ? session.data.ended_ns !== null || Boolean(session.data.purged) : null;
+  const wasRecording = useRef(false);
+  useEffect(() => {
+    // The program exited on its own: the counts on the other tabs were read
+    // while recording, re-read them once.
+    if (ended === false) wasRecording.current = true;
+    if (ended === true && wasRecording.current) {
+      wasRecording.current = false;
+      void client.invalidateQueries({ queryKey: ["summary", sid] });
+      void client.invalidateQueries({ queryKey: ["processes", sid] });
+      void client.invalidateQueries({ queryKey: ["histogram", sid] });
+    }
+  }, [ended, client, sid]);
   const histogram = useQuery({
     queryKey: ["histogram", sid, query.f, query.ev, query.subtree, query.proc],
     queryFn: () => api.histogram(sid, { filter: composedFilter(query), buckets: 60 }),
@@ -118,6 +132,11 @@ export function SessionLayout() {
           {exporter.error ? (
             <span role="alert" className="text-xs text-gap">
               {exporter.error}
+            </span>
+          ) : null}
+          {exporter.notice ? (
+            <span role="status" className="max-w-xs truncate text-xs text-ink-soft" title={exporter.notice}>
+              {exporter.notice}
             </span>
           ) : null}
         </div>

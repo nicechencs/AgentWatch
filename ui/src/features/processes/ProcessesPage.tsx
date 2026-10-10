@@ -12,6 +12,7 @@ import { coverage, type Coverage } from "@/lib/capabilities";
 import { copyText, joinCommand } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
 import { useSessionQuery } from "@/lib/session-query";
+import { sessionQueryOptions } from "@/lib/live-session";
 
 interface MenuState {
   x: number;
@@ -23,7 +24,7 @@ export function ProcessesPage() {
   const { t } = useI18n();
   const { sid } = useParams({ strict: false }) as { sid: string };
   const tree = useQuery({ queryKey: ["processes", sid], queryFn: () => api.processes(sid) });
-  const session = useQuery({ queryKey: ["session", sid], queryFn: () => api.session(sid) });
+  const session = useQuery(sessionQueryOptions(sid));
   const files = coverage(session.data, "file");
   const net = coverage(session.data, "net");
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());

@@ -119,7 +119,8 @@ describe("export and live go through the request layer", () => {
     const file = await fetchExport("s1", "csv");
     expect(invoke).toHaveBeenCalledWith("aw_request", expect.objectContaining({ target: "/api/v1/sessions/s1/export?format=csv" }));
     expect(Array.from(new Uint8Array(await file.blob.arrayBuffer()))).toEqual([0x50, 0x4b, 3, 4, 0xff]);
-    expect(file.name).toBe("s1.zip");
+    // No disposition header: the default name says it is a zip of CSVs.
+    expect(file.name).toBe("s1.csv.zip");
   });
 
   it("an export error is thrown, not navigated to", async () => {

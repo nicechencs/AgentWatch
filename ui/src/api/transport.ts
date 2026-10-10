@@ -15,6 +15,9 @@
  * - `aw_request {method, target, body?}` → `{status, headers, body, body_base64}`.
  *   `body` for JSON, `body_base64` for exact bytes (the CSV export is a zip).
  * - `aw_stream_open {target, onEvent: Channel}` → id, `aw_stream_close {id}`: `/live`.
+ * - `aw_save_export {sid, format}` → `{status, path, cancelled, error_body, bytes}`:
+ *   the shell fetches the export, shows the native "Save As" dialog and writes
+ *   the file there (a webview download link wrote into the launch directory).
  * A rejected command gives `{code, message, detail}` (`message` is plain
  * Chinese for the page; `detail` is technical, for a details field). Only `daemon_unreachable` means
  * the service is not running; `daemon_forbidden` is a permission problem.
@@ -34,6 +37,30 @@ function tauriInvoke(): Invoke | null {
   const internals = (window as unknown as { __TAURI_INTERNALS__?: { invoke?: Invoke } })
     .__TAURI_INTERNALS__;
   return typeof internals?.invoke === "function" ? internals.invoke : null;
+}
+
+/** What `aw_save_export` answers. */
+export interface SavedExport {
+  status: number;
+  path: string | null;
+  cancelled: boolean;
+  error_body: string | null;
+  bytes: number;
+}
+
+/**
+ * App only: export through the shell's "Save As" dialog. Returns null in a
+ * browser (the caller downloads instead). A rejected command (daemon not
+ * reachable, write failed) comes back as the same error {@link send} gives.
+ */
+export async function saveExportInApp(sid: string, format: string): Promise<SavedExport | Response | null> {
+  const invoke = tauriInvoke();
+  if (!invoke) return null;
+  try {
+    return (await invoke("aw_save_export", { sid, format })) as SavedExport;
+  } catch (err) {
+    return channelFailure(err);
+  }
 }
 
 /** True inside the desktop app window. Sign-in is not needed there. */

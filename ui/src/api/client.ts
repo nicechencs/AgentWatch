@@ -5,7 +5,7 @@
  * a later browser start does not inherit the token.
  */
 import { ApiError } from "./errors";
-import { openStream, send as transportSend, sendBytes as transportSendBytes } from "./transport";
+import { openStream, saveExportInApp, send as transportSend, sendBytes as transportSendBytes } from "./transport";
 import type {
   ApiErrorBody,
   ConfigView,
@@ -553,7 +553,8 @@ export const api = {
 
 export type ExportFormat = "jsonl" | "csv" | "md";
 
-const EXPORT_EXT: Record<ExportFormat, string> = { jsonl: "jsonl", csv: "zip", md: "md" };
+// CSV is one file per table in a zip (storage.md §export), so it is named a zip.
+const EXPORT_EXT: Record<ExportFormat, string> = { jsonl: "jsonl", csv: "csv.zip", md: "md" };
 
 export interface ExportFile {
   name: string;
@@ -591,6 +592,42 @@ export async function fetchExport(sid: string, format: ExportFormat): Promise<Ex
   const blob = await response.blob();
   const name = dispositionName(response.headers.get("content-disposition")) ?? `${sid}.${EXPORT_EXT[format]}`;
   return { name, blob };
+}
+
+async function errorOf(response: Response): Promise<ApiError> {
+  const text = await response.text();
+  let body: ApiErrorBody | null = null;
+  try {
+    body = text ? (JSON.parse(text) as ApiErrorBody) : null;
+  } catch {
+    body = null;
+  }
+  return new ApiError(response.status, body, response.statusText);
+}
+
+/** How an export ended: saved by the app (path), downloaded (name), or cancelled. */
+export type ExportOutcome =
+  | { kind: "saved"; path: string }
+  | { kind: "downloaded"; name: string }
+  | { kind: "cancelled" };
+
+/**
+ * Export a session for the user. In the desktop app the shell asks where to
+ * save (native dialog) and writes the file; in a browser it is a download.
+ */
+export async function exportToFile(sid: string, format: ExportFormat): Promise<ExportOutcome> {
+  const inApp = await saveExportInApp(sid, format);
+  if (inApp === null) {
+    const file = await fetchExport(sid, format);
+    saveFile(file);
+    return { kind: "downloaded", name: file.name };
+  }
+  if (inApp instanceof Response) throw await errorOf(inApp);
+  if (inApp.status < 200 || inApp.status >= 300) {
+    throw await errorOf(new Response(inApp.error_body ?? "", { status: inApp.status }));
+  }
+  if (inApp.cancelled || !inApp.path) return { kind: "cancelled" };
+  return { kind: "saved", path: inApp.path };
 }
 
 /** Hand a file to the user as a download without leaving the page. */

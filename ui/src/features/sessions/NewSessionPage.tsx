@@ -1,6 +1,6 @@
 import { useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/api/client";
 import type { SystemProcess, SystemProcessTable } from "@/api/types";
 import { describeError } from "@/api/errors";
@@ -19,7 +19,8 @@ export function NewSessionPage() {
   const [error, setError] = useState<unknown>(null);
   const [pending, setPending] = useState(false);
 
-  const start = async (body: Parameters<typeof api.createSession>[0]) => {
+  // Stable, so the launch form does not re-render on every page update.
+  const start = useCallback(async (body: Parameters<typeof api.createSession>[0]) => {
     setPending(true);
     setError(null);
     try {
@@ -35,7 +36,7 @@ export function NewSessionPage() {
     } finally {
       setPending(false);
     }
-  };
+  }, [client, navigate, t]);
 
   return (
     <main className="px-4 py-3">
@@ -79,10 +80,24 @@ export function NewSessionPage() {
   );
 }
 
-function LaunchForm({ pending, onStart }: { pending: boolean; onStart: (body: Parameters<typeof api.createSession>[0]) => void }) {
+/**
+ * The command and directory boxes are uncontrolled: React never writes their
+ * value after the first render. As controlled inputs, any re-render that ran
+ * between a keystroke reaching the field and React's change handler (the
+ * desktop window re-renders on channel replies; an input method's pending
+ * text is not yet an input event) wrote the old state back into the field,
+ * so typing `sleep 60` in the app left `leep 60`. The text is read on submit.
+ */
+export const LaunchForm = memo(function LaunchForm({
+  pending,
+  onStart,
+}: {
+  pending: boolean;
+  onStart: (body: Parameters<typeof api.createSession>[0]) => void;
+}) {
   const { t } = useI18n();
-  const [command, setCommand] = useState("");
-  const [cwd, setCwd] = useState("");
+  const commandRef = useRef<HTMLInputElement>(null);
+  const cwdRef = useRef<HTMLInputElement>(null);
   const [agent, setAgent] = useState("auto");
   const [proxy, setProxy] = useState(false);
   const [follow, setFollow] = useState(true);
@@ -93,7 +108,8 @@ function LaunchForm({ pending, onStart }: { pending: boolean; onStart: (body: Pa
       className="rounded border border-line p-3"
       onSubmit={(event) => {
         event.preventDefault();
-        const argv = splitCommand(command);
+        const argv = splitCommand(commandRef.current?.value ?? "");
+        const cwd = (cwdRef.current?.value ?? "").trim();
         if (argv.length === 0) return;
         onStart({
           mode: "launch",
@@ -109,11 +125,30 @@ function LaunchForm({ pending, onStart }: { pending: boolean; onStart: (body: Pa
       <h2 className="text-sm font-medium">{t("new.launch")}</h2>
       <label className="mt-3 block text-xs">
         {t("new.command")}
-        <input required value={command} onChange={(event) => setCommand(event.target.value)} className="mt-1 w-full rounded border border-line bg-paper px-2 py-1 font-mono" />
+        <input
+          ref={commandRef}
+          required
+          name="command"
+          defaultValue=""
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
+          className="mt-1 w-full rounded border border-line bg-paper px-2 py-1 font-mono"
+        />
       </label>
       <label className="mt-2 block text-xs">
         {t("new.cwd")}
-        <input value={cwd} onChange={(event) => setCwd(event.target.value)} className="mt-1 w-full rounded border border-line bg-paper px-2 py-1 font-mono" />
+        <input
+          ref={cwdRef}
+          name="cwd"
+          defaultValue=""
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
+          className="mt-1 w-full rounded border border-line bg-paper px-2 py-1 font-mono"
+        />
       </label>
       <label className="mt-2 block text-xs">
         {t("new.agent")}
@@ -144,7 +179,7 @@ function LaunchForm({ pending, onStart }: { pending: boolean; onStart: (body: Pa
       </button>
     </form>
   );
-}
+});
 
 function AttachForm({ pending, onStart }: { pending: boolean; onStart: (body: Parameters<typeof api.createSession>[0]) => void }) {
   const { t } = useI18n();

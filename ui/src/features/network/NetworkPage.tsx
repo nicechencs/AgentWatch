@@ -17,6 +17,7 @@ import { TrafficChart } from "./TrafficChart";
 import { fetchHttp, groupByFlow, HTTP_PAGE_LIMIT, type HttpPage, type HttpRow } from "./http";
 import { FlowMarks, HttpTable } from "./HttpRows";
 import { fill, useNetStrings } from "./strings";
+import { sessionQueryOptions } from "@/lib/live-session";
 
 type GroupBy = "domain" | "proc" | "ip" | "port";
 
@@ -38,7 +39,7 @@ export function NetworkPage() {
   const [selected, setSelected] = useState<NetFlow | null>(null);
   const filter = composedFilter(query);
   const s = useNetStrings();
-  const session = useQuery({ queryKey: ["session", sid], queryFn: () => api.session(sid) });
+  const session = useQuery(sessionQueryOptions(sid));
   const netCoverage = coverage(session.data, "net");
 
   const flows = useQuery({

@@ -91,7 +91,7 @@ impl DoctorSource for Unprobed {
                 status: "没采".to_owned(),
                 detail: Some("此构建没有探测采集器".to_owned()),
             }],
-            categories: default_categories(),
+            categories: default_categories(false),
         }
     }
 }
@@ -141,6 +141,25 @@ impl DoctorSource for HttpDoctor {
 }
 
 fn report_from_doctor_json(body: &Value) -> DoctorReport {
+    let host = body.get("host").unwrap_or(body);
+    let host = HostFacts {
+        os: host
+            .get("os")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| std::env::consts::OS.to_owned()),
+        version: host
+            .get("version")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| "不可得".to_owned()),
+        privileged: host
+            .get("privileged")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
     let probed = body.get("probed").and_then(Value::as_bool).unwrap_or(false);
     let reason = body
         .get("reason")
@@ -162,7 +181,7 @@ fn report_from_doctor_json(body: &Value) -> DoctorReport {
             detail: reason.or_else(|| Some("后台 doctor 没有列出采集器".to_owned())),
         });
     }
-    let mut categories = default_categories();
+    let mut categories = default_categories(host.privileged);
     // Older daemon replies called these rows `categories`; the current daemon
     // calls them `capabilities` and uses `kind`. Accept both shapes so the CLI
     // reports the capability the daemon actually has instead of turning every
@@ -204,26 +223,8 @@ fn report_from_doctor_json(body: &Value) -> DoctorReport {
             }
         }
     }
-    let host = body.get("host").unwrap_or(body);
     DoctorReport {
-        host: HostFacts {
-            os: host
-                .get("os")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| std::env::consts::OS.to_owned()),
-            version: host
-                .get("version")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| "不可得".to_owned()),
-            privileged: host
-                .get("privileged")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        },
+        host,
         collectors,
         categories,
     }
@@ -312,14 +313,14 @@ fn clip_doctor(text: &str) -> String {
 }
 
 /// Categories in capability-matrix order, all unavailable.
-fn default_categories() -> Vec<CategoryRow> {
+fn default_categories(privileged: bool) -> Vec<CategoryRow> {
     CATEGORIES
         .iter()
         .map(|name| CategoryRow {
             category: (*name).to_owned(),
             source: None,
             evidence: Evidence::NA(NaReason::CollectorUnavailable),
-            fix: Some(fix_for(name).to_owned()),
+            fix: Some(fix_for(name, privileged).to_owned()),
         })
         .collect()
 }
@@ -328,8 +329,9 @@ fn default_categories() -> Vec<CategoryRow> {
 /// [`aw_core::CapabilityCategory`]. PRIV is capability-matrix §7.
 pub(crate) const CATEGORIES: [&str; 7] = ["proc", "file", "net", "dns", "url", "scope", "priv"];
 
-fn fix_for(category: &str) -> &'static str {
+fn fix_for(category: &str, privileged: bool) -> &'static str {
     match category {
+        "file" | "net" | "dns" if privileged => "本版本未接入",
         "proc" | "file" | "net" | "dns" => {
             "请以管理员权限（Windows）或 root（Linux/macOS）运行后台，或使用 --no-daemon（证据 S）"
         }
@@ -632,5 +634,47 @@ mod tests {
             .to_owned();
         assert!(!line.contains("不可得"), "{line}");
         assert!(!line.contains("root"), "{line}");
+    }
+
+    #[test]
+    fn privileged_unavailable_rows_report_collectors_are_not_built() {
+        let body = serde_json::json!({
+            "host": { "os": "linux", "version": "6.6", "privileged": true },
+            "capabilities": [
+                { "kind": "file", "evidence": "NA", "available": false },
+                { "kind": "net", "evidence": "NA", "available": false },
+                { "kind": "dns", "evidence": "NA", "available": false }
+            ]
+        });
+        let report = super::report_from_doctor_json(&body);
+        for category in ["file", "net", "dns"] {
+            let row = report
+                .categories
+                .iter()
+                .find(|row| row.category == category)
+                .expect("unavailable category row");
+            assert_eq!(row.fix.as_deref(), Some("本版本未接入"));
+        }
+        assert!(report
+            .categories
+            .iter()
+            .filter(|row| matches!(row.category.as_str(), "file" | "net" | "dns"))
+            .all(|row| !row.fix.as_deref().is_some_and(|fix| fix.contains("root"))));
+
+        let mut unprivileged_body = body;
+        unprivileged_body["host"]["privileged"] = serde_json::Value::Bool(false);
+        let unprivileged = super::report_from_doctor_json(&unprivileged_body);
+        for category in ["file", "net", "dns"] {
+            let row = unprivileged
+                .categories
+                .iter()
+                .find(|row| row.category == category)
+                .expect("unavailable category row");
+            assert!(
+                row.fix.as_deref().is_some_and(|fix| fix.contains("root")),
+                "{category}: {:?}",
+                row.fix
+            );
+        }
     }
 }

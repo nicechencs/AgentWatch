@@ -7,7 +7,7 @@
 //! the page through a Tauri channel. Nothing is dropped between polls because
 //! the cursor is the last id delivered.
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -126,10 +126,27 @@ pub fn check_target(target: &str) -> Result<(), Failure> {
     }
 }
 
+/// One poll of the stream: `GET target` to the daemon. The window passes
+/// [`window_get`]; tests pass a fake.
+pub type Get<'a> = dyn Fn(&str) -> Result<channel::Reply, Failure> + 'a;
+
+/// The window's poll: every call resolves the path again (the pinned daemon,
+/// else the documented order) and goes through the process-wide pin, so a
+/// reconnect after the pinned daemon went away walks system socket, then
+/// per-user — only not-found / refused moves on, other errors are reported.
+///
+/// # Errors
+///
+/// See [`Failure`].
+pub fn window_get(resolve: &dyn Fn() -> PathBuf, target: &str) -> Result<channel::Reply, Failure> {
+    channel::exchange(&resolve(), "GET", target, "")
+}
+
 /// Poll until `closed` is set or `send` reports the page went away. Blocking;
-/// run it on its own thread.
+/// run it on its own thread. Each poll (and so each reconnect) is a fresh
+/// `get`: nothing about which daemon answered last time is held here.
 pub fn run(
-    path: &Path,
+    get: &Get<'_>,
     target: &str,
     closed: &Arc<AtomicBool>,
     send: &mut dyn FnMut(StreamEvent) -> bool,
@@ -138,7 +155,7 @@ pub fn run(
     let mut cursor: Option<String> = None;
     while !closed.load(Ordering::SeqCst) {
         let wanted = with_cursor(target, cursor.as_deref());
-        let pause = match channel::exchange(path, "GET", &wanted, "") {
+        let pause = match get(&wanted) {
             Ok(reply) if reply.status == 200 => {
                 let parsed = parse_sse(&reply.body);
                 for (id, event, data) in parsed.events {
@@ -264,7 +281,7 @@ mod tests {
             got.len() < 2
         };
         super::run(
-            &path,
+            &|t: &str| crate::channel::exchange(&path, "GET", t, ""),
             "/api/v1/sessions/s-1/live",
             &closed,
             &mut send,
@@ -281,5 +298,99 @@ mod tests {
             "{seen:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pinned daemon goes away mid-stream: the next poll re-runs the
+    /// ordered lookup (system first, then per-user) instead of sticking to
+    /// the dead path; a real error on the system socket is reported, not
+    /// skipped.
+    #[test]
+    fn reconnect_re_runs_the_ordered_lookup() {
+        use std::cell::RefCell;
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        use aw_channel::{DialError, Response};
+
+        use crate::channel::{pinned_exchange, reply_of, Pin};
+
+        let system = PathBuf::from("/sys.sock");
+        let user = PathBuf::from("/user.sock");
+        let order = vec![system.clone(), user.clone()];
+        // Per poll: what each path does. Poll 1: only the user daemon is up.
+        // Poll 2: it is gone, a system daemon is up. Poll 3: system denies.
+        let script: Vec<[(&Path, &str); 2]> = vec![
+            [(&system, "down"), (&user, "up")],
+            [(&system, "up"), (&user, "down")],
+            [(&system, "denied"), (&user, "down")],
+        ];
+        let poll = RefCell::new(0_usize);
+        let dialled = RefCell::new(Vec::<(usize, PathBuf)>::new());
+        let pin = Pin::default();
+        let get = |target: &str| {
+            let n = *poll.borrow();
+            *poll.borrow_mut() += 1;
+            let dial = |p: &Path| -> Result<Response, DialError> {
+                dialled.borrow_mut().push((n, p.to_path_buf()));
+                let what = script[n]
+                    .iter()
+                    .find(|(q, _)| *q == p)
+                    .map_or("down", |(_, w)| *w);
+                match what {
+                    "up" => Ok(Response {
+                        status: 200,
+                        headers: vec![],
+                        body: format!("id: {n}\nevent: record\ndata: {}\n\n", p.display())
+                            .into_bytes(),
+                    }),
+                    "denied" => Err(DialError::Forbidden(format!("{}: denied", p.display()))),
+                    _ => Err(DialError::Unreachable(format!("{}: refused", p.display()))),
+                }
+            };
+            let _ = target;
+            pinned_exchange(&pin, &order, &dial)
+                .map(reply_of)
+                .map_err(Into::into)
+        };
+        let closed = Arc::new(AtomicBool::new(false));
+        let mut got = Vec::new();
+        let mut send = |ev: super::StreamEvent| {
+            got.push(ev);
+            got.len() < 3
+        };
+        super::run(
+            &get,
+            "/api/v1/sessions/s-1/live",
+            &closed,
+            &mut send,
+            |_| {},
+        );
+
+        let datas: Vec<String> = got
+            .iter()
+            .map(|ev| match ev {
+                super::StreamEvent::Event { data, .. } => data.clone(),
+                super::StreamEvent::Error { code, .. } => code.clone(),
+            })
+            .collect();
+        assert_eq!(datas, vec!["/user.sock", "/sys.sock", "daemon_forbidden"]);
+        let dialled = dialled.into_inner();
+        // Poll 2: the pinned user socket first, refused, then the walk from
+        // the top finds the system daemon.
+        let second: Vec<_> = dialled
+            .iter()
+            .filter(|(n, _)| *n == 1)
+            .map(|(_, p)| p.clone())
+            .collect();
+        assert_eq!(second, vec![user.clone(), system.clone()]);
+        // Poll 3: the pinned system socket says "denied": reported, the
+        // per-user socket is not tried.
+        let third: Vec<_> = dialled
+            .iter()
+            .filter(|(n, _)| *n == 2)
+            .map(|(_, p)| p.clone())
+            .collect();
+        assert_eq!(third, vec![system]);
     }
 }

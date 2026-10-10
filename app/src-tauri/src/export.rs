@@ -104,12 +104,60 @@ pub fn filter(format: &str) -> Option<(&'static str, Vec<&'static str>)> {
 /// Write `bytes` to `path`, replacing it. The user chose the path in the
 /// dialog (which already asked about overwriting).
 ///
+/// The bytes go to a temp file in the same directory first, are synced, and
+/// are then renamed over `path`, so a failed write never leaves a
+/// half-written export (or a clobbered older file) at the chosen path. The
+/// temp file is removed on failure.
+///
 /// # Errors
 ///
 /// `write_failed` with the OS reason.
 pub fn write(path: &Path, bytes: &[u8]) -> Result<PathBuf, Failure> {
-    std::fs::write(path, bytes)
-        .map_err(|err| write_failed(&format!("could not write {}: {err}", path.display())))?;
+    write_with(path, bytes, &|file, bytes| {
+        use std::io::Write as _;
+        file.write_all(bytes)
+    })
+}
+
+/// [`write`] with the byte-writing step injectable (tests make it fail
+/// halfway).
+fn write_with(
+    path: &Path,
+    bytes: &[u8],
+    put: &dyn Fn(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<PathBuf, Failure> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let fail = |what: &str, err: &std::io::Error| {
+        write_failed(&format!("could not {what} {}: {err}", path.display()))
+    };
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let name = path
+        .file_name()
+        .map_or_else(|| "export".into(), |n| n.to_string_lossy().into_owned());
+    let temp = dir.join(format!(
+        ".{name}.aw-tmp-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|err| fail("write", &err))?;
+    let written = put(&mut file, bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|err| fail("write", &err));
+    drop(file);
+    let renamed =
+        written.and_then(|()| std::fs::rename(&temp, path).map_err(|err| fail("replace", &err)));
+    if let Err(failure) = renamed {
+        let _ = std::fs::remove_file(&temp);
+        return Err(failure);
+    }
     Ok(path.to_path_buf())
 }
 
@@ -182,7 +230,7 @@ pub fn finish(response: &aw_channel::Response, chosen: Option<PathBuf>) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{daemon_error, file_name, filter, finish, target, write};
+    use super::{daemon_error, file_name, filter, finish, target, write, write_with};
 
     fn response(status: u16, body: &[u8]) -> aw_channel::Response {
         aw_channel::Response {
@@ -285,6 +333,43 @@ mod tests {
             missing.err().map(|f| f.code),
             Some("write_failed".to_owned())
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write that fails halfway leaves the chosen path as it was (an older
+    /// file stays intact, a new path stays absent) and no temp file behind.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_failed_write_leaves_no_half_file_and_no_temp() {
+        let dir = std::env::temp_dir().join(format!("aw-export-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let halfway = |file: &mut std::fs::File, bytes: &[u8]| {
+            use std::io::Write as _;
+            file.write_all(&bytes[..bytes.len() / 2])?;
+            Err(std::io::Error::other("disk full"))
+        };
+        let old = dir.join("old.md");
+        std::fs::write(&old, b"previous export").unwrap();
+        let err = write_with(&old, b"new export bytes", &halfway).err();
+        assert_eq!(err.as_ref().map(|f| f.code.as_str()), Some("write_failed"));
+        assert!(err.is_some_and(|f| f.detail.contains("disk full")));
+        assert_eq!(std::fs::read(&old).ok(), Some(b"previous export".to_vec()));
+
+        let fresh = dir.join("fresh.md");
+        assert!(write_with(&fresh, b"abcdef", &halfway).is_err());
+        assert!(!fresh.exists());
+
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["old.md".to_owned()], "no temp file left");
+
+        // And a good write replaces the old file in place.
+        assert!(write(&old, b"new").is_ok());
+        assert_eq!(std::fs::read(&old).ok(), Some(b"new".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

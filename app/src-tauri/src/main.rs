@@ -109,12 +109,14 @@ fn aw_stream_open(
     if let Ok(mut open) = streams.open.lock() {
         open.insert(id, Arc::clone(&closed));
     }
-    let path = channel_path();
     std::thread::Builder::new()
         .name(format!("aw-live-{id}"))
         .spawn(move || {
             let mut send = |event| on_event.send(event).is_ok();
-            stream::run(&path, &target, &closed, &mut send, std::thread::sleep);
+            // Resolved per poll, not once: a reconnect after the pinned
+            // daemon went away walks the ordered lookup again.
+            let get = |target: &str| stream::window_get(&channel_path, target);
+            stream::run(&get, &target, &closed, &mut send, std::thread::sleep);
         })
         .map_err(|err| Failure::broken(&format!("stream thread: {err}")))?;
     Ok(id)

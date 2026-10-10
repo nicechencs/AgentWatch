@@ -217,7 +217,7 @@ pub fn pinned_path(fallback: PathBuf) -> PathBuf {
 ///   a time, never in parallel. Only not found / refused moves on; the first
 ///   other error is returned and nothing is pinned. The first candidate that
 ///   answers becomes the pin.
-fn pinned_exchange(
+pub(crate) fn pinned_exchange(
     pin: &Pin,
     order: &[PathBuf],
     dial: &dyn Fn(&Path) -> Result<aw_channel::Response, DialError>,
@@ -247,12 +247,13 @@ fn pinned_exchange(
 
 /// [`exchange`] with an explicit environment and a fresh [`Pin`]: the dial
 /// order (system socket, then per-user) with a stale system socket falling
-/// through. Tests only; the window goes through the process-wide pin.
+/// through. Tests only (its callers are the Unix socket tests); the window
+/// goes through the process-wide pin.
 ///
 /// # Errors
 ///
 /// See [`Failure`].
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn exchange_in(
     path: &Path,
     method: &str,

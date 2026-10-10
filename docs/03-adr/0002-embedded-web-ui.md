@@ -1,7 +1,7 @@
 # ADR-0002 UI 以桌面 App 为主（React + Vite，Tauri 外壳）
 
 > 状态：已接受
-> 最后更新：2026-10-10（修订：从“浏览器打开、Tauri 以后可选”改为桌面 App 为主）
+> 最后更新：2026-10-10（修订：从“浏览器打开、Tauri 以后可选”改为桌面 App 为主；同日补充：导出与实时流也走统一请求层）
 > 关联：REQ-05、NFR-04、ADR-0005
 
 ## 背景
@@ -13,7 +13,12 @@
 - `ui/` 下用 React + TypeScript + Vite；表格用 TanStack Table 加虚拟滚动；时间线用 ECharts 或 vis-timeline，由 P2 阶段的任务定。
 - **主要形态是桌面 App**：Tauri 2 外壳（`app/src-tauri/`，crate `aw-desktop`），窗口里加载打包进 App 的 `ui/dist`。
 - 进程分工（ADR-0005 不变）：采集服务 `agentwatchd` 继续以管理员权限在后台运行；App 以**普通用户**权限运行，通过**内部通道**（Linux/macOS 的 Unix socket、Windows 的命名管道，见 api-and-cli §1）跟它通信。**App 不开端口、不登录**：daemon 按对端的系统身份（`SO_PEERCRED` 等）认人。
-- 前端只在入口处区分两种运行方式：`ui/src/api/transport.ts` 在 Tauri 窗口里把请求交给外壳转发到内部通道，在浏览器里仍走同源 `/api/v1`。页面代码不感知差别。
+- 前端只在入口处区分两种运行方式：`ui/src/api/transport.ts` 在 Tauri 窗口里把请求交给外壳转发到内部通道，在浏览器里仍走同源 `/api/v1`。页面代码不感知差别。**所有**请求都经过 `ui/src/api/client.ts` → `transport.ts`，包括：
+  - 普通 JSON 调用：外壳命令 `aw_request`，回 `{status, headers, body, body_base64}`；浏览器为 `fetch` 带 `Authorization`。
+  - 导出（JSONL / CSV zip / Markdown）：同一请求取**原始字节**（桌面用 `body_base64`，浏览器 `fetch` 的 Blob），在页面内另存为。不用 `<a href>` 直链——直链在浏览器里不带 token、在 App 里根本到不了 daemon，zip 当文本也会损坏。失败在原页面提示，不跳走。
+  - 实时流 `/live`：App 里用外壳的 `aw_stream_open` / `aw_stream_close`（Tauri Channel 推送 `{kind:"event"|"error",…}`）；浏览器里经同一请求层按 `cursor` 轮询（daemon 的 `/live` 每次回一批就关，`retry: 1000`）。不用 `EventSource`：它不能带 `Authorization`，内部通道上也没有它。
+  - 出错分类：外壳拒绝时给 `{code, message}`。只有 `daemon_unreachable` 显示「服务没有运行」；`daemon_forbidden` 显示无权限连接；`daemon_busy` / `daemon_timeout` / `channel_broken` 等以及 daemon 自己返回的错误显示「服务在运行，但返回了错误」。重试会重新请求。
+  - 接口细节以 `app/README.md`「Page ↔ shell interface」为准；`ui/src/api/client.test.ts` 检查除 `client.ts` / `transport.ts` 外没有代码直接调用 `fetch`。
 - 浏览器方式降为**开发和应急**用途：daemon 仍可在 `127.0.0.1:<api.http_port>`（默认 7456，`0` 关闭）提供同一套 UI，`aw ui` 在内部通道上申请一次性 ticket 后用系统浏览器打开。这条路径保留 ticket、Host 校验和响应头 CSP。
 - 安装包、签名、自动更新不在本次修订范围，另行排期（P4）。
 

@@ -5,7 +5,7 @@
  * a later browser start does not inherit the token.
  */
 import { ApiError } from "./errors";
-import { send as transportSend, sendBytes as transportSendBytes } from "./transport";
+import { openStream, send as transportSend, sendBytes as transportSendBytes } from "./transport";
 import type {
   ApiErrorBody,
   ConfigView,
@@ -505,6 +505,31 @@ export const LIVE_POLL_MS = 1000;
  */
 export function subscribeLive(sid: string, filter: string, handlers: LiveHandlers): () => void {
   let closed = false;
+  let closeStream: (() => void) | null = null;
+  const target = `${API}/sessions/${encodeURIComponent(sid)}/live${qs({ filter })}`;
+  const onFrame = (event: string, data: string) => {
+    if (event === "record") handlers.onRecord(JSON.parse(data) as TimelineItem);
+    if (event === "lagged") {
+      const parsed = JSON.parse(data) as { dropped?: number | boolean };
+      handlers.onLagged(typeof parsed.dropped === "number" ? parsed.dropped : 0);
+    }
+  };
+  // App: the shell polls over the internal channel and pushes events.
+  const streamed = openStream(target, (message) => {
+    if (closed) return;
+    if (message.kind === "event") onFrame(message.event, message.data);
+    else handlers.onError();
+  }).then(
+    (close) => {
+      if (close && closed) close();
+      else closeStream = close;
+      return close !== null;
+    },
+    () => {
+      if (!closed) handlers.onError();
+      return true;
+    },
+  );
   let cursor = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
   const poll = async () => {
@@ -519,11 +544,7 @@ export function subscribeLive(sid: string, filter: string, handlers: LiveHandler
       if (!response.ok) throw new Error(String(response.status));
       for (const frame of parseSse(await response.text())) {
         if (frame.id !== null && Number.isFinite(Number(frame.id))) cursor = Math.max(cursor, Number(frame.id));
-        if (frame.event === "record") handlers.onRecord(JSON.parse(frame.data) as TimelineItem);
-        if (frame.event === "lagged") {
-          const data = JSON.parse(frame.data) as { dropped?: number | boolean };
-          handlers.onLagged(typeof data.dropped === "number" ? data.dropped : 0);
-        }
+        onFrame(frame.event, frame.data);
       }
     } catch {
       if (!closed) handlers.onError();
@@ -531,9 +552,13 @@ export function subscribeLive(sid: string, filter: string, handlers: LiveHandler
     }
     if (!closed) timer = setTimeout(() => void poll(), LIVE_POLL_MS);
   };
-  void poll();
+  // Browser: poll through the same request layer as every call.
+  void streamed.then((inApp) => {
+    if (!inApp) void poll();
+  });
   return () => {
     closed = true;
     if (timer) clearTimeout(timer);
+    closeStream?.();
   };
 }

@@ -19,6 +19,7 @@
     "@tanstack/react-router": "1.170.41",
     "@tanstack/react-table": "8.21.2",
     "@tanstack/react-virtual": "3.13.2",
+    "@tauri-apps/api": "^2",
     "echarts": "5.6.0",
     "react": "18.3.1",
     "react-dom": "18.3.1"

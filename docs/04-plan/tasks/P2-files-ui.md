@@ -591,7 +591,7 @@ flowchart LR
   - token 绑定申请者的用户身份，并按授权模型过滤可见的会话。
 - 校验 `Host` 头必须是 `127.0.0.1:<port>` 或 `localhost:<port>`，防 DNS rebinding；不开 CORS；设置 CSP `default-src 'self'`、`X-Frame-Options: DENY`。
 - 嵌入静态资源：`rust-embed` 打包 `ui/dist`，带 gzip 预压缩；开发模式下代理到 Vite dev server（`AW_UI_DEV_URL`）。
-- `aw ui [--no-open] [--port N]`：申请 ticket 并用默认浏览器打开 `http://127.0.0.1:7456/#ticket=<t>`。
+- `aw ui [--no-open] [--port N]`：申请 ticket 并用默认浏览器打开 `http://127.0.0.1:<port>/#ticket=<t>`（`<port>` 为 daemon 随 ticket 返回的实际 HTTP 端口，即 `api.http_port`，默认 7456；HTTP 关闭时 `aw ui` 直接报告）。
 - 自动生成 OpenAPI（`utoipa`），地址为 `/api/v1/openapi.json`。
 
 **限制**：
@@ -600,7 +600,7 @@ flowchart LR
 
 **验收标准**：
 - [ ] `cargo test -p aw-daemon http_auth` 通过：无 token 返回 401；ticket 重复使用失败；过期 ticket 失败；`Host: evil.com` 返回 421；用户 A 的 token 看不到用户 B 的会话。
-- [ ] `curl -s http://127.0.0.1:7456/api/v1/health` 返回 200，且只含非敏感字段。
+- [ ] `curl -s http://127.0.0.1:<api.http_port>/api/v1/health`（默认 7456） 返回 200，且只含非敏感字段。
 - [ ] 嵌入 UI 后，`aw` 加 `agentwatchd` 的 release 体积合计 <20 MB（NFR-04）。
 
 **参考文档**：[api-and-cli §1](../../01-architecture/api-and-cli.md#1-通信与鉴权)、[security-privacy](../../01-architecture/security-privacy.md)、[ADR-0002](../../03-adr/0002-embedded-web-ui.md)

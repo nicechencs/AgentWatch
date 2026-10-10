@@ -348,7 +348,7 @@ fn session_item(value: &Value) -> Result<SessionItem, QueryError> {
         Some(Value::String(_)) | Some(Value::Null) | None => "不可得".to_owned(),
         Some(_) => {
             return Err(QueryError::Unavailable {
-                detail: "field `mode` is not a string".to_owned(),
+                detail: "字段 `mode` 不是字符串".to_owned(),
             });
         }
     };

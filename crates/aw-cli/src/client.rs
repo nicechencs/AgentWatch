@@ -131,6 +131,8 @@ impl Transport for Box<dyn Transport> {
 pub enum ClientError {
     /// The daemon did not answer. Exit 3.
     Unreachable { detail: String },
+    /// The socket or pipe exists but this account may not open it. Exit 4.
+    Forbidden { detail: String },
     /// The exchange failed after connect. Exit 1.
     Transport { detail: String },
     /// The daemon answered with a non-success status.
@@ -149,6 +151,10 @@ impl fmt::Display for ClientError {
                 f,
                 "daemon unreachable ({detail}). Start it with `aw daemon start`, or pass --no-daemon (polling collectors, all evidence S)"
             ),
+            Self::Forbidden { detail } => write!(
+                f,
+                "the daemon is running, but this account may not open its channel ({detail}). Ask an administrator to add you to the agentwatch group (Windows: AgentWatch Users)"
+            ),
             Self::Transport { detail } => write!(f, "daemon request failed: {detail}"),
             Self::Status { status, message } => {
                 write!(f, "daemon returned HTTP {status}: {message}")
@@ -165,6 +171,7 @@ impl ClientError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Unreachable { .. } => exit::UNREACHABLE,
+            Self::Forbidden { .. } => exit::PERMISSION,
             Self::Transport { .. } => exit::GENERAL,
             Self::Status { status, .. } => from_http_status(*status),
         }
@@ -318,45 +325,39 @@ fn http_exchange(
     roundtrip(&mut stream, &bytes)
 }
 
-#[cfg(unix)]
 fn socket_exchange(
     path: &std::path::Path,
     timeout: Duration,
     request: &ApiRequest,
 ) -> Result<ApiReply, ClientError> {
-    let mut stream =
-        std::os::unix::net::UnixStream::connect(path).map_err(|err| ClientError::Unreachable {
-            detail: format!("unix socket {}: {}", path.display(), err.kind()),
-        })?;
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-    roundtrip(&mut stream, &encode_local_request(request))
+    local_exchange(path, timeout, request)
 }
 
-#[cfg(not(unix))]
-fn socket_exchange(
-    path: &std::path::Path,
-    _timeout: Duration,
-    _request: &ApiRequest,
-) -> Result<ApiReply, ClientError> {
-    Err(ClientError::Unreachable {
-        detail: format!(
-            "unix socket {} is not available on this operating system",
-            path.display()
-        ),
-    })
-}
-
-/// A Windows named pipe opens like a file. No platform API is named here.
+/// Socket and pipe both go through aw-channel, the client the desktop app
+/// uses too: same error classes, pipe-busy retry, and timeout.
 fn pipe_exchange(path: &std::path::Path, request: &ApiRequest) -> Result<ApiReply, ClientError> {
-    let mut pipe = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|err| ClientError::Unreachable {
-            detail: format!("named pipe {}: {}", path.display(), err.kind()),
-        })?;
-    roundtrip(&mut pipe, &encode_local_request(request))
+    local_exchange(path, aw_channel::TIMEOUT, request)
+}
+
+fn local_exchange(
+    path: &std::path::Path,
+    timeout: Duration,
+    request: &ApiRequest,
+) -> Result<ApiReply, ClientError> {
+    use aw_channel::DialError;
+    let reply = aw_channel::exchange(path, &encode_local_request(request), timeout).map_err(
+        |err| match err {
+            DialError::Unreachable(detail) => ClientError::Unreachable { detail },
+            DialError::Forbidden(detail) => ClientError::Forbidden { detail },
+            other => ClientError::Transport {
+                detail: other.to_string(),
+            },
+        },
+    )?;
+    Ok(ApiReply {
+        status: reply.status,
+        body: reply.body,
+    })
 }
 
 fn roundtrip<S: Read + Write>(stream: &mut S, bytes: &[u8]) -> Result<ApiReply, ClientError> {

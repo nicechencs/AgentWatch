@@ -63,17 +63,13 @@ fn host_privileged() -> Option<bool> {
     }
 }
 
-/// One daemon operation. Applied only through [`DaemonControl`].
+/// Service install / uninstall. Applied only through [`DaemonControl`].
+///
+/// `status`, `start`, `stop`, `restart`, and `logs` are not here: they talk
+/// to the running daemon over the internal channel (`cmd/ui.rs`,
+/// `cmd/lifecycle.rs`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DaemonOp {
-    /// `status`.
-    Status,
-    /// `start`.
-    Start,
-    /// `stop`.
-    Stop,
-    /// `restart`.
-    Restart,
     /// `install`. `confirm` is `--yes`. Without it the plan is printed and no
     /// command text is emitted. With it, the command text is still only text.
     Install {
@@ -86,11 +82,6 @@ pub(crate) enum DaemonOp {
         purge: bool,
         /// `--check`: report leftovers, do not remove anything.
         check: bool,
-    },
-    /// `logs`.
-    Logs {
-        /// `--follow`.
-        follow: bool,
     },
 }
 
@@ -121,10 +112,6 @@ pub(crate) struct PlannedControl;
 impl DaemonControl for PlannedControl {
     fn apply(&mut self, op: &DaemonOp) -> Result<DaemonEffect, String> {
         let (state, detail) = match op {
-            DaemonOp::Status => ("unknown", "daemon status is not observed in this build"),
-            DaemonOp::Start => ("planned", "start was recorded; no service was launched"),
-            DaemonOp::Stop => ("planned", "stop was recorded; no service was signalled"),
-            DaemonOp::Restart => ("planned", "restart was recorded; no service was signalled"),
             DaemonOp::Install { confirm } => {
                 if *confirm {
                     (
@@ -156,13 +143,6 @@ impl DaemonControl for PlannedControl {
                     )
                 }
             }
-            DaemonOp::Logs { follow } => {
-                if *follow {
-                    ("empty", "log follow is not attached in this build")
-                } else {
-                    ("empty", "no daemon log is available in this build")
-                }
-            }
         };
         Ok(DaemonEffect {
             state: state.to_owned(),
@@ -173,9 +153,7 @@ impl DaemonControl for PlannedControl {
 
 /// Run one daemon subcommand.
 ///
-/// `status`, `start`, `stop`, `restart`, and `logs` do not call a service
-/// manager. They print that the Service Control Manager is not bound and exit
-/// non-zero. `install` without `--yes` prints the plan and exits with the
+/// `install` without `--yes` prints the plan and exits with the
 /// usage code; it does not emit command text and does not register a service.
 pub(crate) fn run(
     op: DaemonOp,
@@ -183,9 +161,6 @@ pub(crate) fn run(
     privilege: &dyn Privilege,
     control: &mut dyn DaemonControl,
 ) -> Outcome {
-    if let Some(outcome) = refuse_unbound(&op, json) {
-        return outcome;
-    }
     if let DaemonOp::Install { confirm } = op {
         // Printing a plan or command text is not a privileged action, and the
         // production privilege check is hard-wired to "not admin". Gating the
@@ -212,26 +187,6 @@ pub(crate) fn run(
         Ok(effect) => finish(&op, &effect, json),
         Err(detail) => super::error_outcome(exit::GENERAL, "daemon", &detail, json),
     }
-}
-
-/// Control commands have no SCM binding. Success would be a lie.
-fn refuse_unbound(op: &DaemonOp, json: bool) -> Option<Outcome> {
-    let label = match op {
-        DaemonOp::Status => "status",
-        DaemonOp::Start => "start",
-        DaemonOp::Stop => "stop",
-        DaemonOp::Restart => "restart",
-        DaemonOp::Logs { .. } => "logs",
-        DaemonOp::Install { .. } | DaemonOp::Uninstall { .. } => return None,
-    };
-    Some(super::error_outcome(
-        exit::GENERAL,
-        "not_implemented",
-        &format!(
-            "aw daemon {label}: not implemented; Service Control Manager binding is required (未实现：需要服务控制管理器绑定)"
-        ),
-        json,
-    ))
 }
 
 /// Plan text only. Exit [`exit::USAGE`] so a missing `--yes` is not a success.
@@ -496,15 +451,5 @@ mod tests {
                 check: false
             }]
         );
-    }
-
-    #[test]
-    fn status_is_unbound_and_does_not_apply() {
-        let mut control = Recording { seen: Vec::new() };
-        let outcome = run(DaemonOp::Status, false, &Admin(false), &mut control);
-        assert_eq!(outcome.code, exit::GENERAL);
-        let err = String::from_utf8(outcome.stderr).expect("utf8");
-        assert!(err.contains("未实现"), "{err}");
-        assert!(control.seen.is_empty());
     }
 }

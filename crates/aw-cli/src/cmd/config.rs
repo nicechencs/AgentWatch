@@ -243,7 +243,8 @@ fn client_to_config(err: crate::client::ClientError) -> ConfigError {
         crate::client::ClientError::Unreachable { .. } => ConfigError::Unreachable {
             detail: clip_config(&err.to_string()),
         },
-        crate::client::ClientError::Status {
+        crate::client::ClientError::Forbidden { .. }
+        | crate::client::ClientError::Status {
             status: 401 | 403, ..
         } => ConfigError::Forbidden {
             detail: clip_config(&err.to_string()),

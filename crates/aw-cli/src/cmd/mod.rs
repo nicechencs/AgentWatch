@@ -20,6 +20,7 @@ mod gaps;
 mod hook;
 mod http;
 mod http_source;
+mod lifecycle;
 mod mcp_tap;
 mod merge;
 mod procs;
@@ -170,6 +171,9 @@ fn channel_command(cli: &Cli, env_token: Option<String>, json: bool) -> Option<O
         Command::Ui { .. }
             | Command::Daemon(tree::DaemonCmd::Start)
             | Command::Daemon(tree::DaemonCmd::Status)
+            | Command::Daemon(tree::DaemonCmd::Stop)
+            | Command::Daemon(tree::DaemonCmd::Restart)
+            | Command::Daemon(tree::DaemonCmd::Logs { .. })
     );
     if !wanted {
         return None;
@@ -184,8 +188,11 @@ fn channel_command(cli: &Cli, env_token: Option<String>, json: bool) -> Option<O
         Ok(endpoint) => endpoint,
         Err(err) => return Some(endpoint_outcome(err, json)),
     };
-    let open = |endpoint: &Endpoint| -> Box<dyn Transport> {
-        match LoopbackHttp::new(endpoint) {
+    // Re-resolved per dial: a daemon started just now may have bound the
+    // per-user socket because it could not create the system one.
+    let open = |fallback: &Endpoint| -> Box<dyn Transport> {
+        let current = endpoint::resolve(&input).unwrap_or_else(|_| fallback.clone());
+        match LoopbackHttp::new(&current) {
             Ok(transport) => Box::new(transport),
             Err(_) => Box::new(crate::client::MemoryTransport::failing(
                 "transport not built",
@@ -204,9 +211,34 @@ fn channel_command(cli: &Cli, env_token: Option<String>, json: bool) -> Option<O
         Command::Daemon(tree::DaemonCmd::Start) => ui::daemon_start(
             &endpoint,
             &mut || open(&endpoint),
-            &mut ui::ProcessStarter,
+            &mut ui::ProcessStarter::default(),
             ui::START_WAIT,
             json,
+        ),
+        Command::Daemon(tree::DaemonCmd::Stop) => lifecycle::daemon_stop(
+            &endpoint,
+            &mut || open(&endpoint),
+            lifecycle::STOP_WAIT,
+            json,
+        ),
+        Command::Daemon(tree::DaemonCmd::Restart) => lifecycle::daemon_restart(
+            &endpoint,
+            &mut || open(&endpoint),
+            &mut ui::ProcessStarter::default(),
+            lifecycle::STOP_WAIT,
+            ui::START_WAIT,
+            json,
+        ),
+        Command::Daemon(tree::DaemonCmd::Logs { follow, lines }) => lifecycle::daemon_logs(
+            &endpoint,
+            &mut || open(&endpoint),
+            *lines,
+            follow.then_some(lifecycle::Follow {
+                poll: lifecycle::FOLLOW_POLL,
+                max_polls: None,
+            }),
+            json,
+            &mut std::io::stdout(),
         ),
         _ => ui::daemon_status(&endpoint, open(&endpoint), json),
     })
@@ -684,16 +716,18 @@ fn ops_command(
         }
         Command::Daemon(cmd) => {
             let op = match cmd {
-                tree::DaemonCmd::Status => daemon::DaemonOp::Status,
-                tree::DaemonCmd::Start => daemon::DaemonOp::Start,
-                tree::DaemonCmd::Stop => daemon::DaemonOp::Stop,
-                tree::DaemonCmd::Restart => daemon::DaemonOp::Restart,
+                // Real commands over the internal channel; `channel_command`
+                // answers them before this point.
+                tree::DaemonCmd::Status
+                | tree::DaemonCmd::Start
+                | tree::DaemonCmd::Stop
+                | tree::DaemonCmd::Restart
+                | tree::DaemonCmd::Logs { .. } => return None,
                 tree::DaemonCmd::Install { yes } => daemon::DaemonOp::Install { confirm: *yes },
                 tree::DaemonCmd::Uninstall { purge, check } => daemon::DaemonOp::Uninstall {
                     purge: *purge,
                     check: *check,
                 },
-                tree::DaemonCmd::Logs { follow } => daemon::DaemonOp::Logs { follow: *follow },
             };
             Some(daemon::run(
                 op,
@@ -837,6 +871,7 @@ fn client_outcome(err: ClientError, endpoint: &Endpoint, json: bool) -> Outcome 
     let code = err.exit_code();
     let machine = match &err {
         ClientError::Unreachable { .. } => "unreachable",
+        ClientError::Forbidden { .. } => "forbidden",
         ClientError::Transport { .. } => "transport",
         ClientError::Status { status, .. } => match *status {
             401 => "unauthorized",

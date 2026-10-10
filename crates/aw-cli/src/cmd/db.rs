@@ -568,7 +568,8 @@ fn client_to_db(err: crate::client::ClientError) -> DbApiError {
         crate::client::ClientError::Unreachable { .. } => DbApiError::Unreachable {
             detail: clip_db(&err.to_string()),
         },
-        crate::client::ClientError::Status {
+        crate::client::ClientError::Forbidden { .. }
+        | crate::client::ClientError::Status {
             status: 401 | 403, ..
         } => DbApiError::Forbidden {
             detail: clip_db(&err.to_string()),

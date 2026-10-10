@@ -454,7 +454,8 @@ pub fn apply_file_schema(store: &mut Store) -> Result<(), StoreError> {
                 .map_err(|err| StoreError::sqlite("migrate_file_schema", err))?;
             tx.execute(
                 "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                 ON CONFLICT(key) DO UPDATE SET value =
+                     MAX(CAST(schema_meta.value AS INTEGER), CAST(excluded.value AS INTEGER))",
                 params![version.to_string()],
             )
             .map_err(|err| StoreError::sqlite("migrate_file_schema_version", err))?;

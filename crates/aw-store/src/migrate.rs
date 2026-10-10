@@ -30,17 +30,19 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::error::StoreError;
 
-/// Version installed by [`MIGRATION_0001`].
+/// Bootstrap version installed by [`MIGRATION_0001`].
 ///
-/// P2 scripts (`0003` file_access, `0004` timeline, `0005` FTS) are **not**
-/// part of this number. [`crate::SqliteSink::write_batch`] applies them through
-/// [`Store::open_with_scripts`] when a batch contains `file_access` rows, and
-/// [`crate::query::files`] applies them before a file query. A database that
-/// never stores a file row stays at version 1, which is what the P1 reopen
-/// tests assert. `0002_timeline_view.sql` is still applied by
-/// [`crate::query::ensure_timeline`], not by this runner: it is not a numbered
-/// schema change.
+/// Later scripts are applied on demand by the schema helpers, not by
+/// [`Store::open`]. A database with only P1 tables stays at version 1. This
+/// number is not the compatibility ceiling: this binary can also reopen the
+/// schemas installed by those helpers, up to [`INTER_AGENT_SCHEMA_VERSION`].
+/// Versions can be sparse; version 9 or 10 does not imply file or HTTP tables.
+/// `0002_timeline_view.sql` is still applied by [`crate::query::ensure_timeline`],
+/// not by this runner: it is not a numbered schema change.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Highest schema version understood by this binary, independently of bootstrap.
+const SUPPORTED_SCHEMA_VERSION: u32 = INTER_AGENT_SCHEMA_VERSION;
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 
@@ -132,8 +134,9 @@ pub const INTER_AGENT_SCHEMA_VERSION: u32 = 10;
 ///
 /// `file_access` must already exist: 0007's view reads it. A database that has
 /// not applied [`file_schema_scripts`] gets [`StoreError::VersionMismatch`]
-/// rather than a view that fails to create. A database that already has `http`
-/// is left alone, including its `schema_version`.
+/// rather than a view that fails to create. Applying the scripts preserves a
+/// higher stored version. A database that already has `http` is left alone,
+/// including its `schema_version`.
 pub fn apply_http_schema(store: &mut Store) -> Result<(), StoreError> {
     if store.is_read_only() {
         return Err(StoreError::ReadOnly);
@@ -157,7 +160,8 @@ pub fn apply_http_schema(store: &mut Store) -> Result<(), StoreError> {
                 .map_err(|err| StoreError::sqlite("migrate_http_schema", err))?;
             tx.execute(
                 "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                 ON CONFLICT(key) DO UPDATE SET value =
+                     MAX(CAST(schema_meta.value AS INTEGER), CAST(excluded.value AS INTEGER))",
                 rusqlite::params![version.to_string()],
             )
             .map_err(|err| StoreError::sqlite("migrate_http_schema_version", err))?;
@@ -180,8 +184,9 @@ pub fn apply_http_schema(store: &mut Store) -> Result<(), StoreError> {
 /// `http` must already exist ([`apply_http_schema`]). A database without it
 /// gets [`StoreError::VersionMismatch`] rather than an ALTER against a missing
 /// table. A column that is already present is skipped; the other column is
-/// still added. `schema_version` moves to [`PROXY_SCHEMA_VERSION`] only when
-/// this call adds at least one column. A database that already has both is
+/// still added. `schema_version` advances to at least [`PROXY_SCHEMA_VERSION`]
+/// only when this call adds at least one column; a higher stored version is
+/// preserved. A database that already has both is
 /// left alone, including its version.
 ///
 /// `net_flows.via_proxy` and `net_flows.direct` are not added here. 0001
@@ -227,7 +232,8 @@ pub fn apply_proxy_schema(store: &mut Store) -> Result<(), StoreError> {
         }
         tx.execute(
             "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+             ON CONFLICT(key) DO UPDATE SET value =
+                     MAX(CAST(schema_meta.value AS INTEGER), CAST(excluded.value AS INTEGER))",
             rusqlite::params![PROXY_SCHEMA_VERSION.to_string()],
         )
         .map_err(|err| StoreError::sqlite("migrate_proxy_schema_version", err))?;
@@ -248,7 +254,8 @@ pub fn apply_proxy_schema(store: &mut Store) -> Result<(), StoreError> {
 ///
 /// The table does not depend on `http` or `file_access`. A database that
 /// already has it is left alone, including its `schema_version`. `schema_version`
-/// moves to [`AGENT_SCHEMA_VERSION`] only when this call creates the table.
+/// advances to at least [`AGENT_SCHEMA_VERSION`] only when this call creates
+/// the table; a higher stored version is preserved.
 ///
 /// # Errors
 ///
@@ -271,7 +278,8 @@ pub fn apply_agent_schema(store: &mut Store) -> Result<(), StoreError> {
             .map_err(|err| StoreError::sqlite("migrate_agent_events", err))?;
         tx.execute(
             "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+             ON CONFLICT(key) DO UPDATE SET value =
+                     MAX(CAST(schema_meta.value AS INTEGER), CAST(excluded.value AS INTEGER))",
             rusqlite::params![AGENT_SCHEMA_VERSION.to_string()],
         )
         .map_err(|err| StoreError::sqlite("migrate_agent_schema_version", err))?;
@@ -292,8 +300,9 @@ pub fn apply_agent_schema(store: &mut Store) -> Result<(), StoreError> {
 ///
 /// The script does not depend on `http`, `file_access`, or `agent_events`.
 /// A database that already has `watch_groups` is left alone, including its
-/// `schema_version`. `schema_version` moves to [`INTER_AGENT_SCHEMA_VERSION`]
-/// only when this call creates the tables.
+/// `schema_version`. `schema_version` advances to at least
+/// [`INTER_AGENT_SCHEMA_VERSION`] only when this call creates the tables;
+/// a higher stored version is preserved.
 ///
 /// # Errors
 ///
@@ -316,7 +325,8 @@ pub fn apply_inter_agent_schema(store: &mut Store) -> Result<(), StoreError> {
             .map_err(|err| StoreError::sqlite("migrate_inter_agent", err))?;
         tx.execute(
             "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+             ON CONFLICT(key) DO UPDATE SET value =
+                     MAX(CAST(schema_meta.value AS INTEGER), CAST(excluded.value AS INTEGER))",
             rusqlite::params![INTER_AGENT_SCHEMA_VERSION.to_string()],
         )
         .map_err(|err| StoreError::sqlite("migrate_inter_agent_schema_version", err))?;
@@ -402,13 +412,13 @@ const META_HOST_ID: &str = "host_id";
 pub enum OpenStatus {
     /// The file was missing or empty. Migration 0001 ran. No backup was made.
     Created,
-    /// The file was already at [`SCHEMA_VERSION`]. Nothing was written.
+    /// The file has a supported version and no scripts were pending.
     Current,
     /// One or more migrations ran. `backup` is the closed-file copy of the old version.
     Migrated {
         /// Version before this open.
         from: u32,
-        /// Version after this open. Equal to [`SCHEMA_VERSION`] unless a test injects a script.
+        /// Version after this open, including any explicitly supplied scripts.
         to: u32,
         /// `{path}.bak-v{from}` kept after a successful upgrade.
         backup: PathBuf,
@@ -439,10 +449,12 @@ impl std::fmt::Debug for Store {
 }
 
 impl Store {
-    /// Open `path`, creating it when missing, and bring it to [`SCHEMA_VERSION`].
+    /// Open `path`, creating the bootstrap schema when missing.
     ///
-    /// Parent directories are created. On Unix the new or migrated file is mode `0o600`.
-    /// A version higher than [`SCHEMA_VERSION`] yields [`OpenStatus::ReadOnlyNewer`]
+    /// Supported schemas through [`INTER_AGENT_SCHEMA_VERSION`] remain writable;
+    /// optional tables are only added by their schema helpers. Parent directories
+    /// are created. On Unix the new or migrated file is mode `0o600`.
+    /// A version higher than the supported ceiling yields [`OpenStatus::ReadOnlyNewer`]
     /// and does not write. A failed migration deletes the backup made for this attempt
     /// and returns [`StoreError`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -454,7 +466,8 @@ impl Store {
     /// Each entry is `(version, sql)`. Versions must be strictly increasing and
     /// greater than [`SCHEMA_VERSION`] when the built-in script is also pending.
     /// Tests use this to inject a failing statement without editing `0001_init.sql`.
-    /// Production callers should use [`Store::open`].
+    /// A stored version above this binary's supported ceiling remains read-only,
+    /// even when `extra` is supplied. Production callers should use [`Store::open`].
     pub fn open_with_scripts(path: &Path, extra: &[(u32, &str)]) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -467,14 +480,14 @@ impl Store {
         let existed = file_nonempty(path)?;
         let (found, needs_migration) = if existed {
             let found = read_version_quietly(path)?;
-            if found > SCHEMA_VERSION && extra.is_empty() {
+            if found > SUPPORTED_SCHEMA_VERSION {
                 let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                     .map_err(|err| StoreError::sqlite("open_read_only", err))?;
                 return Ok(Self {
                     conn,
                     status: OpenStatus::ReadOnlyNewer {
                         found,
-                        supported: SCHEMA_VERSION,
+                        supported: SUPPORTED_SCHEMA_VERSION,
                     },
                     read_only: true,
                 });
@@ -928,7 +941,7 @@ mod tests {
             let store = Store::open_with_scripts(
                 &path,
                 &[(
-                    2,
+                    SUPPORTED_SCHEMA_VERSION + 1,
                     "UPDATE schema_meta SET value = value WHERE key = 'schema_version';",
                 )],
             )
@@ -938,7 +951,7 @@ mod tests {
                 store.status(),
                 &OpenStatus::Migrated {
                     from: 1,
-                    to: 2,
+                    to: SUPPORTED_SCHEMA_VERSION + 1,
                     backup: backup.clone(),
                 }
             );
@@ -948,8 +961,8 @@ mod tests {
         assert_eq!(
             store.status(),
             &OpenStatus::ReadOnlyNewer {
-                found: 2,
-                supported: 1,
+                found: SUPPORTED_SCHEMA_VERSION + 1,
+                supported: SUPPORTED_SCHEMA_VERSION,
             }
         );
         assert!(store.is_read_only());

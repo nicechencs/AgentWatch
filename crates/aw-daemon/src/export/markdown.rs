@@ -430,70 +430,70 @@ fn push_overview(out: &mut String, summary: &SessionSummary, header: &HeaderBits
         out.push_str("# Session report\n\n");
         out.push_str("This report lists what was recorded. It does not judge the session.\n\n");
         out.push_str("## Session\n\n");
-        en_line(out, "public id", Some(summary.public_id.as_str()));
-        en_line(out, "name", label.as_deref());
-        en_line(out, "agent", summary.agent.as_deref());
-        en_line(out, "mode", Some(header.mode.as_str()));
-        en_line(out, "platform", header.platform.as_deref());
-        en_line(out, "os", header.os_version.as_deref());
-        out.push_str(&format!("- started: {started}\n"));
+        en_line(out, "Session ID", Some(summary.public_id.as_str()));
+        en_line(out, "Name", label.as_deref());
+        en_line(out, "Agent", summary.agent.as_deref());
+        en_line(out, "Source", Some(mode_en(&header.mode).as_str()));
+        en_line(out, "Platform", header.platform.as_deref());
+        en_line(out, "OS version", header.os_version.as_deref());
+        out.push_str(&format!("- Started: {started}\n"));
         match (&ended, &duration) {
             (Some(at), Some(took)) => {
-                out.push_str(&format!("- ended: {at}\n"));
-                out.push_str(&format!("- duration: {took}\n"));
+                out.push_str(&format!("- Ended: {at}\n"));
+                out.push_str(&format!("- Duration: {took}\n"));
             }
-            _ => out.push_str("- ended: not yet (still recording, or no end time was recorded)\n"),
+            _ => out.push_str("- Ended: not yet (still recording, or no end time was recorded)\n"),
         }
-        out.push_str(&format!("- process rows: {}\n", summary.process_count));
-        out.push_str(&format!("- flow rows: {}\n", summary.flow_count));
-        out.push_str(&format!("- dns rows: {}\n", summary.dns_count));
-        out.push_str(&format!("- gap rows: {}\n", summary.gap_count));
+        out.push_str(&format!("- Process records: {}\n", summary.process_count));
+        out.push_str(&format!("- Network flow records: {}\n", summary.flow_count));
+        out.push_str(&format!("- DNS records: {}\n", summary.dns_count));
+        out.push_str(&format!("- Gap records: {}\n", summary.gap_count));
         byte_line(
             out,
-            "bytes up",
+            "Bytes up",
             summary.bytes_up,
-            "every flow left bytes_up unset",
+            "no network flow recorded bytes sent",
         );
         byte_line(
             out,
-            "bytes down",
+            "Bytes down",
             summary.bytes_down,
-            "every flow left bytes_down unset",
+            "no network flow recorded bytes received",
         );
         proxy_line(out, header.proxy_enabled, false);
     } else {
         out.push_str("# 会话报告\n\n");
         out.push_str("本报告只列出已记录的内容，不对会话下结论。\n\n");
         out.push_str("## 会话\n\n");
-        zh_line(out, "public id", Some(summary.public_id.as_str()));
+        zh_line(out, "会话编号", Some(summary.public_id.as_str()));
         zh_line(out, "名称", label.as_deref());
-        zh_line(out, "agent", summary.agent.as_deref());
-        zh_line(out, "模式", Some(header.mode.as_str()));
+        zh_line(out, "智能体", summary.agent.as_deref());
+        zh_line(out, "来源", Some(mode_zh(&header.mode).as_str()));
         zh_line(out, "平台", header.platform.as_deref());
         zh_line(out, "系统版本", header.os_version.as_deref());
-        out.push_str(&format!("- 开始: {started}\n"));
+        out.push_str(&format!("- 开始：{started}\n"));
         match (&ended, &duration) {
             (Some(at), Some(took)) => {
-                out.push_str(&format!("- 结束: {at}\n"));
-                out.push_str(&format!("- 时长: {took}\n"));
+                out.push_str(&format!("- 结束：{at}\n"));
+                out.push_str(&format!("- 时长：{took}\n"));
             }
-            _ => out.push_str("- 结束: 还没有（仍在录制，或没有记录结束时间）\n"),
+            _ => out.push_str("- 结束：还没有（仍在录制，或没有记录结束时间）\n"),
         }
-        out.push_str(&format!("- 进程行数: {}\n", summary.process_count));
-        out.push_str(&format!("- 流记录行数: {}\n", summary.flow_count));
-        out.push_str(&format!("- dns 行数: {}\n", summary.dns_count));
-        out.push_str(&format!("- 缺口行数: {}\n", summary.gap_count));
+        out.push_str(&format!("- 进程记录：{}\n", summary.process_count));
+        out.push_str(&format!("- 网络流记录：{}\n", summary.flow_count));
+        out.push_str(&format!("- DNS 记录：{}\n", summary.dns_count));
+        out.push_str(&format!("- 缺口记录：{}\n", summary.gap_count));
         zh_byte(
             out,
             "上行字节",
             summary.bytes_up,
-            "每条流的 bytes_up 都未记录",
+            "每条网络流都没有记录上行字节数",
         );
         zh_byte(
             out,
             "下行字节",
             summary.bytes_down,
-            "每条流的 bytes_down 都未记录",
+            "每条网络流都没有记录下行字节数",
         );
         proxy_line(out, header.proxy_enabled, true);
     }
@@ -501,16 +501,103 @@ fn push_overview(out: &mut String, summary: &SessionSummary, header: &HeaderBits
 }
 
 fn push_capabilities(out: &mut String, header: &HeaderBits, lang: Lang) {
+    let collectors = collectors_text(header.collectors.as_deref(), lang);
     if lang == Lang::En {
         out.push_str("## Collectors\n\n");
-        en_line(out, "profile", header.collector_profile.as_deref());
-        en_line(out, "collectors", header.collectors.as_deref());
+        en_line(out, "Profile", header.collector_profile.as_deref());
+        en_line(out, "Collectors", collectors.as_deref());
     } else {
         out.push_str("## 采集能力\n\n");
         zh_line(out, "配置", header.collector_profile.as_deref());
-        zh_line(out, "采集器", header.collectors.as_deref());
+        zh_line(out, "采集器", collectors.as_deref());
     }
     out.push('\n');
+}
+
+/// `launch` / `attach` become a reader-facing word; anything else stays as stored.
+fn mode_zh(mode: &str) -> String {
+    match mode {
+        "launch" => "启动".to_owned(),
+        "attach" => "附着".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn mode_en(mode: &str) -> String {
+    match mode {
+        "launch" => "Launch".to_owned(),
+        "attach" => "Attach".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// Collector list as stored: a JSON array (`["poll"]`), plain text, or NULL.
+/// Known names are translated and joined; an unknown name stays as stored.
+fn collectors_text(raw: Option<&str>, lang: Lang) -> Option<String> {
+    let raw = raw.map(str::trim).filter(|text| !text.is_empty())?;
+    let names = collector_names(raw);
+    if names.is_empty() {
+        return None;
+    }
+    let sep = if lang == Lang::En { ", " } else { "、" };
+    Some(
+        names
+            .iter()
+            .map(|name| collector_name(name, lang))
+            .collect::<Vec<_>>()
+            .join(sep),
+    )
+}
+
+/// JSON array of names when the column is one — each item a string or an
+/// object with a `name` field (`{"name":"poll","mode":"poll"}`); otherwise
+/// the text itself.
+fn collector_names(raw: &str) -> Vec<String> {
+    if let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(raw) {
+        let names: Vec<String> = list.iter().filter_map(collector_item_name).collect();
+        if !names.is_empty() {
+            return names;
+        }
+    }
+    vec![raw.to_owned()]
+}
+
+fn collector_item_name(item: &serde_json::Value) -> Option<String> {
+    let name = match item {
+        serde_json::Value::String(name) => name.as_str(),
+        serde_json::Value::Object(object) => object.get("name")?.as_str()?,
+        _ => return None,
+    };
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+fn collector_name(name: &str, lang: Lang) -> String {
+    if lang == Lang::En {
+        match name {
+            "poll" => "process polling",
+            "ebpf" => "eBPF kernel collector",
+            "etw" => "ETW events",
+            "esf" => "EndpointSecurity",
+            "fanotify" => "file watching",
+            "proxy" => "proxy",
+            "dns" => "DNS",
+            other => return other.to_owned(),
+        }
+        .to_owned()
+    } else {
+        match name {
+            "poll" => "进程轮询",
+            "ebpf" => "eBPF 内核采集",
+            "etw" => "ETW 事件采集",
+            "esf" => "EndpointSecurity 采集",
+            "fanotify" => "文件监视",
+            "proxy" => "代理",
+            "dns" => "DNS",
+            other => return other.to_owned(),
+        }
+        .to_owned()
+    }
 }
 
 fn push_gaps(out: &mut String, gaps: &[GapLine], lang: Lang) {
@@ -539,7 +626,10 @@ fn push_gaps(out: &mut String, gaps: &[GapLine], lang: Lang) {
             }
         };
         let reason = gap.reason.as_deref().filter(|text| !text.is_empty());
-        out.push_str(&format!("- {} / {}: {count}", gap.collector, gap.kind));
+        let collector = collector_name(&gap.collector, lang);
+        let kind = gap_kind(&gap.kind, lang);
+        let sep = if lang == Lang::En { ": " } else { "：" };
+        out.push_str(&format!("- {collector} / {kind}{sep}{count}"));
         match reason {
             Some(text) => out.push_str(&format!(" ({text})\n")),
             None => {
@@ -612,12 +702,12 @@ fn unavailable_render(finding: &FindingView, lang: Lang) -> String {
         .unwrap_or("render failed");
     if lang == Lang::En {
         format!(
-            "unavailable (wording id `{id}` did not render: {reason})",
+            "unavailable (sentence `{id}` did not render: {reason})",
             id = finding.wording_id
         )
     } else {
         format!(
-            "不可得（措辞 `{id}` 未能生成：{reason}）",
+            "不可得（句子 `{id}` 未能生成：{reason}）",
             id = finding.wording_id
         )
     }
@@ -657,7 +747,7 @@ fn push_domains(out: &mut String, domains: &[DomainLine], lang: Lang) {
             ));
         } else {
             out.push_str(&format!(
-                "- {name}: {flows} 条流记录，上行字节 {up}，下行字节 {down}\n",
+                "- {name}：{flows} 条网络流，上行字节 {up}，下行字节 {down}\n",
                 flows = row.flows
             ));
         }
@@ -689,18 +779,11 @@ fn push_files(out: &mut String, files: &[FileLine], lang: Lang) {
         } else {
             row.path.clone()
         };
+        let op = file_op(&row.op, lang);
         if lang == Lang::En {
-            out.push_str(&format!(
-                "- {path} ({op}): {hits} rows\n",
-                op = row.op,
-                hits = row.hits
-            ));
+            out.push_str(&format!("- {path} ({op}): {hits} rows\n", hits = row.hits));
         } else {
-            out.push_str(&format!(
-                "- {path}（{op}）: {hits} 行\n",
-                op = row.op,
-                hits = row.hits
-            ));
+            out.push_str(&format!("- {path}（{op}）：{hits} 行\n", hits = row.hits));
         }
     }
     out.push('\n');
@@ -729,17 +812,17 @@ fn push_evidence_footer(out: &mut String, lang: Lang) {
 }
 
 fn en_line(out: &mut String, label: &str, value: Option<&str>) {
-    field_line(out, label, value, "unavailable (not recorded)")
+    field_line(out, label, ": ", value, "unavailable (not recorded)")
 }
 
 fn zh_line(out: &mut String, label: &str, value: Option<&str>) {
-    field_line(out, label, value, "不可得（未记录）")
+    field_line(out, label, "：", value, "不可得（未记录）")
 }
 
-fn field_line(out: &mut String, label: &str, value: Option<&str>, missing: &str) {
+fn field_line(out: &mut String, label: &str, sep: &str, value: Option<&str>, missing: &str) {
     match value.map(str::trim).filter(|text| !text.is_empty()) {
-        Some(text) => out.push_str(&format!("- {label}: {text}\n")),
-        None => out.push_str(&format!("- {label}: {missing}\n")),
+        Some(text) => out.push_str(&format!("- {label}{sep}{text}\n")),
+        None => out.push_str(&format!("- {label}{sep}{missing}\n")),
     }
 }
 
@@ -752,32 +835,72 @@ fn byte_line(out: &mut String, label: &str, value: Option<i64>, reason: &str) {
 
 fn zh_byte(out: &mut String, label: &str, value: Option<i64>, reason: &str) {
     match value {
-        Some(n) => out.push_str(&format!("- {label}: {n}\n")),
-        None => out.push_str(&format!("- {label}: 不可得（{reason}）\n")),
+        Some(n) => out.push_str(&format!("- {label}：{n}\n")),
+        None => out.push_str(&format!("- {label}：不可得（{reason}）\n")),
     }
+}
+
+/// Known file-access ops. An unknown op stays as stored.
+fn file_op(op: &str, lang: Lang) -> String {
+    if lang == Lang::En {
+        return op.to_owned();
+    }
+    match op {
+        "read" => "读取",
+        "write" => "写入",
+        "open" => "打开",
+        "create" => "创建",
+        "delete" | "unlink" => "删除",
+        "rename" => "重命名",
+        "exec" | "execute" => "执行",
+        other => return other.to_owned(),
+    }
+    .to_owned()
+}
+
+/// Known gap kinds. An unknown kind stays as stored.
+fn gap_kind(kind: &str, lang: Lang) -> String {
+    if lang == Lang::En {
+        return match kind {
+            "overflow" => "overflow",
+            "restart" => "restart",
+            "permission" => "permission",
+            "dropped" => "dropped",
+            other => return other.to_owned(),
+        }
+        .to_owned();
+    }
+    match kind {
+        "overflow" => "溢出",
+        "restart" => "重启",
+        "permission" => "权限不足",
+        "dropped" => "丢弃",
+        other => return other.to_owned(),
+    }
+    .to_owned()
 }
 
 fn proxy_line(out: &mut String, enabled: Option<i64>, zh: bool) {
     match enabled {
         Some(0) => {
             if zh {
-                out.push_str("- 代理: 未启用（没有 URL 记录）\n");
+                out.push_str("- 代理：未启用（没有 URL 记录）\n");
             } else {
-                out.push_str("- proxy: off (no URL rows)\n");
+                out.push_str("- Proxy: off (no URL rows)\n");
             }
         }
         Some(_) => {
             if zh {
-                out.push_str("- 代理: 已启用\n");
+                out.push_str("- 代理：已启用\n");
             } else {
-                out.push_str("- proxy: on\n");
+                out.push_str("- Proxy: on\n");
             }
         }
         None => {
             if zh {
-                out.push_str("- 代理: 不可得（未记录是否启用）\n");
+                out.push_str("- 代理：不可得（未记录是否启用）\n");
             } else {
-                out.push_str("- proxy: unavailable (not recorded)\n");
+                out.push_str("- Proxy: unavailable (not recorded)\n");
             }
         }
     }
@@ -859,7 +982,8 @@ fn rule_name(rule: RuleId) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_report, duration_text, load_gaps, local_time, markdown_response, parse_tz, Reader,
+        build_report, collectors_text, duration_text, load_gaps, local_time, markdown_response,
+        parse_tz, Reader,
     };
     use aw_pipeline::wording::Lang;
 
@@ -897,17 +1021,23 @@ mod tests {
             false,
         );
         let zh = zh.unwrap_or_else(|err| panic!("{err:?}"));
-        assert!(zh.contains("- 名称: sleep 9\n"), "{zh}");
+        assert!(zh.contains("- 名称：sleep 9\n"), "{zh}");
         assert!(
-            zh.contains("- 开始: 2026-10-10 21:15:03 (UTC+08:00)\n"),
+            zh.contains("- 开始：2026-10-10 21:15:03 (UTC+08:00)\n"),
             "{zh}"
         );
         assert!(
-            zh.contains("- 结束: 2026-10-10 21:15:12 (UTC+08:00)\n"),
+            zh.contains("- 结束：2026-10-10 21:15:12 (UTC+08:00)\n"),
             "{zh}"
         );
-        assert!(zh.contains("- 时长: 9s\n"), "{zh}");
+        assert!(zh.contains("- 时长：9s\n"), "{zh}");
+        assert!(zh.contains("- 来源：启动\n"), "{zh}");
+        assert!(zh.contains("- 采集器：进程轮询\n"), "{zh}");
         assert!(!zh.contains("started_ns"), "{zh}");
+        assert!(!zh.contains("[\"poll\"]"), "{zh}");
+        assert!(!zh.contains("launch"), "{zh}");
+        assert!(!zh.contains("public id"), "{zh}");
+        assert!(!zh.contains("bytes_up"), "{zh}");
         let en = build_report(
             &store,
             1,
@@ -920,12 +1050,22 @@ mod tests {
             false,
         );
         let en = en.unwrap_or_else(|err| panic!("{err:?}"));
-        assert!(en.contains("- name: sleep 9\n"), "{en}");
+        assert!(en.contains("- Name: sleep 9\n"), "{en}");
         assert!(
-            en.contains("- started: 2026-10-10 13:15:03 (UTC+00:00)\n"),
+            en.contains("- Started: 2026-10-10 13:15:03 (UTC+00:00)\n"),
             "{en}"
         );
+        assert!(en.contains("- Source: Launch\n"), "{en}");
+        assert!(en.contains("- Collectors: process polling\n"), "{en}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collectors_text_reads_name_from_object_items() {
+        assert_eq!(
+            collectors_text(Some(r#"[{"name":"poll"}]"#), Lang::Zh),
+            Some("进程轮询".into())
+        );
     }
 
     #[test]

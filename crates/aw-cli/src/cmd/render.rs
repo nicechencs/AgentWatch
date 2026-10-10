@@ -361,6 +361,7 @@ pub(crate) fn procs_table(nodes: &[ProcItem], tree: bool) -> Table {
             "pid".to_owned(),
             "exe".to_owned(),
             "argv".to_owned(),
+            "退出码".to_owned(),
             "redaction".to_owned(),
         ],
         rows: flatten_proc_rows(nodes, tree)
@@ -377,6 +378,8 @@ pub(crate) fn procs_table(nodes: &[ProcItem], tree: bool) -> Table {
                         node.pid.to_string(),
                         opt_text(node.exe_name.as_deref()),
                         opt_text(node.argv_redacted.as_deref()),
+                        node.exit_code
+                            .map_or_else(|| "没采".to_owned(), |code| code.to_string()),
                         ARGV_NOTE.to_owned(),
                     ],
                     evidence: node.evidence,
@@ -397,6 +400,7 @@ pub(crate) fn procs_json(nodes: &[ProcItem], tree: bool) -> Value {
             "depth": if tree { Some(depth) } else { None },
             "exe": node.exe_name,
             "argv": node.argv_redacted,
+            "exit_code": node.exit_code,
             "redaction": ARGV_NOTE,
             "evidence": evidence_json(&node.evidence),
         })).collect::<Vec<_>>(),

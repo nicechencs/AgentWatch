@@ -531,6 +531,7 @@ fn proc_item(value: &Value, tree: bool) -> Result<ProcItem, QueryError> {
         exe_name: opt_string(value, "exe_name")?,
         // Process nodes do not carry argv. Leave it unknown.
         argv_redacted: None,
+        exit_code: opt_i64_field(value, "exit_code")?,
         evidence: evidence_field(value, "evidence")?,
         children,
     })

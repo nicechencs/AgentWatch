@@ -180,6 +180,7 @@ fn build_report(
         Vec::new()
     };
     let gaps = load_gaps(conn, session_id, user_id)?;
+    let processes = load_processes(conn, session_id, user_id)?;
     let domains = load_domains(conn, session_id, user_id, redact_hosts)?;
     // Same for `file_access` (migration 0003): absent means no file rows.
     let files = if table_exists(conn, "file_access") {
@@ -192,6 +193,7 @@ fn build_report(
     push_overview(&mut prose, &summary, &header, reader);
     push_capabilities(&mut prose, &header, lang);
     push_gaps(&mut prose, &gaps, lang);
+    push_processes(&mut prose, &processes, lang);
     let match_sentences = push_findings(&mut prose, &findings, lang)?;
     push_domains(&mut prose, &domains, lang);
     push_files(&mut prose, &files, lang);
@@ -268,6 +270,45 @@ struct GapLine {
     kind: String,
     count: Option<i64>,
     reason: Option<String>,
+}
+
+struct ProcessLine {
+    pid: i64,
+    exe_name: Option<String>,
+    exit_code: Option<i64>,
+}
+
+fn load_processes(
+    conn: &rusqlite::Connection,
+    session_id: i64,
+    user_id: &str,
+) -> Result<Vec<ProcessLine>, ReportError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.pid, \
+                    (SELECT CASE WHEN i.exe IS NULL THEN NULL \
+                     ELSE replace(i.exe, rtrim(i.exe, replace(replace(i.exe, char(92), char(47)), char(47), '')), '') END \
+                     FROM process_images i \
+                     WHERE i.session_id = p.session_id AND i.proc_uid = p.proc_uid \
+                     ORDER BY i.ts_ns DESC LIMIT 1), \
+                    p.exit_code \
+             FROM processes p \
+             WHERE p.session_id = ?1 \
+               AND EXISTS (SELECT 1 FROM sessions s WHERE s.id = p.session_id AND s.user_id = ?2) \
+             ORDER BY p.start_ns, p.proc_uid",
+        )
+        .map_err(|err| ReportError::Store(err.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params![session_id, user_id], |row| {
+            Ok(ProcessLine {
+                pid: row.get(0)?,
+                exe_name: row.get(1)?,
+                exit_code: row.get(2)?,
+            })
+        })
+        .map_err(|err| ReportError::Store(err.to_string()))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| ReportError::Store(err.to_string()))
 }
 
 fn load_gaps(
@@ -644,6 +685,28 @@ fn push_gaps(out: &mut String, gaps: &[GapLine], lang: Lang) {
     out.push('\n');
 }
 
+fn push_processes(out: &mut String, processes: &[ProcessLine], lang: Lang) {
+    if lang == Lang::En {
+        out.push_str("## Processes\n\n| PID | executable | exit code |\n|---:|---|---:|\n");
+    } else {
+        out.push_str("## 进程\n\n| PID | 可执行文件 | 退出码 |\n|---:|---|---:|\n");
+    }
+    for process in processes {
+        let exe = process
+            .exe_name
+            .as_deref()
+            .unwrap_or("-")
+            .replace('|', "\\\\|");
+        let exit_code = match process.exit_code {
+            Some(code) => code.to_string(),
+            None if lang == Lang::Zh => "没采".to_owned(),
+            None => "not observed".to_owned(),
+        };
+        out.push_str(&format!("| {} | {exe} | {exit_code} |\n", process.pid));
+    }
+    out.push('\n');
+}
+
 fn push_findings(
     out: &mut String,
     findings: &[FindingView],
@@ -980,6 +1043,7 @@ fn rule_name(rule: RuleId) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::{
         build_report, collectors_text, duration_text, load_gaps, local_time, markdown_response,
@@ -1066,6 +1130,46 @@ mod tests {
             collectors_text(Some(r#"[{"name":"poll"}]"#), Lang::Zh),
             Some("进程轮询".into())
         );
+    }
+
+    #[test]
+    fn process_table_keeps_exit_code_unknown_as_not_collected() {
+        let dir = std::env::temp_dir().join(format!(
+            "aw-md-process-exit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let store = aw_store::Store::open(dir.join("t.db")).expect("store");
+        store
+            .connection()
+            .execute_batch(
+                "INSERT INTO sessions (id, public_id, mode, started_ns, platform, user_id, collectors) \
+                 VALUES (1, 's-1', 'launch', 1, 'linux', 'u', '[]'); \
+                 INSERT INTO processes (session_id, proc_uid, pid, depth, start_ns, exit_code, how, evidence, source) \
+                 VALUES (1, 1, 100, 0, 1, 7, 'spawn', 'E1', 'fixture'), \
+                        (1, 2, 101, 0, 2, NULL, 'spawn', 'E1', 'fixture');",
+            )
+            .expect("process rows");
+        let report = build_report(
+            &store,
+            1,
+            "u",
+            Reader {
+                lang: Lang::Zh,
+                tz: 0,
+            },
+            false,
+            false,
+        )
+        .expect("report");
+        assert!(report.contains("| 100 | - | 7 |"), "{report}");
+        assert!(report.contains("| 101 | - | 没采 |"), "{report}");
+        assert!(!report.contains("| 101 | - | 0 |"), "{report}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

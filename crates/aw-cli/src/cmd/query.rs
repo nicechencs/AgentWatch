@@ -191,6 +191,8 @@ pub(crate) struct ProcItem {
     /// labels the column as redacted, so a stored string is not treated as the
     /// original argv.
     pub argv_redacted: Option<String>,
+    /// Exit code, or not observed.
+    pub exit_code: Option<i64>,
     /// Record evidence.
     pub evidence: Evidence,
     /// Children, parent before child. Empty for a flat listing.
@@ -1837,6 +1839,7 @@ pub(crate) fn sample_source() -> MemorySource {
             parent_uid: None,
             exe_name: Some("demo".to_owned()),
             argv_redacted: Some("<redacted>".to_owned()),
+            exit_code: Some(7),
             evidence: Evidence::E1,
             children: vec![ProcItem {
                 proc_uid: 11,
@@ -1844,6 +1847,7 @@ pub(crate) fn sample_source() -> MemorySource {
                 parent_uid: Some(10),
                 exe_name: Some("helper".to_owned()),
                 argv_redacted: None,
+                exit_code: None,
                 evidence: Evidence::S,
                 children: Vec::new(),
             }],
@@ -2180,6 +2184,9 @@ mod tests {
         assert_evidence_column(&rendered);
         assert!(rendered.contains("P1 脱敏为占位"), "{rendered}");
         assert!(rendered.contains("不可得"), "{rendered}");
+        assert!(rendered.contains("退出码"), "{rendered}");
+        assert!(rendered.contains("7"), "{rendered}");
+        assert!(rendered.contains("没采"), "{rendered}");
         // The placeholder text is what was stored. No raw argv is in the sample.
         assert!(!rendered.contains("--token"), "{rendered}");
         insta::assert_snapshot!("procs_tree_table", rendered);
@@ -2187,6 +2194,8 @@ mod tests {
         let json = procs::run("@last", true, true, &source).expect("procs");
         let body = text(&json.stdout);
         assert!(body.contains("P1 脱敏为占位"), "{body}");
+        assert!(body.contains("\"exit_code\": 7"), "{body}");
+        assert!(body.contains("\"exit_code\": null"), "{body}");
         assert_json_evidence(&body);
         insta::assert_snapshot!("procs_tree_json", body);
     }

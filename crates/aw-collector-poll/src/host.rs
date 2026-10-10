@@ -6,13 +6,10 @@
 //! `sysinfo::System` and raw `netstat` text are not `Debug`: both can carry command
 //! lines. Nothing in this module prints a process row.
 
-use std::process::Command;
-
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use aw_core::NaReason;
 
-use crate::netstat::parse_netstat_ano;
 use crate::source::{
     ConnectionSnapshot, ConnectionSource, ProcessRow, ProcessSnapshot, ProcessSource,
     ProcessStartTime, SourceError,
@@ -179,7 +176,7 @@ fn platform_net_unavailable() -> Option<NaReason> {
 
 #[cfg(windows)]
 fn read_netstat() -> Result<ConnectionSnapshot, SourceError> {
-    let output = Command::new("netstat")
+    let output = std::process::Command::new("netstat")
         .args(["-ano"])
         .output()
         .map_err(|_| SourceError::disconnected())?;
@@ -188,7 +185,7 @@ fn read_netstat() -> Result<ConnectionSnapshot, SourceError> {
     }
     // Lossy would invent characters inside an address. Non-UTF8 is a failed sample.
     let text = std::str::from_utf8(&output.stdout).map_err(|_| SourceError::parse())?;
-    parse_netstat_ano(text)
+    crate::netstat::parse_netstat_ano(text)
 }
 
 #[cfg(not(windows))]

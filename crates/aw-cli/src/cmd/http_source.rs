@@ -142,13 +142,13 @@ impl QuerySource for HttpQuerySource {
             let limit = i64::try_from(limit).unwrap_or(i64::MAX);
             pairs.push(("limit".to_owned(), limit.to_string()));
         }
-        let path = format!(
-            "/api/v1/sessions/{}/timeline",
-            encode_path_segment(key)
-        );
+        let path = format!("/api/v1/sessions/{}/timeline", encode_path_segment(key));
         let body = self.call(&get_pairs(&path, &pairs))?;
         let rows = array_field(&body, "rows")?;
-        let items = rows.iter().map(timeline_item).collect::<Result<Vec<_>, _>>()?;
+        let items = rows
+            .iter()
+            .map(timeline_item)
+            .collect::<Result<Vec<_>, _>>()?;
         let next = match body.get("next_cursor") {
             None | Some(Value::Null) => false,
             Some(Value::String(text)) => !text.is_empty(),
@@ -178,10 +178,7 @@ impl QuerySource for HttpQuerySource {
         } else {
             Vec::new()
         };
-        let path = format!(
-            "/api/v1/sessions/{}/processes",
-            encode_path_segment(key)
-        );
+        let path = format!("/api/v1/sessions/{}/processes", encode_path_segment(key));
         let body = self.call(&get_pairs(&path, &pairs))?;
         let rows = array_field(&body, "processes")?;
         rows.iter().map(|row| proc_item(row, tree)).collect()
@@ -319,7 +316,10 @@ fn ns_to_window(ns: i64) -> String {
 
 fn client_to_query(err: ClientError) -> QueryError {
     match err {
-        ClientError::Status { status: 404, message } => QueryError::NotFound {
+        ClientError::Status {
+            status: 404,
+            message,
+        } => QueryError::NotFound {
             session: clip(&message),
         },
         ClientError::Status {
@@ -327,14 +327,16 @@ fn client_to_query(err: ClientError) -> QueryError {
         } => QueryError::BadArgument {
             detail: clip(&err.to_string()),
         },
-        ClientError::Status { status: 401 | 403, .. } => QueryError::Unavailable {
+        ClientError::Status {
+            status: 401 | 403, ..
+        } => QueryError::Unavailable {
             detail: clip(&format!("auth: {err}")),
         },
-        ClientError::Unreachable { .. } | ClientError::Transport { .. } | ClientError::Status { .. } => {
-            QueryError::Unavailable {
-                detail: clip(&err.to_string()),
-            }
-        }
+        ClientError::Unreachable { .. }
+        | ClientError::Transport { .. }
+        | ClientError::Status { .. } => QueryError::Unavailable {
+            detail: clip(&err.to_string()),
+        },
     }
 }
 
@@ -355,7 +357,11 @@ fn session_item(value: &Value) -> Result<SessionItem, QueryError> {
     session_from_fields(value, mode, pinned)
 }
 
-fn session_from_fields(value: &Value, mode: String, pinned: bool) -> Result<SessionItem, QueryError> {
+fn session_from_fields(
+    value: &Value,
+    mode: String,
+    pinned: bool,
+) -> Result<SessionItem, QueryError> {
     let public_id = match value.get("id").and_then(Value::as_str) {
         Some(text) if !text.is_empty() => text.to_owned(),
         _ => {
@@ -501,10 +507,7 @@ fn file_item(value: &Value) -> Result<FileItem, QueryError> {
     let proc = value.get("proc");
     let (proc_pid, proc_exe) = match proc {
         None | Some(Value::Null) => (None, None),
-        Some(obj) => (
-            opt_i64_field(obj, "pid")?,
-            opt_string(obj, "exe_name")?,
-        ),
+        Some(obj) => (opt_i64_field(obj, "pid")?, opt_string(obj, "exe_name")?),
     };
     Ok(FileItem {
         id: opt_i64_field(value, "id")?,
@@ -783,9 +786,11 @@ fn required_i64(value: &Value, name: &str) -> Result<i64, QueryError> {
 fn opt_i64_field(value: &Value, name: &str) -> Result<Option<i64>, QueryError> {
     match value.get(name) {
         None | Some(Value::Null) => Ok(None),
-        Some(other) => json_i64(other).map(Some).ok_or_else(|| QueryError::Unavailable {
-            detail: format!("field `{name}` is not an integer"),
-        }),
+        Some(other) => json_i64(other)
+            .map(Some)
+            .ok_or_else(|| QueryError::Unavailable {
+                detail: format!("field `{name}` is not an integer"),
+            }),
     }
 }
 
@@ -801,7 +806,9 @@ fn opt_string(value: &Value, name: &str) -> Result<Option<String>, QueryError> {
 }
 
 fn json_i64(value: &Value) -> Option<i64> {
-    value.as_i64().or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
 }
 
 /// Process ids travel as hex strings (`format!("{id:x}")`) or as integers.
@@ -809,14 +816,18 @@ fn opt_proc_uid(value: &Value, name: &str) -> Result<Option<i64>, QueryError> {
     match value.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text)) if text.is_empty() => Ok(None),
-        Some(Value::String(text)) => parse_hex_i64(text).map(Some).ok_or_else(|| {
-            QueryError::Unavailable {
+        Some(Value::String(text)) => {
+            parse_hex_i64(text)
+                .map(Some)
+                .ok_or_else(|| QueryError::Unavailable {
+                    detail: format!("field `{name}` is not a proc uid"),
+                })
+        }
+        Some(other) => json_i64(other)
+            .map(Some)
+            .ok_or_else(|| QueryError::Unavailable {
                 detail: format!("field `{name}` is not a proc uid"),
-            }
-        }),
-        Some(other) => json_i64(other).map(Some).ok_or_else(|| QueryError::Unavailable {
-            detail: format!("field `{name}` is not a proc uid"),
-        }),
+            }),
     }
 }
 
@@ -911,4 +922,3 @@ fn parse_na_reason(text: &str) -> NaReason {
         _ => NaReason::Unknown,
     }
 }
-

@@ -1,6 +1,6 @@
 # P0-CI-02: three-OS compile/test gate plus license, advisory, and doc-link jobs.
 # No repository secrets. Signing stays out of this workflow (P4).
-# wording-lint added by P3-CI-01. ui and size-check are later jobs; they are not stubs here.
+# wording-lint added by P3-CI-01, UI checks by P0-CI-04. Size checks stay in P4.
 name: ci
 
 on:
@@ -36,6 +36,28 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
         run: cargo test --workspace
+
+  ui:
+    name: ui
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ui/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: install UI dependencies
+        run: pnpm -C ui install --frozen-lockfile
+      - name: UI lint
+        run: pnpm -C ui lint
+      - name: UI test
+        run: pnpm -C ui test
+      - name: UI build
+        run: pnpm -C ui build
 
   deny:
     name: cargo deny

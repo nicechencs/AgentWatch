@@ -463,7 +463,6 @@ fn udp_loop(socket: UdpSocket, log: Arc<TruthLog>, next_id: Arc<AtomicU64>, stop
                     continue;
                 }
                 let id = next_id.fetch_add(1, Ordering::Relaxed);
-                let _ = socket.send_to(&buf[..n], peer);
                 let _ = log.append(&TruthRecord {
                     connection_id: id,
                     direction: truth_log::Direction::Udp,
@@ -472,6 +471,8 @@ fn udp_loop(socket: UdpSocket, log: Arc<TruthLog>, next_id: Arc<AtomicU64>, stop
                     ok: true,
                     error: None,
                 });
+                // Finish the truth line before acknowledging the datagram.
+                let _ = socket.send_to(&buf[..n], peer);
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}

@@ -1,7 +1,7 @@
 # P0 奠基 任务清单
 
 > 状态：草案
-> 最后更新：2026-10-06
+> 最后更新：2026-10-10
 > 关联：[roadmap](../roadmap.md#p0-奠基)、[任务卡规范](README.md)
 > 里程碑：P0 奠基
 > 截止：2026-10-25
@@ -21,6 +21,7 @@
 | P0-CI-01 | Cargo workspace 骨架与编译加速配置 | CI | M | 无 | A |
 | P0-CI-02 | CI 骨架：三平台矩阵与质量门禁 | CI | M | P0-CI-01 | B |
 | P0-CI-03 | GitHub 仓库初始化：标签、模板、Projects、Milestone | CI | S | 无 | A |
+| P0-CI-04 | 恢复当前代码的格式、Clippy 与无特权测试门禁 | CI | M | P0-CI-02 | E |
 | P0-CORE-01 | aw-core 统一事件类型 | CORE | M | P0-CI-01 | B |
 | P0-CORE-02 | 进程身份 ProcUid 与时钟抽象 | CORE | S | P0-CORE-01 | C |
 | P0-CORE-03 | Collector trait 与能力声明 | CORE | S | P0-CORE-01 | C |
@@ -44,6 +45,7 @@
 ```mermaid
 flowchart LR
     CI01[P0-CI-01 workspace] --> CI02[P0-CI-02 CI]
+    CI02 --> CI04[P0-CI-04 质量门禁修复]
     CI01 --> CORE01[P0-CORE-01 事件类型]
     CORE01 --> CORE02[P0-CORE-02 ProcUid]
     CORE01 --> CORE03[P0-CORE-03 Collector trait]
@@ -592,3 +594,34 @@ flowchart LR
 - [ ] roadmap 阶段复盘表填写 P0 实际结束日期。
 
 **参考文档**：[capability-matrix](../../02-platforms/capability-matrix.md)、[06-research](../../06-research/README.md)
+
+### P0-CI-04 恢复当前代码的格式、Clippy 与无特权测试门禁
+
+- **AREA**: CI
+- **平台**: all
+- **类型**: bug
+- **优先级**: M
+- **规模**: M
+- **依赖**: P0-CI-02
+- **关联**: NFR-08, RISK-09, RISK-13
+- **文件范围**: `crates/`（不含 `aw-store/migrations/`）、`sim/`、`xtask/`、`ui/`（不含依赖清单、锁文件和生成产物）、`.github/workflows/ci.yml`、`docs/README.md`、`docs/04-plan/tasks/P0-foundation.md`、`docs/05-dev/quality-gates.md`
+
+**背景**：当前 main 的三平台 CI 均在格式检查失败，后续 Clippy 与测试被跳过；Linux 本地严格 Clippy 也失败。先恢复已有代码的质量门禁，再继续功能集成。
+
+**实现要点**：
+- 统一现有 Rust 格式，以最小改动修复 Clippy 和已存在测试暴露的问题。
+- 按互不重叠的 crate 分配修复；workspace 格式化和最终验收由主 Agent 串行完成。
+- 用质量检查记录说明命令、结果、实际验证平台及未验证部分。
+
+**限制**：
+- 不修改公共事件类型、证据规则、数据库迁移、HTTP API 契约或依赖选型；不扩展平台采集、代理、Agent 注入等功能。
+- 不通过禁用 lint、放宽 `-D warnings`、跳过测试或批量接受快照掩盖失败；平台门控与测试隔离调整须保留原有断言。
+- 不运行特权采集或修改系统设置；不提交、推送或写入 GitHub，除非用户另行授权。
+
+**验收标准**：
+- [ ] `cargo fmt --all --check`、`cargo check --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 在 Linux 无特权环境通过。
+- [ ] `cargo xtask wording-lint` 通过；修改 UI 源码时 `pnpm -C ui lint`、`pnpm -C ui test`、`pnpm -C ui build` 通过。
+- [ ] 记录检查结果与必要的修复说明；Windows、macOS 未实测时明确注明，三平台 CI 是否通过以实际远端运行结果为准。
+- [ ] 改动均在文件范围内，格式变更与行为修复可以从 diff 中区分。
+
+**参考文档**：[ci-release](../../05-dev/ci-release.md)、[testing](../../05-dev/testing.md)、[coding-conventions](../../05-dev/coding-conventions.md)、[evidence-model](../../01-architecture/evidence-model.md)

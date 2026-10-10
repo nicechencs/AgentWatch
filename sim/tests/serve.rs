@@ -22,6 +22,8 @@ const DOWNLOAD_PATTERN: &[u8] = b"SIM-DOWNLOAD-v1\n";
 
 struct Server {
     child: Child,
+    // Keep the banner pipe open while the server finishes writing it.
+    _stdout: std::process::ChildStdout,
     http_port: u16,
     https_port: u16,
     cert_pem: PathBuf,
@@ -64,10 +66,11 @@ fn spawn_server() -> Server {
         .spawn()
         .expect("spawn sim serve");
 
-    let stdout = child.stdout.take().expect("stdout");
-    let (http_port, https_port) = read_ports(stdout);
+    let mut stdout = child.stdout.take().expect("stdout");
+    let (http_port, https_port) = read_ports(&mut stdout);
     Server {
         child,
+        _stdout: stdout,
         http_port,
         https_port,
         cert_pem: cert_out.join("cert.pem"),

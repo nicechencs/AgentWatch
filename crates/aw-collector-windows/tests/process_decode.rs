@@ -1,4 +1,5 @@
 //! Replay of hand-written Kernel-Process fixtures.
+#![cfg(target_os = "windows")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //!
 //! The files under `fixtures/process/` are not an ETW recording. SPIKE-02 was

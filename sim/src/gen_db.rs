@@ -59,14 +59,16 @@ fn parse_args(args: Vec<String>) -> Result<Opts, String> {
                     .map_err(|_| format!("--sessions is not a number: {raw}"))?;
             }
             "-h" | "--help" => {
-                return Err(
-                    "usage: sim gen-db --rows N [--out bench.db] [--sessions 4]".to_string(),
-                )
+                return Err("usage: sim gen-db --rows N [--out bench.db] [--sessions 4]".to_string())
             }
             other => return Err(format!("unknown gen-db flag `{other}`")),
         }
     }
-    Ok(Opts { rows, out, sessions })
+    Ok(Opts {
+        rows,
+        out,
+        sessions,
+    })
 }
 
 pub(crate) struct Opts {
@@ -86,10 +88,11 @@ pub(crate) struct Opts {
 pub(crate) fn generate(opts: &Opts) -> Result<(), String> {
     use rusqlite::Connection;
 
-    let conn = Connection::open(&opts.out)
-        .map_err(|e| format!("open {}: {e}", opts.out.display()))?;
+    let conn =
+        Connection::open(&opts.out).map_err(|e| format!("open {}: {e}", opts.out.display()))?;
 
-    conn.execute_batch(SCHEMA).map_err(|e| format!("create schema: {e}"))?;
+    conn.execute_batch(SCHEMA)
+        .map_err(|e| format!("create schema: {e}"))?;
 
     // Insert synthetic sessions.
     let sessions = opts.sessions.max(1);
@@ -318,7 +321,7 @@ mod tests {
         // rows is divided across sessions; total should equal or closely approximate
         // (we do rows/sessions per session).
         assert!(
-            count >= 98 && count <= 102,
+            (98..=102).contains(&count),
             "expected ~100 rows, got {count}"
         );
         let _ = std::fs::remove_file(&path);

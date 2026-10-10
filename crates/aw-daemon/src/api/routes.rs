@@ -784,7 +784,10 @@ fn ingest_agent_hook(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
         return hook_result(state, &report);
     }
 
-    let payload = value.get("payload").cloned().unwrap_or_else(|| value.clone());
+    let payload = value
+        .get("payload")
+        .cloned()
+        .unwrap_or_else(|| value.clone());
     let mut memory = super::agent::MemoryAgentEvents::new();
     let outcomes = super::agent::ingest_hook(&mut memory, agent, session.as_deref(), &payload);
     if outcomes.is_empty() && !memory.gaps().is_empty() {
@@ -823,7 +826,11 @@ fn ingest_agent_hook(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
             session: session.clone(),
             agent: row.agent.clone(),
             source: row.source.clone(),
-            tool: none_if_empty(fields.tool.or_else(|| none_if_empty_owned(row.tool.clone()))),
+            tool: none_if_empty(
+                fields
+                    .tool
+                    .or_else(|| none_if_empty_owned(row.tool.clone())),
+            ),
             phase: Some(phase_label(row.phase).to_owned()),
             call_id: row.call_id.clone(),
             command: fields.command,
@@ -859,10 +866,13 @@ fn ingest_agent_hook(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
 
 fn hook_result(state: &mut ApiState, report: &super::query::HookReport) -> ApiResponse {
     match state.query.ingest_self_report(report) {
-        Ok(super::query::HookIngest::Gap) => ApiResponse::json(200, &json!({ "gap": "self_report_dropped" })),
-        Ok(super::query::HookIngest::NoDatabase) => {
-            ApiResponse::json(200, &json!({ "gap": "self_report_dropped", "storage": "not_ready" }))
+        Ok(super::query::HookIngest::Gap) => {
+            ApiResponse::json(200, &json!({ "gap": "self_report_dropped" }))
         }
+        Ok(super::query::HookIngest::NoDatabase) => ApiResponse::json(
+            200,
+            &json!({ "gap": "self_report_dropped", "storage": "not_ready" }),
+        ),
         Ok(super::query::HookIngest::Stored) => {
             ApiResponse::json(200, &json!({ "gap": "self_report_dropped" }))
         }
@@ -1260,8 +1270,7 @@ fn session_sub(
     let store_configured = state.query.db_path.is_some();
     let live = method == "GET" && tail == "live";
     if !tail.is_empty() && (memory.is_none() || store_configured || live) {
-        if let Some(response) =
-            session_query_route(state, method, &sid, tail, caller, query, body)
+        if let Some(response) = session_query_route(state, method, &sid, tail, caller, query, body)
         {
             return response;
         }
@@ -2344,9 +2353,17 @@ mod tests {
                 b"",
             ),
         );
-        assert_eq!(stats.status, 200, "{}", String::from_utf8_lossy(&stats.body));
+        assert_eq!(
+            stats.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&stats.body)
+        );
         let stats_body = json_body(&stats);
-        assert!(stats_body.get("db_bytes").is_some_and(Value::is_null), "{stats_body}");
+        assert!(
+            stats_body.get("db_bytes").is_some_and(Value::is_null),
+            "{stats_body}"
+        );
         assert_eq!(
             stats_body.get("scope").and_then(Value::as_str),
             Some("unconfigured")

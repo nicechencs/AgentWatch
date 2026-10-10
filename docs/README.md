@@ -52,6 +52,7 @@ docs/
 │   ├── coding-conventions.md         代码规范、错误处理、日志、AI 协作约定
 │   ├── testing.md                    单测 / 回放 / 模拟器 / 端到端 / 性能测试
 │   ├── ci-release.md                 CI 矩阵、签名、公证、发布
+│   ├── quality-gates.md              P0-CI-04 本地质量门禁检查记录
 │   └── github-workflow.md            Issue/标签/Projects/Milestone/PR 流程
 └── 06-research/                      调研与技术验证（spike）记录
     ├── README.md                     spike 索引

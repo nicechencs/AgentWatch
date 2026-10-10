@@ -83,8 +83,8 @@ fn build_report(
         .map_err(|err| ReportError::Store(err.to_string()))?
         .ok_or_else(|| ReportError::Store("session not found".to_owned()))?;
     let header = load_header(conn, session_id, user_id)?;
-    let findings = findings_for_report(conn, session_id, user_id, lang)
-        .map_err(ReportError::Store)?;
+    let findings =
+        findings_for_report(conn, session_id, user_id, lang).map_err(ReportError::Store)?;
     let gaps = load_gaps(conn, session_id, user_id)?;
     let domains = load_domains(conn, session_id, user_id, redact_hosts)?;
     let files = load_files(conn, session_id, user_id, redact_paths)?;
@@ -100,10 +100,7 @@ fn build_report(
 
     let mut hits = lint(&prose);
     for sentence in &match_sentences {
-        hits.extend(lint_allowing(
-            sentence,
-            &[RuleId::ContentMatchPhrase],
-        ));
+        hits.extend(lint_allowing(sentence, &[RuleId::ContentMatchPhrase]));
     }
     if !hits.is_empty() {
         return Err(ReportError::Lint(hits));
@@ -184,7 +181,10 @@ fn load_gaps(
         .query(rusqlite::params![session_id, user_id])
         .map_err(|err| ReportError::Store(err.to_string()))?;
     let mut out = Vec::new();
-    while let Some(row) = rows.next().map_err(|err| ReportError::Store(err.to_string()))? {
+    while let Some(row) = rows
+        .next()
+        .map_err(|err| ReportError::Store(err.to_string()))?
+    {
         out.push(GapLine {
             collector: row
                 .get(0)
@@ -233,7 +233,10 @@ fn load_domains(
         .query(rusqlite::params![session_id, user_id])
         .map_err(|err| ReportError::Store(err.to_string()))?;
     let mut out = Vec::new();
-    while let Some(row) = rows.next().map_err(|err| ReportError::Store(err.to_string()))? {
+    while let Some(row) = rows
+        .next()
+        .map_err(|err| ReportError::Store(err.to_string()))?
+    {
         let mut domain: Option<String> = row
             .get(0)
             .map_err(|err| ReportError::Store(err.to_string()))?;
@@ -284,7 +287,10 @@ fn load_files(
         .query(rusqlite::params![session_id, user_id])
         .map_err(|err| ReportError::Store(err.to_string()))?;
     let mut out = Vec::new();
-    while let Some(row) = rows.next().map_err(|err| ReportError::Store(err.to_string()))? {
+    while let Some(row) = rows
+        .next()
+        .map_err(|err| ReportError::Store(err.to_string()))?
+    {
         let mut path: String = row
             .get(0)
             .map_err(|err| ReportError::Store(err.to_string()))?;
@@ -324,8 +330,18 @@ fn push_overview(out: &mut String, summary: &SessionSummary, header: &HeaderBits
         out.push_str(&format!("- flow rows: {}\n", summary.flow_count));
         out.push_str(&format!("- dns rows: {}\n", summary.dns_count));
         out.push_str(&format!("- gap rows: {}\n", summary.gap_count));
-        byte_line(out, "bytes up", summary.bytes_up, "every flow left bytes_up unset");
-        byte_line(out, "bytes down", summary.bytes_down, "every flow left bytes_down unset");
+        byte_line(
+            out,
+            "bytes up",
+            summary.bytes_up,
+            "every flow left bytes_up unset",
+        );
+        byte_line(
+            out,
+            "bytes down",
+            summary.bytes_down,
+            "every flow left bytes_down unset",
+        );
         proxy_line(out, header.proxy_enabled, false);
     } else {
         out.push_str("# 会话报告\n\n");
@@ -346,8 +362,18 @@ fn push_overview(out: &mut String, summary: &SessionSummary, header: &HeaderBits
         out.push_str(&format!("- 流记录行数: {}\n", summary.flow_count));
         out.push_str(&format!("- dns 行数: {}\n", summary.dns_count));
         out.push_str(&format!("- 缺口行数: {}\n", summary.gap_count));
-        zh_byte(out, "上行字节", summary.bytes_up, "每条流的 bytes_up 都未记录");
-        zh_byte(out, "下行字节", summary.bytes_down, "每条流的 bytes_down 都未记录");
+        zh_byte(
+            out,
+            "上行字节",
+            summary.bytes_up,
+            "每条流的 bytes_up 都未记录",
+        );
+        zh_byte(
+            out,
+            "下行字节",
+            summary.bytes_down,
+            "每条流的 bytes_down 都未记录",
+        );
         proxy_line(out, header.proxy_enabled, true);
     }
     out.push('\n');
@@ -422,11 +448,16 @@ fn push_findings(
             }
             continue;
         }
-        grouped.entry(finding.evidence.as_str()).or_default().push(finding);
+        grouped
+            .entry(finding.evidence.as_str())
+            .or_default()
+            .push(finding);
     }
     if lang == Lang::En {
         out.push_str("## Findings\n\n");
-        out.push_str("Grouped by the evidence label stored on the row. A label is not a conclusion.\n\n");
+        out.push_str(
+            "Grouped by the evidence label stored on the row. A label is not a conclusion.\n\n",
+        );
     } else {
         out.push_str("## 发现\n\n");
         out.push_str("按记录上的证据等级分组。等级不是结论。\n\n");
@@ -441,7 +472,10 @@ fn push_findings(
     for (evidence, rows) in &grouped {
         out.push_str(&format!("### {evidence}\n\n"));
         for row in rows {
-            let sentence = row.text.clone().unwrap_or_else(|| unavailable_render(row, lang));
+            let sentence = row
+                .text
+                .clone()
+                .unwrap_or_else(|| unavailable_render(row, lang));
             out.push_str(&format!("- [{sev}] {sentence}\n", sev = row.severity));
         }
         out.push('\n');
@@ -535,7 +569,11 @@ fn push_files(out: &mut String, files: &[FileLine], lang: Lang) {
             row.path.clone()
         };
         if lang == Lang::En {
-            out.push_str(&format!("- {path} ({op}): {hits} rows\n", op = row.op, hits = row.hits));
+            out.push_str(&format!(
+                "- {path} ({op}): {hits} rows\n",
+                op = row.op,
+                hits = row.hits
+            ));
         } else {
             out.push_str(&format!(
                 "- {path}（{op}）: {hits} 行\n",

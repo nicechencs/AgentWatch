@@ -1061,7 +1061,9 @@ impl SessionQuery for StoreQuery {
         let now = unix_now_ns();
         // No user id: a hook is not an HTTP caller. A miss stays NULL.
         let session_id = match report.session.as_deref().filter(|sid| !sid.is_empty()) {
-            Some(sid) => aw_store::session_id_by_public(store.connection(), sid).map_err(map_store)?,
+            Some(sid) => {
+                aw_store::session_id_by_public(store.connection(), sid).map_err(map_store)?
+            }
             None => None,
         };
         if report.dropped {

@@ -9,7 +9,7 @@
 //! A missing field is `None`, which SQLite stores as NULL. An empty string is
 //! not written: that would claim the field was observed and empty.
 
-use rusqlite::{OptionalExtension, params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::StoreError;
 use crate::migrate::{apply_agent_schema, Store};

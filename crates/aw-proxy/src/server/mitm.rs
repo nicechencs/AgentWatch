@@ -187,7 +187,10 @@ impl<P: KeyProtector + Send + 'static> CertificateAuthority for SessionAuthority
         // through to `empty_server_config` makes the handshake fail rather than
         // presenting a certificate dated at the Unix epoch.
         let signed = crate::ca::unix_now().and_then(|now| {
-            self.ca.lock().ok().and_then(|mut store| store.leaf_for(host, now).ok())
+            self.ca
+                .lock()
+                .ok()
+                .and_then(|mut store| store.leaf_for(host, now).ok())
         });
         signed
             .and_then(|leaf| server_config(&leaf).ok())
@@ -224,7 +227,9 @@ fn refusing_server_config() -> Result<Arc<ServerConfig>, MitmError> {
             let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
             server_config_from(vec![der], key)
         }
-        _ => Err(MitmError::Tls("could not build a refusing certificate".to_owned())),
+        _ => Err(MitmError::Tls(
+            "could not build a refusing certificate".to_owned(),
+        )),
     }
 }
 

@@ -565,14 +565,15 @@ fn client_to_db(err: crate::client::ClientError) -> DbApiError {
         crate::client::ClientError::Unreachable { .. } => DbApiError::Unreachable {
             detail: clip_db(&err.to_string()),
         },
-        crate::client::ClientError::Status { status: 401 | 403, .. } => DbApiError::Forbidden {
+        crate::client::ClientError::Status {
+            status: 401 | 403, ..
+        } => DbApiError::Forbidden {
             detail: clip_db(&err.to_string()),
         },
-        crate::client::ClientError::Status { .. } | crate::client::ClientError::Transport { .. } => {
-            DbApiError::Failed {
-                detail: clip_db(&err.to_string()),
-            }
-        }
+        crate::client::ClientError::Status { .. }
+        | crate::client::ClientError::Transport { .. } => DbApiError::Failed {
+            detail: clip_db(&err.to_string()),
+        },
     }
 }
 
@@ -750,7 +751,8 @@ fn stats_view_outcome(view: &DbStatsView, json: bool) -> Outcome {
             Some(n) => n.to_string(),
             None => "不可得".to_owned(),
         };
-        let mut lines = format!("db_bytes {bytes}\nsessions {sessions}\npinned_sessions {pinned}\n");
+        let mut lines =
+            format!("db_bytes {bytes}\nsessions {sessions}\npinned_sessions {pinned}\n");
         for (name, count) in &view.tables {
             lines.push_str(&format!("table {name} {count}\n"));
         }

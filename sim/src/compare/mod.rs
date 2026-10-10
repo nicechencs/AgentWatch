@@ -58,9 +58,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     let report = score(&truth, &session_rows, &session_procs, &session_flows);
 
     let md = report.to_markdown();
-    let json = report
-        .to_json()
-        .map_err(|e| format!("encode json: {e}"))?;
+    let json = report.to_json().map_err(|e| format!("encode json: {e}"))?;
 
     if let Some(p) = &opts.md_out {
         std::fs::write(p, &md).map_err(|e| format!("write md: {e}"))?;
@@ -151,8 +149,8 @@ pub struct TruthEntry {
 }
 
 pub fn load_truth(path: &Path) -> Result<Vec<TruthEntry>, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("read truth {}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read truth {}: {e}", path.display()))?;
     let mut out = Vec::new();
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -165,8 +163,9 @@ pub fn load_truth(path: &Path) -> Result<Vec<TruthEntry>, String> {
         // Skip meta lines (run, server, setup_file, cleanup, spawn_enter, repeat)
         match action.as_str() {
             "run" | "server" | "setup_file" | "cleanup" | "spawn_enter" | "repeat"
-            | "short_lived" | "sleep" | "dns_lookup" | "udp_send" | "long_conn"
-            | "spawn" => continue,
+            | "short_lived" | "sleep" | "dns_lookup" | "udp_send" | "long_conn" | "spawn" => {
+                continue
+            }
             _ => {}
         }
         let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -174,14 +173,11 @@ pub fn load_truth(path: &Path) -> Result<Vec<TruthEntry>, String> {
         if !ok {
             continue;
         }
-        let argv = v
-            .get("argv")
-            .and_then(|x| x.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_str().map(str::to_string))
-                    .collect::<Vec<_>>()
-            });
+        let argv = v.get("argv").and_then(|x| x.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        });
         out.push(TruthEntry {
             action,
             path: v.get("path").and_then(|x| x.as_str()).map(str::to_string),
@@ -247,9 +243,7 @@ impl CompareReport {
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
         out.push_str("## sim compare\n\n");
-        out.push_str(
-            "| action | truth | matched | recall | mean_byte_err | na_fields |\n",
-        );
+        out.push_str("| action | truth | matched | recall | mean_byte_err | na_fields |\n");
         out.push_str("|--------|------:|--------:|-------:|--------------:|----------:|\n");
         for cat in &self.categories {
             let recall = format!("{:.1}%", cat.recall() * 100.0);
@@ -259,15 +253,13 @@ impl CompareReport {
                 .unwrap_or_else(|| "—".to_string());
             out.push_str(&format!(
                 "| {} | {} | {} | {} | {} | {} |\n",
-                cat.action,
-                cat.truth_total,
-                cat.matched,
-                recall,
-                mbe,
-                cat.na_fields,
+                cat.action, cat.truth_total, cat.matched, recall, mbe, cat.na_fields,
             ));
         }
-        out.push_str(&format!("\nsession_only (extra rows): {}\n", self.session_only));
+        out.push_str(&format!(
+            "\nsession_only (extra rows): {}\n",
+            self.session_only
+        ));
         out
     }
 
@@ -287,10 +279,12 @@ pub fn score(
 
     for entry in truth {
         let cat_key = canonical_action(&entry.action);
-        let cat = cats.entry(cat_key.clone()).or_insert_with(|| CategoryScore {
-            action: cat_key.clone(),
-            ..Default::default()
-        });
+        let cat = cats
+            .entry(cat_key.clone())
+            .or_insert_with(|| CategoryScore {
+                action: cat_key.clone(),
+                ..Default::default()
+            });
         cat.truth_total += 1;
 
         match cat_key.as_str() {
@@ -298,7 +292,7 @@ pub fn score(
                 let matched = match_file_row(entry, session_files);
                 if let Some(row) = matched {
                     cat.matched += 1;
-                    score_bytes(cat, entry, &row, &cat_key);
+                    score_bytes(cat, entry, row, &cat_key);
                 }
             }
             "exec" => {
@@ -306,10 +300,8 @@ pub fn score(
                     cat.matched += 1;
                 }
             }
-            "http_upload" | "http_download" => {
-                if match_flow_row(entry, session_flows) {
-                    cat.matched += 1;
-                }
+            "http_upload" | "http_download" if match_flow_row(entry, session_flows) => {
+                cat.matched += 1;
             }
             _ => {
                 // Unrecognized action: count truth but no matching attempted.
@@ -388,14 +380,8 @@ fn match_flow_row(entry: &TruthEntry, rows: &[Value]) -> bool {
     // Flows have no direct path; match by byte direction if present.
     let want_bytes = entry.bytes.unwrap_or(0);
     rows.iter().any(|r| {
-        let up = r
-            .get("bytes_up")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0);
-        let down = r
-            .get("bytes_down")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0);
+        let up = r.get("bytes_up").and_then(|x| x.as_u64()).unwrap_or(0);
+        let down = r.get("bytes_down").and_then(|x| x.as_u64()).unwrap_or(0);
         up == want_bytes || down == want_bytes
     })
 }
@@ -426,7 +412,10 @@ fn score_bytes(cat: &mut CategoryScore, entry: &TruthEntry, row: &Value, action:
 }
 
 fn basename(path: &str) -> String {
-    path.rsplit(['/', '\\']).next().unwrap_or(path).to_lowercase()
+    path.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_lowercase()
 }
 
 // ---------------------------------------------------------------------------
@@ -472,7 +461,12 @@ mod tests {
     #[test]
     fn perfect_recall_exact_bytes() {
         let truth = vec![
-            t("read_file", Some("/tmp/x/home/.ssh/id_rsa"), Some(412), true),
+            t(
+                "read_file",
+                Some("/tmp/x/home/.ssh/id_rsa"),
+                Some(412),
+                true,
+            ),
             t("read_file", Some("/tmp/x/work/data.bin"), Some(4096), true),
         ];
         let files = vec![
@@ -520,12 +514,7 @@ mod tests {
 
     #[test]
     fn na_fields_counted_separately() {
-        let truth = vec![t(
-            "read_file",
-            Some("/tmp/x.bin"),
-            Some(1024),
-            true,
-        )];
+        let truth = vec![t("read_file", Some("/tmp/x.bin"), Some(1024), true)];
         // bytes_read is null => NA
         let files = vec![file_row("/session/x.bin", None, None)];
         let report = score(&truth, &files, &[], &[]);

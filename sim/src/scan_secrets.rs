@@ -55,7 +55,10 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
     }
 
     if all_hits.is_empty() {
-        println!("scan-secrets: no plaintext tokens found in {} file(s) scanned", paths.len());
+        println!(
+            "scan-secrets: no plaintext tokens found in {} file(s) scanned",
+            paths.len()
+        );
         return Ok(());
     }
 
@@ -65,11 +68,19 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         by_rule.entry(hit.rule).or_default().push(hit);
     }
 
-    eprintln!("FAIL: scan-secrets found {} plaintext token(s):", all_hits.len());
+    eprintln!(
+        "FAIL: scan-secrets found {} plaintext token(s):",
+        all_hits.len()
+    );
     for (rule, hits) in &by_rule {
         eprintln!("  rule {rule}: {} occurrence(s)", hits.len());
         for h in hits.iter().take(3) {
-            eprintln!("    {} @ offset {} : {:?}", h.file.display(), h.offset, h.snippet);
+            eprintln!(
+                "    {} @ offset {} : {:?}",
+                h.file.display(),
+                h.offset,
+                h.snippet
+            );
         }
     }
     Err(format!("{} plaintext token(s) found", all_hits.len()))
@@ -78,17 +89,12 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
 fn parse_args(args: Vec<String>) -> Result<Opts, String> {
     let mut db_path = None;
     let mut extra_paths: Vec<PathBuf> = Vec::new();
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
+    for arg in args {
         match arg.as_str() {
             "-h" | "--help" => {
-                return Err(
-                    "usage: sim scan-secrets <db_path> [<extra_file> ...]".to_string(),
-                )
+                return Err("usage: sim scan-secrets <db_path> [<extra_file> ...]".to_string())
             }
-            other if other.starts_with('-') => {
-                return Err(format!("unknown flag `{other}`"))
-            }
+            other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
             other => {
                 if db_path.is_none() {
                     db_path = Some(PathBuf::from(other));
@@ -122,8 +128,7 @@ fn sibling_paths(db: &Path) -> Vec<PathBuf> {
 
 /// Scan one file and return all hits.
 pub fn scan_file(path: &Path) -> Result<Vec<Hit>, String> {
-    let bytes =
-        std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     Ok(scan_bytes(path, &bytes))
 }
 
@@ -159,11 +164,11 @@ struct ScanRule {
 
 #[derive(Clone, Copy)]
 enum CharClass {
-    UpperAlphaNum,      // A-Z 0-9
-    AlphaNum,           // A-Za-z0-9
-    AlphaNumDash,       // A-Za-z0-9-
-    AlphaNumUnderDash,  // A-Za-z0-9_-
-    AlphaNumPlus,       // A-Za-z0-9_-+./=
+    UpperAlphaNum,     // A-Z 0-9
+    AlphaNum,          // A-Za-z0-9
+    AlphaNumDash,      // A-Za-z0-9-
+    AlphaNumUnderDash, // A-Za-z0-9_-
+    AlphaNumPlus,      // A-Za-z0-9_-+./=
 }
 
 impl CharClass {
@@ -290,7 +295,11 @@ static RULES: &[ScanRule] = &[
 
 /// Find all non-overlapping occurrences of `rule` in `bytes`.
 fn find_pattern(bytes: &[u8], rule: &ScanRule) -> Vec<(usize, String)> {
-    let max_len = if rule.max_len == 0 { 2048 } else { rule.max_len };
+    let max_len = if rule.max_len == 0 {
+        2048
+    } else {
+        rule.max_len
+    };
     let mut hits = Vec::new();
     let mut i = 0usize;
     while i + rule.prefix.len() <= bytes.len() {
@@ -299,9 +308,7 @@ fn find_pattern(bytes: &[u8], rule: &ScanRule) -> Vec<(usize, String)> {
             // Extend with the continuation character class.
             let start = i;
             let mut end = i + rule.prefix.len();
-            while end < bytes.len()
-                && end - start < max_len
-                && rule.char_class.matches(bytes[end])
+            while end < bytes.len() && end - start < max_len && rule.char_class.matches(bytes[end])
             {
                 end += 1;
             }
@@ -409,10 +416,7 @@ pub mod tests {
         // The SIMBAIT pattern used in bait_bytes must not trigger any rule.
         let buf = b"SIMBAIT-not-a-secret-SIMBAIT-not-a-secret-SIMBAIT-not-a-secret-".to_vec();
         let hits = scan_bytes(Path::new("test.db"), &buf);
-        assert!(
-            hits.is_empty(),
-            "SIMBAIT triggered a rule: {hits:?}"
-        );
+        assert!(hits.is_empty(), "SIMBAIT triggered a rule: {hits:?}");
     }
 
     #[test]
@@ -454,7 +458,8 @@ pub mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("clean.db");
         let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(b"normal log output without any secrets here").unwrap();
+        f.write_all(b"normal log output without any secrets here")
+            .unwrap();
         drop(f);
 
         let hits = scan_file(&path).unwrap();

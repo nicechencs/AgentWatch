@@ -313,4 +313,3 @@ fn extract_json(extracted: &RpcExtract) -> Value {
         "arg_lengths": extracted.arg_lengths,
     })
 }
-

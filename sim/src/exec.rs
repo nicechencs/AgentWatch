@@ -63,6 +63,8 @@ struct RunCtx<'a> {
 
 struct LocalServer {
     child: Child,
+    // Keep the banner pipe open while the server finishes writing it.
+    _stdout: std::process::ChildStdout,
     endpoints: Endpoints,
     /// Directory that holds the cert and the server's own byte log.
     scratch: PathBuf,
@@ -655,6 +657,29 @@ fn udp_send(step: &Step, ctx: &RunCtx<'_>) -> Result<(), String> {
         Ok(n) => {
             line.bytes = Some(n as u64);
             line.app_bytes = Some(n as u64);
+            if ctx
+                .endpoints
+                .udp_port
+                .is_some_and(|port| addr == SocketAddr::from(([127, 0, 0, 1], port)))
+            {
+                // The local server writes its truth line before echoing. Wait
+                // for that echo so cleanup cannot copy the log too early.
+                let echoed = (|| {
+                    socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+                    let mut echo = [0u8; 2048];
+                    let (len, peer) = socket.recv_from(&mut echo)?;
+                    if peer != addr || echo[..len] != body[..n] {
+                        return Err(std::io::Error::other("unexpected local UDP echo"));
+                    }
+                    Ok(())
+                })();
+                if let Err(err) = echoed {
+                    line.ok = false;
+                    line.error = Some(err.to_string());
+                    append(ctx.truth, &line)?;
+                    return Err(format!("udp_send echo: {err}"));
+                }
+            }
             append(ctx.truth, &line)
         }
         Err(err) => {
@@ -981,11 +1006,11 @@ fn start_local_server(
     let mut child = cmd
         .spawn()
         .map_err(|err| format!("spawn sim serve: {err}"))?;
-    let stdout = child
+    let mut stdout = child
         .stdout
         .take()
         .ok_or_else(|| "serve stdout".to_string())?;
-    let banner = read_banner(stdout, hint.udp, hint.dns);
+    let banner = read_banner(&mut stdout, hint.udp, hint.dns);
     let endpoints = match banner {
         Ok(found) => found,
         Err(err) => {
@@ -1005,6 +1030,7 @@ fn start_local_server(
     endpoints.cert_pem = Some(cert_out.join("cert.pem"));
     Ok(Some(LocalServer {
         child,
+        _stdout: stdout,
         endpoints,
         scratch,
     }))

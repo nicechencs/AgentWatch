@@ -28,12 +28,7 @@ use super::routes::{error_response, ApiResponse, ApiState};
 const MAX_PAGE: i64 = 2000;
 
 /// `GET /sessions/{sid}/http?filter=&cursor=&limit=&from=&to=&redact_paths=&redact_hosts=`.
-pub(crate) fn get_http(
-    state: &ApiState,
-    caller: &Caller,
-    sid: &str,
-    query: &str,
-) -> ApiResponse {
+pub(crate) fn get_http(state: &ApiState, caller: &Caller, sid: &str, query: &str) -> ApiResponse {
     let pairs = query_pairs(query);
     let limit = match page_limit(pairs.get("limit").map(String::as_str)) {
         Ok(limit) => limit,
@@ -121,7 +116,10 @@ enum Bound {
     Int(i64),
 }
 
-fn compile_http_filter(filter: &str, session_start_ns: Option<i64>) -> Result<BoundFilter, ApiResponse> {
+fn compile_http_filter(
+    filter: &str,
+    session_start_ns: Option<i64>,
+) -> Result<BoundFilter, ApiResponse> {
     if filter.is_empty() {
         return Ok(BoundFilter {
             sql: String::new(),
@@ -131,9 +129,8 @@ fn compile_http_filter(filter: &str, session_start_ns: Option<i64>) -> Result<Bo
     // aw-store's public `parse_filter` returns `FilterExpr`, which is not the
     // AST `compile_predicate` accepts (`StoreExpr`, no public parser). The core
     // parser is the shared grammar; map that tree onto `StoreExpr` here.
-    let core = filter::parse(filter).map_err(|err| {
-        error_response(400, "bad_filter", &format!("filter: {err}"))
-    })?;
+    let core = filter::parse(filter)
+        .map_err(|err| error_response(400, "bad_filter", &format!("filter: {err}")))?;
     let expr = core_to_store(&core);
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -145,9 +142,8 @@ fn compile_http_filter(filter: &str, session_start_ns: Option<i64>) -> Result<Bo
         fts: false,
         case_insensitive_paths: cfg!(windows),
     };
-    let compiled = compile_predicate(&expr, StoreTarget::Http, &ctx).map_err(|err| {
-        error_response(400, "bad_filter", &format!("filter: {err}"))
-    })?;
+    let compiled = compile_predicate(&expr, StoreTarget::Http, &ctx)
+        .map_err(|err| error_response(400, "bad_filter", &format!("filter: {err}")))?;
     let params = compiled
         .params
         .into_iter()
@@ -246,8 +242,14 @@ fn list_http(
     }
     let next = if items.len() as i64 > limit {
         items.pop().map(|row| {
-            let ts = row.get("ts_ns").and_then(serde_json::Value::as_i64).unwrap_or(0);
-            let id = row.get("id").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let ts = row
+                .get("ts_ns")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let id = row
+                .get("id")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
             format!("{ts},{id}")
         })
     } else {
@@ -328,7 +330,9 @@ fn opt_text(row: &rusqlite::Row<'_>, idx: usize) -> Result<Option<String>, Strin
 }
 
 fn exe_file_name(path: &str) -> Option<&str> {
-    path.rsplit(['/', '\\']).next().filter(|name| !name.is_empty())
+    path.rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
 }
 
 /// Shared session lookup. Numeric `sid` is `sessions.id` owned by `user_id`.
@@ -430,12 +434,14 @@ pub(crate) fn parse_cursor(raw: Option<&str>) -> Result<Option<(i64, i64)>, ApiR
                     "cursor: expected ts_ns,id",
                 ));
             };
-            let ts = ts.trim().parse::<i64>().map_err(|_| {
-                error_response(400, "bad_argument", "cursor: expected ts_ns,id")
-            })?;
-            let id = id.trim().parse::<i64>().map_err(|_| {
-                error_response(400, "bad_argument", "cursor: expected ts_ns,id")
-            })?;
+            let ts = ts
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| error_response(400, "bad_argument", "cursor: expected ts_ns,id"))?;
+            let id = id
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| error_response(400, "bad_argument", "cursor: expected ts_ns,id"))?;
             Ok(Some((ts, id)))
         }
     }
@@ -499,10 +505,7 @@ pub(crate) fn parse_lang(raw: Option<&str>) -> Result<Lang, ApiResponse> {
 
 pub(crate) fn json_response(status: u16, value: &serde_json::Value) -> ApiResponse {
     let mut headers = BTreeMap::new();
-    headers.insert(
-        "content-type".to_owned(),
-        "application/json".to_owned(),
-    );
+    headers.insert("content-type".to_owned(), "application/json".to_owned());
     let body = serde_json::to_vec(value).unwrap_or_else(|_| br#"{"error":"encode"}"#.to_vec());
     ApiResponse {
         status,
@@ -514,12 +517,14 @@ pub(crate) fn json_response(status: u16, value: &serde_json::Value) -> ApiRespon
 fn core_to_store(expr: &CoreExpr) -> StoreExpr {
     match expr {
         CoreExpr::True => StoreExpr::True,
-        CoreExpr::And(left, right) => {
-            StoreExpr::And(Box::new(core_to_store(left)), Box::new(core_to_store(right)))
-        }
-        CoreExpr::Or(left, right) => {
-            StoreExpr::Or(Box::new(core_to_store(left)), Box::new(core_to_store(right)))
-        }
+        CoreExpr::And(left, right) => StoreExpr::And(
+            Box::new(core_to_store(left)),
+            Box::new(core_to_store(right)),
+        ),
+        CoreExpr::Or(left, right) => StoreExpr::Or(
+            Box::new(core_to_store(left)),
+            Box::new(core_to_store(right)),
+        ),
         CoreExpr::Not(inner) => StoreExpr::Not(Box::new(core_to_store(inner))),
         CoreExpr::Term(term) => StoreExpr::Term(StoreTerm {
             field: store_field(term.field.name()),

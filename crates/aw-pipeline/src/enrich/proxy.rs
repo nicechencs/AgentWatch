@@ -345,7 +345,9 @@ pub fn note_url_na(field_evidence: &mut BTreeMap<String, Evidence>, mark: &FlowM
     let Some(evidence) = url_evidence(mark) else {
         return;
     };
-    field_evidence.entry(URL_FIELD.to_owned()).or_insert(evidence);
+    field_evidence
+        .entry(URL_FIELD.to_owned())
+        .or_insert(evidence);
 }
 
 fn mark_flow(session: &ProxySession, flow: &LoopbackFlow, claimed: bool) -> FlowMark {
@@ -483,7 +485,10 @@ fn matched(obs: &ProxyObservation, flow: &LoopbackFlow) -> HttpAttribution {
         proc_uid: flow.proc_uid,
         pid: flow.pid,
         flow_id: flow.flow_id,
-        flow_na: flow.flow_id.map(|_| None).unwrap_or(Some(NaReason::AttributionBreak)),
+        flow_na: flow
+            .flow_id
+            .map(|_| None)
+            .unwrap_or(Some(NaReason::AttributionBreak)),
         ts_ns: obs.ts_ns,
         method: obs.method.clone(),
         url: obs.url.clone(),

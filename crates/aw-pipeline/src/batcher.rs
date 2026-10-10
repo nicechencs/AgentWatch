@@ -134,12 +134,7 @@ impl<S: RecordSink> Batcher<S> {
     /// `None` does not invent observations. Marks are applied to a copy of each
     /// flow; `out` is not changed. A [`FlowMark::ProxyUpstream`] flow is not
     /// inserted: its bytes stay out of the session's `net_flows`.
-    pub fn ingest_with_proxy(
-        &mut self,
-        out: &Output,
-        proxy: Option<&ProxySession>,
-        now_ns: u64,
-    ) {
+    pub fn ingest_with_proxy(&mut self, out: &Output, proxy: Option<&ProxySession>, now_ns: u64) {
         for gap in &out.gaps {
             if let Some(closed) = self.gaps.observe(gap.clone()) {
                 self.enqueue_gap(&closed, now_ns);

@@ -692,10 +692,7 @@ pub(crate) fn http_request(session: &str, query: &HttpQuery) -> crate::client::A
 
 /// `GET /api/v1/sessions/{sid}/findings?lang&min_severity&evidence`.
 #[must_use]
-pub(crate) fn findings_request(
-    session: &str,
-    query: &FindingQuery,
-) -> crate::client::ApiRequest {
+pub(crate) fn findings_request(session: &str, query: &FindingQuery) -> crate::client::ApiRequest {
     let evidence = query.evidence.join(",");
     let mut pairs: Vec<(&str, &str)> = Vec::new();
     if let Some(lang) = query.lang.as_deref() {
@@ -708,10 +705,7 @@ pub(crate) fn findings_request(
         pairs.push(("evidence", &evidence));
     }
     crate::client::ApiRequest::get_query(
-        &format!(
-            "/api/v1/sessions/{}/findings",
-            encode_path_segment(session)
-        ),
+        &format!("/api/v1/sessions/{}/findings", encode_path_segment(session)),
         encode_query(&pairs),
     )
 }

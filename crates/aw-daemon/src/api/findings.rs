@@ -115,9 +115,7 @@ pub(crate) fn patch_finding(
 ) -> ApiResponse {
     let finding_id = match finding_id.parse::<i64>() {
         Ok(id) => id,
-        Err(_) => {
-            return error_response(400, "bad_argument", "finding id: expected an integer")
-        }
+        Err(_) => return error_response(400, "bad_argument", "finding id: expected an integer"),
     };
     let value: serde_json::Value = match serde_json::from_slice(body) {
         Ok(value) => value,
@@ -261,7 +259,10 @@ fn list_findings(
                 .get("first_ns")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            let id = row.get("id").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let id = row
+                .get("id")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
             format!("{ts},{id}")
         })
     } else {
@@ -319,7 +320,10 @@ fn render_text(
         Ok(pairs) => pairs,
         Err(message) => return (None, Some(message)),
     };
-    let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let refs: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     match render(wording_id, &refs, lang) {
         Ok(text) => (Some(text), None),
         Err(err) => (None, Some(wording_error(&err))),

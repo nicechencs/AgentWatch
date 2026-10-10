@@ -469,7 +469,10 @@ pub fn run_foreground(
     }
 
     let stop = StopFlag::new();
-    let batcher = Batcher::spawn(Arc::clone(&stop));
+    // Stop the batcher only after collectors have stopped. Sharing the runtime
+    // flag would let it exit as soon as the stop file is seen.
+    let batcher_stop = StopFlag::new();
+    let batcher = Batcher::spawn(Arc::clone(&batcher_stop));
     // The registry binds 127.0.0.1:0 only, and only from `OtlpRegistry::open`.
     // Nothing here calls `open`: the foreground runtime has no session yet, and
     // the session orchestrator does not carry an agent id to bind one to.
@@ -524,8 +527,8 @@ pub fn run_foreground(
 
     // Order is part of the acceptance test. Do not reorder these lines.
     tracing::info!("{}", SHUTDOWN_STOP_COLLECTORS);
-    // The batcher is the only other thread. Stopping it stands in for "collectors stopped".
-    stop.request();
+    // Release the batcher after collector shutdown, then wait before closing the store.
+    batcher_stop.request();
     batcher.join();
     tracing::info!("{}", SHUTDOWN_FLUSH);
     tracing::info!("{}", SHUTDOWN_CLOSE_STORE);

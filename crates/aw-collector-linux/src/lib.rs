@@ -59,6 +59,8 @@ pub use legacy::{
     SOURCE_SOCK_DIAG,
 };
 pub use loader::{classify_attach_error, BpfLoader, EmbeddedProgram, LoaderConfig};
+#[cfg(target_os = "linux")]
+pub use loader::{AyaLoader, AyaUnavailable};
 pub use lost::{lost_gap, LostSample, LOST_SOURCE};
 pub use maps::{
     shared_maps, MapKind, MapSpec, EVENTS, EVENTS_RINGBUF_BYTES, LOST, SCOPE_CGROUPS, SCOPE_PIDS,
@@ -72,6 +74,8 @@ pub use probe::{
     all_probes, parse_collector_arg, select_tier, MountFailure, MountResult, PermissionError,
     Privilege, ProbeHost, ProbeId, ScriptedHost, Tier, TierDecision, TierRequest,
 };
+#[cfg(target_os = "linux")]
+pub use scope::UnverifiedCgroupHost;
 pub use scope::{
     cleanup_cgroup, escape_gap, run_attach, run_launch as run_scope_launch, scope_cgroups_map,
     scope_pids_map, session_dir, v1_doctor_hint, AdoptWait as ScopeAdoptWait, AttachOutcome,

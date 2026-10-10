@@ -298,10 +298,7 @@ impl<'a> Cursor<'a> {
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], ParseError> {
-        let end = self
-            .at
-            .checked_add(n)
-            .ok_or(ParseError::Malformed)?;
+        let end = self.at.checked_add(n).ok_or(ParseError::Malformed)?;
         if end > self.buf.len() {
             return Err(ParseError::Incomplete);
         }

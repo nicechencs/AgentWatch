@@ -205,7 +205,9 @@ impl ConfigApi for HttpConfigApi {
     fn schema(&mut self) -> Result<Value, ConfigError> {
         // `GET /api/v1/config/schema` is not a route. Do not print `{}`.
         Err(ConfigError::Failed {
-            detail: "GET /api/v1/config/schema is not served; this command does not invent a schema".to_owned(),
+            detail:
+                "GET /api/v1/config/schema is not served; this command does not invent a schema"
+                    .to_owned(),
         })
     }
 
@@ -214,7 +216,9 @@ impl ConfigApi for HttpConfigApi {
         // client (it loads files offline). A call that does reach here must
         // not claim there are no rules.
         Err(ConfigError::Failed {
-            detail: "GET /api/v1/rules is not served; this command does not invent an empty rule list".to_owned(),
+            detail:
+                "GET /api/v1/rules is not served; this command does not invent an empty rule list"
+                    .to_owned(),
         })
     }
 }
@@ -239,17 +243,18 @@ fn client_to_config(err: crate::client::ClientError) -> ConfigError {
         crate::client::ClientError::Unreachable { .. } => ConfigError::Unreachable {
             detail: clip_config(&err.to_string()),
         },
-        crate::client::ClientError::Status { status: 401 | 403, .. } => ConfigError::Forbidden {
+        crate::client::ClientError::Status {
+            status: 401 | 403, ..
+        } => ConfigError::Forbidden {
             detail: clip_config(&err.to_string()),
         },
         crate::client::ClientError::Status { status: 400, .. } => ConfigError::Invalid {
             detail: clip_config(&err.to_string()),
         },
-        crate::client::ClientError::Status { .. } | crate::client::ClientError::Transport { .. } => {
-            ConfigError::Failed {
-                detail: clip_config(&err.to_string()),
-            }
-        }
+        crate::client::ClientError::Status { .. }
+        | crate::client::ClientError::Transport { .. } => ConfigError::Failed {
+            detail: clip_config(&err.to_string()),
+        },
     }
 }
 

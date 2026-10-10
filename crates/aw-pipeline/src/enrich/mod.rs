@@ -12,6 +12,6 @@ pub use domain::{
 pub use proc_cache::{ProcCache, ProcCacheConfig, ProcInfo, DEFAULT_CAPACITY, DEFAULT_LINGER_SECS};
 pub use proxy::{
     apply_via_proxy, note_url_na, plan, url_evidence, DirectMark, FlowMark, HttpAttribution,
-    LoopbackFlow, ProxyObservation, ProxyPlan, ProxySelf, ProxySession, ViaProxy, DOMAIN_SOURCE_PROXY,
-    QUIC_PORT, URL_FIELD,
+    LoopbackFlow, ProxyObservation, ProxyPlan, ProxySelf, ProxySession, ViaProxy,
+    DOMAIN_SOURCE_PROXY, QUIC_PORT, URL_FIELD,
 };

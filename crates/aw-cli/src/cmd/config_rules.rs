@@ -70,10 +70,7 @@ pub(crate) fn test(
         match read_expect(Path::new(expect)) {
             Ok(expected) => {
                 if canonical(&actual) != canonical(&expected) {
-                    let detail = format!(
-                        "findings do not match {}",
-                        Path::new(expect).display()
-                    );
+                    let detail = format!("findings do not match {}", Path::new(expect).display());
                     let mut outcome =
                         super::error_outcome(exit::GENERAL, "expect_mismatch", &detail, json_mode);
                     // The actual findings stay on stdout so the difference is visible
@@ -240,15 +237,12 @@ fn read_fixture(path: &Path) -> Result<Vec<FixtureRecord>, String> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let value: Value = serde_json::from_str(trimmed).map_err(|_| {
-            format!(
-                "{}:{line_no}: fixture line is not JSON",
-                path.display()
-            )
-        })?;
-        records.push(fixture_record(&value).map_err(|detail| {
-            format!("{}:{line_no}: {detail}", path.display())
-        })?);
+        let value: Value = serde_json::from_str(trimmed)
+            .map_err(|_| format!("{}:{line_no}: fixture line is not JSON", path.display()))?;
+        records.push(
+            fixture_record(&value)
+                .map_err(|detail| format!("{}:{line_no}: {detail}", path.display()))?,
+        );
     }
     Ok(records)
 }
@@ -281,9 +275,10 @@ fn proc_node(value: &Value) -> Result<ProcNode, String> {
 }
 
 fn rule_record(object: &Map<String, Value>) -> Result<RuleRecord, String> {
-    let record_type = required_str(object, "record")
-        .or_else(|_| required_str(object, "record_type"))?;
-    let id = optional_u64(object, "id")?.or_else(|| optional_u64(object, "record_id").ok().flatten());
+    let record_type =
+        required_str(object, "record").or_else(|_| required_str(object, "record_type"))?;
+    let id =
+        optional_u64(object, "id")?.or_else(|| optional_u64(object, "record_id").ok().flatten());
     let id = id.ok_or_else(|| "record is missing id".to_owned())?;
     let ts_ns = required_u64(object, "ts_ns")?;
     let mut record = RuleRecord::new(record_type, id, ts_ns);
@@ -394,8 +389,8 @@ fn optional_u64(object: &Map<String, Value>, key: &str) -> Result<Option<u64>, S
 }
 
 fn read_expect(path: &Path) -> Result<Value, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|err| format!("read expect {}: {err}", path.display()))?;
+    let text =
+        fs::read_to_string(path).map_err(|err| format!("read expect {}: {err}", path.display()))?;
     serde_json::from_str(&text).map_err(|_| format!("{} is not JSON", path.display()))
 }
 
@@ -478,7 +473,11 @@ fn list_outcome(set: &RuleSet, json_mode: bool) -> Outcome {
 fn list_text(set: &RuleSet) -> String {
     let mut lines = String::new();
     for rule in set.rules() {
-        let kind = if rule.user_override { "user" } else { "builtin" };
+        let kind = if rule.user_override {
+            "user"
+        } else {
+            "builtin"
+        };
         lines.push_str(&format!("{kind} {} v{}\n", rule.id, rule.version));
         if let Some(over) = set.overrides().iter().find(|item| item.rule_id == rule.id) {
             lines.push_str(&format!(

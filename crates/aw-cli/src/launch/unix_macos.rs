@@ -453,9 +453,11 @@ impl PosixSpawnApi {
     }
 
     fn child_mut(&mut self) -> Result<&mut std::process::Child, LaunchError> {
-        self.child.as_mut().ok_or_else(|| LaunchError::ContinueFailed {
-            detail: "no child exists for this step".to_owned(),
-        })
+        self.child
+            .as_mut()
+            .ok_or_else(|| LaunchError::ContinueFailed {
+                detail: "no child exists for this step".to_owned(),
+            })
     }
 
     fn spawn_command(&mut self, request: &LaunchRequest) -> Result<u32, LaunchError> {

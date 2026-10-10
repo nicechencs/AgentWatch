@@ -101,7 +101,11 @@ impl AgentEventRow {
     ///
     /// [`IngestError::Oversize`] when the encoded call is still over 4 KB.
     /// [`IngestError::Encode`] when the summary cannot be serialized.
-    pub fn from_bounded(session_id: Option<String>, channel: &str, call: &AgentToolCall) -> Result<Self, IngestError> {
+    pub fn from_bounded(
+        session_id: Option<String>,
+        channel: &str,
+        call: &AgentToolCall,
+    ) -> Result<Self, IngestError> {
         let summary_json = serde_json::to_string(&call.summary).map_err(|_| IngestError::Encode)?;
         let row = Self {
             session_id,
@@ -141,7 +145,10 @@ pub enum StoreAgentEvent {
     /// Accepted into the in-memory buffer. The database was not written.
     ///
     /// `table` is [`AGENT_EVENTS_TABLE`]. `reason` says the migration is absent.
-    StorageNotReady { table: &'static str, reason: &'static str },
+    StorageNotReady {
+        table: &'static str,
+        reason: &'static str,
+    },
     /// A future migration inserted the row. Not constructed today.
     Stored { table: &'static str },
 }
@@ -247,7 +254,9 @@ pub(crate) fn ingest_hook(
         match AgentEventRow::from_bounded(session_id.map(str::to_owned), "hook", &bounded) {
             Ok(row) => outcomes.push(store.insert(row)),
             Err(IngestError::Oversize) => store.record_gap(session_id, "oversize"),
-            Err(IngestError::NotJson | IngestError::Encode) => store.record_gap(session_id, "encode"),
+            Err(IngestError::NotJson | IngestError::Encode) => {
+                store.record_gap(session_id, "encode")
+            }
         }
     }
     outcomes
@@ -469,7 +478,9 @@ fn parse_head(buf: &[u8], header_end: usize, length: usize) -> Result<OtlpReques
 }
 
 fn header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|window| window == b"\r\n\r\n").map(|i| i + 4)
+    buf.windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|i| i + 4)
 }
 
 fn content_length(buf: &[u8]) -> Option<usize> {
@@ -489,7 +500,10 @@ fn handle(request: &OtlpRequest, shared: &Mutex<OtlpShared>) -> u16 {
     if !request.method.eq_ignore_ascii_case("POST") {
         return 405;
     }
-    if !matches!(request.path.as_str(), "/v1/logs" | "/v1/traces" | "/v1/metrics") {
+    if !matches!(
+        request.path.as_str(),
+        "/v1/logs" | "/v1/traces" | "/v1/metrics"
+    ) {
         return 404;
     }
     if is_protobuf(&request.content_type) {
@@ -553,15 +567,19 @@ fn otel_tool_calls(agent: &str, value: &Value) -> Vec<AgentToolCall> {
         return out;
     };
     for resource in records {
-        let Some(scopes) = resource.get("scopeLogs").and_then(Value::as_array).or_else(|| {
-            resource.get("scope_logs").and_then(Value::as_array)
-        }) else {
+        let Some(scopes) = resource
+            .get("scopeLogs")
+            .and_then(Value::as_array)
+            .or_else(|| resource.get("scope_logs").and_then(Value::as_array))
+        else {
             continue;
         };
         for scope in scopes {
-            let Some(logs) = scope.get("logRecords").and_then(Value::as_array).or_else(|| {
-                scope.get("log_records").and_then(Value::as_array)
-            }) else {
+            let Some(logs) = scope
+                .get("logRecords")
+                .and_then(Value::as_array)
+                .or_else(|| scope.get("log_records").and_then(Value::as_array))
+            else {
                 continue;
             };
             for log in logs {

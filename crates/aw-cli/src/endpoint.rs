@@ -45,6 +45,7 @@ pub const LINUX_SOCKET: &str = "/run/agentwatch/api.sock";
 pub const MACOS_SOCKET: &str = "/var/run/agentwatch/api.sock";
 
 /// Windows CLI named pipe (api-and-cli §1).
+#[cfg(target_os = "windows")]
 pub const WINDOWS_PIPE: &str = r"\\.\pipe\agentwatch-api";
 
 /// Environment variable read when `--token` is absent on an HTTP address.

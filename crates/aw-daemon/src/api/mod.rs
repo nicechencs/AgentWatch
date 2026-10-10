@@ -13,13 +13,13 @@
 
 mod agent;
 mod auth;
+mod findings;
 mod http;
+mod http_events;
 mod openapi;
 mod proxy;
 mod query;
 mod routes;
-mod http_events;
-mod findings;
 
 pub(crate) use agent::OtlpRegistry;
 pub(crate) use findings::share;

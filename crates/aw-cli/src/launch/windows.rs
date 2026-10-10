@@ -526,7 +526,9 @@ impl JobApi for CommandJobApi {
         // must not be reported as having run. `run_launch` only calls this
         // after a successful assign, which this type does not return.
         Err(LaunchError::WaitFailed {
-            detail: "ResumeThread was not called; the process was not suspended and is not in a Job".to_owned(),
+            detail:
+                "ResumeThread was not called; the process was not suspended and is not in a Job"
+                    .to_owned(),
         })
     }
 

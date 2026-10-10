@@ -14,6 +14,7 @@
 //! by itself; callers pass a configured path (tests and `--foreground` use a
 //! temp directory via `storage.data_dir`).
 
+#[cfg(target_os = "windows")]
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};

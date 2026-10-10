@@ -10,6 +10,7 @@
  * is not in package.json. Install it on demand: pnpm -C ui add -D openapi-typescript
  */
 import { spawnSync } from "node:child_process";
+import process from "node:process";
 
 const url = process.argv[2] ?? "http://127.0.0.1:7456/api/v1/openapi.json";
 const result = spawnSync(

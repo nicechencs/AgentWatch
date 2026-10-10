@@ -183,10 +183,7 @@ impl HostSampler {
         self.mono_ns = self.mono_ns.saturating_add(sample_period_ns());
         let wall_ns = wall_now_ns();
         let mut sink = VecSink::with_capacity(SINK_CAPACITY);
-        if let Err(err) = self
-            .collector
-            .poll_once(&mut sink, self.mono_ns, wall_ns)
-        {
+        if let Err(err) = self.collector.poll_once(&mut sink, self.mono_ns, wall_ns) {
             tracing::warn!(error = %err, "poll sample failed");
             self.pending_store_failure = true;
             return;
@@ -483,9 +480,7 @@ fn find_proc<'a>(
 ) -> Option<&'a ProcFact> {
     let start_secs = u64::try_from(start.start_time_ns).ok()? / 1_000_000_000;
     table.iter().find(|row| {
-        !used.contains(&row.pid)
-            && row.ppid == start.ppid
-            && row.start_secs == start_secs
+        !used.contains(&row.pid) && row.ppid == start.ppid && row.start_secs == start_secs
     })
 }
 
@@ -711,10 +706,7 @@ fn map_events(events: &[aw_core::RawEvent], now_ns: u64) -> WriteBatch {
         }
     }
     if skipped_pid.saturating_add(skipped_depth) > 0 {
-        gaps.push(depth_gap(
-            now_ns,
-            skipped_pid.saturating_add(skipped_depth),
-        ));
+        gaps.push(depth_gap(now_ns, skipped_pid.saturating_add(skipped_depth)));
     }
     batch.gaps = gaps;
     batch
@@ -1076,6 +1068,24 @@ fn json_string_array(items: &[String]) -> String {
     format!("[{body}]")
 }
 
+fn json_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => {
+                out.push_str(&format!("\\u{:04x}", u32::from(c)));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod depth_tests {
     use super::depths_by_pid;
@@ -1119,22 +1129,3 @@ mod depth_tests {
         assert!(!depths.contains_key(&8));
     }
 }
-
-fn json_string(text: &str) -> String {
-    let mut out = String::from("\"");
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            c if c.is_control() => {
-                out.push_str(&format!("\\u{:04x}", u32::from(c)));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-

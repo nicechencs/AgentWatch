@@ -45,6 +45,7 @@ impl SourceError {
         }
     }
 
+    #[cfg(windows)]
     pub(crate) const fn permission() -> Self {
         Self {
             kind: SourceFailure::Permission,

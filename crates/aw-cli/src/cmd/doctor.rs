@@ -121,9 +121,11 @@ impl DoctorSource for HttpDoctor {
             let transport = crate::client::LoopbackHttp::new(&self.endpoint)?;
             let mut client = crate::client::Client::new(self.endpoint.clone(), transport);
             let reply = client.call(&crate::client::ApiRequest::get("/api/v1/doctor"))?;
-            reply.json().ok_or_else(|| crate::client::ClientError::Transport {
-                detail: "daemon returned a non-JSON body".to_owned(),
-            })
+            reply
+                .json()
+                .ok_or_else(|| crate::client::ClientError::Transport {
+                    detail: "daemon returned a non-JSON body".to_owned(),
+                })
         })();
         match fetched {
             Ok(body) => report_from_doctor_json(&body),
@@ -158,9 +160,7 @@ fn report_from_doctor_json(body: &Value) -> DoctorReport {
             } else {
                 "unavailable".to_owned()
             },
-            detail: reason.or_else(|| {
-                Some("daemon doctor listed no collectors".to_owned())
-            }),
+            detail: reason.or_else(|| Some("daemon doctor listed no collectors".to_owned())),
         });
     }
     let mut categories = default_categories();

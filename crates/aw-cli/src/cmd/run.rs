@@ -244,7 +244,9 @@ impl Launcher for PlatformLauncher {
 
     fn forward_interrupt(&mut self, _pid: u32) -> Result<(), LaunchDispatchError> {
         Err(LaunchDispatchError::NotImplemented {
-            detail: "interrupt forwarding is not wired; the child is waited without a signal forwarder".to_owned(),
+            detail:
+                "interrupt forwarding is not wired; the child is waited without a signal forwarder"
+                    .to_owned(),
         })
     }
 }
@@ -423,7 +425,8 @@ const PROXY_PORT_UNBOUND: &str = "监听未启动，没有可用端口";
 
 /// One line on stderr. Says the child was not started and nothing on the
 /// system was changed. Does not claim the listener is missing from this build.
-const PROXY_PLAN_NOTE: &str = "子进程启动尚未接入，本次只给出注入计划，没有设置系统代理，没有改证书库";
+const PROXY_PLAN_NOTE: &str =
+    "子进程启动尚未接入，本次只给出注入计划，没有设置系统代理，没有改证书库";
 
 /// `<session_tmp>` is the directory a later card will pass to
 /// [`aw_proxy::write_session_material`]. These are the planned paths only.
@@ -487,7 +490,10 @@ fn proxy_plan(args: &RunArgs<'_>, flags: DeferredFlags) -> Result<Option<ProxyPl
 /// already lists names only, and this follows that.
 fn write_proxy_plan(out: &mut dyn Write, plan: &ProxyPlan) -> io::Result<()> {
     writeln!(out, "[aw] {PROXY_PLAN_NOTE}")?;
-    writeln!(out, "[aw] 代理端口：{PROXY_PORT_UNBOUND}。未绑定的端口不会被印成可用代理")?;
+    writeln!(
+        out,
+        "[aw] 代理端口：{PROXY_PORT_UNBOUND}。未绑定的端口不会被印成可用代理"
+    )?;
     writeln!(
         out,
         "[aw] --proxy-on-reject {}。CA 计划路径 {SESSION_CA_PEM}，bundle 计划路径 {SESSION_BUNDLE_PEM}。证书库未修改",

@@ -49,7 +49,12 @@ impl TempDir {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("aw-rule-load-{nanos}"));
+        // Parallel tests can read the same clock value (macOS timer resolution),
+        // so add the pid and a per-process counter.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("aw-rule-load-{}-{nanos}-{seq}", std::process::id()));
         fs::create_dir(&path).expect("temp dir");
         Self { path }
     }

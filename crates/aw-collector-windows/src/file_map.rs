@@ -1071,6 +1071,172 @@ fn strip_prefix_ci<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aw_core::{EventKind, Evidence, NaReason};
+
+    fn clock(at: u64) -> DecodeClock {
+        DecodeClock {
+            ts_mono_ns: at,
+            ts_wall_ns: Some(1_700_000_000_000_000_000),
+        }
+    }
+
+    fn props(event_id: u16) -> FileProperties {
+        FileProperties::bare(event_id)
+    }
+
+    fn emitted(decoded: DecodedFile) -> Vec<RawEvent> {
+        match decoded {
+            DecodedFile::Emitted(events) => events,
+            other => panic!("expected emitted events, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reused_file_object_does_not_keep_the_previous_path() {
+        let mut decoder = FileDecoder::new();
+        let mut create = props(file::EVENT_CREATE);
+        create.pid = Some(40);
+        create.file_object = Some(0x1000);
+        create.file_name = Some(r"\Device\HarddiskVolume3\first.txt".to_owned());
+        create.create_disposition = Some(file::FILE_OPEN);
+        assert!(matches!(
+            decoder.decode(&create, 1, clock(1_000), None),
+            DecodedFile::Emitted(_)
+        ));
+        let mut close = props(file::EVENT_CLOSE);
+        close.pid = Some(40);
+        close.file_object = Some(0x1000);
+        assert!(matches!(
+            decoder.decode(&close, 2, clock(2_000), None),
+            DecodedFile::Emitted(_)
+        ));
+
+        let mut again = props(file::EVENT_CREATE);
+        again.pid = Some(40);
+        again.file_object = Some(0x1000);
+        again.file_name = Some(r"\Device\HarddiskVolume3\second.txt".to_owned());
+        again.create_disposition = Some(file::FILE_OPEN);
+        let opened = emitted(decoder.decode(&again, 3, clock(3_000), None));
+        let path = opened.iter().find_map(|event| match &event.kind {
+            EventKind::FileOpen(open) => Some(open.path.clone()),
+            _ => None,
+        });
+        assert_eq!(path.as_deref(), Some(r"\Device\HarddiskVolume3\second.txt"));
+    }
+
+    #[test]
+    fn system_delayed_writes_stay_with_the_creating_process() {
+        let mut decoder = FileDecoder::new();
+        let owner = KnownProcess {
+            uid: ProcUid(70),
+            pid: 40,
+        };
+        let mut create = props(file::EVENT_CREATE);
+        create.pid = Some(40);
+        create.file_object = Some(0x2000);
+        create.file_name = Some(r"\Device\HarddiskVolume3\held.txt".to_owned());
+        create.create_disposition = Some(file::FILE_OPEN);
+        decoder.decode(&create, 1, clock(1_000), Some(owner));
+
+        let mut write = props(file::EVENT_WRITE);
+        write.pid = Some(PID_SYSTEM);
+        write.file_object = Some(0x2000);
+        write.io_size = Some(32);
+        assert!(matches!(
+            decoder.decode(&write, 2, clock(2_000), None),
+            DecodedFile::Accumulated
+        ));
+
+        let mut close = props(file::EVENT_CLOSE);
+        close.pid = Some(PID_SYSTEM);
+        close.file_object = Some(0x2000);
+        let events = emitted(decoder.decode(&close, 3, clock(3_000), None));
+        let write = events
+            .iter()
+            .find(|event| matches!(event.kind, EventKind::FileWrite(_)));
+        let write = write.expect("aggregated write");
+        assert_eq!(write.proc.as_ref().map(|proc| proc.pid), Some(40));
+        assert_eq!(
+            write.field_evidence.get("proc"),
+            Some(&Evidence::NA(NaReason::AttributionBreak))
+        );
+        match &write.kind {
+            EventKind::FileWrite(row) => assert_eq!(row.bytes, Some(32)),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn volume_and_unc_paths_are_rewritten_without_querying_devices() {
+        let mut decoder = FileDecoder::new();
+        decoder.set_volumes(vec![VolumeMapping {
+            device: r"\Device\HarddiskVolume3".to_owned(),
+            drive: "C:".to_owned(),
+        }]);
+        let mut create = props(file::EVENT_CREATE);
+        create.pid = Some(40);
+        create.file_object = Some(0x3000);
+        create.file_name = Some(r"\Device\HarddiskVolume3\dir\a.txt".to_owned());
+        create.create_disposition = Some(file::FILE_OPEN);
+        let opened = emitted(decoder.decode(&create, 1, clock(1_000), None));
+        let path = opened.iter().find_map(|event| match &event.kind {
+            EventKind::FileOpen(open) => Some(open.path.clone()),
+            _ => None,
+        });
+        assert_eq!(path.as_deref(), Some(r"C:\dir\a.txt"));
+
+        let mut unc = props(file::EVENT_CREATE);
+        unc.pid = Some(40);
+        unc.file_object = Some(0x3001);
+        unc.file_name = Some(r"\Device\Mup\server\share\a.txt".to_owned());
+        unc.create_disposition = Some(file::FILE_OPEN);
+        let opened = emitted(decoder.decode(&unc, 2, clock(2_000), None));
+        let path = opened.iter().find_map(|event| match &event.kind {
+            EventKind::FileOpen(open) => Some(open.path.clone()),
+            _ => None,
+        });
+        assert_eq!(path.as_deref(), Some(r"\\server\share\a.txt"));
+    }
+
+    #[test]
+    fn reads_of_one_object_collapse_to_one_close_record() {
+        let mut decoder = FileDecoder::new();
+        let mut create = props(file::EVENT_CREATE);
+        create.pid = Some(40);
+        create.file_object = Some(0x4000);
+        create.file_name = Some(r"\Device\HarddiskVolume9\notes.txt".to_owned());
+        create.create_disposition = Some(file::FILE_OPEN);
+        decoder.decode(&create, 1, clock(1_000), None);
+        for index in 0..3_u64 {
+            let mut read = props(file::EVENT_READ);
+            read.pid = Some(40);
+            read.file_object = Some(0x4000);
+            read.io_size = Some(10);
+            read.byte_offset = Some(index * 10);
+            assert!(matches!(
+                decoder.decode(&read, 2 + index, clock(2_000 + index), None),
+                DecodedFile::Accumulated
+            ));
+        }
+        let mut close = props(file::EVENT_CLOSE);
+        close.pid = Some(40);
+        close.file_object = Some(0x4000);
+        let events = emitted(decoder.decode(&close, 6, clock(5_000), None));
+        let reads: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::FileRead(_)))
+            .collect();
+        assert_eq!(reads.len(), 1);
+        match &reads[0].kind {
+            EventKind::FileRead(row) => assert_eq!(row.bytes, Some(30)),
+            _ => unreachable!(),
+        }
+    }
+}
+
 /// Strip `device` from the front of `path`, requiring a `\` boundary so
 /// `HarddiskVolume1` does not match `HarddiskVolume10`.
 fn strip_device<'a>(path: &'a str, device: &str) -> Option<&'a str> {

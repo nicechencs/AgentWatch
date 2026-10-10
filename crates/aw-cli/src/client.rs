@@ -88,13 +88,13 @@ impl ApiRequest {
     }
 }
 
-/// Status and body from one exchange. Response headers are not kept: this card
-/// only needs the status and the JSON the stub returns.
+/// Status and body from one exchange. Response headers are not kept: the client
+/// only needs the status and the returned JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiReply {
     /// HTTP status.
     pub status: u16,
-    /// Body bytes. JSON for the daemon stub.
+    /// Body bytes. JSON for daemon API responses.
     pub body: Vec<u8>,
 }
 

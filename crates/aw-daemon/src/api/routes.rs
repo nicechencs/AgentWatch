@@ -1,9 +1,8 @@
 //! Method + path + headers + body → status + body.
 //!
-//! No socket is required to call [`dispatch`]. [`accept_one`] binds `127.0.0.1:0`
-//! only long enough to prove the address, then closes it. The daemon binary does
-//! not start this listener. axum is not in the offline lock; this is a loopback
-//! HTTP stub, not the three transports.
+//! No socket is required to call [`dispatch`]. The daemon's loopback listener
+//! ([`super::http`]) and its internal channel both call it. axum is not in the
+//! offline lock; the listener is `std::net`, not the three transports.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -736,7 +735,7 @@ pub fn dispatch(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
         return ingest_agent_hook(state, req);
     }
 
-    // Socket/pipe ticket issuance is not an HTTP-bearer flow. Over this stub,
+    // Socket/pipe ticket issuance is not an HTTP-bearer flow. Over HTTP,
     // a presented bearer (or an explicit test caller header is not invented):
     // HTTP callers redeem tokens; issuing a ticket requires an already-known
     // bearer so the ticket is bound to that user. A missing bearer is 401.
@@ -3080,7 +3079,10 @@ mod tests {
         assert_eq!(status, 403, "{body}");
         assert_eq!(body["error"]["code"], "not_your_process");
         let message = body["error"]["message"].as_str().unwrap_or_default();
-        assert!(message.contains("不属于你的账户"), "{message}");
+        assert!(
+            message.contains("another account") && message.contains("administrator"),
+            "{message}"
+        );
         assert_eq!(session_count(&db), before, "a refused attach writes no row");
 
         let (status, body) = post(

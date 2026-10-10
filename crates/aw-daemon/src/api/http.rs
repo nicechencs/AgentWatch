@@ -1,9 +1,8 @@
 //! Loopback HTTP listener (P2-DAEMON-01).
 //!
-//! axum is not a dependency of this crate. The card asks for it; the workspace
-//! lock and the P1 stub both say it is not available offline, and root
-//! `Cargo.toml` is out of scope. This module is the transport: `std::net` on a
-//! thread, the same [`super::routes::dispatch`] the stub tests call, plus the
+//! axum is not a dependency of this crate. This module is the transport:
+//! `std::net` on a thread, calling the same [`super::routes::dispatch`] as the
+//! route tests, plus the
 //! security headers the card requires (`Content-Security-Policy`,
 //! `X-Frame-Options: DENY`, no CORS).
 //!

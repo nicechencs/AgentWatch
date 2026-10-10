@@ -1,9 +1,7 @@
 //! Linux cgroup v2 launch state machine (P1-LNX-04, linux.md §4.1).
 //!
-//! Wired by P1-CLI-02's `launch/mod.rs` under `cfg(target_os = "linux")`. The
-//! `mod unix_linux;` line in `launch/mod.rs` is unconditional for now, so the
-//! state machine compiles and its tests run on Windows. P1-CLI-02 should gate
-//! that line with `cfg(target_os = "linux")` when it dispatches `aw run`.
+//! Wired by `launch/mod.rs` under `cfg(target_os = "linux")`. Production `aw run`
+//! uses [`LocalCgroupHost`].
 //!
 //! The steps, in order:
 //!
@@ -37,10 +35,9 @@
 //!
 //! # What is not verified
 //!
-//! SPIKE-05 did not run on Linux. cgroup v2, `StartTransientUnit`, and the
-//! pipe-then-exec handshake are 【待验证】. [`UnverifiedCgroupLaunch`] is the
-//! Linux stub. Every method returns [`LaunchError::NotVerified`]. It does not
-//! fork. Default tests do not construct it.
+//! [`UnverifiedCgroupLaunch`] is the test double. Every method returns
+//! [`LaunchError::NotVerified`] and it does not fork. Default tests do not
+//! construct it. Production uses [`LocalCgroupHost`], which is not that type.
 //!
 //! # Adopt timeout
 //!
@@ -579,11 +576,10 @@ pub fn run_launch<L: CgroupLaunch>(
     })
 }
 
-/// Linux stub. Compiles only on Linux. Starts nothing.
+/// Test double. Compiles only on Linux. Starts nothing.
 ///
-/// SPIKE-05 did not run on Linux. Until cgroup v2 and `StartTransientUnit` are
-/// measured, this type refuses every step with [`LaunchError::NotVerified`]
-/// instead of forking from a default test or from an unwired command.
+/// Refuses every step with [`LaunchError::NotVerified`] so a default test does
+/// not fork. Production uses [`LocalCgroupHost`], not this type.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Default)]
 pub struct UnverifiedCgroupLaunch;

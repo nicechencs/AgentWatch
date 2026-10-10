@@ -1,7 +1,6 @@
 //! `aw sessions list|show|rename|pin|unpin|delete` (P1-CLI-03).
 //!
-//! Records come from a [`QuerySource`]. The live daemon is not queried: its
-//! session routes are still a stub.
+//! Records come from a [`QuerySource`]. Production passes the daemon client.
 
 use std::io;
 

@@ -146,7 +146,7 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
         || is_wired_ops(&cli.command)
         || is_live_session_command(&cli.command);
     if !needs_endpoint {
-        // Stubs that probe `/health`, and ops that stay unwired (daemon).
+        // Offline commands and the injected test path do not resolve an endpoint.
         let mut source = query::UnavailableSource;
         return dispatch(cli, env_token, &mut LiveHttp, &mut source, &mut LiveControl);
     }
@@ -1074,7 +1074,8 @@ fn version_outcome(check: bool, json: bool) -> Outcome {
 }
 
 /// `GET /health`. Socket and pipe endpoints fail inside [`Client::call`] and never
-/// call `open`. A 2xx body is discarded: the command itself is still a stub.
+/// call `open`. A 2xx body is discarded because the injected dispatcher only
+/// uses this probe for commands it does not wire itself.
 fn probe(endpoint: &Endpoint, http: &mut dyn HttpFactory) -> Result<(), ClientError> {
     let transport: Box<dyn Transport> = match endpoint {
         Endpoint::Http { .. } => http.open(endpoint)?,
@@ -1241,7 +1242,7 @@ mod tests {
     fn health_200_then_unimplemented_is_exit_1() {
         let mut http = script(200, r#"{"status":"ok"}"#);
         // `ps` is implemented (P1-CLI-02) and does not probe `/health`.
-        // `ui` is still a stub, so a live daemon stays exit 1.
+        // This socket-free test dispatcher does not wire `ui`.
         let outcome = run(
             &["--http", "http://127.0.0.1:7456", "--token", TOKEN, "ui"],
             None,
@@ -1376,7 +1377,7 @@ mod tests {
     fn json_errors_use_the_machine_code() {
         let mut http = script(200, r#"{"status":"ok"}"#);
         // `doctor` is implemented (P1-CLI-04) and does not probe `/health`.
-        // A still-stub command keeps the machine error code.
+        // An unwired command in this injected dispatcher keeps the machine error code.
         let outcome = run(
             &[
                 "--json",

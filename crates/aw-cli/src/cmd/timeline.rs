@@ -1,10 +1,9 @@
 //! `aw timeline <S> [--filter --from --to --follow --limit]` (P1-CLI-03).
 //!
-//! `--follow` renders the same lines a live subscription would. The daemon has
-//! no `/sessions/{sid}/live` handler, so the production source returns
-//! `not_connected` and says the real subscription is not wired (真实订阅未接通).
-//! Tests inject a [`QuerySource`] and check the rendered gap marker and evidence
-//! column. The NFR-05 delay (< 2 s) is not measured here.
+//! `--follow` renders a [`QuerySource`] subscription. The daemon provides an
+//! SSE endpoint at `/sessions/{sid}/live`, but the current HTTP client does not
+//! consume streams, so its source returns `Unavailable`. Tests inject a source
+//! and check the rendered gap marker and evidence column.
 
 use std::io;
 
@@ -103,9 +102,9 @@ fn follow(
     color: bool,
     source: &dyn QuerySource,
 ) -> io::Result<Outcome> {
-    // One poll of the injected source. A live daemon would loop; this build
-    // does not, because `/live` is not connected. The poll interval is recorded
-    // so a later card can stay under the 2 s bound.
+    // One poll of the injected source. The HTTP source cannot consume the SSE
+    // stream, so it returns `Unavailable`; the interval is retained for a
+    // stream-capable client.
     let _interval = super::query::follow_poll_interval();
     match source.follow(key, None) {
         Ok(rows) => {

@@ -1,9 +1,9 @@
 //! Library surface for the Linux launch state machine (P1-LNX-04).
 //!
-//! `aw` itself is the `aw` bin and does not link this crate. This lib exists so
-//! `crates/aw-cli/src/launch/unix_linux.rs` compiles and its tests run before
-//! P1-CLI-02 registers it from `launch/mod.rs` under `cfg(target_os = "linux")`.
-//! Nothing here is called by `main`.
+//! `aw` itself is the `aw` bin and does not link this crate. This lib exposes the
+//! Linux launch state machine so its tests run outside the bin.
+//! [`UnverifiedCgroupLaunch`] is the test double; it refuses every step and does
+//! not fork. Production `aw run` uses `LocalCgroupHost` from the bin.
 
 #![forbid(unsafe_code)]
 

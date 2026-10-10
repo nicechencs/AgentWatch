@@ -57,7 +57,9 @@ const ROWS: &[Row] = &[
     Row {
         code: "not_your_process",
         zh: "不能接管其他用户的进程，需要管理员权限",
-        en: Some("attaching to another user's process needs an administrator"),
+        // The daemon sends one of two messages with this code (attach names the
+        // administrator requirement, adopt does not), so either one is a detail.
+        en: Some("this process belongs to another account"),
     },
     Row {
         code: "unauthorized",
@@ -273,7 +275,11 @@ fn detail_adds(stock: Option<&str>, message: &str) -> bool {
     if message.is_empty() {
         return false;
     }
-    !matches!(stock, Some(stock) if message.eq_ignore_ascii_case(stock))
+    // The stock text may be the shared opening of several daemon messages for
+    // one code; a message that starts with it adds nothing to the sentence.
+    !matches!(stock, Some(stock) if message
+        .get(..stock.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(stock)))
 }
 
 #[cfg(test)]
@@ -358,12 +364,15 @@ mod tests {
 
     #[test]
     fn known_403_is_the_other_user_sentence() {
-        let text = render(
+        let daemon = "this process belongs to another account; recording another account's process needs an administrator";
+        let text = render(403, Some("not_your_process"), daemon);
+        assert_eq!(text, "不能接管其他用户的进程，需要管理员权限");
+        let adopt = render(
             403,
             Some("not_your_process"),
-            "attaching to another user's process needs an administrator",
+            "this process belongs to another account and cannot be adopted",
         );
-        assert_eq!(text, "不能接管其他用户的进程，需要管理员权限");
+        assert_eq!(adopt, "不能接管其他用户的进程，需要管理员权限", "{adopt}");
         // The same situation under the daemon's other code reads the same way,
         // and a message that adds something is kept as the detail.
         let other = render(403, Some("forbidden"), "administrator required");

@@ -1,9 +1,8 @@
 //! `aw export` (P1-CLI-04).
 //!
 //! The CLI does not open the database. Records come from an [`ExportSource`].
-//! The production source is a stub that has no session: the daemon and
-//! `aw-store` are not dependencies of this crate. Tests inject records and
-//! assert the bytes this module writes.
+//! Production uses [`HttpExport`], which fetches the daemon's export. Tests
+//! inject records and assert the bytes this module writes.
 //!
 //! `md` is refused with exit 2. `--format` defaults to `jsonl`.
 

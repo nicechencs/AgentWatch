@@ -169,9 +169,10 @@ fn check_pid_owner(
         return Ok(before);
     }
     let message = if allow_admin {
-        "这个进程不属于你的账户；记录别的账户的进程需要管理员权限"
+        "this process belongs to another account; recording another account's process needs an \
+         administrator"
     } else {
-        "这个进程不属于你的账户，不能接管"
+        "this process belongs to another account and cannot be adopted"
     };
     Err(error_response(403, "not_your_process", message))
 }

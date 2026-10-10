@@ -438,6 +438,16 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
         };
         pending.target.root_pid = pid;
         pending.target.root_hint = root_hint;
+        // Write the root's row now, while `aw run` still holds it at the gate:
+        // the foreground loop starts the sampler up to a poll later, and a
+        // root that exits (and posts `/exit`) before then would otherwise be
+        // zero processes with no exit code. The sampler's row is the same id.
+        if pending.target.root_hint.is_some() {
+            if let Ok(path) = db_path(state) {
+                let _ = crate::sample::HostSampler::for_target(path, pending.target.clone())
+                    .persist_root_hint();
+            }
+        }
         let response = ApiResponse::json(200, &json!({ "id": sid, "root_pid": pid }));
         state.watch_requests.push(WatchRequest::Start {
             target: Box::new(pending.target),

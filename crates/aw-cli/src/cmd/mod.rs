@@ -146,7 +146,7 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
         || is_wired_ops(&cli.command)
         || is_live_session_command(&cli.command);
     if !needs_endpoint {
-        // Stubs that probe `/health`, and ops that stay unwired (export, daemon).
+        // Offline commands and the injected test path do not resolve an endpoint.
         let mut source = query::UnavailableSource;
         return dispatch(cli, env_token, &mut LiveHttp, &mut source, &mut LiveControl);
     }
@@ -286,7 +286,7 @@ fn is_query(command: &Command) -> bool {
 
 fn is_wired_ops(command: &Command) -> bool {
     match command {
-        Command::Doctor { .. } | Command::Db(_) => true,
+        Command::Doctor { .. } | Command::Db(_) | Command::Export { .. } => true,
         Command::Config(tree::ConfigCmd::Rules(_)) => false,
         Command::Config(_) => true,
         _ => false,
@@ -875,6 +875,21 @@ fn query_command(
     }
 }
 
+/// `aw export`. A resolved endpoint fetches `GET /sessions/{sid}/export`.
+/// Without one (the injected test dispatcher) there is still no session.
+fn export_command(args: export::ExportArgs<'_>, endpoint: Option<&Endpoint>) -> Outcome {
+    let output_file = args.output.map(std::path::Path::new);
+    let Some(endpoint) = endpoint else {
+        return export::run(args, &mut export::EmptyExport);
+    };
+    let format = match export::parse_format(args.format) {
+        Ok(format) => format,
+        Err(_) => return export::run(args, &mut export::EmptyExport),
+    };
+    let mut source = export::DaemonExport::new(export::HttpExport::new(endpoint.clone()), format);
+    export::run_to(args, &mut source, output_file)
+}
+
 /// `export`, `doctor`, `daemon`, and `db` (P1-CLI-04).
 ///
 /// These do not touch a service manager or open SQLite. Each command calls an
@@ -905,7 +920,7 @@ fn ops_command(
             redact_paths,
             redact_hosts,
             ..
-        } => Some(export::run(
+        } => Some(export_command(
             export::ExportArgs {
                 session,
                 format: format.as_deref(),
@@ -915,7 +930,7 @@ fn ops_command(
                 redact_hosts: *redact_hosts,
                 json,
             },
-            &mut export::EmptyExport,
+            endpoint,
         )),
         Command::Doctor { perf } => {
             if let Some(endpoint) = endpoint {
@@ -1059,7 +1074,8 @@ fn version_outcome(check: bool, json: bool) -> Outcome {
 }
 
 /// `GET /health`. Socket and pipe endpoints fail inside [`Client::call`] and never
-/// call `open`. A 2xx body is discarded: the command itself is still a stub.
+/// call `open`. A 2xx body is discarded because the injected dispatcher only
+/// uses this probe for commands it does not wire itself.
 fn probe(endpoint: &Endpoint, http: &mut dyn HttpFactory) -> Result<(), ClientError> {
     let transport: Box<dyn Transport> = match endpoint {
         Endpoint::Http { .. } => http.open(endpoint)?,
@@ -1226,7 +1242,7 @@ mod tests {
     fn health_200_then_unimplemented_is_exit_1() {
         let mut http = script(200, r#"{"status":"ok"}"#);
         // `ps` is implemented (P1-CLI-02) and does not probe `/health`.
-        // `ui` is still a stub, so a live daemon stays exit 1.
+        // This socket-free test dispatcher does not wire `ui`.
         let outcome = run(
             &["--http", "http://127.0.0.1:7456", "--token", TOKEN, "ui"],
             None,
@@ -1361,7 +1377,7 @@ mod tests {
     fn json_errors_use_the_machine_code() {
         let mut http = script(200, r#"{"status":"ok"}"#);
         // `doctor` is implemented (P1-CLI-04) and does not probe `/health`.
-        // A still-stub command keeps the machine error code.
+        // An unwired command in this injected dispatcher keeps the machine error code.
         let outcome = run(
             &[
                 "--json",

@@ -1,16 +1,14 @@
 //! Injected read model for `sessions`, `timeline`, `procs`, `flows`, `gaps`,
 //! `files`, `around`, and `search`.
 //!
-//! The daemon's HTTP API is still a stub (`aw-daemon` `api/routes.rs` answers
-//! `/health` and does not serve these paths). These commands therefore do not
-//! dial it. A [`QuerySource`] supplies the records. Production uses
-//! [`UnavailableSource`], which reports that the daemon query API is not
-//! connected. Tests use an in-memory source. `aw-cli` does not depend on
-//! `aw-store`; the shapes here mirror the `file_access` columns in storage.md
-//! and the `/files`, `/around`, and `/search` responses in api-and-cli §3
-//! without importing the store.
+//! A [`QuerySource`] supplies the records. Production uses
+//! [`super::http_source::HttpQuerySource`], which dials the daemon. Tests use an
+//! in-memory source, and [`UnavailableSource`] stands in where a test has not
+//! injected one. `aw-cli` does not depend on `aw-store`; the shapes here mirror
+//! the `file_access` columns in storage.md and the `/files`, `/around`, and
+//! `/search` responses in api-and-cli §3 without importing the store.
 //!
-//! The request each command would send, once the daemon serves it:
+//! The request each command sends:
 //!
 //! - `GET /api/v1/sessions/{sid}/files?filter&group_by&sort&cursor&limit`
 //! - `GET /api/v1/sessions/{sid}/around?ref=<table>:<id>&window=<dur>`
@@ -30,8 +28,8 @@ use aw_core::NaReason;
 
 /// Why a query did not return records.
 ///
-/// `NotFound` and `BadArgument` are produced by the in-memory source, which is
-/// test-only. The production source only returns `Unavailable`.
+/// `NotFound` and `BadArgument` are produced by the in-memory source and by the
+/// daemon client. `Unavailable` is a source that was not given a daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum QueryError {
@@ -41,7 +39,7 @@ pub(crate) enum QueryError {
     NoSessions,
     /// `--group-by` / `--sort` / a time bound the command refused.
     BadArgument { detail: String },
-    /// No live query API is wired. The message says so; it is not a fake empty list.
+    /// No query source is available. The message says why; it is not a fake empty list.
     Unavailable { detail: String },
 }
 
@@ -72,8 +70,9 @@ pub(crate) struct SessionItem {
     pub started_ns: Option<i64>,
     /// End, or still running.
     pub ended_ns: Option<i64>,
-    /// Excluded from retention.
-    pub pinned: bool,
+    /// Excluded from retention. `None` when the reply did not carry `pinned`
+    /// (the store summary omits it); printed as 没采, never as unpinned.
+    pub pinned: Option<bool>,
     /// Record evidence. A session the user created is E1 (the tool observed it).
     pub evidence: Evidence,
 }
@@ -91,6 +90,9 @@ pub(crate) struct SessionShow {
     pub dns_count: Option<i64>,
     /// Gap rows.
     pub gap_count: Option<i64>,
+    /// The watched process's exit code. `None` when the reply omitted it or
+    /// sent null — not observed, never printed as `0`.
+    pub exit_code: Option<i64>,
     /// Sum of `bytes_up`. `None` when every flow left the column unknown.
     pub bytes_up: Option<i64>,
     /// Sum of `bytes_down`.
@@ -114,8 +116,7 @@ pub(crate) struct CapabilityFact {
 
 /// Constraints for [`QuerySource::list_sessions`].
 ///
-/// Fields are read by the in-memory source. The production source ignores them
-/// and returns [`QueryError::Unavailable`].
+/// Fields the in-memory source and the daemon client both read.
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub(crate) struct SessionQuery {
@@ -159,7 +160,7 @@ pub(crate) struct TimelinePage {
 
 /// Bounds for one timeline page.
 ///
-/// Fields are read by the in-memory source. The production source ignores them.
+/// Fields the in-memory source and the daemon client both read.
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub(crate) struct TimelineBounds {
@@ -301,9 +302,9 @@ pub(crate) trait QuerySource {
 
     /// Events that arrived after `after_ns` (exclusive). Used by `--follow`.
     ///
-    /// The live `/sessions/{sid}/live` stream is not connected. A source that
-    /// cannot subscribe returns [`QueryError::Unavailable`]. The memory source
-    /// returns whatever it was given, so tests can check the rendered lines.
+    /// The daemon's `/sessions/{sid}/live` endpoint is an SSE stream. A source
+    /// that cannot consume it returns [`QueryError::Unavailable`]. The memory
+    /// source returns whatever it was given, so tests can check rendered lines.
     ///
     /// # Errors
     ///
@@ -989,6 +990,8 @@ impl QuerySource for MemorySource {
                     .count() as i64,
             ),
             gap_count: Some(i64::try_from(session.gaps.len()).unwrap_or(i64::MAX)),
+            // The in-memory fixture has no session-level exit code.
+            exit_code: None,
             bytes_up,
             bytes_down,
             capabilities: session.capabilities.clone(),
@@ -1013,7 +1016,7 @@ impl QuerySource for MemorySource {
 
     fn set_pinned(&mut self, key: &str, pinned: bool) -> Result<SessionItem, QueryError> {
         let index = self.find(key)?;
-        self.sessions[index].item.pinned = pinned;
+        self.sessions[index].item.pinned = Some(pinned);
         Ok(self.sessions[index].item.clone())
     }
 
@@ -1623,16 +1626,6 @@ pub(crate) fn opt_i64(value: Option<i64>) -> String {
     }
 }
 
-/// Bool cell.
-#[must_use]
-pub(crate) fn yes_no(value: bool) -> &'static str {
-    if value {
-        "yes"
-    } else {
-        "no"
-    }
-}
-
 /// `--from` / `--to` as an absolute nanosecond, or a session-relative `+30s`
 /// measured from `started_ns`. `-10m` is relative to `now_ns`.
 ///
@@ -1753,9 +1746,8 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Result<i64, String> {
     Ok(era * 146_097 + doe - 719_468)
 }
 
-/// How long `--follow` waits between polls of the source. The acceptance bound
-/// is under 2 s against a live daemon; this interval is what the stub uses so
-/// a test does not sleep.
+/// Candidate polling interval for a stream-capable `--follow` source. Tests can
+/// inspect the fixed value without sleeping.
 #[must_use]
 pub(crate) fn follow_poll_interval() -> Duration {
     Duration::from_millis(200)
@@ -1784,7 +1776,7 @@ pub(crate) fn sample_source() -> MemorySource {
             agent: Some("example-agent".to_owned()),
             started_ns: Some(1_700_000_000_000_000_000),
             ended_ns: Some(1_700_000_060_000_000_000),
-            pinned: false,
+            pinned: Some(false),
             evidence: Evidence::E1,
         },
         capabilities: vec![
@@ -2149,9 +2141,9 @@ mod tests {
 
     #[test]
     fn timeline_follow_renders_the_stub_format() {
-        // Real `/live` is not connected. The memory source stands in so the
-        // line format (gap marker, evidence column) can be checked. Delay
-        // under 2 s is not measured.
+        // The HTTP client does not consume the SSE stream. The memory source
+        // stands in so the line format (gap marker, evidence column) can be
+        // checked. Delay under 2 s is not measured.
         let source = sample_source();
         let outcome = timeline::run(
             TimelineArgs {

@@ -1,7 +1,6 @@
 //! `aw sessions list|show|rename|pin|unpin|delete` (P1-CLI-03).
 //!
-//! Records come from a [`QuerySource`]. The live daemon is not queried: its
-//! session routes are still a stub.
+//! Records come from a [`QuerySource`]. Production passes the daemon client.
 
 use std::io;
 
@@ -143,10 +142,7 @@ fn pin(
     match source.set_pinned(session, pinned) {
         Ok(item) => {
             let action = if pinned { "pin" } else { "unpin" };
-            let doc = mutation_json(
-                action,
-                &json!({ "id": item.public_id, "pinned": item.pinned }),
-            );
+            let doc = mutation_json(action, &json!({ "id": item.public_id, "pinned": pinned }));
             let table = render::session_table(std::slice::from_ref(&item));
             Ok(write_ok(mode, &table, &doc)?)
         }
@@ -326,6 +322,98 @@ mod tests {
         assert_eq!(
             String::from_utf8(outcome.stderr).expect("utf8"),
             "aw: 找不到会话 `no-such-name`\n"
+        );
+    }
+
+    /// The store summary omits `pinned` and sends `exit_code: null`. The table
+    /// says 没采 for both; JSON keeps the nulls.
+    #[test]
+    fn show_missing_pinned_and_null_exit_code_are_not_collected() {
+        let detail = r#"{
+            "id":"s-theirs","name":null,"mode":"launch","agent":null,
+            "started_ns":10,"ended_ns":20,"exit_code":null,
+            "stats":{"process_count":1,"flow_count":0,"dns_count":0,"gap_count":0}
+        }"#;
+        let paths = Rc::new(RefCell::new(Vec::new()));
+        let script = Script {
+            paths: Rc::clone(&paths),
+            replies: RefCell::new(vec![(200, detail)]),
+        };
+        let mut source = HttpQuerySource::with_transport(endpoint(), script);
+        let table = run(
+            &SessionsCmd::Show {
+                session: "s-theirs".to_owned(),
+            },
+            false,
+            &mut source,
+        )
+        .expect("show");
+        assert_eq!(table.code, exit::OK);
+        let text = String::from_utf8(table.stdout).expect("utf8");
+        assert!(text.contains("没采"), "{text}");
+        // An absent pin is not "no", and a null exit code is not 0.
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.contains("pinned") && line.contains("no")),
+            "{text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.contains("exit_code")
+                && line.split_whitespace().any(|cell| cell == "0")),
+            "{text}"
+        );
+
+        let script = Script {
+            paths: Rc::clone(&paths),
+            replies: RefCell::new(vec![(200, detail)]),
+        };
+        let mut source = HttpQuerySource::with_transport(endpoint(), script);
+        let json = run(
+            &SessionsCmd::Show {
+                session: "s-theirs".to_owned(),
+            },
+            true,
+            &mut source,
+        )
+        .expect("show json");
+        let body: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+        assert!(body["session"]["pinned"].is_null(), "{body}");
+        assert!(body["session"]["exit_code"].is_null(), "{body}");
+    }
+
+    /// A collected exit code is printed as that code, including 0.
+    #[test]
+    fn show_prints_a_collected_exit_code() {
+        let detail = r#"{
+            "id":"s-mine","name":"demo","mode":"launch","agent":null,
+            "started_ns":10,"ended_ns":20,"exit_code":0,"pinned":true,
+            "stats":{"process_count":1,"flow_count":0,"dns_count":0,"gap_count":0}
+        }"#;
+        let paths = Rc::new(RefCell::new(Vec::new()));
+        let script = Script {
+            paths: Rc::clone(&paths),
+            replies: RefCell::new(vec![(200, detail)]),
+        };
+        let mut source = HttpQuerySource::with_transport(endpoint(), script);
+        let outcome = run(
+            &SessionsCmd::Show {
+                session: "s-mine".to_owned(),
+            },
+            false,
+            &mut source,
+        )
+        .expect("show");
+        let text = String::from_utf8(outcome.stdout).expect("utf8");
+        assert!(
+            text.lines().any(|line| line.contains("exit_code")
+                && line.split_whitespace().any(|cell| cell == "0")),
+            "{text}"
+        );
+        assert!(
+            text.lines()
+                .any(|line| line.contains("pinned") && line.contains("yes")),
+            "{text}"
         );
     }
 }

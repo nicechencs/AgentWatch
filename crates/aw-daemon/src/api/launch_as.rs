@@ -308,7 +308,7 @@ pub(crate) fn helper_main() -> std::process::ExitCode {
     let Ok(spec) = serde_json::from_str::<HelperSpec>(&input) else {
         return fail(serde_json::json!({"drop": "spec malformed"}));
     };
-    if spec.uid == 0 || spec.argv.is_empty() || spec.groups.first() != Some(&spec.gid) {
+    if !valid_helper_spec(&spec) {
         return fail(serde_json::json!({"drop": "spec refused"}));
     }
     if let Err(step) = switch_account(&spec) {
@@ -369,12 +369,25 @@ fn switch_account(spec: &HelperSpec) -> Result<(), &'static str> {
     if have != want {
         return Err("groups not switched");
     }
-    if nix::unistd::setuid(Uid::from_raw(0)).is_ok()
-        || nix::unistd::setgid(Gid::from_raw(0)).is_ok()
-    {
+    // A non-root account may legitimately have group 0 as its primary group.
+    // Calling setgid(0) is then a no-op it is allowed to make, not a privilege
+    // regain. A different primary gid must not be able to switch to gid 0.
+    let regained_uid = nix::unistd::setuid(Uid::from_raw(0)).is_ok();
+    let regained_gid = root_gid_regained(spec.gid, nix::unistd::setgid(Gid::from_raw(0)).is_ok());
+    if regained_uid || regained_gid {
         return Err("root regained");
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn valid_helper_spec(spec: &HelperSpec) -> bool {
+    spec.uid != 0 && !spec.argv.is_empty() && spec.groups.first() == Some(&spec.gid)
+}
+
+#[cfg(target_os = "linux")]
+fn root_gid_regained(primary_gid: u32, setgid_succeeded: bool) -> bool {
+    primary_gid != 0 && setgid_succeeded
 }
 
 /// macOS (root daemon): std's `uid`/`gid` (std clears supplementary groups),
@@ -602,5 +615,28 @@ mod tests {
         assert!(!who.name.is_empty());
         assert!(who.home.is_absolute());
         assert_eq!(who.groups.first(), Some(&who.gid));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_root_user_with_primary_group_zero_is_valid() {
+        let spec = super::HelperSpec {
+            uid: 1000,
+            gid: 0,
+            groups: vec![0],
+            argv: vec!["true".to_owned()],
+            cwd: "/".to_owned(),
+            env: Vec::new(),
+        };
+        assert!(super::valid_helper_spec(&spec));
+        assert!(
+            !super::root_gid_regained(spec.gid, true),
+            "setgid(0) is a permitted no-op for primary gid 0"
+        );
+        assert!(super::root_gid_regained(1000, true));
+        assert!(!super::valid_helper_spec(&super::HelperSpec {
+            uid: 0,
+            ..spec
+        }));
     }
 }

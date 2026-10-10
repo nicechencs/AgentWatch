@@ -2,9 +2,9 @@
 //!
 //! `--no-daemon` starts the target as the calling user through an injected
 //! [`Launcher`], then prints a session summary. The default daemon path first
-//! records `/sessions/run`, starts the child as the caller behind a Unix pipe
-//! gate, and hands it over through `/adopt` before releasing it to exec. On
-//! Windows the local production launcher is
+//! records `/sessions/run`, starts the child held (at a Unix pipe gate or with
+//! Windows `CREATE_SUSPENDED`), and hands it over through `/adopt` before
+//! releasing it. On Windows the local `--no-daemon` production launcher is
 //! [`launch::production`]: Job assignment is unavailable, so no process is
 //! created. On macOS it spawns with `Command` and says suspension was not
 //! applied. On Linux [`launch::LocalCgroupHost`] places the child in a delegated
@@ -29,12 +29,22 @@
 use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::process::{Child, Command};
 
+#[cfg(all(unix, not(target_os = "macos")))]
+use nix::fcntl::OFlag;
 #[cfg(unix)]
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+#[cfg(target_os = "macos")]
+use nix::unistd::pipe;
+#[cfg(all(unix, not(target_os = "macos")))]
+use nix::unistd::pipe2;
 #[cfg(unix)]
-use nix::unistd::{pipe, write};
+use nix::unistd::write;
 
 use aw_proxy::{plan_injection, Injection, ProxyOnReject};
 
@@ -244,12 +254,12 @@ pub(crate) trait SpawnedChild {
     /// general CLI failure because it has no numeric exit code to forward.
     fn wait(&mut self) -> Result<i32, String>;
 
-    /// Let a held Unix child exec its target after the daemon accepted
-    /// `/adopt`. Direct-spawn platforms have no gate, so this is a no-op.
+    /// Release a child held until the daemon accepted `/adopt`: the Unix pipe
+    /// gate lets it `exec`, while Windows resumes its primary thread.
     ///
     /// # Errors
     ///
-    /// The pipe gate could not be released. The caller must reap the child.
+    /// The launch gate could not be released. The caller must reap the child.
     fn release(&mut self) -> Result<(), String>;
 
     /// Stop and reap a child that the daemon refused to adopt.
@@ -300,40 +310,201 @@ fn os_code(error: &std::io::Error) -> String {
 pub(crate) struct CommandSpawner;
 
 #[cfg(not(unix))]
-struct ProcessChild(Child);
+struct ProcessChild {
+    child: Child,
+    #[cfg(windows)]
+    suspended: bool,
+}
 
 #[cfg(not(unix))]
 impl SpawnedChild for ProcessChild {
     fn pid(&self) -> u32 {
-        self.0.id()
+        self.child.id()
     }
 
     fn wait(&mut self) -> Result<i32, String> {
-        self.0
+        self.child
             .wait()
             .map(|status| status.code().unwrap_or(exit::GENERAL))
             .map_err(|error| wait_error_text(&error))
     }
 
     fn release(&mut self) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            if !self.suspended {
+                return Ok(());
+            }
+            windows_release::resume_primary_thread(self.child.id())
+                .map_err(|code| format!("无法放行被挂起的程序（系统错误码 {code}）"))?;
+            // Only clear this after ResumeThread succeeds, so repeated calls
+            // are harmless and never raise the thread's suspend count again.
+            self.suspended = false;
+        }
         Ok(())
     }
 
     fn kill_and_reap(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
-/// The shell runs with the pipe read end open, and cannot reach the target
-/// `exec` until the parent writes to the other end. The write end is
-/// close-on-exec, so an eventual target cannot accidentally keep the gate open.
-/// `dash` accepts dynamic redirections only for one-digit descriptors, so the
-/// read uses the portable `/dev/fd/N` alias. A higher-numbered read end is
-/// harmless after EOF and is left for target exit rather than turning a valid
-/// launch into shell exit 125.
+/// Windows-specific FFI for releasing exactly one `CREATE_SUSPENDED` child.
+///
+/// `std::process::Child` exposes the PID but not the primary-thread handle, so
+/// locate that thread in a Toolhelp snapshot. A just-created suspended process
+/// has not executed target code, therefore its sole process-owned thread is
+/// the primary thread to resume.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_release {
+    use std::mem::size_of;
+
+    use windows::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_NOT_FOUND, ERROR_NO_MORE_FILES, HANDLE,
+    };
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    /// Resume the single primary thread which `CREATE_SUSPENDED` stopped.
+    ///
+    /// The returned number is a Win32 system error code suitable for the
+    /// user-facing Chinese error at the caller.
+    pub(super) fn resume_primary_thread(pid: u32) -> Result<(), u32> {
+        // SAFETY: the requested snapshot flag and PID are plain values; the
+        // returned handle is closed exactly once below on every result path.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
+            .map_err(|error| error_code(&error))?;
+        let result = resume_from_snapshot(snapshot, pid);
+        close_handle(snapshot);
+        result
+    }
+
+    fn resume_from_snapshot(snapshot: HANDLE, pid: u32) -> Result<(), u32> {
+        let mut entry = THREADENTRY32 {
+            dwSize: size_of::<THREADENTRY32>() as u32,
+            ..THREADENTRY32::default()
+        };
+        // SAFETY: `entry` is initialized with the ABI-required `dwSize` and
+        // remains valid for the synchronous Toolhelp call.
+        unsafe { Thread32First(snapshot, &mut entry) }.map_err(|error| error_code(&error))?;
+
+        loop {
+            if entry.th32OwnerProcessID == pid {
+                return resume_thread(entry.th32ThreadID);
+            }
+
+            entry.dwSize = size_of::<THREADENTRY32>() as u32;
+            // SAFETY: as above, `snapshot` remains open and `entry` points to
+            // writable initialized storage with the ABI-required size.
+            match unsafe { Thread32Next(snapshot, &mut entry) } {
+                Ok(()) => {}
+                Err(error) if error_code(&error) == ERROR_NO_MORE_FILES.0 => {
+                    return Err(ERROR_NOT_FOUND.0);
+                }
+                Err(error) => return Err(error_code(&error)),
+            }
+        }
+    }
+
+    fn resume_thread(thread_id: u32) -> Result<(), u32> {
+        // SAFETY: `thread_id` came from the current Toolhelp snapshot. The
+        // returned handle is closed exactly once before this function returns.
+        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, thread_id) }
+            .map_err(|error| error_code(&error))?;
+        // SAFETY: `thread` is a valid handle opened with THREAD_SUSPEND_RESUME.
+        let prior_suspend_count = unsafe { ResumeThread(thread) };
+        // ResumeThread reports failure only with u32::MAX. Read the thread's
+        // last-error value before CloseHandle can alter it.
+        let resume_error = (prior_suspend_count == u32::MAX).then(last_error);
+        close_handle(thread);
+        resume_error.map_or(Ok(()), Err)
+    }
+
+    fn error_code(error: &windows::core::Error) -> u32 {
+        // Win32 APIs above create HRESULT_FROM_WIN32 values. Their low word is
+        // the original system error code shown to the user.
+        error.code().0 as u32 & 0xffff
+    }
+
+    fn last_error() -> u32 {
+        // SAFETY: GetLastError reads the calling thread's error state only.
+        unsafe { GetLastError().0 }
+    }
+
+    fn close_handle(handle: HANDLE) {
+        // SAFETY: every caller passes one handle returned by the corresponding
+        // successful Win32 open/create call, and calls this helper once.
+        let _ = unsafe { CloseHandle(handle) };
+        // A close failure cannot reverse a successful ResumeThread. Retrying
+        // `release` to report it would resume the target more than once.
+    }
+}
+
+/// The shell reads the gate from fd 3 and closes it before `exec`ing the
+/// target. Both pipe ends begin close-on-exec; [`keep_gate_read_fd_for_child`]
+/// creates fd 3 without that flag only in the shell child.
 #[cfg(unix)]
-const GATE_SHELL: &str = r#"fd=$1; shift; IFS= read -r _ < "/dev/fd/$fd" || exit 125; case "$fd" in [0-9]) eval "exec $fd<&-" ;; esac; exec "$@""#;
+const GATE_SHELL: &str = r#"IFS= read -r _ <&3 || exit 125; exec 3<&-; exec "$@""#;
+
+/// Descriptor reserved for the gate in the shell child. It is closed before
+/// the shell reaches the target `exec`.
+#[cfg(unix)]
+const GATE_FD: i32 = 3;
+
+/// Create a gate pipe whose descriptors are close-on-exec from birth whenever
+/// the platform supports `pipe2`. macOS has no `pipe2`, so set the flag on
+/// both descriptors before either can be handed to a child.
+#[cfg(unix)]
+fn gate_pipe() -> nix::Result<(OwnedFd, OwnedFd)> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        pipe2(OFlag::O_CLOEXEC)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (read_fd, write_fd) = pipe()?;
+        set_cloexec(&read_fd)?;
+        set_cloexec(&write_fd)?;
+        Ok((read_fd, write_fd))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_cloexec(fd: &OwnedFd) -> nix::Result<()> {
+    let flags = fcntl(fd, FcntlArg::F_GETFD)?;
+    let flags = FdFlag::from_bits_truncate(flags) | FdFlag::FD_CLOEXEC;
+    fcntl(fd, FcntlArg::F_SETFD(flags)).map(drop)
+}
+
+/// Keep the read end available to the gate shell as fd 3. The original read
+/// descriptor remains close-on-exec, so only fd 3 is inherited; the shell
+/// closes it before starting the target.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn keep_gate_read_fd_for_child(command: &mut Command, read_fd: OwnedFd) {
+    // SAFETY: The closure runs only between fork and exec. It invokes only
+    // `dup2` and, when the source is already fd 3, `fcntl(F_SETFD)`, which are
+    // async-signal-safe. The duplicated OwnedFd is intentionally forgotten so
+    // fd 3 stays open until the shell executes; no parent descriptor is
+    // changed because this runs in the child.
+    unsafe {
+        command.pre_exec(move || {
+            let duplicated =
+                nix::unistd::dup2_raw(&read_fd, GATE_FD).map_err(std::io::Error::from)?;
+            std::mem::forget(duplicated);
+            if read_fd.as_raw_fd() == GATE_FD {
+                let flags = fcntl(&read_fd, FcntlArg::F_GETFD).map_err(std::io::Error::from)?;
+                let flags = FdFlag::from_bits_truncate(flags) & !FdFlag::FD_CLOEXEC;
+                fcntl(&read_fd, FcntlArg::F_SETFD(flags)).map_err(std::io::Error::from)?;
+            }
+            Ok(())
+        });
+    }
+}
 
 #[cfg(unix)]
 struct GatedChild {
@@ -401,23 +572,17 @@ impl Spawner for CommandSpawner {
             let resolved = resolve_program(program, path_env.as_deref(), spec.cwd.as_deref())
                 .map_err(|error| spawn_error_text(&error))?;
             let program = &resolved;
-            let (read_fd, write_fd) = pipe().map_err(nix_spawn_error_text)?;
-            let flags = fcntl(&write_fd, FcntlArg::F_GETFD).map_err(nix_spawn_error_text)?;
-            let flags = FdFlag::from_bits_truncate(flags) | FdFlag::FD_CLOEXEC;
-            fcntl(&write_fd, FcntlArg::F_SETFD(flags)).map_err(nix_spawn_error_text)?;
+            let (read_fd, write_fd) = gate_pipe().map_err(nix_spawn_error_text)?;
             let mut command = Command::new("/bin/sh");
             command
                 .arg("-c")
                 .arg(GATE_SHELL)
                 .arg("aw-run")
-                .arg(read_fd.as_raw_fd().to_string())
                 .arg(program)
                 .args(args);
             configure_command(&mut command, spec);
+            keep_gate_read_fd_for_child(&mut command, read_fd);
             let child = command.spawn().map_err(|error| spawn_error_text(&error))?;
-            // The shell owns the read end now. Once this copy is dropped, an
-            // aw crash closes the only write end and the shell exits 125.
-            drop(read_fd);
             Ok(Box::new(GatedChild {
                 child,
                 release_fd: Some(write_fd),
@@ -428,9 +593,17 @@ impl Spawner for CommandSpawner {
             let mut command = Command::new(program);
             command.args(args);
             configure_command(&mut command, spec);
+            #[cfg(windows)]
+            command.creation_flags(0x0000_0004); // CREATE_SUSPENDED
             command
                 .spawn()
-                .map(|child| Box::new(ProcessChild(child)) as Box<dyn SpawnedChild>)
+                .map(|child| {
+                    Box::new(ProcessChild {
+                        child,
+                        #[cfg(windows)]
+                        suspended: true,
+                    }) as Box<dyn SpawnedChild>
+                })
                 .map_err(|error| spawn_error_text(&error))
         }
     }
@@ -2286,6 +2459,71 @@ mod tests {
         assert_eq!(child.wait().expect("wait target"), 0);
         assert!(marker.is_file(), "the target did not run after release");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn command_spawner_does_not_leak_the_gate_pipe_into_the_target() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = std::env::temp_dir().join(format!(
+            "aw-cli-gate-fds-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory");
+        // A plain spawn inherits whatever non-CLOEXEC descriptors this test
+        // process already holds (runners differ; fd 4 is one such extra). The
+        // gate pipe is the only descriptor the spawner may add, and the target
+        // must not keep it, so the two fd sets have to match.
+        let script = "ls /proc/self/fd > \"$1\"";
+        let baseline_path = dir.join("baseline-fds");
+        let baseline_status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg("aw-gate-fd-test")
+            .arg(&baseline_path)
+            .status()
+            .expect("baseline spawn");
+        assert!(
+            baseline_status.success(),
+            "baseline ls failed: {baseline_status}"
+        );
+        let fds = dir.join("target-fds");
+        let command = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            "aw-gate-fd-test".to_owned(),
+            fds.to_string_lossy().into_owned(),
+        ];
+        let spec = RunSpec::new(command).expect("run spec");
+        let mut child = super::CommandSpawner.spawn(&spec).expect("held child");
+        child.release().expect("release gate");
+        assert_eq!(child.wait().expect("wait target"), 0);
+        // The gate occupies fd 3 in the shell child (closing whatever the test
+        // harness may have inherited there), so the gated target can have
+        // fewer descriptors than a plain spawn, never one the plain spawn lacks.
+        let gated = listed_fds(&fds);
+        let plain = listed_fds(&baseline_path);
+        assert!(
+            gated.iter().all(|fd| plain.contains(fd)),
+            "the gate pipe must not remain in the target: gated {gated:?}, plain {plain:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        fn listed_fds(path: &std::path::Path) -> Vec<u32> {
+            let mut open_fds: Vec<u32> = std::fs::read_to_string(path)
+                .expect("fd list")
+                .lines()
+                .map(|fd| fd.parse().expect("numeric fd"))
+                .collect();
+            open_fds.sort_unstable();
+            open_fds
+        }
     }
 
     #[test]

@@ -319,6 +319,8 @@ export interface Gap {
   from_ns: number;
   to_ns: number;
   collector: string;
+  /** Set when the record names a source separately from the collector. */
+  source?: string | null;
   kinds: string[];
   affected: string[];
   count: number;

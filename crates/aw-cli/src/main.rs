@@ -1,10 +1,9 @@
-//! `aw` entry point (P1-CLI-01).
-//!
-//! Parses the command tree, resolves the daemon endpoint, and dispatches.
-//! Business commands are stubs: they probe the daemon and then report that
-//! they are not implemented.
+//! AgentWatch command-line entry point: parses commands, resolves the daemon endpoint, and dispatches.
 
-#![forbid(unsafe_code)]
+// Unsafe code is denied. `cmd::run` has two documented exceptions: the Unix
+// `pre_exec` that keeps the pipe gate out of the target, and the Windows FFI
+// that resumes a CREATE_SUSPENDED child after daemon adoption.
+#![deny(unsafe_code)]
 
 mod client;
 mod cmd;

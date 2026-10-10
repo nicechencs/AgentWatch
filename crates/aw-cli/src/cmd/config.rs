@@ -14,8 +14,8 @@
 //! refuses to spawn an editor in this build (no editor is a side effect this
 //! card owns), and tells the operator to use `set`.
 //!
-//! [`UnwiredConfig`] is the production client: the routes are still stubs, so
-//! every call is exit 3 instead of printing a fake empty config.
+//! [`HttpConfigApi`] is the production client. [`UnwiredConfig`] is the test
+//! stand-in: every call is exit 3 instead of printing a fake empty config.
 
 use serde_json::{json, Value};
 

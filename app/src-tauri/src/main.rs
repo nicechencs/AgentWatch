@@ -76,7 +76,11 @@ async fn aw_save_export(
         let name = export::file_name(&sid, &format, response.header("content-disposition"));
         let mut dialog = app.dialog().file().set_file_name(&name);
         let paths = app.path();
-        if let Some(dir) = export::default_dir(paths.download_dir().ok(), paths.home_dir().ok()) {
+        if let Some(dir) = export::default_dir(
+            paths.download_dir().ok(),
+            paths.home_dir().ok(),
+            std::path::Path::is_dir,
+        ) {
             dialog = dialog.set_directory(dir);
         }
         if let Some((label, extensions)) = export::filter(&format) {

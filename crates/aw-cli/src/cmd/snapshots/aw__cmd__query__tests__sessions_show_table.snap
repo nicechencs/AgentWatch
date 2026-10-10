@@ -9,6 +9,7 @@ agent       example-agent                                                  E1 �
 started_ns  1700000000000000000                                            E1 系统
 ended_ns    1700000060000000000                                            E1 系统
 pinned      no                                                             E1 系统
+exit_code   没采                                                           E1 系统
 processes   2                                                              E1 系统
 flows       3                                                              E1 系统
 dns         0                                                              E1 系统

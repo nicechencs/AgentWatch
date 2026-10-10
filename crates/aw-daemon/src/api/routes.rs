@@ -1,9 +1,8 @@
 //! Method + path + headers + body → status + body.
 //!
-//! No socket is required to call [`dispatch`]. [`accept_one`] binds `127.0.0.1:0`
-//! only long enough to prove the address, then closes it. The daemon binary does
-//! not start this listener. axum is not in the offline lock; this is a loopback
-//! HTTP stub, not the three transports.
+//! No socket is required to call [`dispatch`]. The daemon's loopback listener
+//! ([`super::http`]) and its internal channel both call it. axum is not in the
+//! offline lock; the listener is `std::net`, not the three transports.
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -736,7 +735,7 @@ pub fn dispatch(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
         return ingest_agent_hook(state, req);
     }
 
-    // Socket/pipe ticket issuance is not an HTTP-bearer flow. Over this stub,
+    // Socket/pipe ticket issuance is not an HTTP-bearer flow. Over HTTP,
     // a presented bearer (or an explicit test caller header is not invented):
     // HTTP callers redeem tokens; issuing a ticket requires an already-known
     // bearer so the ticket is bound to that user. A missing bearer is 401.
@@ -1162,6 +1161,8 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                         "id": session.id,
                         "user_id": session.user_id,
                         "name": session.name,
+                        "platform": null,
+                        "os_version": null,
                     })
                 })
                 .collect();
@@ -1182,6 +1183,8 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                             "session_id": row.id,
                             "name": row.name,
                             "mode": row.mode,
+                            "platform": platform_or_host(row.platform.as_deref()),
+                            "os_version": row.os_version,
                             "agent": row.agent,
                             "started_ns": row.started_ns,
                             "ended_ns": row.ended_ns,
@@ -1602,6 +1605,8 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
                 "ended_ns": summary.ended_ns,
                 "exit_code": summary.exit_code,
                 "mode": summary.mode,
+                "platform": platform_or_host(summary.platform.as_deref()),
+                "os_version": summary.os_version,
                 "collectors": stored_collectors_json(&summary.collectors),
                 "argv": super::query::argv_value(summary.argv.as_deref()),
                 "stats": counts_json(&aw_store::SessionCounts {
@@ -1617,6 +1622,16 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
         ),
         Err(err) => from_backend(err),
     }
+}
+
+/// Stored session rows use [`std::env::consts::OS`] when they are created.
+/// Older rows may have a nullable platform, so keep the API usable without
+/// changing the representation of newly-created rows.
+fn platform_or_host(stored: Option<&str>) -> String {
+    stored
+        .filter(|platform| !platform.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| std::env::consts::OS.to_owned())
 }
 
 /// Built-in redaction rules (always on, read-only), so Settings can list
@@ -2839,6 +2854,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn session_detail_and_summary_json_carry_platform_and_os_version() {
+        let (dir, db) = seeded_db(
+            "detail-platform",
+            "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, os_version, collectors) VALUES (1, 's-macos', 'launch', 'alice', 1, 'macos', '14.6', '[]');",
+        );
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+
+        let (status, body) = get_as(&mut state, "alice", "/api/v1/sessions/s-macos");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["platform"], "macos");
+        assert_eq!(body["os_version"], "14.6");
+
+        let (status, body) = get_as(&mut state, "alice", "/api/v1/sessions/s-macos/summary");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["platform"], "macos");
+        assert_eq!(body["os_version"], "14.6");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn null_session_platform_falls_back_to_the_host_in_list_and_detail() {
+        let (dir, db) = seeded_db("null-platform", "");
+        // New rows require a platform, but a query must remain useful for an
+        // imported older row whose column is nullable.
+        let legacy_schema = rusqlite::Connection::open(&db).and_then(|connection| {
+            connection.execute_batch(
+                "
+                PRAGMA foreign_keys = OFF;
+                BEGIN;
+                CREATE TABLE sessions_legacy (
+                  id INTEGER PRIMARY KEY,
+                  public_id TEXT NOT NULL UNIQUE,
+                  name TEXT,
+                  mode TEXT NOT NULL CHECK (mode IN ('launch','attach')),
+                  agent TEXT,
+                  root_proc_uid INTEGER,
+                  argv TEXT,
+                  cwd TEXT,
+                  user_id TEXT NOT NULL,
+                  started_ns INTEGER NOT NULL,
+                  ended_ns INTEGER,
+                  end_reason TEXT,
+                  exit_code INTEGER,
+                  proxy_enabled INTEGER NOT NULL DEFAULT 0,
+                  proxy_port INTEGER,
+                  platform TEXT,
+                  os_version TEXT,
+                  collectors TEXT NOT NULL,
+                  collector_profile TEXT,
+                  config_digest TEXT,
+                  pinned INTEGER NOT NULL DEFAULT 0,
+                  stats TEXT
+                );
+                DROP TABLE sessions;
+                ALTER TABLE sessions_legacy RENAME TO sessions;
+                CREATE INDEX idx_sessions_started ON sessions(started_ns);
+                INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors)
+                VALUES (1, 's-unknown-platform', 'launch', 'alice', 1, NULL, '[]');
+                COMMIT;
+                ",
+            )
+        });
+        assert!(legacy_schema.is_ok(), "{legacy_schema:?}");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+
+        let (status, body) = get_as(&mut state, "alice", "/api/v1/sessions");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["sessions"][0]["platform"], std::env::consts::OS);
+
+        let (status, body) = get_as(&mut state, "alice", "/api/v1/sessions/s-unknown-platform");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["platform"], std::env::consts::OS);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// None of these may answer 501 any more (the bug this card fixes).
     #[test]
     fn attach_run_adopt_and_purge_never_answer_501() {
@@ -3059,7 +3154,10 @@ mod tests {
         assert_eq!(status, 403, "{body}");
         assert_eq!(body["error"]["code"], "not_your_process");
         let message = body["error"]["message"].as_str().unwrap_or_default();
-        assert!(message.contains("不属于你的账户"), "{message}");
+        assert!(
+            message.contains("another account") && message.contains("administrator"),
+            "{message}"
+        );
         assert_eq!(session_count(&db), before, "a refused attach writes no row");
 
         let (status, body) = post(
@@ -3218,6 +3316,40 @@ mod tests {
         );
         assert_eq!(status, 200, "{body}");
 
+        // A pid can be reused. Seed another depth-0 row with this pid but a
+        // different identity; `/exit` must only update the adopted root row.
+        let (db_id, root_proc_uid, start_ns): (i64, i64, i64) = rusqlite::Connection::open(&db)
+            .and_then(|conn| {
+                let db_id: i64 = conn.query_row(
+                    "SELECT id FROM sessions WHERE public_id = ?1",
+                    [&sid],
+                    |row| row.get(0),
+                )?;
+                let root_proc_uid: i64 = conn.query_row(
+                    "SELECT root_proc_uid FROM sessions WHERE id = ?1",
+                    [db_id],
+                    |row| row.get(0),
+                )?;
+                let start_ns: i64 = conn.query_row(
+                    "SELECT start_ns FROM processes WHERE session_id = ?1 AND proc_uid = ?2",
+                    rusqlite::params![db_id, root_proc_uid],
+                    |row| row.get(0),
+                )?;
+                Ok((db_id, root_proc_uid, start_ns))
+            })
+            .expect("adopted root row");
+        let reused_proc_uid = root_proc_uid.wrapping_add(1);
+        rusqlite::Connection::open(&db)
+            .and_then(|conn| {
+                conn.execute(
+                    "INSERT INTO processes \
+                     (session_id, proc_uid, pid, depth, start_ns, how, evidence, source) \
+                     VALUES (?1, ?2, ?3, 0, ?4, 'snapshot', 'S', 'fixture')",
+                    rusqlite::params![db_id, reused_proc_uid, pid, start_ns.saturating_add(1)],
+                )
+            })
+            .expect("reused pid row");
+
         nix::unistd::write(&write_fd, b"1\n").expect("release gate");
         drop(write_fd);
         assert_eq!(child.wait().expect("reap child").code(), Some(7));
@@ -3234,15 +3366,25 @@ mod tests {
             let mut stmt = conn
                 .prepare(
                     "SELECT p.exit_code FROM processes p JOIN sessions s ON s.id = p.session_id \
-                     WHERE s.public_id = ?1 AND p.pid = ?2",
+                     WHERE s.public_id = ?1 AND p.proc_uid = ?2",
                 )
                 .expect("prepare");
-            stmt.query_map(rusqlite::params![sid, pid], |r| r.get(0))
+            stmt.query_map(rusqlite::params![sid, root_proc_uid], |r| r.get(0))
                 .expect("query")
                 .map(|r| r.expect("row"))
                 .collect()
         };
         assert_eq!(root_code(&db), vec![Some(7)], "before any poll");
+        let reused_code: Option<i64> = rusqlite::Connection::open(&db)
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT exit_code FROM processes WHERE session_id = ?1 AND proc_uid = ?2",
+                    rusqlite::params![db_id, reused_proc_uid],
+                    |row| row.get(0),
+                )
+            })
+            .expect("reused pid row");
+        assert_eq!(reused_code, None, "reused pid did not receive root status");
         let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
         let mut watches = crate::watch::Watches::new(db.clone());
         watches.tick(&shared);

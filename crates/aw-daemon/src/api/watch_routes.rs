@@ -116,16 +116,18 @@ fn collector_available() -> Result<(), ApiResponse> {
     }
 }
 
-/// Real uid of `pid`: the first field of the `Uid:` line in
-/// `/proc/<pid>/status` (real, not effective). Not the owner of the `/proc/<pid>`
-/// directory, which is root for every process. `None` when the line cannot be read.
-fn pid_owner(pid: u32) -> Option<String> {
+/// Real, effective, and saved uids of `pid` from `/proc/<pid>/status`.
+/// `/proc/<pid>` itself is root-owned, so its directory owner is not useful.
+/// `None` means the three identity fields could not be read.
+fn pid_owner(pid: u32) -> Option<[u32; 3]> {
     #[cfg(target_os = "linux")]
     {
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
         let line = status.lines().find(|line| line.starts_with("Uid:"))?;
-        let real = line[4..].split_whitespace().next()?;
-        real.parse::<u32>().ok().map(|uid| uid.to_string())
+        let mut uids = line[4..]
+            .split_whitespace()
+            .map(|uid| uid.parse::<u32>().ok());
+        Some([uids.next()??, uids.next()??, uids.next()??])
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -134,27 +136,43 @@ fn pid_owner(pid: u32) -> Option<String> {
     }
 }
 
-/// The pid must be running and identifiable, and its real uid must be the
-/// caller's. `allow_admin` lets an administrator attach to another account's
-/// process; adopt never does (`allow_admin` false), so an administrator cannot
-/// take over a process that belongs to someone else.
-fn check_pid_owner(caller: &Caller, pid: u32, allow_admin: bool) -> Result<(), ApiResponse> {
+/// The pid must be running and identifiable. Adoption requires real,
+/// effective, and saved uids all to belong to the caller. `allow_admin` is
+/// only for explicit attach, where an administrator may record another
+/// account's process; adopt always passes `false`.
+fn check_pid_owner(
+    caller: &Caller,
+    pid: u32,
+    allow_admin: bool,
+) -> Result<aw_core::ProcUid, ApiResponse> {
     collector_available()?;
-    if crate::sample::proc_uid_of(pid).is_none() {
-        return Err(error_response(
+    let before = crate::sample::proc_uid_of(pid).ok_or_else(|| {
+        error_response(
             400,
             "no_such_process",
             "pid is not running (or its identity cannot be read)",
+        )
+    })?;
+    let caller_uid = caller.user_id.parse::<u32>().ok();
+    let owner = pid_owner(pid);
+    let after = crate::sample::proc_uid_of(pid);
+    if after != Some(before) {
+        return Err(error_response(
+            400,
+            "no_such_process",
+            "pid changed while its identity was being checked",
         ));
     }
-    let owner = pid_owner(pid);
-    if owner.as_deref() == Some(caller.user_id.as_str()) || (allow_admin && caller.admin) {
-        return Ok(());
+    let owned_by_caller = owner
+        .is_some_and(|uids| caller_uid.is_some_and(|uid| uids.iter().all(|actual| *actual == uid)));
+    if owned_by_caller || (allow_admin && caller.admin) {
+        return Ok(before);
     }
     let message = if allow_admin {
-        "这个进程不属于你的账户；记录别的账户的进程需要管理员权限"
+        "this process belongs to another account; recording another account's process needs an \
+         administrator"
     } else {
-        "这个进程不属于你的账户，不能接管"
+        "this process belongs to another account and cannot be adopted"
     };
     Err(error_response(403, "not_your_process", message))
 }
@@ -227,6 +245,32 @@ fn label_from_argv(argv: &[String]) -> String {
     }
 }
 
+/// The display label for an attach target: its executable base name, or the
+/// base name of `argv[0]` when the executable path is unavailable.
+fn attach_target_name(exe: Option<&str>, argv: Option<&[String]>) -> Option<String> {
+    fn base_name(path: &str) -> Option<&str> {
+        path.rsplit(['/', '\\'])
+            .find(|part| !part.trim().is_empty())
+    }
+
+    let name = exe.and_then(base_name).or_else(|| {
+        argv.and_then(|items| items.first())
+            .and_then(|arg0| base_name(arg0))
+    })?;
+    let redactor = aw_pipeline::Redactor::new(&aw_pipeline::config::RedactionConfig::default());
+    Some(redactor.scrub_text(name))
+}
+
+/// Read the target from the same process table used by the attach picker.
+/// The table is live, so a target that exits during creation may not have a
+/// label to retain.
+fn attach_target_name_for_pid(pid: u32) -> Option<String> {
+    let process = aw_collector_poll::host_process_table()?
+        .into_iter()
+        .find(|process| process.row.pid == pid)?;
+    attach_target_name(process.row.exe.as_deref(), process.row.argv.as_deref())
+}
+
 fn target_for(
     caller: &Caller,
     body: &Value,
@@ -234,7 +278,13 @@ fn target_for(
     root_pid: u32,
     argv: Option<&[String]>,
 ) -> Result<SampleTarget, ApiResponse> {
-    let name = opt_text(body, "name").or_else(|| argv.map(label_from_argv));
+    let name = opt_text(body, "name")
+        .or_else(|| argv.map(label_from_argv))
+        .or_else(|| {
+            (mode == "attach")
+                .then(|| attach_target_name_for_pid(root_pid))
+                .flatten()
+        });
     Ok(SampleTarget {
         db_id: 0,
         public_id: new_public_id()?,
@@ -279,7 +329,7 @@ fn create_inner(
     match value.get("mode").and_then(Value::as_str) {
         Some("attach") => {
             let pid = pid_field(&value)?;
-            check_pid_owner(caller, pid, true)?;
+            let _ = check_pid_owner(caller, pid, true)?;
             let mut target = target_for(caller, &value, "attach", pid, None)?;
             insert_session(&path, &mut target)?;
             let response = created(&target, json!({}));
@@ -356,6 +406,8 @@ fn create_inner(
                 }
             }
             let mut target = target_for(caller, &value, "launch", pid, Some(&argv))?;
+            target.root_hint =
+                crate::sample::root_hint(pid, argv0_basename(target.argv_json.as_deref()));
             insert_session(&path, &mut target)?;
             let response = created(&target, json!({}));
             state.watch_requests.push(WatchRequest::Start {
@@ -430,23 +482,46 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
         }
         let pid = pid_field(&value)?;
         // Never `allow_admin`: an administrator cannot adopt another account's pid.
-        check_pid_owner(caller, pid, false)?;
-        let root_hint = argv0_basename(pending.target.argv_json.as_deref())
-            .and_then(|name| crate::sample::root_hint(pid, name));
+        let adopted_uid = check_pid_owner(caller, pid, false)?;
+        let root_hint =
+            crate::sample::root_hint(pid, argv0_basename(pending.target.argv_json.as_deref()))
+                .filter(|hint| hint.uid == adopted_uid)
+                .ok_or_else(|| {
+                    error_response(
+                        400,
+                        "no_such_process",
+                        "pid changed while adoption was being recorded",
+                    )
+                })?;
+        let path = db_path(state)?;
+        let root_proc_uid = i64::from_ne_bytes(root_hint.uid.0.to_ne_bytes());
+        rusqlite::Connection::open(&path)
+            .and_then(|conn| {
+                conn.execute(
+                    "UPDATE sessions SET root_proc_uid = ?1 WHERE id = ?2",
+                    rusqlite::params![root_proc_uid, pending.target.db_id],
+                )
+            })
+            .map_err(|err| {
+                tracing::warn!(session = sid, pid, error = %err, "adopted root identity was not written");
+                error_response(500, "store", "cannot record the adopted root identity")
+            })?;
         let Some(mut pending) = state.pending_launches.remove(sid) else {
             return Err(not_found());
         };
         pending.target.root_pid = pid;
-        pending.target.root_hint = root_hint;
+        pending.target.root_hint = Some(root_hint);
         // Write the root's row now, while `aw run` still holds it at the gate:
         // the foreground loop starts the sampler up to a poll later, and a
         // root that exits (and posts `/exit`) before then would otherwise be
         // zero processes with no exit code. The sampler's row is the same id.
-        if pending.target.root_hint.is_some() {
-            if let Ok(path) = db_path(state) {
-                let _ = crate::sample::HostSampler::for_target(path, pending.target.clone())
-                    .persist_root_hint();
-            }
+        if !crate::sample::HostSampler::for_target(path, pending.target.clone()).persist_root_hint()
+        {
+            tracing::warn!(
+                session = sid,
+                pid,
+                "adopted root process row was not written"
+            );
         }
         let response = ApiResponse::json(200, &json!({ "id": sid, "root_pid": pid }));
         state.watch_requests.push(WatchRequest::Start {
@@ -481,14 +556,14 @@ pub(super) fn record_exit(
         let path = db_path(state)?;
         let conn = rusqlite::Connection::open(&path)
             .map_err(|_| error_response(500, "store", "cannot open the database"))?;
-        let row: Option<(i64, String)> = conn
+        let row: Option<(i64, String, Option<i64>)> = conn
             .query_row(
-                "SELECT id, user_id FROM sessions WHERE public_id = ?1",
+                "SELECT id, user_id, root_proc_uid FROM sessions WHERE public_id = ?1",
                 [sid],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .ok();
-        let Some((db_id, owner)) = row else {
+        let Some((db_id, owner, root_proc_uid)) = row else {
             return Err(error_response(404, "not_found", "session not found"));
         };
         // This status comes from the unprivileged caller that created the
@@ -502,13 +577,18 @@ pub(super) fn record_exit(
             rusqlite::params![exit_code, db_id],
         )
         .map_err(|_| error_response(500, "store", "cannot update the session"))?;
-        // The launched root (depth 0) carries the same status; children stay
-        // NULL (not observed), never 0.
-        let _ = conn.execute(
-            "UPDATE processes SET exit_code = ?1 \
-             WHERE session_id = ?2 AND depth = 0 AND exit_code IS NULL",
-            rusqlite::params![exit_code, db_id],
-        );
+        // The launched root carries the same status. Its stored `proc_uid`
+        // includes pid plus start time, so a reused pid cannot receive it.
+        let updated = conn
+            .execute(
+                "UPDATE processes SET exit_code = ?1 \
+             WHERE session_id = ?2 AND proc_uid = ?3 AND exit_code IS NULL",
+                rusqlite::params![exit_code, db_id, root_proc_uid],
+            )
+            .map_err(|_| error_response(500, "store", "cannot update the root process"))?;
+        if updated == 0 {
+            tracing::warn!(session = db_id, "exit did not update a root process row");
+        }
         let stored: i32 = conn
             .query_row(
                 "SELECT exit_code FROM sessions WHERE id = ?1",
@@ -575,7 +655,7 @@ pub(super) fn attach(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u
                 "session is not open for attach",
             ));
         }
-        check_pid_owner(caller, pid, true)?;
+        let _ = check_pid_owner(caller, pid, true)?;
         let target = SampleTarget {
             db_id,
             public_id: sid.to_owned(),
@@ -667,5 +747,56 @@ mod spawn_error_tests {
         let response = spawn_error(&std::io::Error::from(std::io::ErrorKind::NotFound));
         assert_eq!(response.status, 400);
         assert!(!String::from_utf8_lossy(&response.body).contains("entity"));
+    }
+}
+
+#[cfg(test)]
+mod attach_target_name_tests {
+    use super::attach_target_name;
+
+    #[test]
+    fn attach_name_prefers_the_executable_then_argv_zero() {
+        let argv = vec!["/usr/local/bin/from-argv".to_owned()];
+        assert_eq!(
+            attach_target_name(Some("/opt/tools/from-exe"), Some(&argv)),
+            Some("from-exe".to_owned())
+        );
+        assert_eq!(
+            attach_target_name(None, Some(&argv)),
+            Some("from-argv".to_owned())
+        );
+        assert_eq!(attach_target_name(None, None), None);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::expect_used)]
+mod ownership_tests {
+    use super::{check_pid_owner, Caller};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopted_pid_requires_all_uids_and_accepts_a_real_child() {
+        let caller = Caller {
+            user_id: crate::sample::current_user_id(),
+            admin: false,
+        };
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn child");
+        assert!(check_pid_owner(&caller, child.id(), false).is_ok());
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let result = check_pid_owner(&caller, 1, false);
+        if nix::unistd::geteuid().as_raw() == 0 {
+            assert!(result.is_ok(), "root caller may adopt pid 1");
+        } else {
+            let response = result.expect_err("non-root caller must not adopt pid 1");
+            assert_eq!(response.status, 403);
+            let body: serde_json::Value = serde_json::from_slice(&response.body).expect("JSON");
+            assert_eq!(body["error"]["code"], "not_your_process");
+        }
     }
 }

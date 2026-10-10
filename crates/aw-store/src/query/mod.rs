@@ -98,6 +98,10 @@ pub struct SessionListItem {
     pub name: Option<String>,
     /// `launch` or `attach`.
     pub mode: String,
+    /// Platform identifier, or unknown.
+    pub platform: Option<String>,
+    /// OS version, or unknown.
+    pub os_version: Option<String>,
     /// Agent profile, or unknown.
     pub agent: Option<String>,
     /// Start, Unix nanoseconds.
@@ -212,6 +216,10 @@ pub struct SessionSummary {
     pub bytes_down: Option<i64>,
     /// `launch` or `attach`.
     pub mode: String,
+    /// Platform identifier, or unknown.
+    pub platform: Option<String>,
+    /// OS version, or unknown.
+    pub os_version: Option<String>,
     /// `sessions.collectors`: JSON array of collector names, as stored.
     pub collectors: String,
     /// Finding rows; see [`SessionCounts::finding_count`].
@@ -372,7 +380,7 @@ pub fn list_sessions(
 ) -> Result<Vec<SessionListItem>, QueryError> {
     let pred = compile_optional(filter.expr.as_deref(), Target::Sessions, None, None)?;
     let mut sql = String::from(
-        "SELECT id, public_id, name, mode, agent, started_ns, ended_ns, pinned, collectors, argv \
+        "SELECT id, public_id, name, mode, platform, os_version, agent, started_ns, ended_ns, pinned, collectors, argv \
          FROM sessions WHERE user_id = ?",
     );
     let mut bind: Vec<Param> = vec![Param::Text(user_id.to_string())];
@@ -417,12 +425,14 @@ pub fn list_sessions(
                 public_id: row.get(1)?,
                 name: row.get(2)?,
                 mode: row.get(3)?,
-                agent: row.get(4)?,
-                started_ns: row.get(5)?,
-                ended_ns: row.get(6)?,
-                pinned: row.get(7)?,
-                collectors: row.get(8)?,
-                argv: row.get(9)?,
+                platform: row.get(4)?,
+                os_version: row.get(5)?,
+                agent: row.get(6)?,
+                started_ns: row.get(7)?,
+                ended_ns: row.get(8)?,
+                pinned: row.get(9)?,
+                collectors: row.get(10)?,
+                argv: row.get(11)?,
                 counts: SessionCounts::default(),
             })
         })
@@ -446,7 +456,7 @@ pub fn session_summary(
     let head = conn
         .query_row(
             "SELECT s.id, s.public_id, s.name, s.agent, s.started_ns, s.ended_ns, \
-                    s.exit_code, s.mode, s.collectors, s.argv \
+                    s.exit_code, s.mode, s.platform, s.os_version, s.collectors, s.argv \
              FROM sessions s WHERE s.id = ? AND s.user_id = ?",
             rusqlite::params![session_id, user_id],
             |row| {
@@ -459,15 +469,29 @@ pub fn session_summary(
                     row.get::<_, Option<i64>>(5)?,
                     row.get::<_, Option<i64>>(6)?,
                     row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(8)?,
                     row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, Option<String>>(11)?,
                 ))
             },
         )
         .optional()
         .map_err(|err| QueryError::sqlite("session_summary", err))?;
-    let Some((id, public_id, name, agent, started_ns, ended_ns, exit_code, mode, collectors, argv)) =
-        head
+    let Some((
+        id,
+        public_id,
+        name,
+        agent,
+        started_ns,
+        ended_ns,
+        exit_code,
+        mode,
+        platform,
+        os_version,
+        collectors,
+        argv,
+    )) = head
     else {
         return Ok(None);
     };
@@ -488,6 +512,8 @@ pub fn session_summary(
         bytes_up: counts.bytes_up,
         bytes_down: counts.bytes_down,
         mode,
+        platform,
+        os_version,
         collectors,
         finding_count: counts.finding_count,
         argv,
@@ -2810,9 +2836,20 @@ mod tests {
     /// UI re-review #144 new-5: the list and search need the command of an
     /// unnamed session, not just its public id.
     #[test]
-    fn list_and_summary_carry_the_stored_argv() {
+    fn list_carries_platform_os_version_and_stored_argv() {
         let conn = conn();
         session(&conn, 1, "u", 10);
+        conn.execute(
+            "UPDATE sessions SET platform = 'linux', os_version = '6.8' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let item = list_sessions(&conn, "u", &SessionFilter::default())
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(item.platform.as_deref(), Some("linux"));
+        assert_eq!(item.os_version.as_deref(), Some("6.8"));
         conn.execute(
             "UPDATE sessions SET argv = '[\"sleep\",\"90\"]' WHERE id = 1",
             [],

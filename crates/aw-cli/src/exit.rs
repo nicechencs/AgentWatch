@@ -14,10 +14,10 @@ pub const UNREACHABLE: i32 = 3;
 /// The caller is authenticated but not allowed.
 pub const PERMISSION: i32 = 4;
 
-/// Map an HTTP status from the daemon stub onto a CLI exit code.
+/// Map an HTTP status from the daemon onto a CLI exit code.
 ///
 /// `401` and `403` are permission (`4`). `421` (foreign Host) is treated as
-/// unreachable (`3`): the stub refused the request before any handler ran.
+/// unreachable (`3`): the daemon refused the request before any handler ran.
 /// Other `4xx` are usage (`2`). `5xx` and anything else are a general error (`1`).
 #[must_use]
 pub fn from_http_status(status: u16) -> i32 {

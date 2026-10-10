@@ -1,9 +1,8 @@
 //! `aw export` (P1-CLI-04).
 //!
 //! The CLI does not open the database. Records come from an [`ExportSource`].
-//! The production source is a stub that has no session: the daemon and
-//! `aw-store` are not dependencies of this crate. Tests inject records and
-//! assert the bytes this module writes.
+//! Production uses [`HttpExport`], which fetches the daemon's export. Tests
+//! inject records and assert the bytes this module writes.
 //!
 //! `md` is refused with exit 2. `--format` defaults to `jsonl`.
 
@@ -11,6 +10,8 @@ use std::io::{self, Write};
 
 use serde_json::{json, Value};
 
+use crate::client::{ApiRequest, Client, ClientError, LoopbackHttp, Transport};
+use crate::endpoint::Endpoint;
 use crate::exit;
 use crate::output::{parse_session, SessionRef};
 
@@ -70,15 +71,185 @@ pub(crate) trait ExportSource {
     ///
     /// A source-level failure. The message must not contain argv, URLs, or tokens.
     fn load(&mut self, query: &ExportQuery) -> Result<Option<ExportBatch>, String>;
+
+    /// Body of a daemon export, after a successful [`Self::load`].
+    ///
+    /// The default is `None`: the caller writes [`ExportBatch`] itself. A source
+    /// that already holds the daemon's file returns those bytes once.
+    fn take_export_body(&mut self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Production source. Has no database and no daemon, so every session is absent.
+///
+/// The live path uses [`DaemonExport`] instead. This stays for the test
+/// dispatcher, which has no endpoint.
 #[derive(Debug, Default)]
 pub(crate) struct EmptyExport;
 
 impl ExportSource for EmptyExport {
     fn load(&mut self, _query: &ExportQuery) -> Result<Option<ExportBatch>, String> {
         Ok(None)
+    }
+}
+
+/// Why a daemon export did not return bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExportFetchError {
+    /// The session is not this caller's. `session` is what the user typed.
+    NotFound { session: String },
+    /// The daemon refused the query, or the channel failed. Already Chinese.
+    Failed { detail: String },
+}
+
+/// `GET /api/v1/sessions/{session}/export`. The body is the daemon's file,
+/// passed through unchanged (JSONL text, or a zip when `format=csv`).
+pub(crate) trait ExportFetch {
+    /// Ask the daemon for one export.
+    ///
+    /// # Errors
+    ///
+    /// [`ExportFetchError::NotFound`] names `session`. [`ExportFetchError::Failed`]
+    /// is a channel or daemon failure whose text is already safe to print.
+    fn fetch(&mut self, session: &str, query: &str) -> Result<Vec<u8>, ExportFetchError>;
+}
+
+/// [`ExportSource`] that asks the daemon and keeps the body. Filtering and
+/// redaction happen on the daemon (`filter`, `redact_paths`, `redact_hosts`).
+pub(crate) struct DaemonExport<F: ExportFetch> {
+    fetch: F,
+    /// `format=jsonl` or `format=csv`, decided by [`run`] before the load.
+    format: &'static str,
+    /// Body from the last successful load. [`ExportSource::take_export_body`] returns it.
+    bytes: Option<Vec<u8>>,
+}
+
+impl<F: ExportFetch> DaemonExport<F> {
+    /// Bind `fetch`. `format` is the query value the daemon expects.
+    #[must_use]
+    pub(crate) fn new(fetch: F, format: ExportFormat) -> Self {
+        Self {
+            fetch,
+            format: match format {
+                ExportFormat::Jsonl => "jsonl",
+                ExportFormat::Csv => "csv",
+            },
+            bytes: None,
+        }
+    }
+}
+
+impl<F: ExportFetch> ExportSource for DaemonExport<F> {
+    fn load(&mut self, query: &ExportQuery) -> Result<Option<ExportBatch>, String> {
+        let session = session_key(&query.session);
+        let mut pairs = vec![("format", self.format)];
+        if let Some(filter) = query.filter.as_deref() {
+            pairs.push(("filter", filter));
+        }
+        if query.redact_paths {
+            pairs.push(("redact_paths", "1"));
+        }
+        if query.redact_hosts {
+            pairs.push(("redact_hosts", "1"));
+        }
+        let raw = super::query::encode_query(&pairs);
+        match self.fetch.fetch(&session, &raw) {
+            Ok(body) => {
+                self.bytes = Some(body);
+                // The records are the raw body. An empty batch only tells
+                // [`run`] the session exists; the body is what is written.
+                Ok(Some(ExportBatch {
+                    header: ExportHeader {
+                        session,
+                        export_version: 1,
+                    },
+                    records: Vec::new(),
+                }))
+            }
+            Err(ExportFetchError::NotFound { .. }) => Ok(None),
+            Err(ExportFetchError::Failed { detail }) => Err(detail),
+        }
+    }
+
+    fn take_export_body(&mut self) -> Option<Vec<u8>> {
+        self.bytes.take()
+    }
+}
+
+/// Production fetch. Dials the same internal channel the other commands use.
+pub(crate) struct HttpExport<T: Transport = LoopbackHttp> {
+    endpoint: Endpoint,
+    transport: Option<T>,
+}
+
+impl HttpExport<LoopbackHttp> {
+    /// Bind `endpoint`. The socket is opened on the first fetch.
+    #[must_use]
+    pub(crate) fn new(endpoint: Endpoint) -> Self {
+        Self {
+            endpoint,
+            transport: None,
+        }
+    }
+}
+
+impl<T: Transport> HttpExport<T> {
+    /// Answer from `transport` instead of dialing. Tests use this.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_transport(endpoint: Endpoint, transport: T) -> Self {
+        Self {
+            endpoint,
+            transport: Some(transport),
+        }
+    }
+
+    fn exchange(&mut self, request: &ApiRequest) -> Result<crate::client::ApiReply, ClientError> {
+        if let Some(transport) = self.transport.take() {
+            let mut client = Client::new(self.endpoint.clone(), transport);
+            let result = client.call(request);
+            self.transport = Some(client.transport);
+            result
+        } else {
+            let transport = LoopbackHttp::new(&self.endpoint)?;
+            let mut client = Client::new(self.endpoint.clone(), transport);
+            client.call(request)
+        }
+    }
+}
+
+impl<T: Transport> ExportFetch for HttpExport<T> {
+    fn fetch(&mut self, session: &str, query: &str) -> Result<Vec<u8>, ExportFetchError> {
+        let path = format!(
+            "/api/v1/sessions/{}/export",
+            super::query::encode_path_segment(session)
+        );
+        match self.exchange(&ApiRequest::get_query(&path, query)) {
+            Ok(reply) => Ok(reply.body),
+            Err(ClientError::Status { status: 404, .. }) => Err(ExportFetchError::NotFound {
+                session: session.to_owned(),
+            }),
+            Err(err) => Err(ExportFetchError::Failed {
+                detail: clip(&err.to_string()),
+            }),
+        }
+    }
+}
+
+fn clip(text: &str) -> String {
+    const MAX: usize = 240;
+    let mut out: String = text.chars().take(MAX).collect();
+    if text.chars().count() > MAX {
+        out.push('…');
+    }
+    out
+}
+
+fn session_key(session: &SessionRef) -> String {
+    match session {
+        SessionRef::Last => "@last".to_owned(),
+        SessionRef::IdOrName(id) => id.clone(),
     }
 }
 
@@ -257,6 +428,16 @@ pub(crate) struct ExportArgs<'a> {
 /// even when the caller also names `-o` (tests pass a cursor; the command
 /// still reports the path).
 pub(crate) fn run(args: ExportArgs<'_>, source: &mut dyn ExportSource) -> Outcome {
+    run_to(args, source, None)
+}
+
+/// [`run`], plus an optional file the daemon body is copied into. `output_file`
+/// is `Some` only when the caller passed `-o` and this process should create it.
+pub(crate) fn run_to(
+    args: ExportArgs<'_>,
+    source: &mut dyn ExportSource,
+    output_file: Option<&std::path::Path>,
+) -> Outcome {
     let ExportArgs {
         session,
         format,
@@ -285,15 +466,21 @@ pub(crate) fn run(args: ExportArgs<'_>, source: &mut dyn ExportSource) -> Outcom
     let batch = match source.load(&query) {
         Ok(Some(batch)) => batch,
         Ok(None) => {
+            let typed = session_key(&query.session);
             return error_outcome(
                 exit::GENERAL,
                 "not_found",
-                "export 还没有会话来源（此构建没有后台数据库）",
+                &format!("找不到会话 `{typed}`"),
                 json,
             );
         }
         Err(detail) => return error_outcome(exit::GENERAL, "export", &detail, json),
     };
+    // A daemon export is already a file. Writing `batch` would drop it: that
+    // source returns no records of its own.
+    if let Some(body) = source.take_export_body() {
+        return finish_daemon_body(body, output, output_file, format, json);
+    }
     let mut bytes = Vec::new();
     let count = match format {
         ExportFormat::Jsonl => write_jsonl(&mut bytes, &batch),
@@ -342,14 +529,64 @@ fn error_outcome(code: i32, machine: &str, message: &str, json: bool) -> Outcome
     super::error_outcome(code, machine, message, json)
 }
 
+/// Write the daemon's body to stdout, or to `-o` when one was named.
+fn finish_daemon_body(
+    body: Vec<u8>,
+    output: Option<&str>,
+    output_file: Option<&std::path::Path>,
+    format: ExportFormat,
+    json: bool,
+) -> Outcome {
+    let format_name = match format {
+        ExportFormat::Jsonl => "jsonl",
+        ExportFormat::Csv => "csv",
+    };
+    if let Some(path) = output_file {
+        if let Err(err) = std::fs::write(path, &body) {
+            return error_outcome(
+                exit::GENERAL,
+                "export",
+                &format!("写到 {path} 失败：{err}", path = path.display()),
+                json,
+            );
+        }
+    }
+    if json {
+        let doc = json!({
+            "bytes": body.len(),
+            "format": format_name,
+            "output": output,
+        });
+        return Outcome {
+            code: exit::OK,
+            stdout: format!("{doc}\n").into_bytes(),
+            stderr: Vec::new(),
+        };
+    }
+    let stdout = match output {
+        Some(path) => format!("已写入 {path}（{} 字节）\n", body.len()).into_bytes(),
+        None => body,
+    };
+    Outcome {
+        code: exit::OK,
+        stdout,
+        stderr: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        parse_format, write_csv, write_jsonl, ExportBatch, ExportFormat, ExportHeader,
-        ExportRecord, FormatError,
+        parse_format, run, run_to, write_csv, write_jsonl, DaemonExport, ExportArgs, ExportBatch,
+        ExportFormat, ExportHeader, ExportRecord, FormatError, HttpExport,
     };
+    use crate::client::{ApiReply, ApiRequest, ClientError, Transport};
+    use crate::endpoint::{Endpoint, HttpBase};
+    use crate::exit;
+    use std::cell::RefCell;
     use std::io;
+    use std::rc::Rc;
 
     /// Bytes that would be written to `-o`. Separate from the status line so a
     /// test can parse the export without scraping the summary.
@@ -435,6 +672,154 @@ mod tests {
             .contains("不支持"));
         assert_eq!(parse_format(None), Ok(ExportFormat::Jsonl));
         assert_eq!(parse_format(Some("csv")), Ok(ExportFormat::Csv));
+    }
+
+    struct Script {
+        seen: Rc<RefCell<Vec<(String, String)>>>,
+        status: u16,
+        body: Vec<u8>,
+    }
+
+    impl Transport for Script {
+        fn exchange(&mut self, request: &ApiRequest) -> Result<ApiReply, ClientError> {
+            self.seen
+                .borrow_mut()
+                .push((request.path.clone(), request.query.clone()));
+            let body = if self.status == 404 {
+                br#"{"error":{"code":"not_found","message":"session not found"}}"#.to_vec()
+            } else {
+                self.body.clone()
+            };
+            Ok(ApiReply {
+                status: self.status,
+                body,
+            })
+        }
+    }
+
+    fn endpoint() -> Endpoint {
+        Endpoint::Http {
+            base: HttpBase {
+                host: "127.0.0.1".to_owned(),
+                port: 9,
+            },
+            token: "test-token".to_owned(),
+        }
+    }
+
+    /// The daemon's body is what stdout gets. It is not rebuilt into records.
+    #[test]
+    fn daemon_bytes_pass_through_to_stdout() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let body = b"{\"type\":\"header\",\"session\":\"s-typed\"}\n{\"type\":\"processes\"}\n";
+        let script = Script {
+            seen: Rc::clone(&seen),
+            status: 200,
+            body: body.to_vec(),
+        };
+        let mut source = DaemonExport::new(
+            HttpExport::with_transport(endpoint(), script),
+            ExportFormat::Jsonl,
+        );
+        let outcome = run(
+            ExportArgs {
+                session: "s-typed",
+                format: Some("jsonl"),
+                output: None,
+                filter: Some("cat=proc"),
+                redact_paths: true,
+                redact_hosts: false,
+                json: false,
+            },
+            &mut source,
+        );
+        assert_eq!(
+            outcome.code,
+            exit::OK,
+            "{}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+        assert_eq!(outcome.stdout, body);
+        assert_eq!(
+            seen.borrow().clone(),
+            vec![(
+                "/api/v1/sessions/s-typed/export".to_owned(),
+                "format=jsonl&filter=cat%3Dproc&redact_paths=1".to_owned(),
+            )]
+        );
+    }
+
+    /// `-o` writes the same bytes and prints a Chinese summary, not the body.
+    #[test]
+    fn daemon_bytes_go_to_the_output_path() {
+        let dir = std::env::temp_dir().join(format!("aw-export-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("out.jsonl");
+        let body = b"{\"type\":\"header\"}\n";
+        let script = Script {
+            seen: Rc::new(RefCell::new(Vec::new())),
+            status: 200,
+            body: body.to_vec(),
+        };
+        let mut source = DaemonExport::new(
+            HttpExport::with_transport(endpoint(), script),
+            ExportFormat::Jsonl,
+        );
+        let outcome = run_to(
+            ExportArgs {
+                session: "@last",
+                format: None,
+                output: Some(path.to_str().expect("utf8 path")),
+                filter: None,
+                redact_paths: false,
+                redact_hosts: false,
+                json: false,
+            },
+            &mut source,
+            Some(path.as_path()),
+        );
+        assert_eq!(
+            outcome.code,
+            exit::OK,
+            "{}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+        let text = String::from_utf8(outcome.stdout).expect("utf8");
+        assert!(text.contains("已写入"), "{text}");
+        assert!(!text.contains("header"), "{text}");
+        assert_eq!(std::fs::read(&path).expect("file"), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 404 names the id the user typed, in Chinese.
+    #[test]
+    fn daemon_404_names_the_typed_session() {
+        let script = Script {
+            seen: Rc::new(RefCell::new(Vec::new())),
+            status: 404,
+            body: Vec::new(),
+        };
+        let mut source = DaemonExport::new(
+            HttpExport::with_transport(endpoint(), script),
+            ExportFormat::Csv,
+        );
+        let outcome = run(
+            ExportArgs {
+                session: "s-someone-else",
+                format: Some("csv"),
+                output: None,
+                filter: None,
+                redact_paths: false,
+                redact_hosts: true,
+                json: false,
+            },
+            &mut source,
+        );
+        assert_eq!(outcome.code, exit::GENERAL);
+        assert_eq!(
+            String::from_utf8(outcome.stderr).expect("utf8"),
+            "aw: 找不到会话 `s-someone-else`\n"
+        );
     }
 
     #[test]

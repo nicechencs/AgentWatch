@@ -96,8 +96,14 @@ export function SessionLayout() {
           {t("app.name")}
         </Link>
         <span className="text-ink-faint">▸</span>
+        <nav aria-label={t("session.breadcrumb")} className="flex min-w-0 items-center gap-1 text-sm">
+          <Link to="/" className="text-ink-soft underline" data-breadcrumb="sessions">
+            {t("nav.sessions")}
+          </Link>
+          <span className="text-ink-faint">/</span>
+          <span className="truncate">{sessionTitle(data)}</span>
+        </nav>
         <span className="font-mono text-xs">{data.public_id}</span>
-        <span className="truncate text-sm">{sessionTitle(data)}</span>
         <span className={`text-xs ${active ? "text-accent" : "text-ink-faint"}`}>
           {active ? `● ${t("session.recording")}` : `○ ${t("session.stopped")}`}
         </span>

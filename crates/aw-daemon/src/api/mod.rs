@@ -1,9 +1,8 @@
 //! Local API: auth, loopback HTTP, and session queries (P1-DAEMON-03, P2-DAEMON-01/02).
 //!
-//! axum is not a dependency. P2-DAEMON-01 asks for it; the P1 stub and this
-//! crate's `Cargo.toml` keep a `std::net` listener in [`http`] that calls the
-//! same [`routes::dispatch`]. Unix-socket peer credentials and the Windows
-//! named-pipe DACL are still not implemented. [`pipe_dacl_configured`] stays
+//! axum is not a dependency. The `std::net` listener in [`http`] calls the same
+//! [`routes::dispatch`] as the other transports. Unix-socket peer credentials
+//! and the Windows named-pipe DACL are still not implemented. [`pipe_dacl_configured`] stays
 //! `false` until a later card runs that check.
 //!
 //! `dead_code` is allowed on the public surface so the listener can exist

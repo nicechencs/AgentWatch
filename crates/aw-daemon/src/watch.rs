@@ -123,13 +123,16 @@ impl Watches {
                 .iter()
                 .any(|r| r.sampler.target().db_id == db_id)
             {
-                let root_pid = running.sampler.target().root_pid;
                 // Only the status the daemon reaped. An attached root (no child)
                 // and a status with no code stay unknown; they are not written
                 // as 0. The poll sampler cannot see a non-child's status, so
                 // children are left NULL here too.
                 if let Some(code) = code {
-                    record_root_exit(&self.db_path, db_id, root_pid, code);
+                    if let Some(root) = running.sampler.target().root_hint.as_ref() {
+                        record_root_exit(&self.db_path, db_id, root, code);
+                    } else {
+                        tracing::warn!(session = db_id, "root exit had no stored process identity");
+                    }
                 }
                 self.end(db_id, "exited", code);
             }
@@ -222,26 +225,50 @@ impl Watches {
 /// Write `code` onto the root's `processes` row, and its `exit_ns` when that
 /// is still NULL.
 ///
-/// The row is the one for `root_pid` in session `db_id`. The poll sampler
-/// records the process but not its status (a non-child's status is not
+/// The row is selected by its pid/start-time identity, not pid alone. The poll
+/// sampler records the process but not its status (a non-child's status is not
 /// readable), so this is the only place a daemon-spawned root's code is stored.
 /// A code already stored is kept: the first observation wins, and `0` is never
 /// written in place of an unknown one. Other rows of the session, including
-/// children, are not touched. A missing row or a database that cannot be
-/// opened leaves the table as it was; the session end is recorded separately.
-pub(crate) fn record_root_exit(db_path: &std::path::Path, db_id: i64, root_pid: u32, code: i32) {
+/// children or a reused pid, are not touched.
+pub(crate) fn record_root_exit(
+    db_path: &std::path::Path,
+    db_id: i64,
+    root: &crate::sample::RootHint,
+    code: i32,
+) {
     let Ok(conn) = rusqlite::Connection::open(db_path) else {
         return;
     };
-    let pid = i64::from(root_pid);
     let code = i64::from(code);
-    let _ = conn.execute(
+    let root_uid = i64::from_ne_bytes(root.uid.0.to_ne_bytes());
+    let Ok(start_ns) = i64::try_from(root.start_ns) else {
+        tracing::warn!(
+            session = db_id,
+            "root exit had an invalid process start time"
+        );
+        return;
+    };
+    let Ok(updated) = conn.execute(
         "UPDATE processes SET \
             exit_code = COALESCE(exit_code, ?1), \
             exit_ns = COALESCE(exit_ns, ?2) \
-         WHERE session_id = ?3 AND pid = ?4 AND exit_code IS NULL",
-        rusqlite::params![code, now_ns(), db_id, pid],
-    );
+         WHERE session_id = ?3 AND proc_uid = ?4 AND pid = ?5 AND start_ns = ?6 \
+           AND exit_code IS NULL",
+        rusqlite::params![
+            code,
+            now_ns(),
+            db_id,
+            root_uid,
+            i64::from(root.pid),
+            start_ns
+        ],
+    ) else {
+        return;
+    };
+    if updated == 0 {
+        tracing::warn!(session = db_id, "root exit did not update a process row");
+    }
 }
 
 /// Unix nanoseconds.

@@ -100,7 +100,7 @@ impl HttpBase {
         format!("http://{}:{}", self.host, self.port)
     }
 
-    /// `Host` header the daemon stub accepts: `127.0.0.1:<port>` or `localhost:<port>`.
+    /// `Host` header the daemon accepts: `127.0.0.1:<port>` or `localhost:<port>`.
     #[must_use]
     pub fn host_header(&self) -> String {
         format!("{}:{}", self.host, self.port)

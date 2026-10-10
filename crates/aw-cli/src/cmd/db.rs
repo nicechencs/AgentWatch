@@ -9,9 +9,9 @@
 //! - `POST /api/v1/db/migrate` with `{ "dry_run": bool }`
 //! - `POST /api/v1/db/purge` with `{ "older_than"?, "all", "confirm": true }`
 //!
-//! [`DbApi`] is that boundary. [`UnwiredApi`] is what production uses until the
-//! daemon serves the routes: every call is exit 3, not an empty success that
-//! would claim the database was vacuumed or purged.
+//! [`DbApi`] is that boundary. Production uses [`HttpDbApi`]. [`UnwiredApi`] is
+//! the test stand-in: every call is exit 3, not an empty success that would
+//! claim the database was vacuumed or purged.
 //!
 //! `purge --all` needs an administrator ([`super::daemon::Privilege`]) and
 //! exits 4 otherwise. `purge --older-than` does not. Pinned sessions are never
@@ -308,8 +308,8 @@ pub(crate) struct PurgeBody {
     pub all: bool,
 }
 
-/// Production client. No socket is opened: the query API for these routes is
-/// not wired in this build, and an empty success would claim a vacuum happened.
+/// Test client. No socket is opened, and an empty success would claim a vacuum
+/// happened. Production uses [`HttpDbApi`].
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct UnwiredApi;
 

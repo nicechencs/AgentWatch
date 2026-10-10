@@ -306,6 +306,7 @@ export function toGap(raw: unknown): Gap {
     from_ns: typeof r.from_ns === "number" ? r.from_ns : 0,
     to_ns: typeof r.to_ns === "number" ? r.to_ns : 0,
     collector: typeof r.collector === "string" ? r.collector : "",
+    source: strOrNull(r.source),
     kinds: list(r.kinds ?? r.kind),
     affected: list(r.affected ?? r.affects),
     count: typeof r.count === "number" ? r.count : 0,

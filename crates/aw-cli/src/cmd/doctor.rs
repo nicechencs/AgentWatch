@@ -96,10 +96,9 @@ impl DoctorSource for Unprobed {
     }
 }
 
-/// Production source. `GET /api/v1/doctor` says the request path does not probe
-/// collectors. That is mapped onto the same NA categories [`Unprobed`] prints,
-/// with the daemon's reason on the collector row. Categories the daemon does
-/// not list stay NA; they are not dropped.
+/// Production source. `GET /api/v1/doctor` returns the daemon's active
+/// collector capabilities. Categories the daemon does not list stay NA; they
+/// are not dropped.
 ///
 /// [`Unprobed`] stays for tests and for a daemon this process could not reach.
 /// A failed call does not invent an "ok" collector.
@@ -164,9 +163,18 @@ fn report_from_doctor_json(body: &Value) -> DoctorReport {
         });
     }
     let mut categories = default_categories();
-    if let Some(Value::Array(rows)) = body.get("categories") {
+    // Older daemon replies called these rows `categories`; the current daemon
+    // calls them `capabilities` and uses `kind`. Accept both shapes so the CLI
+    // reports the capability the daemon actually has instead of turning every
+    // row into the default unavailable answer.
+    let capability_rows = body.get("categories").or_else(|| body.get("capabilities"));
+    if let Some(Value::Array(rows)) = capability_rows {
         for row in rows {
-            let Some(name) = row.get("category").and_then(Value::as_str) else {
+            let Some(name) = row
+                .get("category")
+                .or_else(|| row.get("kind"))
+                .and_then(Value::as_str)
+            else {
                 continue;
             };
             let Some(slot) = categories.iter_mut().find(|item| item.category == name) else {
@@ -179,7 +187,8 @@ fn report_from_doctor_json(body: &Value) -> DoctorReport {
                 .get("source")
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
-                .map(str::to_owned);
+                .map(str::to_owned)
+                .or_else(|| capability_source(body, name));
             if let Some(code) = row.get("evidence").and_then(Value::as_str) {
                 if let Some(evidence) = evidence_from_code(code) {
                     slot.evidence = evidence;
@@ -189,6 +198,9 @@ fn report_from_doctor_json(body: &Value) -> DoctorReport {
                 if !fix.is_empty() {
                     slot.fix = Some(fix.to_owned());
                 }
+            }
+            if !matches!(slot.evidence, Evidence::NA(_)) {
+                slot.fix = None;
             }
         }
     }
@@ -215,6 +227,29 @@ fn report_from_doctor_json(body: &Value) -> DoctorReport {
         collectors,
         categories,
     }
+}
+
+/// The daemon's top-level capability rows do not repeat their collector name.
+/// Recover it from the collector's identical capability list for display.
+fn capability_source(body: &Value, category: &str) -> Option<String> {
+    body.get("collectors")?
+        .as_array()?
+        .iter()
+        .find(|collector| {
+            collector
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .is_some_and(|caps| {
+                    caps.iter().any(|cap| {
+                        cap.get("kind").and_then(Value::as_str) == Some(category)
+                            && cap.get("evidence").and_then(Value::as_str) != Some("NA")
+                    })
+                })
+        })
+        .and_then(|collector| collector.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
 }
 
 fn collector_from_json(value: &Value) -> Option<CollectorProbe> {
@@ -559,5 +594,43 @@ mod tests {
         let err = String::from_utf8(outcome.stderr).expect("utf8");
         assert!(err.contains("P2"), "{err}");
         assert!(outcome.stdout.is_empty());
+    }
+
+    #[test]
+    fn privileged_running_poll_makes_process_sampling_available() {
+        let body = serde_json::json!({
+            "probed": true,
+            "host": { "os": "linux", "version": "6.6", "privileged": true },
+            "collectors": [{
+                "name": "poll",
+                "status": "running",
+                "running": true,
+                "capabilities": [
+                    { "kind": "proc", "evidence": "S" },
+                    { "kind": "file", "evidence": "NA", "na_reason": "collector_unavailable" }
+                ]
+            }],
+            "capabilities": [
+                { "kind": "proc", "evidence": "S", "available": true },
+                { "kind": "file", "evidence": "NA", "na_reason": "collector_unavailable", "available": false }
+            ]
+        });
+        let report = super::report_from_doctor_json(&body);
+        let proc = report
+            .categories
+            .iter()
+            .find(|row| row.category == "proc")
+            .expect("proc row");
+        assert_eq!(proc.source.as_deref(), Some("poll"));
+        assert_eq!(proc.evidence, Evidence::S);
+        assert_eq!(proc.fix, None);
+
+        let line = super::report_text(&report)
+            .lines()
+            .find(|line| line.starts_with("proc  "))
+            .expect("process row")
+            .to_owned();
+        assert!(!line.contains("不可得"), "{line}");
+        assert!(!line.contains("root"), "{line}");
     }
 }

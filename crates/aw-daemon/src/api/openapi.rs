@@ -58,8 +58,11 @@ fn paths() -> Value {
         "/processes": op("get", "Current system process tree for the attach picker.", true, "implemented"),
         "/sessions": {
             "get": op_body("List sessions visible to the caller.", true, "implemented"),
-            "post": op_body("Create a session. Launch/attach is accepted and recorded; the scope provider is not started by this card.", true, "implemented")
+            "post": op_body("Create a session and start watching it (poll sampler, evidence S; Linux). mode=attach {pid}: another user's process needs an administrator (403). mode=launch {argv, cwd?, env?}: the daemon starts the program as its own user, so only that user may ask; others get 403 launch_needs_cli (use aw run). Elsewhere 503 collector_unavailable.", true, "implemented")
         },
+        "/sessions/run": op("post", "aw run: record a launch session {argv} and return {id, ticket, adopt_timeout_ms}. The caller starts the process itself, then posts /adopt.", true, "implemented"),
+        "/sessions/{sid}/adopt": op("post", "{ticket, pid}: hand the caller's process to a /sessions/run session within 5 s. Wrong ticket 403, late 410 adopt_timeout.", true, "implemented"),
+        "/sessions/{sid}/attach": op("post", "{pid}: watch one more root in an open session the caller owns. Another user's process needs an administrator.", true, "implemented"),
         "/sessions/{sid}": {
             "get": op_body("Session detail and stats.", true, "implemented"),
             "patch": op_body("Rename or pin.", true, "implemented"),

@@ -67,6 +67,20 @@ impl Redactor {
         }
     }
 
+    /// The argv rules [`Self::apply`] runs on a `ProcessStart`, for a command
+    /// line that is not an event (the `sessions.argv` of `aw run`).
+    pub fn redact_args(&self, argv: &[String]) -> Vec<String> {
+        if self.disabled {
+            return argv.to_vec();
+        }
+        let mut args: Vec<Arg> = argv.iter().map(|arg| Arg::new(arg.clone())).collect();
+        let exe_base = argv
+            .first()
+            .map(|exe| exe.rsplit(['/', '\\']).next().unwrap_or(exe).to_owned());
+        self.redact_argv(&mut args, exe_base.as_deref());
+        args.iter().map(|arg| arg.as_str().to_owned()).collect()
+    }
+
     /// Run B-class token rules over free text. Used for URLs and summaries.
     pub fn scrub_text(&self, text: &str) -> String {
         self.replace_tokens(text)

@@ -38,6 +38,7 @@ mod sample;
 mod service;
 mod session;
 mod supervisor;
+mod watch;
 
 fn main() -> ExitCode {
     // Keeps the collector crates linked. No platform collector is started here.

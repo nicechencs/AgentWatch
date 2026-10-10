@@ -1162,6 +1162,8 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                         "id": session.id,
                         "user_id": session.user_id,
                         "name": session.name,
+                        "platform": null,
+                        "os_version": null,
                     })
                 })
                 .collect();
@@ -1182,6 +1184,8 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                             "session_id": row.id,
                             "name": row.name,
                             "mode": row.mode,
+                            "platform": row.platform,
+                            "os_version": row.os_version,
                             "agent": row.agent,
                             "started_ns": row.started_ns,
                             "ended_ns": row.ended_ns,
@@ -2835,6 +2839,23 @@ mod tests {
         let (status, body) = get_as(&mut state, "1001", "/api/v1/sessions/@last");
         assert_eq!(status, 404, "{body}");
         assert_eq!(body["error"]["code"], "no_sessions");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_list_json_carries_platform_and_os_version() {
+        let (dir, db) = seeded_db(
+            "list-platform",
+            "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, os_version, collectors) VALUES (1, 's-macos', 'launch', 'alice', 1, 'macos', '14.6', '[]');",
+        );
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+
+        let (status, body) = get_as(&mut state, "alice", "/api/v1/sessions");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["sessions"][0]["platform"], "macos");
+        assert_eq!(body["sessions"][0]["os_version"], "14.6");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

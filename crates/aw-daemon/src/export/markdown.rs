@@ -106,9 +106,18 @@ fn local_time(ns: i64, tz: i32) -> String {
     )
 }
 
-/// `6s`, `1m 05s`, `2h 03m`.
-fn duration_text(ns: i64) -> String {
-    let secs = ns.max(0) / 1_000_000_000;
+/// Sub-second values say they are under one second; whole seconds use `6s`,
+/// `1m 05s`, or `2h 03m`.
+fn duration_text(ns: i64, lang: Lang) -> String {
+    let ns = ns.max(0);
+    if ns < 1_000_000_000 {
+        return if lang == Lang::En {
+            "under 1 s".to_owned()
+        } else {
+            "不到 1 秒".to_owned()
+        };
+    }
+    let secs = ns / 1_000_000_000;
     if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {
@@ -462,11 +471,12 @@ fn load_files(
 fn push_overview(out: &mut String, summary: &SessionSummary, header: &HeaderBits, reader: Reader) {
     let lang = reader.lang;
     let label = session_label(summary);
+    let platform = header.platform.as_deref().map(platform_name);
     let started = local_time(summary.started_ns, reader.tz);
     let ended = summary.ended_ns.map(|ns| local_time(ns, reader.tz));
     let duration = summary
         .ended_ns
-        .map(|ns| duration_text(ns.saturating_sub(summary.started_ns)));
+        .map(|ns| duration_text(ns.saturating_sub(summary.started_ns), lang));
     if lang == Lang::En {
         out.push_str("# Session report\n\n");
         out.push_str("This report lists what was recorded. It does not judge the session.\n\n");
@@ -475,7 +485,7 @@ fn push_overview(out: &mut String, summary: &SessionSummary, header: &HeaderBits
         en_line(out, "Name", label.as_deref());
         en_line(out, "Agent", summary.agent.as_deref());
         en_line(out, "Source", Some(mode_en(&header.mode).as_str()));
-        en_line(out, "Platform", header.platform.as_deref());
+        en_line(out, "Platform", platform);
         en_line(out, "OS version", header.os_version.as_deref());
         out.push_str(&format!("- Started: {started}\n"));
         match (&ended, &duration) {
@@ -510,7 +520,7 @@ fn push_overview(out: &mut String, summary: &SessionSummary, header: &HeaderBits
         zh_line(out, "名称", label.as_deref());
         zh_line(out, "智能体", summary.agent.as_deref());
         zh_line(out, "来源", Some(mode_zh(&header.mode).as_str()));
-        zh_line(out, "平台", header.platform.as_deref());
+        zh_line(out, "平台", platform);
         zh_line(out, "系统版本", header.os_version.as_deref());
         out.push_str(&format!("- 开始：{started}\n"));
         match (&ended, &duration) {
@@ -539,6 +549,17 @@ fn push_overview(out: &mut String, summary: &SessionSummary, header: &HeaderBits
         proxy_line(out, header.proxy_enabled, true);
     }
     out.push('\n');
+}
+
+/// Known platform identifiers use their reader-facing names. Unknown values
+/// are kept verbatim so a newer platform is still shown rather than hidden.
+fn platform_name(platform: &str) -> &str {
+    match platform {
+        "linux" => "Linux",
+        "macos" | "darwin" => "macOS",
+        "windows" => "Windows",
+        other => other,
+    }
 }
 
 fn push_capabilities(out: &mut String, header: &HeaderBits, lang: Lang) {
@@ -1047,7 +1068,7 @@ fn rule_name(rule: RuleId) -> &'static str {
 mod tests {
     use super::{
         build_report, collectors_text, duration_text, load_gaps, local_time, markdown_response,
-        parse_tz, Reader,
+        parse_tz, platform_name, Reader,
     };
     use aw_pipeline::wording::Lang;
 
@@ -1096,6 +1117,7 @@ mod tests {
         );
         assert!(zh.contains("- 时长：9s\n"), "{zh}");
         assert!(zh.contains("- 来源：启动\n"), "{zh}");
+        assert!(zh.contains("- 平台：Linux\n"), "{zh}");
         assert!(zh.contains("- 采集器：进程轮询\n"), "{zh}");
         assert!(!zh.contains("started_ns"), "{zh}");
         assert!(!zh.contains("[\"poll\"]"), "{zh}");
@@ -1120,6 +1142,7 @@ mod tests {
             "{en}"
         );
         assert!(en.contains("- Source: Launch\n"), "{en}");
+        assert!(en.contains("- Platform: Linux\n"), "{en}");
         assert!(en.contains("- Collectors: process polling\n"), "{en}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1182,9 +1205,22 @@ mod tests {
         assert_eq!(parse_tz(Some("480")), 480);
         assert_eq!(parse_tz(Some("9999")), 0);
         assert_eq!(parse_tz(None), 0);
-        assert_eq!(duration_text(6_400_000_000), "6s");
-        assert_eq!(duration_text(65_000_000_000), "1m 05s");
-        assert_eq!(duration_text(7_380_000_000_000), "2h 03m");
+        assert_eq!(duration_text(0, Lang::Zh), "不到 1 秒");
+        assert_eq!(duration_text(350_000_000, Lang::Zh), "不到 1 秒");
+        assert_eq!(duration_text(0, Lang::En), "under 1 s");
+        assert_eq!(duration_text(350_000_000, Lang::En), "under 1 s");
+        assert_eq!(duration_text(6_400_000_000, Lang::Zh), "6s");
+        assert_eq!(duration_text(65_000_000_000, Lang::Zh), "1m 05s");
+        assert_eq!(duration_text(7_380_000_000_000, Lang::Zh), "2h 03m");
+    }
+
+    #[test]
+    fn platform_names_are_human_readable_in_both_report_languages() {
+        assert_eq!(platform_name("linux"), "Linux");
+        assert_eq!(platform_name("macos"), "macOS");
+        assert_eq!(platform_name("darwin"), "macOS");
+        assert_eq!(platform_name("windows"), "Windows");
+        assert_eq!(platform_name("freebsd"), "freebsd");
     }
 
     #[test]

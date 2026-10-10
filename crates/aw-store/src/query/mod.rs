@@ -98,6 +98,10 @@ pub struct SessionListItem {
     pub name: Option<String>,
     /// `launch` or `attach`.
     pub mode: String,
+    /// Platform identifier, or unknown.
+    pub platform: Option<String>,
+    /// OS version, or unknown.
+    pub os_version: Option<String>,
     /// Agent profile, or unknown.
     pub agent: Option<String>,
     /// Start, Unix nanoseconds.
@@ -372,7 +376,7 @@ pub fn list_sessions(
 ) -> Result<Vec<SessionListItem>, QueryError> {
     let pred = compile_optional(filter.expr.as_deref(), Target::Sessions, None, None)?;
     let mut sql = String::from(
-        "SELECT id, public_id, name, mode, agent, started_ns, ended_ns, pinned, collectors, argv \
+        "SELECT id, public_id, name, mode, platform, os_version, agent, started_ns, ended_ns, pinned, collectors, argv \
          FROM sessions WHERE user_id = ?",
     );
     let mut bind: Vec<Param> = vec![Param::Text(user_id.to_string())];
@@ -417,12 +421,14 @@ pub fn list_sessions(
                 public_id: row.get(1)?,
                 name: row.get(2)?,
                 mode: row.get(3)?,
-                agent: row.get(4)?,
-                started_ns: row.get(5)?,
-                ended_ns: row.get(6)?,
-                pinned: row.get(7)?,
-                collectors: row.get(8)?,
-                argv: row.get(9)?,
+                platform: row.get(4)?,
+                os_version: row.get(5)?,
+                agent: row.get(6)?,
+                started_ns: row.get(7)?,
+                ended_ns: row.get(8)?,
+                pinned: row.get(9)?,
+                collectors: row.get(10)?,
+                argv: row.get(11)?,
                 counts: SessionCounts::default(),
             })
         })
@@ -2810,9 +2816,20 @@ mod tests {
     /// UI re-review #144 new-5: the list and search need the command of an
     /// unnamed session, not just its public id.
     #[test]
-    fn list_and_summary_carry_the_stored_argv() {
+    fn list_carries_platform_os_version_and_stored_argv() {
         let conn = conn();
         session(&conn, 1, "u", 10);
+        conn.execute(
+            "UPDATE sessions SET platform = 'linux', os_version = '6.8' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let item = list_sessions(&conn, "u", &SessionFilter::default())
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(item.platform.as_deref(), Some("linux"));
+        assert_eq!(item.os_version.as_deref(), Some("6.8"));
         conn.execute(
             "UPDATE sessions SET argv = '[\"sleep\",\"90\"]' WHERE id = 1",
             [],

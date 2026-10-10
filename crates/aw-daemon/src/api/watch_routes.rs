@@ -227,6 +227,32 @@ fn label_from_argv(argv: &[String]) -> String {
     }
 }
 
+/// The display label for an attach target: its executable base name, or the
+/// base name of `argv[0]` when the executable path is unavailable.
+fn attach_target_name(exe: Option<&str>, argv: Option<&[String]>) -> Option<String> {
+    fn base_name(path: &str) -> Option<&str> {
+        path.rsplit(['/', '\\'])
+            .find(|part| !part.trim().is_empty())
+    }
+
+    let name = exe.and_then(base_name).or_else(|| {
+        argv.and_then(|items| items.first())
+            .and_then(|arg0| base_name(arg0))
+    })?;
+    let redactor = aw_pipeline::Redactor::new(&aw_pipeline::config::RedactionConfig::default());
+    Some(redactor.scrub_text(name))
+}
+
+/// Read the target from the same process table used by the attach picker.
+/// The table is live, so a target that exits during creation may not have a
+/// label to retain.
+fn attach_target_name_for_pid(pid: u32) -> Option<String> {
+    let process = aw_collector_poll::host_process_table()?
+        .into_iter()
+        .find(|process| process.row.pid == pid)?;
+    attach_target_name(process.row.exe.as_deref(), process.row.argv.as_deref())
+}
+
 fn target_for(
     caller: &Caller,
     body: &Value,
@@ -234,7 +260,13 @@ fn target_for(
     root_pid: u32,
     argv: Option<&[String]>,
 ) -> Result<SampleTarget, ApiResponse> {
-    let name = opt_text(body, "name").or_else(|| argv.map(label_from_argv));
+    let name = opt_text(body, "name")
+        .or_else(|| argv.map(label_from_argv))
+        .or_else(|| {
+            (mode == "attach")
+                .then(|| attach_target_name_for_pid(root_pid))
+                .flatten()
+        });
     Ok(SampleTarget {
         db_id: 0,
         public_id: new_public_id()?,
@@ -667,5 +699,24 @@ mod spawn_error_tests {
         let response = spawn_error(&std::io::Error::from(std::io::ErrorKind::NotFound));
         assert_eq!(response.status, 400);
         assert!(!String::from_utf8_lossy(&response.body).contains("entity"));
+    }
+}
+
+#[cfg(test)]
+mod attach_target_name_tests {
+    use super::attach_target_name;
+
+    #[test]
+    fn attach_name_prefers_the_executable_then_argv_zero() {
+        let argv = vec!["/usr/local/bin/from-argv".to_owned()];
+        assert_eq!(
+            attach_target_name(Some("/opt/tools/from-exe"), Some(&argv)),
+            Some("from-exe".to_owned())
+        );
+        assert_eq!(
+            attach_target_name(None, Some(&argv)),
+            Some("from-argv".to_owned())
+        );
+        assert_eq!(attach_target_name(None, None), None);
     }
 }

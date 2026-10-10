@@ -10,6 +10,8 @@ import { Count } from "@/components/Count";
 import { EmptyNote, ErrorNote, Loading } from "@/components/QueryState";
 import { RelTime } from "@/components/RelTime";
 import { formatDuration } from "@/lib/format";
+import { NotCollected } from "@/components/NotCollected";
+import { coverage } from "@/lib/capabilities";
 import { diskUnavailableText, diskUsed } from "@/lib/disk";
 import { useI18n } from "@/lib/i18n";
 import { useExport } from "@/lib/use-export";
@@ -238,7 +240,10 @@ function SessionRow({
       <td className="px-2 py-1 tabular-nums">{duration}</td>
       <td className="px-2 py-1"><ListStat value={session.stats?.proc_count} /></td>
       <td className="px-2 py-1">
-        {session.stats ? (
+        {coverage(session, "net") === "not_collected" ? (
+          // Same wording as the overview: not collected, not 0 and not 不可得.
+          <NotCollected kind="net" />
+        ) : session.stats ? (
           <>
             <Bytes value={session.stats.bytes_up} /> / <Bytes value={session.stats.bytes_down} />
           </>
@@ -246,7 +251,7 @@ function SessionRow({
           <ListStat value={undefined} />
         )}
       </td>
-      <td className="px-2 py-1"><ListStat value={session.stats?.finding_count} /></td>
+      <td className="px-2 py-1"><ListStat value={session.stats?.finding_count} unknownTip /></td>
       <td className="px-2 py-1">
         {session.stats?.gap_count ? <span className="text-gap">{session.stats.gap_count}</span> : <Count value={session.stats?.gap_count ?? 0} />}
       </td>
@@ -292,9 +297,9 @@ function StatusCell({ purged, pinned, active }: { purged: boolean; pinned: boole
  * A count the list endpoint does not return. The overview has it; saying
  * 「不可得」 here contradicted the number there, so the cell points to it.
  */
-function ListStat({ value }: { value: number | null | undefined }) {
+function ListStat({ value, unknownTip = false }: { value: number | null | undefined; unknownTip?: boolean }) {
   const { t } = useI18n();
-  if (value === undefined) {
+  if (value === undefined || (unknownTip && value === null)) {
     return <span className="text-ink-faint" title={t("sessions.statInOverview")}>–</span>;
   }
   return <Count value={value} />;

@@ -130,6 +130,14 @@ function CommandLine({ command }: { command: string }) {
   );
 }
 
+/**
+ * Whether this daemon build routes `/proxy/ca` and `/proxy/rotate-ca`. It does
+ * not: the handlers in `crates/aw-daemon/src/api/proxy.rs` are not in the
+ * route table or `openapi.rs`. Asking anyway put a 404 in the console on every
+ * Settings visit. Flip this when the routes are wired.
+ */
+export const CA_ROUTES_SERVED = false;
+
 /** Container: loads /proxy/ca, wires rotate and on_tls_reject. */
 export function ProxySection({ config, admin }: { config: ConfigView; admin: boolean }) {
   const s = useProxyStrings();
@@ -139,8 +147,10 @@ export function ProxySection({ config, admin }: { config: ConfigView; admin: boo
   const [onTlsReject, setOnTlsReject] = useState<TlsReject>(proxy.on_tls_reject ?? "fail");
   const [notice, setNotice] = useState<string | null>(null);
 
-  const caQuery = useQuery({ queryKey: ["proxy-ca"], queryFn: () => proxyApi.caInfo(), retry: false });
-  const ca: CaState = caQuery.isLoading
+  const caQuery = useQuery({ queryKey: ["proxy-ca"], queryFn: () => proxyApi.caInfo(), retry: false, enabled: CA_ROUTES_SERVED });
+  const ca: CaState = !CA_ROUTES_SERVED
+    ? { kind: "unavailable" }
+    : caQuery.isLoading
     ? { kind: "loading" }
     : caQuery.isError
       ? routeMissing(caQuery.error)
@@ -180,7 +190,7 @@ export function ProxySection({ config, admin }: { config: ConfigView; admin: boo
       onTlsReject={onTlsReject}
       notice={notice}
       busy={rotate.isPending || save.isPending}
-      onRotate={() => rotate.mutate()}
+      onRotate={() => (CA_ROUTES_SERVED ? rotate.mutate() : setNotice(s.rotateUnavailable))}
       onChangeTlsReject={(value) => save.mutate(value)}
     />
   );

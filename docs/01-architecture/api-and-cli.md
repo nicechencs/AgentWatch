@@ -164,8 +164,8 @@ $ aw run --proxy -- claude
 | POST | `/sessions/run` | `aw run` 用。`{argv, cwd?, name?, agent?}` 记一条 `mode=launch` 会话，返回 201 `{id, ticket, adopt_timeout_ms: 5000}`。进程由调用方以自己的身份创建，再在 5 秒内调 `/adopt`；超时会话以 `adopt_timeout` 结束。`sessions.argv` 先过内置脱敏再存。 |
 | POST | `/sessions/{sid}/adopt` | `{ticket, pid}`。ticket 不符 403，超时 410 `adopt_timeout`，没有等待中的启动 404（他人的也是 404）。 |
 | POST | `/sessions/{sid}/attach` | `{pid}`：在自己的、未结束的会话里再多记录一个根进程；他人进程需管理员。会话已结束 409。 |
-| GET | `/sessions` | 列表。参数：`?since&until&agent&active&q&cursor&limit` |
-| GET | `/sessions/{sid}` | 会话详情 + `stats`，另带 `mode` 和 `collectors`。`collectors` 是数组，每项 `{name, mode, capabilities:[{kind, evidence, na_reason?}]}`：轮询采集器 `poll` 列 `proc`=S，`file`、`dns`=NA（`collector_unavailable`），`net` 在 Windows 为 S、其他平台为 NA。库里存的采集器名没有能力描述时（未知名字），该项 `capabilities` 为空并带 `note: "collector_not_described"`，界面据此说“不能确认是否采集”，不说“没有发生”。`/summary` 同样带这两个字段。 |
+| GET | `/sessions` | 列表。参数：`?since&until&agent&active&q&cursor&limit`。每行带 `collectors`（同会话详情）和 `stats`（同 `/summary` 的计数），列表和概览的数字一致；类别没采时界面两处都写「没采」。 |
+| GET | `/sessions/{sid}` | 会话详情 + `stats`（与会话列表、`/summary` 同一个计数函数 `aw_store::session_counts`：`process_count, flow_count, dns_count, gap_count, bytes_up, bytes_down, finding_count`；库里还没有 `findings` 表时 `finding_count` 为 null，不是 0），另带 `mode` 和 `collectors`。`collectors` 是数组，每项 `{name, mode, capabilities:[{kind, evidence, na_reason?}]}`：轮询采集器 `poll` 列 `proc`=S，`file`、`dns`=NA（`collector_unavailable`），`net` 在 Windows 为 S、其他平台为 NA。库里存的采集器名没有能力描述时（未知名字），该项 `capabilities` 为空并带 `note: "collector_not_described"`，界面据此说“不能确认是否采集”，不说“没有发生”。`/summary` 同样带这两个字段。 |
 | PATCH | `/sessions/{sid}` | `{name?, pinned?}` |
 | PATCH | `/sessions/{sid}/findings/{id}` | body：`{user_state: "confirmed"\|"ignored"\|null}`。只接受这三个值。`null` 清除标记。写入 `user_state_by`（当前用户）和 `user_state_ns`（Unix 纳秒）。不属于该用户的会话或发现返回 404。 |
 | POST | `/sessions/{sid}/stop` | 停止监控。写入 `ended_ns`；之后不再往这个会话写新记录。daemon 自带的 `daemon-sample` 会话也一样：采样器每次采样前读一次 `ended_ns`，已停止就停掉，daemon 重启后也不再恢复采样。 |
@@ -198,7 +198,7 @@ $ aw run --proxy -- claude
 | GET, POST | `/sessions/{sid}/export` | 参数：`?format&filter&redact_paths&redact_hosts&lang`。`format=md`（GET 或 POST）返回 `text/markdown`：会话信息、采集能力、缺口、按证据等级分组的发现（`content_match` 单独一节）、按流记录条数的域名、按访问行数的文件，文末固定附证据等级说明。未知字段写「不可得」并带原因。全文先过 `wording::lint`（内容匹配句只放行 `ContentMatchPhrase`）；有违规时 HTTP 422，body 为 `{"error":{"code":"wording_lint","violations":[...]}}`，不返回报告正文。`format=jsonl` 返回 `application/x-ndjson`，`format=csv` 返回各表 CSV 的 zip（`application/zip`），行与脱敏规则和 `aw export` 相同（`aw-store` 的同一写出函数），`filter`、`redact_paths`、`redact_hosts` 同样生效。其他 `format` 以及没有数据库的内存会话仍是 501。 |
 | GET | `/sessions/{sid}/live` | SSE 实时事件流（已脱敏、已归属的记录增量） |
 | GET | `/search` | 参数：`?q&kind&since&limit`。跨会话搜索。回复 `{"fts_enabled", "hits":[{src, src_id, session_id, public_id, text, ts_ns, evidence}]}`：`text` 是来源行存的文字（`file_access.path`；`process_images` 为 `exe`，没有 `exe` 时为 `argv`），`ts_ns` 是 `file_access.first_ns` 或 `process_images.ts_ns`（Unix 纳秒），`evidence` 照来源行原样。来源行没有的值为 null，不推测。 |
-| GET/PUT | `/config` | 读取/修改配置（PUT 仅管理员） |
+| GET/PUT | `/config` | 读取/修改配置（PUT 仅管理员）。GET 回复 `{"config": {...}, "builtin_redaction_rules": [{id, scope, pattern}]}`：内置脱敏规则始终生效、只读，`scope` 为 `text`/`argv`/`env`/`url`/`header`，结构性规则（如 `env.secret_name`）`pattern` 为 null。列表来自 `aw_pipeline::builtin_rules()`，与实际运行的规则同一张表。自定义规则在 `config.redaction.rules`，按正则表达式匹配。 |
 | GET | `/rules` | 已加载的规则 |
 | GET | `/db/stats` | |
 | POST | `/db/purge` | 仅管理员（非管理员 403）。body：`{older_than?: "30d", all?: bool, dry_run?: bool, confirm?: bool}`，`older_than` 与 `all` 至少一个。两步：`dry_run: true` 只列出将删除的会话 `{"dry_run":true,"would_purge":[{public_id,session_id}]}`，不删；真正删除必须带 `confirm: true`，否则 400 `confirm_required`。固定（pinned）和未结束的会话永不删除；每删一个在 `schema_meta` 留 `purged:<public_id>` 审计记录（storage §5）。返回 `{"purged":[{public_id,session_id,reason,deleted_ns}]}`。CLI `aw db purge` 在 `--yes` 或交互确认后才发 `confirm: true`。 |

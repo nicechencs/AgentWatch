@@ -6,7 +6,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { ApiError, describeError } from "@/api/errors";
-import { parseSse, subscribeLive, toDoctor, toProcessNode, toSearchResult, toSession } from "@/api/client";
+import { parseSse, subscribeLive, toConfigView, toDoctor, toProcessNode, toSearchResult, toSession } from "@/api/client";
 import { capabilitiesUnknown, coverage, kindLabel, uncollectedKinds } from "@/lib/capabilities";
 import { diskUnavailableText, diskUsed } from "@/lib/disk";
 import { dayKey, isWallTime } from "@/lib/format";
@@ -202,6 +202,43 @@ describe("details", () => {
       expect(ZH[key]).not.toMatch(/^不可得/u);
       expect((en as Record<string, string>)[key]).not.toMatch(/^unavailable/iu);
     }
+  });
+  it("detail 7: the list row carries the overview counts and coverage", () => {
+    const row = toSession({
+      id: "s1",
+      session_id: 1,
+      started_ns: 5,
+      collectors: [{ name: "poll", capabilities: [{ kind: "proc", evidence: "S" }, { kind: "net", evidence: "NA" }] }],
+      stats: { process_count: 640, gap_count: 0, finding_count: 2, bytes_up: null, bytes_down: null },
+    });
+    expect(row.stats?.proc_count).toBe(640);
+    expect(row.stats?.finding_count).toBe(2);
+    expect(coverage(row, "net")).toBe("not_collected");
+  });
+  it("detail 9: Settings lists the built-in redaction rules", () => {
+    const view = toConfigView({
+      config: { redaction: { rules: [{ id: "custom-1", builtin: false, pattern: "x+", description: null }] } },
+      builtin_redaction_rules: [{ id: "tok.github", scope: "text", pattern: "gh" }, { id: "env.secret_name", scope: "env", pattern: null }],
+    });
+    expect(view.redaction.rules.map((r) => [r.id, r.builtin])).toEqual([["tok.github", true], ["env.secret_name", true], ["custom-1", false]]);
+    expect(ZH["redact.rule.tok.github"]).toBeTruthy();
+    expect(ZH["redact.rule.env.secret_name"]).toBeTruthy();
+  });
+  it("Settings does not request the unrouted /proxy/ca (console 404)", async () => {
+    const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
+    const { ProxySection, CA_ROUTES_SERVED } = await import("@/features/settings/proxy/ProxySection");
+    expect(CA_ROUTES_SERVED).toBe(false);
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => { calls.push(String(url)); return new Response("{}", { status: 200 }); }));
+    const view = toConfigView({ config: { proxy: { on_tls_reject: "fail" } } });
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ProxySection config={view} admin={false} />
+      </QueryClientProvider>,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    vi.unstubAllGlobals();
+    expect(calls.filter((url) => url.includes("/proxy/"))).toEqual([]);
   });
   it("disk usage unavailable is one sentence, not 不可得 / 不可得", () => {
     const stats = { available: false, reason: "per-user stats are not exported", db_bytes: null, wal_bytes: null } as never;

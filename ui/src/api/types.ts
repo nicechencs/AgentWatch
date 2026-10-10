@@ -383,6 +383,8 @@ export interface RedactionRule {
   builtin: boolean;
   pattern: string;
   description: string | null;
+  /** Built-in rules: `text`, `argv`, `env`, `url` or `header`. */
+  scope?: string | null;
 }
 
 export interface ConfigView {

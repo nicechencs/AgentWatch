@@ -304,7 +304,17 @@ export function toConfigView(raw: unknown): ConfigView {
       ...(retention as object),
       max_db_bytes: numOrNull(retention.max_db_bytes) ?? (mb === null ? undefined : mb * 1024 * 1024),
     },
-    redaction: { ...(redaction as object), rules: arr(redaction.rules) },
+    // Built-in rules come next to the config (`builtin_redaction_rules`):
+    // read-only, always on. Custom rules stay in `config.redaction.rules`.
+    redaction: {
+      ...(redaction as object),
+      rules: [
+        ...arr(outer.builtin_redaction_rules)
+          .filter(isObj)
+          .map((rule) => ({ id: String(rule.id ?? ""), builtin: true, pattern: strOrNull(rule.pattern) ?? "", description: null, scope: strOrNull(rule.scope) })),
+        ...arr(redaction.rules),
+      ],
+    },
     collectors: configCollectors(r.collectors),
     proxy: { ca_fingerprint: null, ca_created_ns: null, ...(proxy as object) },
     rules: arr(r.rules),

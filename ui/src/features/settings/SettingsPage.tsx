@@ -170,7 +170,9 @@ function Privacy({ config, admin }: { config: ConfigView; admin: boolean }) {
         {config.redaction.rules.map((rule) => (
           <li key={rule.id} className="flex items-baseline gap-2 border-b border-line/60 py-1">
             <span className="font-mono">{rule.id}</span>
-            <span className="truncate text-ink-faint">{rule.builtin ? rule.description : rule.pattern}</span>
+            <span className="truncate text-ink-faint" title={rule.pattern || undefined}>
+              {rule.builtin ? builtinRuleText(t, rule) : rule.pattern}
+            </span>
             {rule.builtin ? null : <span className="text-ink-faint">{t("settings.customRule")}</span>}
           </li>
         ))}
@@ -266,4 +268,12 @@ function Appearance() {
       </label>
     </Section>
   );
+}
+
+/** Chinese (or English) sentence for a built-in rule; the regex when there is none. */
+function builtinRuleText(t: (key: string) => string, rule: { id: string; description: string | null; pattern: string }): string {
+  const key = `redact.rule.${rule.id}`;
+  const text = t(key);
+  if (text !== key) return text;
+  return rule.description ?? rule.pattern;
 }

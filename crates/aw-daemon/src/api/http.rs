@@ -174,12 +174,21 @@ fn serve_conn(
             };
         }
     };
-    let response = {
+    let (response, slow) = {
         let mut guard = match state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        dispatch(&mut guard, &request)
+        match super::routes::take_slow(&mut guard, &request, None) {
+            Some(job) => (None, Some(job)),
+            None => (Some(dispatch(&mut guard, &request)), None),
+        }
+    };
+    // An export is built after the lock is released (see `take_slow`).
+    let response = match (response, slow) {
+        (Some(response), _) => response,
+        (None, Some(job)) => job(),
+        (None, None) => super::routes::error_response(500, "internal", "no response"),
     };
     // Method + route + status only. The raw path is not logged: a query string
     // was split off, but a path segment can still carry a token or a ticket.

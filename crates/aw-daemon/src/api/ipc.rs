@@ -134,12 +134,24 @@ fn answer(
     if let Some(reply) = super::control::handle(control, request, caller) {
         return reply;
     }
-    let reply = {
+    let (reply, slow) = {
         let mut guard = match state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        super::routes::dispatch_peer(&mut guard, request, caller)
+        match super::routes::take_slow(&mut guard, request, Some(caller)) {
+            Some(job) => (None, Some(job)),
+            None => (
+                Some(super::routes::dispatch_peer(&mut guard, request, caller)),
+                None,
+            ),
+        }
+    };
+    // An export is built after the lock is released (see `take_slow`).
+    let reply = match (reply, slow) {
+        (Some(reply), _) => reply,
+        (None, Some(job)) => job(),
+        (None, None) => super::routes::error_response(500, "internal", "no response"),
     };
     super::control::decorate(control, request, reply)
 }

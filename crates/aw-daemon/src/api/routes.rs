@@ -736,6 +736,62 @@ pub fn dispatch(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     route_authed(state, req, &caller)
 }
 
+/// Work that runs after the shared-state lock is released.
+pub(crate) type Deferred = Box<dyn FnOnce() -> ApiResponse + Send>;
+
+/// Requests that only read the database and can take long (exports) are
+/// authenticated under the lock and then built without it, so one large
+/// export does not hold every other request on the socket and the HTTP
+/// listener behind the same mutex. `peer` is the internal channel's caller;
+/// `None` means HTTP, where the bearer is checked here. Anything else, or a
+/// request that fails authentication, returns `None` and goes through
+/// [`dispatch`] / [`dispatch_peer`] as before (so errors are unchanged).
+pub(crate) fn take_slow(
+    state: &mut ApiState,
+    req: &HttpRequest,
+    peer: Option<&Caller>,
+) -> Option<Deferred> {
+    if req.body_too_large {
+        return None;
+    }
+    let get_or_post =
+        req.method.eq_ignore_ascii_case("GET") || req.method.eq_ignore_ascii_case("POST");
+    let sid = req
+        .path
+        .strip_prefix("/api/v1/sessions/")?
+        .strip_suffix("/export")?
+        .to_owned();
+    if !get_or_post || sid.is_empty() || sid.contains('/') {
+        return None;
+    }
+    let db_path = state.query.db_path.clone()?;
+    let caller = match peer {
+        Some(caller) => caller.clone(),
+        None => authenticate(state, req).ok()?,
+    };
+    let query = req.query.clone();
+    let md = export_format_is_md(&query);
+    let data = crate::export::data::DataFormat::from_query(&query);
+    if !md && data.is_none() {
+        return None;
+    }
+    Some(Box::new(move || {
+        // A read-only view: the database path and nothing else. Tickets, the
+        // live hub, and the watch queue stay behind the lock.
+        let snapshot = ApiState {
+            query: StoreQuery::open_path(db_path),
+            ..ApiState::default()
+        };
+        match data {
+            _ if md => crate::export::markdown::export_markdown(&snapshot, &caller, &sid, &query),
+            Some(format) => {
+                crate::export::data::export_data(&snapshot, &caller, &sid, &query, format)
+            }
+            None => error_response(400, "bad_argument", "format"),
+        }
+    }))
+}
+
 /// Dispatch one request that arrived on the internal channel (Unix socket or
 /// named pipe, see `api/ipc.rs`).
 ///
@@ -2980,6 +3036,93 @@ mod tests {
             "daemon/poll unknown store_failure ×2"
         );
         assert_eq!(by_cat("gap")["fields"]["count"], 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_is_built_after_the_lock_with_the_same_answer() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "aw-routes-slow-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let db = dir.join("agentwatch.db");
+        let seeded = aw_store::Store::open(&db).map(|store| {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors) \
+                     VALUES (1, 'sx', 'attach', 'alice', 1, 'linux', '[\"poll\"]')",
+                    [],
+                )
+                .is_ok()
+        });
+        assert!(matches!(seeded, Ok(true)));
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+        let alice = token_for(&mut state, "alice", false);
+        let bob = token_for(&mut state, "bob", false);
+        let request = |token: Option<&str>, query: &str| {
+            let mut r = req(
+                "GET",
+                "/api/v1/sessions/sx/export",
+                Some("127.0.0.1:7456"),
+                token,
+                b"",
+            );
+            r.query = query.to_owned();
+            r
+        };
+        // Not an export, no token, a foreign Host, an unknown format: the
+        // normal path answers (and keeps its error codes).
+        let mut list = request(Some(&alice), "");
+        list.path = "/api/v1/sessions".to_owned();
+        assert!(super::take_slow(&mut state, &list, None).is_none());
+        assert!(super::take_slow(&mut state, &request(None, "format=jsonl"), None).is_none());
+        let mut foreign = request(Some(&alice), "format=jsonl");
+        foreign
+            .headers
+            .insert("host".to_owned(), "evil.com".to_owned());
+        assert!(super::take_slow(&mut state, &foreign, None).is_none());
+        assert!(super::take_slow(&mut state, &request(Some(&alice), "format=pdf"), None).is_none());
+
+        let mut jobs = Vec::new();
+        for format in ["jsonl", "csv", "md"] {
+            let r = request(Some(&alice), &format!("format={format}"));
+            let expected = dispatch(&mut state, &r);
+            assert_eq!(expected.status, 200, "{format}");
+            let job = super::take_slow(&mut state, &r, None);
+            assert!(job.is_some(), "{format}");
+            jobs.push((format, expected, job));
+        }
+        let hidden = super::take_slow(&mut state, &request(Some(&bob), "format=jsonl"), None);
+        let peer = super::Caller {
+            user_id: "alice".to_owned(),
+            admin: false,
+        };
+        let over_channel =
+            super::take_slow(&mut state, &request(None, "format=jsonl"), Some(&peer));
+        // The jobs own everything they need: the state can go away first.
+        drop(state);
+        for (format, expected, job) in jobs {
+            let Some(job) = job else { continue };
+            let got = job();
+            assert_eq!(got.status, expected.status, "{format}");
+            assert_eq!(
+                got.header("content-type"),
+                expected.header("content-type"),
+                "{format}"
+            );
+            if format != "md" {
+                // Markdown carries a generation time; the data formats are exact.
+                assert_eq!(got.body, expected.body, "{format}");
+            }
+        }
+        assert_eq!(hidden.map(|job| job().status), Some(404));
+        assert_eq!(over_channel.map(|job| job().status), Some(200));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

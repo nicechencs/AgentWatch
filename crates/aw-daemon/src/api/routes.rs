@@ -3171,6 +3171,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `aw run` posts `/exit` as soon as the root exits, which can be before
+    /// the foreground loop's first poll starts a sampler. The root's row must
+    /// already exist (written at `/adopt`) so the code lands on it, and the
+    /// later poll keeps it: one row, exit code 7, never NULL.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn exit_posted_before_any_poll_lands_on_the_root_row() {
+        use std::os::fd::AsRawFd;
+
+        let (dir, db) = seeded_db("exit-before-poll", "");
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(
+                r#"fd=$1; shift; IFS= read -r _ < "/dev/fd/$fd" || exit 125; case "$fd" in [0-9]) eval "exec $fd<&-" ;; esac; exec "$@""#,
+            )
+            .arg("aw-daemon-test-gate")
+            .arg(read_fd.as_raw_fd().to_string())
+            .arg("sh")
+            .arg("-c")
+            .arg("exit 7")
+            .spawn()
+            .expect("held child");
+        let pid = child.id();
+        drop(read_fd);
+
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &crate::sample::current_user_id(), false);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions/run",
+            r#"{"argv":["sh","-c","exit 7"]}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let sid = body["id"].as_str().unwrap_or_default().to_owned();
+        let ticket = body["ticket"].as_str().unwrap_or_default();
+        let (status, body) = post(
+            &mut state,
+            &token,
+            &format!("/api/v1/sessions/{sid}/adopt"),
+            &format!(r#"{{"ticket":"{ticket}","pid":{pid}}}"#),
+        );
+        assert_eq!(status, 200, "{body}");
+
+        nix::unistd::write(&write_fd, b"1\n").expect("release gate");
+        drop(write_fd);
+        assert_eq!(child.wait().expect("reap child").code(), Some(7));
+
+        let (status, body) = post(
+            &mut state,
+            &token,
+            &format!("/api/v1/sessions/{sid}/exit"),
+            r#"{"exit_code":7}"#,
+        );
+        assert_eq!(status, 200, "{body}");
+        let root_code = |db: &std::path::Path| -> Vec<Option<i64>> {
+            let conn = rusqlite::Connection::open(db).expect("db");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT p.exit_code FROM processes p JOIN sessions s ON s.id = p.session_id \
+                     WHERE s.public_id = ?1 AND p.pid = ?2",
+                )
+                .expect("prepare");
+            stmt.query_map(rusqlite::params![sid, pid], |r| r.get(0))
+                .expect("query")
+                .map(|r| r.expect("row"))
+                .collect()
+        };
+        assert_eq!(root_code(&db), vec![Some(7)], "before any poll");
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+        let mut watches = crate::watch::Watches::new(db.clone());
+        watches.tick(&shared);
+        watches.tick(&shared);
+        assert_eq!(
+            root_code(&db),
+            vec![Some(7)],
+            "after the poll: one row, code kept"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[allow(clippy::expect_used)]

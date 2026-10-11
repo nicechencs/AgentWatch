@@ -14,6 +14,7 @@
 //! - Only Linux reads process identity for the poll sampler today; elsewhere
 //!   these routes answer 503 `collector_unavailable` and create nothing.
 
+use aw_platform::{Capability, Owner, PlatformError};
 use serde_json::{json, Value};
 
 use super::auth::{random_secret, Caller};
@@ -92,47 +93,49 @@ fn argv0_basename(argv_json: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The daemon's effective uid (0 when it runs as root).
-fn daemon_uid() -> u32 {
-    #[cfg(unix)]
+fn collector_available() -> Result<(), ApiResponse> {
+    aw_platform::require_capability(Capability::ProcessIdentity).map_err(platform_unavailable)
+}
+
+/// The daemon account comes from the platform boundary, never from a target
+/// conditional in this shared route.
+fn daemon_uid() -> Result<u32, ApiResponse> {
+    match aw_platform::platform()
+        .current_owner()
+        .map_err(platform_unavailable)?
     {
-        nix::unistd::geteuid().as_raw()
-    }
-    #[cfg(not(unix))]
-    {
-        u32::MAX
+        Owner::Unix { euid, .. } => Ok(euid),
+        Owner::Windows { .. } => Err(platform_unavailable(PlatformError::Unsupported {
+            capability: "unix_account_switch",
+            os: aw_platform::platform().os(),
+            kind: aw_platform::UnsupportedKind::NotSupportedOnThisOs,
+        })),
     }
 }
 
-fn collector_available() -> Result<(), ApiResponse> {
-    if cfg!(target_os = "linux") {
-        Ok(())
-    } else {
-        Err(error_response(
+fn platform_unavailable(error: PlatformError) -> ApiResponse {
+    match error {
+        PlatformError::Unsupported {
+            capability,
+            os,
+            kind,
+        } => ApiResponse::json(
+            503,
+            &json!({
+                "error": {
+                    "code": "collector_unavailable",
+                    "message": "the requested collector capability is unavailable",
+                    "capability": capability,
+                    "os": os,
+                    "kind": kind.as_str(),
+                }
+            }),
+        ),
+        _ => error_response(
             503,
             "collector_unavailable",
-            "the poll sampler reads process identity only on Linux in this build",
-        ))
-    }
-}
-
-/// Real, effective, and saved uids of `pid` from `/proc/<pid>/status`.
-/// `/proc/<pid>` itself is root-owned, so its directory owner is not useful.
-/// `None` means the three identity fields could not be read.
-fn pid_owner(pid: u32) -> Option<[u32; 3]> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        let line = status.lines().find(|line| line.starts_with("Uid:"))?;
-        let mut uids = line[4..]
-            .split_whitespace()
-            .map(|uid| uid.parse::<u32>().ok());
-        Some([uids.next()??, uids.next()??, uids.next()??])
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
+            "the requested collector capability is unavailable",
+        ),
     }
 }
 
@@ -154,7 +157,10 @@ fn check_pid_owner(
         )
     })?;
     let caller_uid = caller.user_id.parse::<u32>().ok();
-    let owner = pid_owner(pid);
+    let owner = aw_platform::platform()
+        .process_identity(pid)
+        .map_err(platform_unavailable)?
+        .and_then(|process| process.owner);
     let after = crate::sample::proc_uid_of(pid);
     if after != Some(before) {
         return Err(error_response(
@@ -163,8 +169,12 @@ fn check_pid_owner(
             "pid changed while its identity was being checked",
         ));
     }
-    let owned_by_caller = owner
-        .is_some_and(|uids| caller_uid.is_some_and(|uid| uids.iter().all(|actual| *actual == uid)));
+    let owned_by_caller = owner.is_some_and(|owner| match owner {
+        Owner::Unix {
+            ruid, euid, suid, ..
+        } => caller_uid.is_some_and(|uid| [ruid, euid, suid].iter().all(|actual| *actual == uid)),
+        Owner::Windows { sid, .. } => sid == caller.user_id,
+    });
     if owned_by_caller || (allow_admin && caller.admin) {
         return Ok(before);
     }
@@ -344,7 +354,7 @@ fn create_inner(
             collector_available()?;
             // Whose account: only the OS-verified caller (see `launch_as`).
             // A `uid` / `user` in the body is never read.
-            let who = super::launch_as::identity_for(&caller.user_id, daemon_uid())?;
+            let who = super::launch_as::identity_for(&caller.user_id, daemon_uid()?)?;
             let cwd = opt_text(&value, "cwd");
             let env: Vec<(String, String)> = value
                 .get("env")
@@ -412,7 +422,7 @@ fn create_inner(
             let response = created(&target, json!({}));
             state.watch_requests.push(WatchRequest::Start {
                 target: Box::new(target),
-                child: Some(crate::watch::released_child(child)),
+                child: Some(aw_platform::released_child(child)),
             });
             Ok(response)
         }

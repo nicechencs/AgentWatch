@@ -15,13 +15,12 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::Child;
 use std::sync::{Arc, Mutex};
 
 use crate::api::ApiState;
 use crate::sample::{HostSampler, SampleTarget};
 
-use aw_platform::{PlatformError, ReapOutcome, ReleasedChild};
+use aw_platform::{ReapOutcome, ReleasedChild};
 
 /// How long `POST /sessions/run` waits for `/adopt`. Same as the orchestrator.
 pub(crate) const ADOPT_TIMEOUT_NS: i64 = 5_000_000_000;
@@ -48,46 +47,6 @@ pub(crate) struct PendingLaunch {
 struct Running {
     sampler: HostSampler,
     child: Option<Box<dyn ReleasedChild>>,
-}
-
-/// Wrap the daemon's already-launched child in the interface-v2 ownership
-/// type. The watcher only ever reaps this owned handle, never a PID lookup.
-pub(crate) fn released_child(child: Child) -> Box<dyn ReleasedChild> {
-    Box::new(DaemonReleasedChild { child })
-}
-
-struct DaemonReleasedChild {
-    child: Child,
-}
-
-fn child_outcome(status: std::process::ExitStatus) -> ReapOutcome {
-    match status.code() {
-        Some(code) => ReapOutcome::Exited(code),
-        #[cfg(unix)]
-        None => {
-            use std::os::unix::process::ExitStatusExt;
-            ReapOutcome::Signaled(status.signal().unwrap_or_default())
-        }
-        #[cfg(not(unix))]
-        None => ReapOutcome::Signaled(0),
-    }
-}
-
-impl ReleasedChild for DaemonReleasedChild {
-    fn pid(&self) -> u32 {
-        self.child.id()
-    }
-
-    fn try_reap(&mut self) -> Result<ReapOutcome, PlatformError> {
-        Ok(self
-            .child
-            .try_wait()?
-            .map_or(ReapOutcome::StillRunning, child_outcome))
-    }
-
-    fn wait(mut self: Box<Self>) -> Result<ReapOutcome, PlatformError> {
-        Ok(child_outcome(self.child.wait()?))
-    }
 }
 
 /// Samplers for API-started sessions. Owned by the foreground loop.

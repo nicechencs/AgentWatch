@@ -1,8 +1,9 @@
 use crate::{
     Capability, CapabilityStatus, IdentifiedCaller, Owner, PeerIdentity, Platform, PlatformError,
-    ProcessEntry, SamplingProcess, SpawnRequest, UnsupportedKind,
+    ProcessEntry, ReapOutcome, ReleasedChild, SamplingProcess, SpawnRequest, UnsupportedKind,
 };
 use std::path::{Path, PathBuf};
+use std::process::Child;
 pub(crate) struct CurrentPlatform;
 fn no(capability: &'static str) -> PlatformError {
     PlatformError::Unsupported {
@@ -37,6 +38,9 @@ impl Platform for CurrentPlatform {
     ) -> Result<Box<dyn crate::HeldChild>, PlatformError> {
         Err(no("spawn_suspended"))
     }
+    fn released_child(&self, child: Child) -> Box<dyn ReleasedChild> {
+        Box::new(MacosReleasedChild { child })
+    }
     fn process_identity(&self, _: u32) -> Result<Option<ProcessEntry>, PlatformError> {
         Err(no("process_identity"))
     }
@@ -69,4 +73,29 @@ impl Platform for CurrentPlatform {
     fn current_owner(&self) -> Result<Owner, PlatformError> {
         Err(no("current_owner"))
     }
+}
+
+struct MacosReleasedChild {
+    child: Child,
+}
+impl ReleasedChild for MacosReleasedChild {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+    fn try_reap(&mut self) -> Result<ReapOutcome, PlatformError> {
+        Ok(self
+            .child
+            .try_wait()?
+            .map_or(ReapOutcome::StillRunning, reap_outcome))
+    }
+    fn wait(mut self: Box<Self>) -> Result<ReapOutcome, PlatformError> {
+        Ok(reap_outcome(self.child.wait()?))
+    }
+}
+fn reap_outcome(status: std::process::ExitStatus) -> ReapOutcome {
+    use std::os::unix::process::ExitStatusExt;
+    status.code().map_or_else(
+        || ReapOutcome::Signaled(status.signal().unwrap_or_default()),
+        ReapOutcome::Exited,
+    )
 }

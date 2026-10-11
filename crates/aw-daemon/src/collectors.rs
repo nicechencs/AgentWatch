@@ -1,5 +1,5 @@
-//! The only file in this crate that names a platform.
-//! Later tasks assemble real collectors here.
+//! Collector wiring is selected by `aw-platform`.
+//! Later tasks assemble real collectors through that boundary.
 
 /// Confirms the daemon links every collector crate it is allowed to depend on.
 pub fn wired() -> bool {
@@ -15,12 +15,10 @@ pub fn wired() -> bool {
         std::any::type_name::<aw_collector_poll::Placeholder>(),
     );
 
-    #[cfg(target_os = "linux")]
-    let _ = std::any::type_name::<aw_collector_linux::LinuxCollector>();
-    #[cfg(target_os = "windows")]
-    let _ = std::any::type_name::<aw_collector_windows::WindowsCollector>();
-    #[cfg(target_os = "macos")]
-    let _ = std::any::type_name::<aw_collector_macos::MacosCollector>();
+    // `aw-platform` is the sole target selector.  Naming its selected OS
+    // implementation here keeps this shared assembly file free of target
+    // branches while still ensuring the current platform is linked.
+    let _ = aw_platform::platform().os();
 
     true
 }

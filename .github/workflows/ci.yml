@@ -70,6 +70,31 @@ jobs:
       - name: UI build
         run: pnpm -C ui build
 
+  # The hold-delay hook is deliberately absent from production artifacts.  Its
+  # contract test is separate so the test-only feature never leaks into the
+  # normal workspace test invocation above.
+  hold-contract:
+    name: held-launch contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: release artifacts omit the hold-delay switch
+        shell: bash
+        run: |
+          cargo build --release --locked -p aw-daemon -p aw-cli
+          if strings target/release/agentwatchd target/release/aw | grep -q 'AW_TEST_HOLD_DELAY_MS'; then
+            echo 'test-only hold-delay switch is present in a release artifact' >&2
+            exit 1
+          fi
+      - name: hold-delay platform contract
+        run: cargo test --locked -p aw-platform --features test-hold-delay
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest

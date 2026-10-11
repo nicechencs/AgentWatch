@@ -351,6 +351,9 @@ impl Platform for CurrentPlatform {
         }
         spawn_gate(request)
     }
+    fn released_child(&self, child: Child) -> Box<dyn ReleasedChild> {
+        Box::new(LinuxReleasedChild { child })
+    }
     fn process_identity(&self, pid: u32) -> Result<Option<ProcessEntry>, PlatformError> {
         entry(pid)
     }

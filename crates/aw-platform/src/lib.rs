@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::Child;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -227,6 +228,18 @@ pub enum Capability {
     SecureDataDir,
     ExitCode,
 }
+impl Capability {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SpawnSuspended => "spawn_suspended",
+            Self::ProcessIdentity => "process_identity",
+            Self::ProcessTable => "process_table",
+            Self::PeerIdentity => "peer_identity",
+            Self::SecureDataDir => "secure_data_dir",
+            Self::ExitCode => "exit_code",
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityStatus {
     Available,
@@ -242,6 +255,12 @@ pub trait Platform: Send + Sync {
         caller: &IdentifiedCaller,
         request: &SpawnRequest,
     ) -> Result<Box<dyn HeldChild>, PlatformError>;
+    /// Convert an already-created OS child into the sole reap handle.
+    ///
+    /// This is for legacy launch paths while they are moved to
+    /// [`Platform::spawn_suspended`]. Callers cannot use it for an arbitrary
+    /// pid, only for a `Child` handle they already own.
+    fn released_child(&self, child: Child) -> Box<dyn ReleasedChild>;
     fn process_identity(&self, pid: u32) -> Result<Option<ProcessEntry>, PlatformError>;
     fn process_table(&self) -> Result<Vec<ProcessEntry>, PlatformError>;
     fn sampling_process(&self, pid: u32) -> Result<Option<SamplingProcess>, PlatformError>;
@@ -257,6 +276,32 @@ pub trait Platform: Send + Sync {
 pub fn platform() -> &'static dyn Platform {
     static CURRENT: CurrentPlatform = CurrentPlatform;
     &CURRENT
+}
+
+/// Require a capability from the selected operating-system implementation.
+/// The unavailable result keeps its capability, OS, and exact unsupported
+/// kind instead of asking callers to infer one from a target conditional.
+pub fn require_capability(capability: Capability) -> Result<(), PlatformError> {
+    let current = platform();
+    match current.capability(capability) {
+        CapabilityStatus::Available => Ok(()),
+        CapabilityStatus::NotInThisBuild => Err(PlatformError::Unsupported {
+            capability: capability.as_str(),
+            os: current.os(),
+            kind: UnsupportedKind::NotInThisBuild,
+        }),
+        CapabilityStatus::NotSupportedOnThisOs => Err(PlatformError::Unsupported {
+            capability: capability.as_str(),
+            os: current.os(),
+            kind: UnsupportedKind::NotSupportedOnThisOs,
+        }),
+    }
+}
+
+/// Turn an owned standard-library child handle into the platform's only reap
+/// handle.  The watcher stores this result directly and never reaps by pid.
+pub fn released_child(child: Child) -> Box<dyn ReleasedChild> {
+    platform().released_child(child)
 }
 
 #[cfg(unix)]

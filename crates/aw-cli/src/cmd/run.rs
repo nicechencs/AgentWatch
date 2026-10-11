@@ -43,7 +43,9 @@ use serde_json::{json, Value};
 use crate::exit;
 use crate::launch::{self, LaunchDispatchError, Launched, RunSpec, UnixLauncher};
 
-use super::attach::{user_locale_env, BeginRunRequest, ControlError, DaemonSessions};
+use super::attach::{
+    user_locale_env, BeginRunRequest, CleanupLeftovers, ControlError, DaemonSessions,
+};
 use super::Outcome;
 
 /// Flags `aw run` acts on. Built by dispatch from the parsed command.
@@ -256,6 +258,13 @@ pub(crate) trait SpawnedChild {
 
     /// Stop and reap a child that the daemon refused to adopt.
     fn kill_and_reap(&mut self);
+
+    /// Remaining descendants reported by a bounded supervisor cleanup.  The
+    /// default has no report because a child that was fully cleaned up must
+    /// not be represented by a made-up zero.
+    fn cleanup_leftovers(&mut self) -> Option<CleanupLeftovers> {
+        None
+    }
 }
 
 /// Spawn a child for the default daemon-backed `aw run` path.
@@ -437,8 +446,13 @@ impl SpawnedChild for PlatformChild {
             let _ = held.abort();
         }
         if let Some(released) = self.released.take() {
-            if let Some(terminal) = self.terminal.take() {
-                drop(terminal);
+            if let Some(mut terminal) = self.terminal.take() {
+                // The terminal owner must restore the foreground group and
+                // perform the bounded cooperative cleanup, including a
+                // daemon commit failure after the target was released.
+                drop(released);
+                terminal.abort_and_reap();
+                return;
             }
             let _ = crate::launch::terminal::forward_to_group(
                 released.pid(),
@@ -528,8 +542,12 @@ impl SpawnedChild for PlatformGatedChild {
         }
         #[cfg(unix)]
         if let Some(released) = self.released.take() {
-            if let Some(terminal) = self.terminal.take() {
-                drop(terminal);
+            if let Some(mut terminal) = self.terminal.take() {
+                // Do not bypass TERM/grace/STOP/KILL merely because a daemon
+                // operation failed after release.
+                drop(released);
+                terminal.abort_and_reap();
+                return;
             }
             let _ = crate::launch::terminal::forward_to_group(
                 released.pid(),
@@ -542,14 +560,15 @@ impl SpawnedChild for PlatformGatedChild {
     }
 }
 
-/// Linux's non-terminal CLI-created root is held by the private watchdog until
-/// daemon adoption. The daemon records the real program pid; it never owns the
+/// Linux's CLI-created root is held by the private watchdog until daemon
+/// adoption. The daemon records the real program pid; it never owns the
 /// watchdog's cleanup boundary.
 #[cfg(target_os = "linux")]
 struct LinuxWatchdogChild {
     watchdog: crate::launch::watchdog::Watchdog,
     program: String,
     cwd: Option<String>,
+    terminal: Option<crate::launch::terminal::TerminalChild>,
 }
 
 #[cfg(target_os = "linux")]
@@ -559,6 +578,9 @@ impl SpawnedChild for LinuxWatchdogChild {
     }
 
     fn wait(&mut self) -> Result<i32, String> {
+        if let Some(mut terminal) = self.terminal.take() {
+            return terminal.wait();
+        }
         self.watchdog
             .wait()
             .map_err(|_| "等待程序结束失败".to_owned())
@@ -579,7 +601,14 @@ impl SpawnedChild for LinuxWatchdogChild {
     }
 
     fn kill_and_reap(&mut self) {
+        // Drop restores aw's foreground process group before the watchdog
+        // starts its bounded cleanup sequence.
+        self.terminal.take();
         self.watchdog.abort();
+    }
+
+    fn cleanup_leftovers(&mut self) -> Option<CleanupLeftovers> {
+        self.watchdog.cleanup_leftovers()
     }
 }
 
@@ -728,27 +757,53 @@ impl Spawner for CommandSpawner {
             let Some((program, args)) = spec.command.split_first() else {
                 return Err(("spawn_failed", "程序名为空".to_owned()));
             };
-            if crate::launch::watchdog::should_wrap() {
-                return crate::launch::watchdog::Watchdog::spawn(spec)
-                    .map(|watchdog| {
-                        Box::new(LinuxWatchdogChild {
-                            watchdog,
-                            program: program.clone(),
-                            cwd: spec.cwd.clone(),
-                        }) as Box<dyn SpawnedChild>
-                    })
-                    .map_err(|_| {
-                        (
-                            "spawn_failed",
-                            "程序启动到一半出错，已经结束，没有运行：无法完成启动".to_owned(),
-                        )
-                    });
+            let terminal_decision = crate::launch::terminal::TerminalDecision::before_fork();
+            // The watchdog becomes the program's parent.  A foreground
+            // terminal job must instead be waited with WUNTRACED by the CLI
+            // itself so Ctrl-Z can return the terminal to the shell before
+            // `aw` stops.  Background/no-TTY launches use the watchdog,
+            // which is the subreaper and owns their bounded descendant
+            // cleanup.
+            if crate::launch::watchdog::should_wrap() && !terminal_decision.handoff_requested() {
+                return crate::launch::watchdog::Watchdog::spawn(
+                    spec,
+                    terminal_decision.handoff_requested(),
+                )
+                .and_then(|watchdog| {
+                    let terminal = if terminal_decision.handoff_requested() {
+                        let mut terminal =
+                            crate::launch::terminal::TerminalChild::new_with_watchdog(
+                                // The watchdog is the direct child; the real
+                                // program owns the target process group.
+                                watchdog.process_pid(),
+                                watchdog.pid(),
+                                terminal_decision,
+                                watchdog.control_clone()?,
+                            )
+                            .map_err(|_| crate::launch::watchdog::WatchdogError::Unavailable)?;
+                        terminal.expect_child_foreground();
+                        Some(terminal)
+                    } else {
+                        None
+                    };
+                    Ok(Box::new(LinuxWatchdogChild {
+                        watchdog,
+                        program: program.clone(),
+                        cwd: spec.cwd.clone(),
+                        terminal,
+                    }) as Box<dyn SpawnedChild>)
+                })
+                .map_err(|_| {
+                    (
+                        "spawn_failed",
+                        "程序启动到一半出错，已经结束，没有运行：无法完成启动".to_owned(),
+                    )
+                });
             }
             // The program name is not resolved here. The hold stage's parent
             // only builds candidate strings; the child tries them after it has
             // switched identity, so this process never stats a PATH directory.
             let caller = IdentifiedCaller::current_user().map_err(|_| caller_identity_error())?;
-            let terminal_decision = crate::launch::terminal::TerminalDecision::before_fork();
             let request = SpawnRequest {
                 command: std::iter::once(program.clone())
                     .chain(args.iter().cloned())
@@ -758,18 +813,23 @@ impl Spawner for CommandSpawner {
                 terminal_handoff: terminal_decision.handoff_requested(),
                 env_source: aw_platform::EnvSource::Inherit,
             };
-            let held = platform()
+            let mut held = platform()
                 .spawn_suspended(&caller, &request)
                 .map_err(|error| platform_spawn_error(program, spec.cwd.as_deref(), error))?;
             // The held child can perform its handoff before it reads the gate.
             // Build this guard immediately after `spawn_suspended`, rather
             // than at release, so adopt and every other early error restores
             // aw's foreground group.
-            let mut terminal = crate::launch::terminal::TerminalChild::new(
-                held.pid(),
-                terminal_decision,
-            )
-            .map_err(|error| ("spawn_failed", error))?;
+            let mut terminal =
+                match crate::launch::terminal::TerminalChild::new(held.pid(), terminal_decision) {
+                    Ok(terminal) => terminal,
+                    Err(error) => {
+                        let pid = held.pid();
+                        let _ = held.abort();
+                        crate::launch::terminal::abort_unmanaged_child(pid, terminal_decision);
+                        return Err(("spawn_failed", error));
+                    }
+                };
             terminal.expect_child_foreground();
             Ok(Box::new(PlatformGatedChild {
                 held: Some(held),
@@ -798,14 +858,19 @@ impl Spawner for CommandSpawner {
                 terminal_handoff: terminal_decision.handoff_requested(),
                 env_source: aw_platform::EnvSource::Inherit,
             };
-            let held = aw_platform::platform()
+            let mut held = aw_platform::platform()
                 .spawn_suspended(&caller, &request)
                 .map_err(|error| platform_spawn_error(program, spec.cwd.as_deref(), error))?;
-            let mut terminal = crate::launch::terminal::TerminalChild::new(
-                held.pid(),
-                terminal_decision,
-            )
-            .map_err(|error| ("spawn_failed", error))?;
+            let mut terminal =
+                match crate::launch::terminal::TerminalChild::new(held.pid(), terminal_decision) {
+                    Ok(terminal) => terminal,
+                    Err(error) => {
+                        let pid = held.pid();
+                        let _ = held.abort();
+                        crate::launch::terminal::abort_unmanaged_child(pid, terminal_decision);
+                        return Err(("spawn_failed", error));
+                    }
+                };
             terminal.expect_child_foreground();
             Ok(Box::new(PlatformChild {
                 held: Some(held),
@@ -1033,6 +1098,7 @@ fn launch_linux_with_started(
         Err(err) if cgroup_fallback_allowed(&err) => {
             use std::os::unix::process::CommandExt;
 
+            let terminal_decision = crate::launch::terminal::TerminalDecision::before_fork();
             let mut child = std::process::Command::new(program);
             child.args(&argv);
             // The relay below addresses this group, so descendants that keep
@@ -1049,14 +1115,18 @@ fn launch_linux_with_started(
                 .map_err(|error| io_spawn_dispatch_error(program, spec.cwd.as_deref(), error))?;
             let pid = spawned.id();
             started(pid);
-            let mut terminal = crate::launch::terminal::TerminalChild::new(
-                pid,
-                crate::launch::terminal::TerminalDecision::before_fork(),
-            )
-                .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
-            terminal
-                .give_child_foreground()
-                .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
+            let mut terminal =
+                match crate::launch::terminal::TerminalChild::new(pid, terminal_decision) {
+                    Ok(terminal) => terminal,
+                    Err(detail) => {
+                        crate::launch::terminal::abort_unmanaged_child(pid, terminal_decision);
+                        return Err(LaunchDispatchError::NotImplemented { detail });
+                    }
+                };
+            if let Err(detail) = terminal.give_child_foreground() {
+                terminal.abort_and_reap();
+                return Err(LaunchDispatchError::NotImplemented { detail });
+            }
             drop(spawned);
             Ok(Launched {
                 code: terminal
@@ -1375,18 +1445,29 @@ pub(crate) fn daemon_run(
     let mut child = match spawner.spawn(&spec) {
         Ok(child) => child,
         Err((code, detail)) => {
-            let _ = sessions.stop_monitoring(&launch.public_id, None);
+            // A pending run has no executed program.  It is not a stopped
+            // session: discard the reservation so callers never observe an
+            // empty launch after a local spawn failure.
+            let _ = sessions.discard_run(&launch);
             return super::error_outcome(exit::GENERAL, code, &detail, args.json);
         }
     };
     if let Err(error) = sessions.adopt(&launch, child.pid()) {
         child.kill_and_reap();
+        // Adoption did not make the held process runnable.  This is still a
+        // failed launch, not a recorded session with zero useful events.
+        let _ = sessions.discard_run(&launch);
         return daemon_error_outcome(error, args.json, true);
     }
     if let Err((code, detail)) = child.release() {
         child.kill_and_reap();
         let _ = sessions.discard_run(&launch);
         return super::error_outcome(exit::GENERAL, code, &detail, args.json);
+    }
+    if let Err(error) = sessions.commit_run(&launch) {
+        child.kill_and_reap();
+        let _ = sessions.discard_run(&launch);
+        return daemon_error_outcome(error, args.json, true);
     }
 
     let (pin_state, pin_warning) = if args.pin {
@@ -1406,12 +1487,21 @@ pub(crate) fn daemon_run(
             return super::error_outcome(exit::GENERAL, "wait_failed", &detail, args.json)
         }
     };
+    let leftovers_warning = child.cleanup_leftovers().and_then(|leftovers| {
+        sessions
+            .record_leftovers(&launch, &leftovers)
+            .err()
+            .map(|error| format!("[aw] 警告：后台没有记录未结束的子程序：{error}\n"))
+    });
     let exit_warning = sessions
         .record_exit(&launch, code)
         .err()
         .map(|error| format!("[aw] 警告：daemon 未记录程序退出码：{error}\n"));
     if level == SummaryLevel::None || args.quiet {
         let mut stderr = pin_warning.unwrap_or_default();
+        if let Some(warning) = leftovers_warning {
+            stderr.push_str(&warning);
+        }
         if let Some(warning) = exit_warning {
             stderr.push_str(&warning);
         }
@@ -1441,6 +1531,9 @@ pub(crate) fn daemon_run(
         return super::error_outcome(exit::GENERAL, "summary", &error.to_string(), args.json);
     }
     if let Some(warning) = pin_warning {
+        stderr.extend_from_slice(warning.as_bytes());
+    }
+    if let Some(warning) = leftovers_warning {
         stderr.extend_from_slice(warning.as_bytes());
     }
     if let Some(warning) = exit_warning {
@@ -1992,6 +2085,11 @@ mod tests {
             }
         }
 
+        fn commit_run(&mut self, _: &LaunchSession) -> Result<(), ControlError> {
+            self.log.borrow_mut().push("commit");
+            Ok(())
+        }
+
         fn record_exit(&mut self, _: &LaunchSession, _: i32) -> Result<(), ControlError> {
             self.log.borrow_mut().push("exit");
             match self.exit.take() {
@@ -2498,7 +2596,7 @@ mod tests {
         assert_eq!(outcome.code, 7);
         assert_eq!(
             *log.borrow(),
-            vec!["begin", "spawn", "adopt", "release", "pin", "wait", "exit"]
+            vec!["begin", "spawn", "adopt", "release", "commit", "pin", "wait", "exit"]
         );
         let request = sessions.seen_begin.expect("begin request");
         assert_eq!(request.argv, command);
@@ -2537,7 +2635,10 @@ mod tests {
             &mut EmptySummary,
         );
         assert_eq!(outcome.code, exit::USAGE);
-        assert_eq!(*log.borrow(), vec!["begin", "spawn", "adopt", "kill"]);
+        assert_eq!(
+            *log.borrow(),
+            vec!["begin", "spawn", "adopt", "kill", "discard"]
+        );
         assert!(text(&outcome.stderr).contains("后台没有接管程序，已将其结束"));
     }
 
@@ -2568,7 +2669,7 @@ mod tests {
         assert!(text(&outcome.stderr).contains("未记录程序退出码"));
         assert_eq!(
             *log.borrow(),
-            vec!["begin", "spawn", "adopt", "release", "wait", "exit"]
+            vec!["begin", "spawn", "adopt", "release", "commit", "wait", "exit"]
         );
     }
 
@@ -2713,7 +2814,7 @@ mod tests {
             &mut EmptySummary,
         );
         assert_eq!(outcome.code, 5, "{}", text(&outcome.stderr));
-        assert_eq!(*log.borrow(), vec!["begin", "adopt", "exit"]);
+        assert_eq!(*log.borrow(), vec!["begin", "adopt", "commit", "exit"]);
         let begin = sessions.seen_begin.expect("begin request");
         assert_eq!(begin.argv, command);
         assert!(text(&outcome.stderr).contains("s-daemon"));
@@ -3140,7 +3241,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_failure_stops_the_pending_session_without_printing_argv() {
+    fn spawn_failure_discards_the_uncommitted_session_without_printing_argv() {
         let command = vec!["private-tool".to_owned(), "--secret".to_owned()];
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut sessions = FakeSessions::new(Rc::clone(&log));
@@ -3167,7 +3268,7 @@ mod tests {
             &mut EmptySummary,
         );
         assert_eq!(outcome.code, exit::GENERAL);
-        assert_eq!(sessions.stops, vec!["s-daemon".to_owned()]);
+        assert_eq!(sessions.discards, vec!["s-daemon".to_owned()]);
         let text = text(&outcome.stderr);
         let body: serde_json::Value = serde_json::from_str(&text).expect("json");
         assert_eq!(body["error"]["code"], "spawn_failed");

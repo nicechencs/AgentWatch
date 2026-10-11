@@ -642,20 +642,22 @@ fn spawn_as_self(
     })
 }
 
-/// `POST /sessions/run`: record the session and hand back an adopt ticket.
-/// The caller (`aw run`) starts the process itself, as itself, then posts
-/// `/sessions/{id}/adopt` within [`ADOPT_TIMEOUT_NS`].
+/// `POST /sessions/run`: reserve an in-memory launch ticket.
+///
+/// The caller (`aw run`) starts a held process itself, then posts `/adopt` and
+/// releases its close-on-exec gate.  Only `/commit`, after that gate reports a
+/// successful exec, writes the session row.  A missing program therefore
+/// leaves no write-then-delete empty session behind.
 pub(super) fn run(state: &mut ApiState, caller: &Caller, body: &[u8]) -> ApiResponse {
     let mut inner = || -> Result<ApiResponse, ApiResponse> {
         let value = parse(body)?;
         let argv = argv_field(&value)?;
         collector_available()?;
-        let path = db_path(state)?;
-        let mut target = target_for(caller, &value, "launch", 0, Some(&argv))?;
+        let _ = db_path(state)?;
+        let target = target_for(caller, &value, "launch", 0, Some(&argv))?;
         let ticket = random_secret("r-").ok_or_else(|| {
             error_response(503, "random_unavailable", "the OS random source failed")
         })?;
-        insert_session(&path, &mut target)?;
         let response = created(
             &target,
             json!({ "ticket": ticket, "adopt_timeout_ms": ADOPT_TIMEOUT_NS / 1_000_000 }),
@@ -698,6 +700,9 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
                 "adopt arrived after the timeout; the session was closed",
             ));
         }
+        if pending.target.root_pid != 0 {
+            return Err(not_found());
+        }
         let pid = pid_field(&value)?;
         // Never `allow_admin`: an administrator cannot adopt another account's pid.
         let adopted_uid = check_pid_owner(caller, pid, false)?;
@@ -711,39 +716,66 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
                         "pid changed while adoption was being recorded",
                     )
                 })?;
-        let path = db_path(state)?;
-        require_writable_database(&path)?;
-        let root_proc_uid = i64::from_ne_bytes(root_hint.uid.0.to_ne_bytes());
-        aw_store::open_connection(&path)
-            .and_then(|conn| {
-                conn.execute(
-                    "UPDATE sessions SET root_proc_uid = ?1 WHERE id = ?2",
-                    rusqlite::params![root_proc_uid, pending.target.db_id],
-                )
-            })
-            .map_err(|err| {
-                tracing::warn!(session = sid, pid, error = %err, "adopted root identity was not written");
-                error_response(500, "store", "cannot record the adopted root identity")
-            })?;
-        let Some(mut pending) = state.pending_launches.remove(sid) else {
+        let Some(pending) = state.pending_launches.get_mut(sid) else {
             return Err(not_found());
         };
         pending.target.root_pid = pid;
         pending.target.root_hint = Some(root_hint);
         pending.target.root_identity = pending.target.root_hint.as_ref().map(|hint| hint.uid);
-        // Write the root's row now, while `aw run` still holds it at the gate:
-        // the foreground loop starts the sampler up to a poll later, and a
-        // root that exits (and posts `/exit`) before then would otherwise be
-        // zero processes with no exit code. The sampler's row is the same id.
+        Ok(ApiResponse::json(
+            200,
+            &json!({ "id": sid, "root_pid": pid }),
+        ))
+    };
+    match inner(state) {
+        Ok(response) | Err(response) => response,
+    }
+}
+
+/// Commit a caller-owned held launch after its close-on-exec report confirms
+/// the target actually executed.  This is intentionally separate from
+/// `/adopt`: adoption proves identity and scope, whereas exec success is the
+/// point at which a durable audit session becomes truthful.
+pub(super) fn commit(state: &mut ApiState, caller: &Caller, sid: &str) -> ApiResponse {
+    let inner = |state: &mut ApiState| -> Result<ApiResponse, ApiResponse> {
+        let not_found = || error_response(404, "not_found", "no launch is waiting for commit");
+        let pending = state.pending_launches.get(sid).ok_or_else(not_found)?;
+        if pending.target.user_id != caller.user_id {
+            return Err(not_found());
+        }
+        if pending.deadline_ns <= now_ns() || pending.target.root_pid == 0 {
+            return Err(error_response(
+                410,
+                "adopt_timeout",
+                "launch was not adopted in time",
+            ));
+        }
+        let path = db_path(state)?;
+        let Some(mut pending) = state.pending_launches.remove(sid) else {
+            return Err(not_found());
+        };
+        if let Err(response) = insert_session(&path, &mut pending.target) {
+            // Keep the in-memory reservation available for a short retry when
+            // a transient database lock prevented the first commit.
+            state.pending_launches.insert(sid.to_owned(), pending);
+            return Err(response);
+        }
+        // `SampleTarget::session_row` writes `root_proc_uid` in the same
+        // batch as the session itself.  Do not add a second post-insert write:
+        // if that write were to fail, it would turn a successful exec into a
+        // partially committed launch.
         if !crate::sample::HostSampler::for_target(path, pending.target.clone()).persist_root_hint()
         {
             tracing::warn!(
                 session = sid,
-                pid,
-                "adopted root process row was not written"
+                pid = pending.target.root_pid,
+                "committed root identity was not written"
             );
         }
-        let response = ApiResponse::json(200, &json!({ "id": sid, "root_pid": pid }));
+        let response = ApiResponse::json(
+            200,
+            &json!({ "id": sid, "root_pid": pending.target.root_pid }),
+        );
         state.watch_requests.push(WatchRequest::Start {
             target: Box::new(pending.target),
             child: None,
@@ -828,6 +860,120 @@ pub(super) fn record_exit(
     }
 }
 
+/// `POST /sessions/{sid}/leftovers` stores a bounded terminal/watchdog
+/// cleanup report on an already committed launch. It holds no command text or
+/// process metadata: only the true survivor count, at most five pids, and one
+/// pid that returned `EPERM`. The App turns this into its fixed wording.
+pub(super) fn record_leftovers(
+    state: &mut ApiState,
+    caller: &Caller,
+    sid: &str,
+    body: &[u8],
+) -> ApiResponse {
+    let inner = || -> Result<ApiResponse, ApiResponse> {
+        let value = parse(body)?;
+        let count = value
+            .get("count")
+            .and_then(Value::as_u64)
+            .and_then(|count| u32::try_from(count).ok())
+            .filter(|count| *count > 0)
+            .ok_or_else(|| {
+                error_response(400, "bad_argument", "count: expected a positive integer")
+            })?;
+        let pids: Vec<u32> = value
+            .get("pids")
+            .and_then(Value::as_array)
+            .ok_or_else(|| error_response(400, "bad_argument", "pids: expected an array"))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .filter(|pid| *pid > 0)
+                    .ok_or_else(|| {
+                        error_response(400, "bad_argument", "pids: expected positive integers")
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        if pids.len() > 5 || u32::try_from(pids.len()).unwrap_or(u32::MAX) > count {
+            return Err(error_response(
+                400,
+                "bad_argument",
+                "pids: expected at most five ids and no more than count",
+            ));
+        }
+        let eperm_pid = match value.get("eperm_pid") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .filter(|pid| *pid > 0)
+                    .ok_or_else(|| {
+                        error_response(
+                            400,
+                            "bad_argument",
+                            "eperm_pid: expected a positive integer",
+                        )
+                    })?,
+            ),
+        };
+        let path = db_path(state)?;
+        require_writable_database(&path)?;
+        let mut conn = aw_store::open_connection(&path)
+            .map_err(|_| error_response(500, "store", "cannot open the database"))?;
+        let tx = conn
+            .transaction()
+            .map_err(|_| error_response(500, "store", "cannot begin cleanup report"))?;
+        let row: Option<(i64, String, Option<String>)> = tx
+            .query_row(
+                "SELECT id, user_id, stats FROM sessions WHERE public_id = ?1",
+                [sid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| error_response(500, "store", "cannot inspect the session"))?;
+        let Some((db_id, owner, stored_stats)) = row else {
+            return Err(error_response(404, "not_found", "session not found"));
+        };
+        if owner != caller.user_id {
+            return Err(error_response(404, "not_found", "session not found"));
+        }
+        let mut stats = stored_stats
+            .as_deref()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        let Some(object) = stats.as_object_mut() else {
+            return Err(error_response(
+                500,
+                "store",
+                "cannot prepare cleanup report",
+            ));
+        };
+        object.insert(
+            "cleanup_leftovers".to_owned(),
+            json!({ "count": count, "pids": pids, "eperm_pid": eperm_pid }),
+        );
+        let stats = serde_json::to_string(&stats)
+            .map_err(|_| error_response(500, "store", "cannot encode cleanup report"))?;
+        tx.execute(
+            "UPDATE sessions SET stats = ?1 WHERE id = ?2",
+            rusqlite::params![stats, db_id],
+        )
+        .map_err(|_| error_response(500, "store", "cannot store cleanup report"))?;
+        tx.commit()
+            .map_err(|_| error_response(500, "store", "cannot finish cleanup report"))?;
+        Ok(ApiResponse::json(
+            200,
+            &json!({ "id": sid, "count": count }),
+        ))
+    };
+    match inner() {
+        Ok(response) | Err(response) => response,
+    }
+}
+
 /// `POST /sessions/{sid}/discard` removes a launch that failed before `exec`.
 ///
 /// The CLI reaches this only after it adopted a held child and its close-on-exec
@@ -835,6 +981,15 @@ pub(super) fn record_exit(
 /// the transaction refuses any process other than the adopted root, so a
 /// normal recorded session can never be erased through this narrow cleanup.
 pub(super) fn discard(state: &mut ApiState, caller: &Caller, sid: &str) -> ApiResponse {
+    // Before `/commit` there is deliberately no database row.  Removing this
+    // caller-owned reservation is enough; it cannot leave an empty session.
+    if let Some(pending) = state.pending_launches.get(sid) {
+        if pending.target.user_id != caller.user_id {
+            return error_response(404, "not_found", "session not found");
+        }
+        state.pending_launches.remove(sid);
+        return ApiResponse::json(200, &json!({ "id": sid, "discarded": true }));
+    }
     let mut inner = || -> Result<ApiResponse, ApiResponse> {
         let path = db_path(state)?;
         require_writable_database(&path)?;

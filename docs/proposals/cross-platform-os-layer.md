@@ -144,14 +144,14 @@ macOS 崩溃兜底用看门狗管道，不用「另起一个小看门狗发 `SIG
 
 | 系统 | `aw` 自己启动时 | 已放行的后台启动程序 |
 |---|---|---|
-| Linux | 无控制终端时为 `aw → watchdog → program`。watchdog 在启动 program 前调用 `PR_SET_CHILD_SUBREAPER`，并用独立 session / process group 避开终端组信号；它通过私有 pipe EOF 与 `PR_SET_PDEATHSIG`（设定后复查 `getppid`）观察 `aw`。`aw` 死亡或 program 结束时，先对 `/proc` 中全部后代 `SIGSTOP`，再 `SIGKILL`、重扫并 `waitpid`；目标以 `(pid, ppid, starttime)` 核对，避免 PID 复用。故意 `setsid` 的后代也会被 subreaper 收养并清理。有控制终端时保留终端前台交接路径：一个新 session 不能把其中的程序组设为原终端的前台组，因此此路径暂不包 watchdog。 | 不包 watchdog；release 后继续运行。 |
-| macOS | 保留 CLI 的 pipe-EOF + `kqueue` 看护和进程组清理；没有 Linux 的 subreaper，因此自行 `setsid` / 改进程组的后代可能脱离这次清理。【待验证】 | 不包 watchdog；release 后继续运行。 |
-| Windows | 保留 `KILL_ON_JOB_CLOSE` Job，CLI 异常退出时关闭 Job 结束其中的普通后代。 | release 前去掉该限制；release 后继续运行。 |
+| Linux | 非交互路径为 `aw → watchdog → program`：watchdog 在启动 program 前调用 `PR_SET_CHILD_SUBREAPER`，无终端时另开 session；它通过私有 pipe EOF 与 `PR_SET_PDEATHSIG`（设定后用创建方 pid 复查）观察 `aw`；`aw` 也是后备 subreaper。前台终端路径暂时保留 `aw → program`，以便 `aw` 用 `WUNTRACED` 完成 Ctrl+Z 的 shell 作业控制契约；两条路径都只能在启动前确认 `aw` 是 stdin 前台组后才移交终端。watchdog 路径在程序结束、aw 死亡或错误时先给后代 `SIGTERM`，等最多 2 秒，再 `SIGSTOP` 加 `SIGKILL`、重扫并 `waitpid`；整个清理最多 5 秒。目标以 `(pid, ppid, starttime)` 核对，避免 PID 复用。只有真实终端断开才向程序组转发 `SIGHUP`；其他清理绝不发它。 | 不包 watchdog；release 后继续运行。 |
+| macOS | CLI 的同组清理也采用 `SIGTERM`、最多 2 秒、`SIGSTOP`+`SIGKILL` 的顺序；只有真实终端断开可发 `SIGHUP`。没有 Linux 的 subreaper，因此自行 `setsid` / 改进程组的后代可能脱离这次清理。【待验证】 | 不包 watchdog；release 后继续运行。 |
+| Windows | 对仍在运行的程序先请求正常终止（可用时 `GenerateConsoleCtrlEvent` / `WM_CLOSE`），等最多 2 秒，再终止整个 Job object；程序自己的退出码不被剩余子程序改变。 | release 前去掉该限制；release 后继续运行。 |
 
 Linux 看护进程与目标之间的启动采用 re-exec 后的私有 socket，不把目标的
 argv、环境变量或工作目录放进看护进程的 argv / 环境；fork 到 exec 的过渡只做
 async-signal-safe 原始系统调用。控制终端场景继续由 `aw run` 的终端层移交前台并
-转发 `SIGINT` / `SIGTERM` / `SIGHUP`；watchdog 不成为终端前台进程。
+转发 `SIGINT` / `SIGTERM`；`SIGHUP` 只在确认终端实际断开时转发。watchdog 不成为终端前台进程；经 watchdog 的 Linux 程序组信号都走其私有控制通道，前台作业控制仍由 `aw` 的终端等待器处理。
 
 ## C. 搬走清单
 

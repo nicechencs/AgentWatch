@@ -80,6 +80,7 @@ fn answer(stream: &mut UnixStream) {
     } else if request.starts_with("POST /api/v1/sessions/run ") {
         (201, r#"{"id":"s-pty","ticket":"pty-ticket"}"#)
     } else if request.starts_with("POST /api/v1/sessions/s-pty/adopt ")
+        || request.starts_with("POST /api/v1/sessions/s-pty/commit ")
         || request.starts_with("POST /api/v1/sessions/s-pty/exit ")
     {
         (200, "{}")
@@ -103,8 +104,7 @@ fn answer(stream: &mut UnixStream) {
 #[test]
 fn pty_default_and_no_daemon_cover_input_signals_and_terminal_close() {
     if Command::new("python3").arg("--version").output().is_err() {
-        eprintln!("pty terminal regression skipped: python3 is unavailable");
-        return;
+        panic!("python3 is required for the pty terminal regression");
     }
     let daemon = DaemonStub::start();
     let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/terminal_pty.py");

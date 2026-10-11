@@ -272,7 +272,7 @@ fn spawn_inner(
         // never produce EOF because the child would still own a writer.
         ffi::close_fd(std::os::fd::AsRawFd::as_raw_fd(&gate_write));
         ffi::child_take_foreground(&prepared);
-        ffi::child_restore_terminal_signal_defaults(&prepared);
+        ffi::child_restore_signal_defaults(&prepared);
         ffi::child_hold(&prepared);
     }
     ffi::set_own_group(pid);
@@ -681,23 +681,37 @@ mod ffi {
         exit_step(GateStep::Terminal);
     }
 
-    /// A process launched from a test runner can inherit ignored terminal
-    /// signals. `execve` preserves that disposition, so reset them after the
-    /// foreground handoff and before the target can run. This is deliberately
-    /// limited to terminal launches: non-terminal callers may intentionally
-    /// arrange their own signal handling.
-    pub(super) fn child_restore_terminal_signal_defaults(prepared: &Prepared) {
-        if !prepared.terminal_handoff {
-            return;
-        }
-        for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP] {
+    /// `execve` preserves ignored signal dispositions and the signal mask.
+    /// A target may be started by a shell, test harness, or watchdog that has
+    /// deliberately ignored signals for its own lifetime, so restore every
+    /// catchable disposition (including SIGPIPE) and clear the mask before
+    /// the target is allowed to execute. This is unconditional: a non-terminal
+    /// target must not inherit a supervisor's SIGINT/SIGTERM/SIGPIPE policy.
+    pub(super) fn child_restore_signal_defaults(prepared: &Prepared) {
+        // POSIX leaves the numeric upper bound implementation-defined.  Linux
+        // has 64 catchable signals and macOS rejects unsupported numbers with
+        // EINVAL; treating that one error as a skipped number keeps this raw
+        // post-fork loop portable without allocating or consulting libc data.
+        for signal in 1..=64 {
+            if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+                continue;
+            }
             if set_default_disposition(signal) {
+                continue;
+            }
+            if errno_now() == libc::EINVAL {
                 continue;
             }
             report_errno(prepared.report, errno_now());
             wait_for_release(prepared.gate_read);
             exit_step(GateStep::Terminal);
         }
+        if clear_signal_mask() {
+            return;
+        }
+        report_errno(prepared.report, errno_now());
+        wait_for_release(prepared.gate_read);
+        exit_step(GateStep::Terminal);
     }
 
     fn set_default_disposition(signal: libc::c_int) -> bool {
@@ -713,6 +727,20 @@ mod ffi {
                 action.sa_sigaction = libc::SIG_DFL;
                 libc::sigaction(signal, &action, std::ptr::null_mut()) == 0
             }
+        }
+    }
+
+    fn clear_signal_mask() -> bool {
+        let mut empty = unsafe {
+            // SAFETY: `empty` is immediately initialized by sigemptyset
+            // before sigprocmask reads it.
+            std::mem::MaybeUninit::<libc::sigset_t>::zeroed().assume_init()
+        };
+        unsafe {
+            // SAFETY: both calls use valid stack storage and only change the
+            // held child's own mask before it can execute target code.
+            libc::sigemptyset(&mut empty) == 0
+                && libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut()) == 0
         }
     }
 

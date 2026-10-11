@@ -14,6 +14,8 @@
 
 use std::io;
 use std::os::fd::AsFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -31,6 +33,10 @@ const SIGNAL_POLL: Duration = Duration::from_millis(10);
 /// Give cooperative leftover processes a bounded chance to flush and exit
 /// before freezing the process group and killing any survivors.
 const LEFTOVER_GRACE: Duration = Duration::from_secs(2);
+/// Cleanup (including terminal restoration and reaping the direct child) must
+/// not make an error path hang indefinitely.  The final wait is therefore
+/// non-blocking and shares this one deadline with the TERM grace period.
+const CLEANUP_LIMIT: Duration = Duration::from_secs(5);
 
 /// A pre-fork terminal decision.  `aw run` may hand a terminal to the target
 /// only while its own process group is already foreground on stdin.  Keeping
@@ -62,6 +68,10 @@ impl TerminalDecision {
 /// `aw run` invocation.  Dropping it restores `aw`'s group before unregistering
 /// signal handlers, including during unwinding on an error path.
 pub(crate) struct TerminalChild {
+    /// The direct child owned by this CLI and therefore the only pid this
+    /// waiter may reap. With the Linux watchdog this is the watchdog, while
+    /// `child_group` remains the program's distinct process group.
+    direct_child: Pid,
     child_group: Pid,
     aw_group: Pid,
     controls_terminal: bool,
@@ -71,6 +81,13 @@ pub(crate) struct TerminalChild {
     /// them actually ignored in `aw`, rather than forwarding them twice.
     ignored_interrupts: Option<aw_platform::TerminalInterruptIgnore>,
     relay_registrations: Vec<signal_hook::SigId>,
+    signal_route: SignalRoute,
+}
+
+enum SignalRoute {
+    Group,
+    #[cfg(target_os = "linux")]
+    Watchdog(UnixStream),
 }
 
 /// One pending bit per signal.  A previous single atomic slot let a later
@@ -101,11 +118,15 @@ impl PendingSignals {
 
     fn take_all(&self) -> [Option<Signal>; 3] {
         [
-            self.interrupt.swap(false, Ordering::SeqCst).then_some(Signal::SIGINT),
+            self.interrupt
+                .swap(false, Ordering::SeqCst)
+                .then_some(Signal::SIGINT),
             self.terminate
                 .swap(false, Ordering::SeqCst)
                 .then_some(Signal::SIGTERM),
-            self.hangup.swap(false, Ordering::SeqCst).then_some(Signal::SIGHUP),
+            self.hangup
+                .swap(false, Ordering::SeqCst)
+                .then_some(Signal::SIGHUP),
         ]
     }
 }
@@ -114,7 +135,38 @@ impl TerminalChild {
     /// Install the run-local signal relay before the child is released.  A
     /// non-TTY still gets the relay, but never calls `tcsetpgrp`.
     pub(crate) fn new(pid: u32, decision: TerminalDecision) -> Result<Self, String> {
-        let raw_pid = i32::try_from(pid).map_err(|_| "子进程号超出 Unix pid 范围".to_owned())?;
+        Self::new_inner(pid, pid, decision, SignalRoute::Group)
+    }
+
+    /// The Linux watchdog owns program-group signals and descendant cleanup.
+    /// The terminal waiter still owns the direct watchdog child and terminal
+    /// foreground restoration, while forwarding relay bytes over its private
+    /// socket rather than calling `killpg` itself.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new_with_watchdog(
+        watchdog_pid: u32,
+        program_pid: u32,
+        decision: TerminalDecision,
+        control: UnixStream,
+    ) -> Result<Self, String> {
+        Self::new_inner(
+            watchdog_pid,
+            program_pid,
+            decision,
+            SignalRoute::Watchdog(control),
+        )
+    }
+
+    fn new_inner(
+        direct_pid: u32,
+        group_pid: u32,
+        decision: TerminalDecision,
+        signal_route: SignalRoute,
+    ) -> Result<Self, String> {
+        let direct_raw =
+            i32::try_from(direct_pid).map_err(|_| "子进程号超出 Unix pid 范围".to_owned())?;
+        let group_raw =
+            i32::try_from(group_pid).map_err(|_| "子进程号超出 Unix pid 范围".to_owned())?;
         let aw_group = getpgrp();
         let controls_terminal = decision.controls_terminal;
         let pending_signals = PendingSignals::new();
@@ -150,13 +202,15 @@ impl TerminalChild {
         };
 
         Ok(Self {
-            child_group: Pid::from_raw(raw_pid),
+            direct_child: Pid::from_raw(direct_raw),
+            child_group: Pid::from_raw(group_raw),
             aw_group,
             controls_terminal,
             child_is_foreground: false,
             pending_signals,
             ignored_interrupts,
             relay_registrations,
+            signal_route,
         })
     }
 
@@ -201,7 +255,7 @@ impl TerminalChild {
                     // Continue to relay the actual hangup. The cleanup path
                     // below will make a second best-effort restoration.
                 }
-                if forward_group(self.child_group, signal).is_err() {
+                if self.forward_signal(signal).is_err() {
                     if saw_hup {
                         self.cleanup_after_error();
                         return Ok(128 + Signal::SIGHUP as i32);
@@ -211,14 +265,17 @@ impl TerminalChild {
                 }
             }
 
-            match aw_platform::unix_peek_exit(self.child_group.as_raw() as u32) {
+            match aw_platform::unix_peek_exit(self.direct_child.as_raw() as u32) {
                 Ok(Some(outcome)) => {
-                    self.finish_after_exit();
-                    self.reap_after_cleanup();
+                    let cleanup_deadline = std::time::Instant::now() + CLEANUP_LIMIT;
+                    self.finish_after_exit(cleanup_deadline);
+                    self.reap_after_cleanup(cleanup_deadline);
                     return Ok(match outcome {
                         aw_platform::ReapOutcome::Exited(code) => code,
                         aw_platform::ReapOutcome::Signaled(signal) => 128 + signal,
-                        aw_platform::ReapOutcome::StillRunning => unreachable!("waitid reported exit"),
+                        aw_platform::ReapOutcome::StillRunning => {
+                            unreachable!("waitid reported exit")
+                        }
                     });
                 }
                 Ok(None) => {}
@@ -237,14 +294,14 @@ impl TerminalChild {
             }
 
             match waitpid(
-                self.child_group,
+                self.direct_child,
                 Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED),
             ) {
                 Ok(WaitStatus::Exited(_, code)) => {
                     // `waitid(WNOWAIT)` above is the normal exit path. Keep
                     // this defensive fallback for a transition that races its
                     // no-hang poll.
-                    self.finish_after_exit();
+                    self.finish_after_exit(std::time::Instant::now() + CLEANUP_LIMIT);
                     return Ok(code);
                 }
                 Ok(WaitStatus::Signaled(_, signal, _)) => {
@@ -253,7 +310,7 @@ impl TerminalChild {
                     // than to aw's relay.  Clean the group in that case too:
                     // a descendant that ignored SIGINT must not survive after
                     // its group leader has ended.
-                    self.finish_after_exit();
+                    self.finish_after_exit(std::time::Instant::now() + CLEANUP_LIMIT);
                     return Ok(128 + signal as i32);
                 }
                 Ok(WaitStatus::Stopped(_, _)) => {
@@ -285,6 +342,13 @@ impl TerminalChild {
         }
     }
 
+    /// Abort a released target after a launch-state-machine error. This uses
+    /// the same bounded restore, TERM, grace, STOP/KILL, and reap sequence as
+    /// a terminal wait error; callers must not replace it with bare SIGKILL.
+    pub(crate) fn abort_and_reap(&mut self) {
+        self.cleanup_after_error();
+    }
+
     fn take_pending_signals(&self) -> [Option<Signal>; 3] {
         self.pending_signals.take_all()
     }
@@ -294,7 +358,7 @@ impl TerminalChild {
             // A non-interactive caller has no shell job-control contract.  Do
             // not leave its run permanently stopped merely because a target
             // sent itself SIGTSTP/SIGSTOP.
-            return forward_group(self.child_group, Signal::SIGCONT);
+            return self.forward_signal(Signal::SIGCONT);
         }
 
         self.restore_aw_foreground()?;
@@ -305,27 +369,35 @@ impl TerminalChild {
         signal_hook::low_level::emulate_default_handler(Signal::SIGTSTP as i32)
             .map_err(|_| "无法暂停 aw 以交还终端".to_owned())?;
         self.give_child_foreground()?;
-        forward_group(self.child_group, Signal::SIGCONT)
+        self.forward_signal(Signal::SIGCONT)
     }
 
-    fn finish_after_exit(&mut self) {
+    fn finish_after_exit(&mut self, cleanup_deadline: std::time::Instant) {
         let _ = self.restore_aw_foreground();
-        self.cleanup_leftovers();
+        if self.owns_group_cleanup() {
+            self.cleanup_leftovers(cleanup_deadline);
+        }
     }
 
     /// Failure cleanup always restores first, then gives every group member a
     /// cooperative SIGTERM phase. SIGHUP is deliberately absent here: it is
     /// sent only when `aw` itself received a real terminal disconnect.
     fn cleanup_after_error(&mut self) {
+        let deadline = std::time::Instant::now() + CLEANUP_LIMIT;
         let _ = self.restore_aw_foreground();
-        self.cleanup_leftovers();
-        self.reap_after_cleanup();
+        if self.owns_group_cleanup() {
+            self.cleanup_leftovers(deadline);
+        } else {
+            self.abort_watchdog();
+        }
+        self.reap_after_cleanup(deadline);
     }
 
-    fn cleanup_leftovers(&self) {
+    fn cleanup_leftovers(&self, cleanup_deadline: std::time::Instant) {
         let _ = killpg(self.child_group, Signal::SIGTERM);
-        let deadline = std::time::Instant::now() + LEFTOVER_GRACE;
-        while group_exists(self.child_group) && std::time::Instant::now() < deadline {
+        let grace_deadline =
+            std::cmp::min(cleanup_deadline, std::time::Instant::now() + LEFTOVER_GRACE);
+        while group_exists(self.child_group) && std::time::Instant::now() < grace_deadline {
             std::thread::sleep(SIGNAL_POLL);
         }
         if group_exists(self.child_group) {
@@ -336,18 +408,52 @@ impl TerminalChild {
         }
     }
 
-    fn reap_after_cleanup(&self) {
-        loop {
-            match waitpid(self.child_group, None) {
+    fn reap_after_cleanup(&mut self, cleanup_deadline: std::time::Instant) {
+        while std::time::Instant::now() < cleanup_deadline {
+            match waitpid(
+                self.direct_child,
+                Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED),
+            ) {
                 Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => return,
                 Ok(WaitStatus::Stopped(_, _)) => {
-                    let _ = forward_group(self.child_group, Signal::SIGCONT);
+                    let _ = self.forward_signal(Signal::SIGCONT);
                 }
-                Ok(WaitStatus::Continued(_)) | Ok(WaitStatus::StillAlive) => {}
+                Ok(WaitStatus::Continued(_)) | Ok(WaitStatus::StillAlive) => {
+                    std::thread::sleep(SIGNAL_POLL);
+                }
                 #[cfg(target_os = "linux")]
-                Ok(WaitStatus::PtraceEvent(_, _, _)) | Ok(WaitStatus::PtraceSyscall(_)) => {}
+                Ok(WaitStatus::PtraceEvent(_, _, _)) | Ok(WaitStatus::PtraceSyscall(_)) => {
+                    std::thread::sleep(SIGNAL_POLL);
+                }
                 Err(_) => return,
             }
+        }
+    }
+
+    fn forward_signal(&mut self, signal: Signal) -> Result<(), String> {
+        match &mut self.signal_route {
+            SignalRoute::Group => forward_group(self.child_group, signal),
+            #[cfg(target_os = "linux")]
+            SignalRoute::Watchdog(control) => {
+                use std::io::Write;
+                control
+                    .write_all(&[signal as u8])
+                    .and_then(|_| control.flush())
+                    .map_err(|_| "无法转发信号给子进程".to_owned())
+            }
+        }
+    }
+
+    fn owns_group_cleanup(&self) -> bool {
+        matches!(&self.signal_route, SignalRoute::Group)
+    }
+
+    fn abort_watchdog(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let SignalRoute::Watchdog(control) = &mut self.signal_route {
+            use std::io::Write;
+            let _ = control.write_all(&[b'A']);
+            let _ = control.flush();
         }
     }
 
@@ -361,19 +467,65 @@ impl TerminalChild {
     }
 
     fn switch_foreground(&self, group: Pid) -> Result<(), String> {
-        let mut stop_signals = SigSet::empty();
-        stop_signals.add(Signal::SIGTTOU);
-        stop_signals.add(Signal::SIGTTIN);
-        let previous = stop_signals
-            .thread_swap_mask(SigmaskHow::SIG_BLOCK)
-            .map_err(|_| "无法切换终端前台程序组".to_owned())?;
-        let stdin = io::stdin();
-        let switched = tcsetpgrp(stdin.as_fd(), group).is_ok();
-        let restored_mask = previous.thread_set_mask().is_ok();
-        if switched && restored_mask {
-            Ok(())
-        } else {
-            Err("无法切换终端前台程序组".to_owned())
+        switch_foreground_group(group)
+    }
+}
+
+/// Perform one foreground-group switch while blocking job-control stop
+/// signals. Kept outside `TerminalChild` for the narrow window where a held
+/// child performed terminal handoff but installing the guard itself failed.
+fn switch_foreground_group(group: Pid) -> Result<(), String> {
+    let mut stop_signals = SigSet::empty();
+    stop_signals.add(Signal::SIGTTOU);
+    stop_signals.add(Signal::SIGTTIN);
+    let previous = stop_signals
+        .thread_swap_mask(SigmaskHow::SIG_BLOCK)
+        .map_err(|_| "无法切换终端前台程序组".to_owned())?;
+    let stdin = io::stdin();
+    let switched = tcsetpgrp(stdin.as_fd(), group).is_ok();
+    let restored_mask = previous.thread_set_mask().is_ok();
+    if switched && restored_mask {
+        Ok(())
+    } else {
+        Err("无法切换终端前台程序组".to_owned())
+    }
+}
+
+/// The held spawn path can hand the terminal to a child before the parent has
+/// installed its [`TerminalChild`] guard. If guard creation then fails, still
+/// restore the caller and clean the exact just-created process group with the
+/// normal bounded order.
+pub(crate) fn abort_unmanaged_child(pid: u32, decision: TerminalDecision) {
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return;
+    };
+    let group = Pid::from_raw(raw_pid);
+    if decision.controls_terminal {
+        let _ = switch_foreground_group(getpgrp());
+    }
+    let deadline = std::time::Instant::now() + CLEANUP_LIMIT;
+    let _ = killpg(group, Signal::SIGTERM);
+    let grace = std::cmp::min(deadline, std::time::Instant::now() + LEFTOVER_GRACE);
+    while group_exists(group) && std::time::Instant::now() < grace {
+        std::thread::sleep(SIGNAL_POLL);
+    }
+    if group_exists(group) {
+        let _ = killpg(group, Signal::SIGSTOP);
+        let _ = killpg(group, Signal::SIGKILL);
+    }
+    while std::time::Instant::now() < deadline {
+        match waitpid(group, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)) {
+            Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) | Err(_) => return,
+            Ok(WaitStatus::Stopped(_, _)) => {
+                let _ = killpg(group, Signal::SIGKILL);
+            }
+            Ok(WaitStatus::Continued(_)) | Ok(WaitStatus::StillAlive) => {
+                std::thread::sleep(SIGNAL_POLL);
+            }
+            #[cfg(target_os = "linux")]
+            Ok(WaitStatus::PtraceEvent(_, _, _)) | Ok(WaitStatus::PtraceSyscall(_)) => {
+                std::thread::sleep(SIGNAL_POLL);
+            }
         }
     }
 }
@@ -404,7 +556,10 @@ fn forward_group(group: Pid, signal: Signal) -> Result<(), String> {
 }
 
 fn group_exists(group: Pid) -> bool {
-    !matches!(killpg(group, Option::<Signal>::None), Err(nix::errno::Errno::ESRCH))
+    !matches!(
+        killpg(group, Option::<Signal>::None),
+        Err(nix::errno::Errno::ESRCH)
+    )
 }
 
 #[cfg(test)]
@@ -432,11 +587,8 @@ mod tests {
         command.args(["-c", "kill -TERM $$"]);
         command.process_group(0);
         let child = command.spawn().expect("spawn target");
-        let mut terminal = TerminalChild::new(
-            child.id(),
-            TerminalDecision::before_fork(),
-        )
-        .expect("terminal relay");
+        let mut terminal = TerminalChild::new(child.id(), TerminalDecision::before_fork())
+            .expect("terminal relay");
         drop(child);
         assert_eq!(terminal.wait().expect("wait target"), 143);
     }
@@ -460,11 +612,8 @@ mod tests {
         ]);
         command.process_group(0);
         let child = command.spawn().expect("spawn target");
-        let mut terminal = TerminalChild::new(
-            child.id(),
-            TerminalDecision::before_fork(),
-        )
-        .expect("terminal relay");
+        let mut terminal = TerminalChild::new(child.id(), TerminalDecision::before_fork())
+            .expect("terminal relay");
         let deadline = Instant::now() + Duration::from_secs(2);
         while !marker.is_file() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));

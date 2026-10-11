@@ -75,6 +75,15 @@ export function SessionLayout() {
   const data = session.data;
   const status = sessionStatus(data, t);
   const active = status.kind === "recording";
+  const leftovers = data.cleanup_leftovers;
+  const leftoversText = leftovers
+    ? t(leftovers.eperm_pid ? "session.cleanupLeftoversEperm" : "session.cleanupLeftovers", {
+        count: leftovers.count,
+        pids: leftovers.pids.join("、"),
+        suffix: leftovers.count > leftovers.pids.length ? "等" : "",
+        ...(leftovers.eperm_pid ? { pid: leftovers.eperm_pid } : {}),
+      })
+    : null;
 
   const stop = async () => {
     setStopping(true);
@@ -156,6 +165,7 @@ export function SessionLayout() {
           ) : null}
         </div>
       </header>
+      {leftoversText ? <p role="status" className="border-b border-gap px-3 py-2 text-sm text-gap">{leftoversText}</p> : null}
       {stopNotice ? <p role="status" className="px-3 py-1 text-xs text-ink-soft">{t("session.stopNotice")}</p> : null}
       {stopError ? <ErrorNote error={stopError} /> : null}
       <nav className="flex gap-1 border-b border-line px-3">

@@ -747,6 +747,7 @@ impl LocalCgroupHost {
     ) -> Result<LaunchResult, LaunchError> {
         use std::os::unix::process::CommandExt;
 
+        let terminal_decision = super::terminal::TerminalDecision::before_fork();
         let parent = delegated_parent()?;
         let session = parent.join(format!("agentwatch-{session_id}"));
         if let Err(err) = std::fs::create_dir(&session) {
@@ -777,7 +778,7 @@ impl LocalCgroupHost {
             }
         };
         started(spawned.id());
-        move_and_wait(spawned, &session)
+        move_and_wait(spawned, &session, terminal_decision)
     }
 }
 
@@ -921,20 +922,24 @@ fn self_cgroup_relative() -> Result<std::path::PathBuf, String> {
 fn move_and_wait(
     spawned: std::process::Child,
     session: &std::path::Path,
+    terminal_decision: super::terminal::TerminalDecision,
 ) -> Result<LaunchResult, LaunchError> {
     let pid = spawned.id();
-    let mut terminal = super::terminal::TerminalChild::new(
-        pid,
-        super::terminal::TerminalDecision::before_fork(),
-    )
-    .map_err(|_| LaunchError::WaitFailed {
-            detail: "无法安装程序信号转发".to_owned(),
-        })?;
-    terminal
-        .give_child_foreground()
-        .map_err(|_| LaunchError::WaitFailed {
+    let mut terminal = match super::terminal::TerminalChild::new(pid, terminal_decision) {
+        Ok(terminal) => terminal,
+        Err(_) => {
+            super::terminal::abort_unmanaged_child(pid, terminal_decision);
+            return Err(LaunchError::WaitFailed {
+                detail: "无法安装程序信号转发".to_owned(),
+            });
+        }
+    };
+    if terminal.give_child_foreground().is_err() {
+        terminal.abort_and_reap();
+        return Err(LaunchError::WaitFailed {
             detail: "无法切换终端前台程序组".to_owned(),
-        })?;
+        });
+    }
     let procs = session.join("cgroup.procs");
     let write = std::fs::write(&procs, format!("{pid}"));
     // `TerminalChild` is now the one WUNTRACED waiter for this direct child.
@@ -986,12 +991,13 @@ mod launch_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn refused_cgroup_procs_keeps_the_running_program() {
+        let terminal_decision = TerminalDecision::before_fork();
         let child = std::process::Command::new("sh")
             .args(["-c", "exit 5"])
             .spawn()
             .expect("spawn sh");
         let missing = std::env::temp_dir().join(format!("aw-no-cgroup-{}", std::process::id()));
-        let result = move_and_wait(child, &missing).expect("not an error");
+        let result = move_and_wait(child, &missing, terminal_decision).expect("not an error");
         assert_eq!(result.code, Some(5), "the program ran to its own end");
         assert!(!result.scoped);
         assert!(result.cgroup_path.is_empty());

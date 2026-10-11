@@ -120,9 +120,9 @@
        - **看门进程自己意外死了**：aw 也设 `PR_SET_CHILD_SUBREAPER`，所以程序会被挂回 aw 名下。aw 读到状态管道 EOF、又没收到最后的状态时，自己接手：`waitpid` 程序，再按下面同样的循环做清理，同时报「看门进程意外退出」。
        - **清理循环**（程序退出以后、aw 正常退出以后、aw 被杀以后，都会跑一遍，所以 `--no-daemon` 的「aw 一退出，程序和它启动的子程序都会跟着结束」三种情况都成立）：
          1. 扫一遍 `/proc/*/stat`，按 ppid 找出看门进程的所有子孙。因为它是 subreaper，孤儿都已经挂到它名下了，所以这样找不会漏掉 `setsid` 出去的那些；
-         2. 先给每一个子孙发 **SIGSTOP**，冻住，让它们没法再 fork。然后重新扫描，新冒出来的接着 SIGSTOP，一直扫到某一轮没有新的为止，所以一直 fork 的子程序也压得住；
-         3. 再给所有子孙发 **SIGKILL**，用 `waitpid(-1, WNOHANG)` 把挂到自己名下的都回收掉；
-         4. 重新扫描，回到第 1 步，直到 `waitpid` 返回 ECHILD、而且扫描结果为空。有上限：总共 5 秒；到点还有剩下的，把剩下的进程号和命令名写进日志，aw 报「还有 N 个子程序没能结束」，退出码不变。
+         2. 先给每一个子孙发 **SIGTERM**，给它们最多 2 秒自行收尾；正常结束、Ctrl+C 和错误清理都不发 SIGHUP，只有已确认的终端断开才向程序组转发 SIGHUP；
+         3. 仍存活的先发 **SIGSTOP**，冻住让它们不能再 fork；重新扫描，新冒出来的也接着 SIGSTOP，随后给所有幸存者发 **SIGKILL**，并用 `waitpid(-1, WNOHANG)` 回收；
+         4. 重新扫描，直到 `waitpid` 返回 ECHILD、而且扫描结果为空；从第 1 步起总上限 5 秒。到点还有剩下的，记录并展示「程序已经结束，但它启动的 N 个子程序没能结束，可能还在运行（进程号：…）。可以用 `kill -9 进程号` 手动结束。」（至多 5 个 pid，更多写「等」），程序退出码不变。
        - `aw __no-daemon-watchdog` 是隐藏子命令：clap 里 `hide = true`，不出现在 `aw --help`，帮助快照里断言它不出现。
        - 解析 `/proc/<pid>/stat` 时，命令名可能带空格和括号，**从最后一个 `)` 往后切字段**（ppid 是 `)` 后第 2 个字段，启动时间是第 20 个），加单元测试（命令名是 `a) b (c`）。
        - **防进程号复用（发每一个信号之前都核对）**：每个目标记成（pid、ppid、启动时间），启动时间是 `/proc/<pid>/stat` 第 22 列。发信号前重新读一遍，三项有一项对不上就跳过（说明原来那个进程已经没了，号被别人用了）。内核支持（5.3 及以上）时优先用 `pidfd_open` + `pidfd_send_signal`，它本身就不会打到被复用的号上；（pid、ppid、启动时间）这一套是不支持时的退路，也是第 1 步扫描时判断「是不是我的子孙」的依据。
@@ -130,7 +130,7 @@
      - Mac（watchdog + kqueue，**唯一的例外**）：看门进程用 kqueue `EVFILT_PROC` + `NOTE_EXIT` 盯 aw 的 pid，aw 一死就 `killpg` 整组。macOS 没有 subreaper，清不到自己 `setsid`/改了进程组的孙程序，所以 Mac 的 `--no-daemon` 帮助单独一句（规矩 11）。
      - Windows：靠 Job Object。aw 持有一个带 `KILL_ON_JOB_CLOSE` 的 Job，不允许 breakaway，覆盖整棵树（包括自己另起进程组的）；aw 死了句柄关闭，整棵树结束（接第 6 步；345d216 已经这样做）。
    - PDEATHSIG 的三个坑写进实现注释并各有测试：setuid 会清掉它，所以要在切完身份**之后**再设；设完马上查 `getppid()` 是否已经变了（父进程可能先死）；它跟的是**发起 fork 的那个线程**，fork 看门进程要在活得跟 aw 一样长的线程（主线程）里做。
-   - 信号：默认模式下 aw 收到的 SIGINT、SIGTERM、SIGHUP 原样转发给程序的进程组，跟 `--no-daemon` 一样（Linux 经看门进程转发，见上）；aw 的退出码 = 128+信号号（SIGINT → 130）。`ProcessGroupForwarder` 每 10ms 醒一次（`run.rs:1049`）改成阻塞等信号。
+   - 信号：默认模式下 aw 收到的 SIGINT、SIGTERM 经 Linux 看门进程转发；SIGHUP 仅在终端真的断开时才转发，不能把 `nohup` / shell 作业通知误当终端断开。aw 的退出码只报告程序自己的结果（SIGINT → 130），绝不被清理到的子程序改写。
    - 能保证的范围：**Linux（有没有 cgroup v2 都一样，靠看门进程当 subreaper）和 Windows（Job）都保证程序和它的所有子孙**跟着结束，包括自己 `setsid`/`setpgid` 出去的、中间那一层先退出留下来的；例外只有两种：子孙换成了别的用户（`sudo` 一类），记日志并如实报「还有 N 个子程序没能结束」。**Mac 是唯一的例外**：只保证直接子程序和留在同一进程组里的孙程序，脱离进程组的孙程序不保证——这是唯一一处「这个系统不支持」。
 7. **终端前台**（Linux 和 Mac 的 `aw run` 默认模式、`--no-daemon` 都要覆盖。Linux 默认模式也一样：c21dcec 以后 Linux 默认模式走 `hold.rs`，程序同样在自己的进程组里，`launch/unix_linux.rs:756` 的 `process_group(0)` 也是，所以 Linux 默认模式同样会卡在 SIGTTIN，不能只修 Mac）：
    - 在终端里时，子程序进程组用 `tcsetpgrp` 设成前台；aw 调 `tcsetpgrp` 前后**挡住 SIGTTOU**（否则 aw 自己在后台组时会被停住）。
@@ -717,7 +717,7 @@
 | 1 | winpipe A 的过关 | 不改代码，看第 0 步之后的 Windows CI | — | Win CI 绿 + PM 开发模式真机连跑 5 条命令都成功 |
 | 2 | **CLI 安全修**（`--owner`；CLI 路，紧跟第 0a 步推。`--data-dir` 已提前到第 0a 步⑤，这里不再做） | CI 加 release 行为检查（`test-hold-delay` 同样只在测试 feature 里）；`--owner` 统一走 `mutation_owner`（stop / attach 加进程也是），主人的会话 + `--owner 别人` 拒绝，主人带 `--owner=自己` 放行，后台解析用户名，「找不到用户」「查不到…对应的账户」两句，用户列显示用户名，管理员按会话名只找自己的；**内存会话分支放进 `#[cfg(test)]`**；改掉原来断言「主人带 `--owner=自己` 被拒」的测试；通知 Test-bot 改用测试版跑 `--purge --data-dir` | 后台和 CLI 一起改、测试一起加，不碰平台层 | A4 的参数化表；release 检查；release 走不到内存分支 |
 | 3 | winpipe B（**已推 93a6cfa**） | 查管道归谁（GetSecurityInfo）；`aw hook` 走带保护的打开函数；改注释；反向测试；clippy 禁止直接打开管道 | 只动 Windows 和 aw-channel | 匿名级别被拒、对面不是后台时一个字节都不发 |
-| 4 | **启动契约**（aw-xplat-macfix；Linux 门控泄漏**已推 c21dcec**，改走 hold.rs、压力测试 `crates/aw-platform/tests/gate_concurrent_spawn.rs` 已在 dev，所以证明工作区的 dash/dup2-到-3 补丁**不再拿**） | A1 规矩 1–11：c21dcec 剩下的三处（Linux `pipe2`、附加组按 `getgrouplist`、子进程里不分配；macOS 环境泄漏已在第 0a 步）；PATH 父进程拼候选、子进程切身份后挨个 execve；采集 crate 禁 Command + `xtask spawn-audit` + tokio 不开 process；Mac `pipe()` 后马上 FD_CLOEXEC + 子进程原始循环关 fd；唯一启动函数 + `SPAWN_LOCK` + clippy 禁 `Command::new`/`fork`；子进程里不分配、删 `clear_preload`、信号复位、报错管道、release 失败不丢 pid；附加组按 `getgrouplist`；自检补两项；程序名解析；看门进程（Linux：aw → 看门进程 → 程序，subreaper、SIGSTOP 再 SIGKILL 循环、pid+ppid+启动时间；Mac kqueue），替换 345d216 的 sh 看门进程；只绑 aw 起的程序；默认模式信号转发；tcsetpgrp（Linux/Mac 的默认模式和 `--no-daemon`、SIGTTOU、WUNTRACED、panic、aw 被杀后看门进程还前台）；`--no-daemon` 帮助（Linux/Windows 统一句，Mac 单独一句）；环境测试按完整集合；依赖里会起进程的 crate 清单 | 第 0 步之后 Mac 已绿；Linux/Mac 共用 hold.rs；Windows Job 部分如果没法在同一提交里绿，拆到第 6 步 | `gate_concurrent_spawn` 48×20 零泄漏（压力 48×300 零泄漏，dev tip 已是 0/14400）、40 路并发启动零失败、A1 共用测试全部 |
+| 4 | **启动契约**（aw-xplat-macfix；Linux 门控泄漏**已推 c21dcec**，改走 hold.rs、压力测试 `crates/aw-platform/tests/gate_concurrent_spawn.rs` 已在 dev，所以证明工作区的 dash/dup2-到-3 补丁**不再拿**） | A1 规矩 1–11：c21dcec 剩下的三处（Linux `pipe2`、附加组按 `getgrouplist`、子进程里不分配；macOS 环境泄漏已在第 0a 步）；PATH 父进程拼候选、子进程切身份后挨个 execve；采集 crate 禁 Command + `xtask spawn-audit` + tokio 不开 process；Mac `pipe()` 后马上 FD_CLOEXEC + 子进程原始循环关 fd；唯一启动函数 + `SPAWN_LOCK` + clippy 禁 `Command::new`/`fork`；子进程里不分配、删 `clear_preload`、信号复位、报错管道、release 失败不丢 pid；附加组按 `getgrouplist`；自检补两项；程序名解析；看门进程（Linux：aw → 看门进程 → 程序，subreaper、SIGTERM 后最多 2 秒、SIGSTOP+SIGKILL、总计最多 5 秒、pid+ppid+启动时间；Mac 同组清理），只在真实终端断开转发 SIGHUP；只绑 aw 起的程序；默认模式信号转发；tcsetpgrp（Linux/Mac 的默认模式和 `--no-daemon`、SIGTTOU、WUNTRACED、panic、aw 被杀后看门进程还前台）；`--no-daemon` 帮助（Linux/Windows 统一句，Mac 单独一句）；环境测试按完整集合；依赖里会起进程的 crate 清单 | 第 0 步之后 Mac 已绿；Linux/Mac 共用 hold.rs；Windows Job 部分如果没法在同一提交里绿，拆到第 6 步 | `gate_concurrent_spawn` 48×20 零泄漏（压力 48×300 零泄漏，dev tip 已是 0/14400）、40 路并发启动零失败、A1 共用测试全部 |
 | 5 | DB 第二+三轮 + 附着修复（**已推 da00935、6a11d6d、36abe45**；剩下的进 5b） | 8fff164 + retention 修复 + `lock_past_busy_timeout` 修复；A2 规矩 2–7：超时一张表、撤回、只把取名字挪到回复之后（`check_pid_owner` 留在前面）、后台计时 `--duration`、**大锁里不碰库**、**FTS 新行不先 DELETE、改/删按 rowid**；「正在读取进程…」状态；按测量决定规矩 8（常驻写连接、列表计数） | 8fff164 的 retention 失败修完才推；A2 的 CLI 部分跟后台同一个提交，不会出现两头不一致的中间版本 | **同一个 200MB 库 + 2–3 个整机会话在采样，attach 单进程和 `--pid 1` 各 5 次都 ≤ 1.5 秒、POST ≤ 0.3 秒**；CI 缩小版；命令行被杀后会话照样按时结束；dbintegrity 压力测试 |
 | 5b | **DB 第四轮：行 id 按三类表 + 回归项**（aw-xplat-fix） | A3 规矩 1：事件表加 `sampler` + `seq` + 唯一索引（保留 `id` 主键）、实体表按列合并（会变列比 `last_seq`、只写一次的列 COALESCE、不同采样器不互比）、桶和 file_access 计数写总数取 MAX；计数器归后台；`seq_next` 只当高水位；FTS rowid 由 (src, src_id) 推出、`http` 补删除触发器；`process_images.seq` → `exec_seq`；迁移 0012；去掉 `replay_writes`；FTS 改/删按 rowid；Test-bot 6a11d6d 回归 7 条；超时常量 12 秒进 aw-core；A2 规矩 6 剩下的（读请求不进大锁） | 迁移和写入同一个提交，没有「新代码 + 老表」的中间版本；API 的 `seq` 别名保留，UI 不跟着红 | A3 测试全部（含启动顺序、`db_migrating`）；0011 → 0012 迁移测试（含 207MB 库上迁移 ≤ 8 秒）；附着验收（H3 的 D/I 组）和 40 路并发启动（H3）都不回退 |
 | 6 | Windows 第三轮（aw-xplat-win，**部分已推 345d216**） | `.cmd` 转义、整棵进程树 Job（接第 4 步）、等待有上限、PPID 复用；数据目录句柄化（`OPEN_REPARSE_POINT` + `SetSecurityInfo`、带安全描述符建目录、子项）+ 真建 junction/symlink 的测试 | 只动 Windows | Win CI + 真机清单 + 数据目录矩阵 Windows 那几格 |
@@ -836,7 +836,7 @@
 |---|---|---|
 | 挡-1 附着慢根因写错、验收定错 | 用 10 组对照计时证实是 FTS 全表扫描 DELETE + 库写锁 + 全局大锁；扫描已否定；验收改成「同库同采样会话 ≤ 1.5 秒 / POST ≤ 0.3 秒」，修后达标 | A2、H2、E 第 5 步 |
 | 挡-2 进程树按 parent_uid 现算修不好 | 改成 (b) 查询时 parent_uid 为空按 ppid + 启动时间找（主）+ (a) 采样时补；测试改成孩子 parent_uid 为 NULL、pid 复用 | B5、E 第 12 步 |
-| 挡-3 aw 被强杀谁来清理、Mac 写反、PDEATHSIG 不能用在后台起的程序 | 只绑 aw 起的程序；看门进程（Linux：看门进程是 subreaper、夹在 aw 和程序之间，SIGSTOP 再 SIGKILL 循环清理；Mac kqueue NOTE_EXIT；Windows Job）；PDEATHSIG 三个坑；Mac 写成「脱离进程组的孙程序不保证」；测试加「后台被杀程序还在跑」 | A1 规矩 6、C1 |
+| 挡-3 aw 被强杀谁来清理、Mac 写反、PDEATHSIG 不能用在后台起的程序 | 只绑 aw 起的程序；看门进程（Linux：看门进程是 subreaper、夹在 aw 和程序之间，SIGTERM 后最多 2 秒、SIGSTOP+SIGKILL、总计最多 5 秒；Mac 同组清理；Windows Job）；PDEATHSIG 三个坑；Mac 写成「脱离进程组的孙程序不保证」；测试加「后台被杀程序还在跑」 | A1 规矩 6、C1 |
 | 挡-4 hold.rs 附加组来源、异步信号安全、挂住时拿着所有 fd | 附加组一律 `getgrouplist`；父进程准备指针数组、删 `clear_preload`；子进程关 fd（Linux close_range，Mac 原始循环 close，PM 13:13）；测试加挂住阶段白名单、A/B 中止 | A1 规矩 1、3、4 |
 | 要补 1 数据目录放宽 | A4 规矩 6 + 测试矩阵，第 0 步（Windows 句柄化第 6 步） | A4、E |
 | 要补 2 错误码 46+ 种、两张已有表 | B1 重写：41 + 5，`not_implemented` 格式、`json!` 禁用、从 daemon_errors.rs 生成、码名不改、`write_failed` 删 | B1、E 第 8a 步 |
@@ -879,7 +879,7 @@
 - 不截断也不拒绝，按用户加载（跟登录一样，initgroups 语义）。libc 的 `initgroups()` 不是异步信号安全的，所以组列表在 fork **之前**解析（`getgrouplist`，缓冲区给大，溢出就加大重试）；子进程里只做系统调用（macOS 的 `initgroups(ngroups, gidset, gmuid)` 系统调用通过 gmuid 开启动态成员解析，或者用准备好的列表 `setgroups`），fork 后不做任何查询。系统仍然只给一部分时：记日志，并在 doctor 里如实显示，绝不悄悄丢掉。
 
 ### `--no-daemon` 时 aw 退出，子程序怎样跟着结束（13:51 更正）
-- Linux（看门进程设 `PR_SET_CHILD_SUBREAPER`，进程关系 aw → 看门进程 → 程序，有没有 cgroup 都一样）和 Windows（Job Object `KILL_ON_JOB_CLOSE`）能清到孙程序，包括自己另起进程组的。细节（退出码转交、信号经看门进程转发、tcsetpgrp、SIGSTOP 再 SIGKILL 的清理循环、按 pid+ppid+启动时间防复用、看门进程自己单独一个进程组）见 A1 规矩 6（PM 14:04 定）。
+- Linux（看门进程设 `PR_SET_CHILD_SUBREAPER`，进程关系 aw → 看门进程 → 程序，有没有 cgroup 都一样）和 Windows（Job Object `KILL_ON_JOB_CLOSE`）能清到孙程序，包括自己另起进程组的。细节（退出码转交、信号经看门进程转发、tcsetpgrp、SIGTERM 后最多 2 秒再 SIGSTOP+SIGKILL、总计最多 5 秒、按 pid+ppid+启动时间防复用、看门进程自己单独一个进程组）见 A1 规矩 6（PM 14:04 定）。
 - Mac：看门进程 + kqueue 会 `killpg` 整个进程组，但清不到自己 `setsid`/改了进程组的孙程序（macOS 没有 subreaper）。所以只有 Mac 的 `--no-daemon` 帮助单独一句（见 UI-147-wording.md），Linux 跟 Windows 用统一那句，Mac 的 doctor「aw 退出时清理子程序」一项也不写单纯的「可用」，带同样的说明。帮助快照按系统分开存。
 
 ### UI审查 13:50 新增文字（数据目录其余失败、option_not_wired）

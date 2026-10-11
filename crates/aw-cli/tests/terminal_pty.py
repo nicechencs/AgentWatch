@@ -56,13 +56,28 @@ def spawn(mode, argv):
 def interactive(mode, label, argv, inputs, expected):
     pid, fd = spawn(mode, argv)
     output = read_for(fd, 0.3)
-    for text in inputs:
-        os.write(fd, text)
-        output += read_for(fd, 0.35)
-    os.write(fd, b"\x04")
-    output += read_for(fd, 1.5)
-    code = wait_for_exit(pid, 3, label)
-    os.close(fd)
+    try:
+        for text in inputs:
+            os.write(fd, text)
+            output += read_for(fd, 0.35)
+        os.write(fd, b"\x04")
+        output += read_for(fd, 1.5)
+        code = wait_for_exit(pid, 3, label)
+    except BaseException as error:
+        # A pty master reports EIO once the program side has closed.  Do not
+        # hide the only useful diagnostic behind that write error: collect the
+        # child status and all output before failing the Rust harness.
+        output += read_for(fd, 0.5)
+        try:
+            code = wait_for_exit(pid, 3, label)
+        except BaseException:
+            code = "unavailable"
+        raise AssertionError(
+            "%s pty I/O failed (%s); aw exit=%s; output=%r"
+            % (label, error, code, output)
+        )
+    finally:
+        os.close(fd)
     for item in expected:
         if item not in output:
             raise AssertionError("%s missing %r in %r" % (label, item, output))
@@ -74,7 +89,17 @@ def marker_program(marker):
     return [
         PYTHON,
         "-c",
-        "import os, pathlib, signal, sys, time; signal.signal(signal.SIGHUP, signal.SIG_DFL); pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(120)",
+        "import os, pathlib, signal, sys, time\n"
+        "marker = pathlib.Path(sys.argv[1])\n"
+        "signals = marker.with_suffix('.signals')\n"
+        "def received(signum, _frame):\n"
+        "    with signals.open('a') as out: out.write(str(signum) + '\\n')\n"
+        "    if signum == signal.SIGINT: raise SystemExit(130)\n"
+        "    if signum == signal.SIGHUP: raise SystemExit(129)\n"
+        "signal.signal(signal.SIGINT, received)\n"
+        "signal.signal(signal.SIGHUP, received)\n"
+        "marker.write_text(str(os.getpid()))\n"
+        "time.sleep(120)",
         marker,
     ]
 
@@ -113,6 +138,16 @@ def terminal_signal(mode, label, close_terminal):
     code = wait_for_exit(pid, 3, label)
     if code != expected:
         raise AssertionError("%s returned %s, expected %s" % (label, code, expected))
+    signals = marker + ".signals"
+    delivered = []
+    if os.path.exists(signals):
+        delivered = [int(line) for line in open(signals).read().splitlines()]
+        os.unlink(signals)
+    if not close_terminal and delivered.count(signal.SIGINT) != 1:
+        raise AssertionError(
+            "%s delivered SIGINT %s times, expected exactly once (%r)"
+            % (label, delivered.count(signal.SIGINT), delivered)
+        )
     assert_gone(child, label)
     os.unlink(marker)
 
@@ -208,10 +243,62 @@ def restored_foreground(mode, label, argv, expected_code):
         )
 
 
+def background_aw_never_takes_foreground(mode, label):
+    """Start aw in a background process group below a real shell pgrp."""
+    master, slave = os.openpty()
+    report_read, report_write = os.pipe()
+    shell = os.fork()
+    if shell == 0:
+        try:
+            os.close(master)
+            os.close(report_read)
+            os.setsid()
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+            shell_group = os.getpgrp()
+            os.tcsetpgrp(slave, shell_group)
+            aw = os.fork()
+            if aw == 0:
+                os.setpgrp()
+                os.dup2(slave, 0)
+                os.dup2(slave, 1)
+                os.dup2(slave, 2)
+                if slave > 2:
+                    os.close(slave)
+                os.execv(AW, [AW, "run", "-q"] + mode + ["--", "sh", "-c", "sleep 0.5"])
+            # The terminal must remain with the shell while aw is running,
+            # not merely after it has finished and restored it.
+            time.sleep(0.15)
+            during = os.tcgetpgrp(slave)
+            _, status = os.waitpid(aw, 0)
+            after = os.tcgetpgrp(slave)
+            code = os.waitstatus_to_exitcode(status)
+            os.write(report_write, ("%d %d %d %d" % (code, during, after, shell_group)).encode())
+        finally:
+            os._exit(0)
+    os.close(slave)
+    os.close(report_write)
+    data = os.read(report_read, 128)
+    os.close(report_read)
+    _, status = os.waitpid(shell, 0)
+    os.close(master)
+    if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+        raise AssertionError("%s shell harness failed" % label)
+    try:
+        code, during, after, shell_group = [int(value) for value in data.split()]
+    except ValueError:
+        raise AssertionError("%s did not report foreground state: %r" % (label, data))
+    if code != 0:
+        raise AssertionError("%s returned %s" % (label, code))
+    if during != shell_group or after != shell_group:
+        raise AssertionError(
+            "%s changed terminal foreground pgrp (during=%s after=%s shell=%s)"
+            % (label, during, after, shell_group)
+        )
+
+
 def main():
     if PYTHON is None:
-        print("pty terminal regression skipped: python3 is unavailable")
-        return
+        raise AssertionError("python3 is required for the pty terminal regression")
     scenarios = [
         ("cat", ["cat"], [b"cat-line\n"], [b"cat-line"]),
         (
@@ -247,6 +334,7 @@ def main():
             ["/no/such/aw-pty-program"],
             1,
         )
+        background_aw_never_takes_foreground(mode, prefix + " background foreground")
 
 
 if __name__ == "__main__":

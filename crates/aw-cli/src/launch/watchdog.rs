@@ -5,14 +5,12 @@
 //! helper becomes a new session and Linux child subreaper before it creates the
 //! held program, so cleanup reaches descendants which daemonize with `setsid`.
 
-#[cfg(not(test))]
-use std::io::IsTerminal;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, ExitStatus};
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
     mpsc, Arc,
 };
 use std::time::Duration;
@@ -34,6 +32,8 @@ const CONFIG: u8 = b'C';
 const START: u8 = b'S';
 const RELEASED: u8 = b'G';
 const FAILED: u8 = b'F';
+const ABORT: u8 = b'A';
+const CLEANUP: u8 = b'L';
 const MAX_CONFIG_BYTES: usize = 1 << 20;
 const SIGNAL_POLL: Duration = Duration::from_millis(5);
 
@@ -43,6 +43,48 @@ pub struct Watchdog {
     control: UnixStream,
     program_pid: u32,
     released: bool,
+    cleanup: Option<CleanupReport>,
+}
+
+/// Bounded cleanup data that can safely cross the private watchdog socket and
+/// be attached to a daemon-backed session.  It contains identifiers only, no
+/// command text, environment, or process data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CleanupReport {
+    pub(crate) count: u32,
+    pub(crate) pids: Vec<u32>,
+    pub(crate) eperm_pid: Option<u32>,
+}
+
+enum SupervisorEvent {
+    Signal(Signal),
+    Abort,
+    Closed,
+}
+
+struct PendingSignals {
+    interrupt: Arc<AtomicBool>,
+    terminate: Arc<AtomicBool>,
+}
+
+impl PendingSignals {
+    fn new() -> Self {
+        Self {
+            interrupt: Arc::new(AtomicBool::new(false)),
+            terminate: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn take_all(&self) -> [Option<Signal>; 2] {
+        [
+            self.interrupt
+                .swap(false, Ordering::SeqCst)
+                .then_some(Signal::SIGINT),
+            self.terminate
+                .swap(false, Ordering::SeqCst)
+                .then_some(Signal::SIGTERM),
+        ]
+    }
 }
 
 /// Failure that crossed the private watchdog protocol.
@@ -62,9 +104,10 @@ pub fn is_internal() -> bool {
         .is_some_and(|arg| arg == INTERNAL_ARGUMENT)
 }
 
-/// A terminal target must remain in the terminal session so the terminal layer
-/// can hand its process group foreground control. See the design note for this
-/// necessary session-boundary exception.
+/// Non-interactive Linux CLI-created targets are supervised by the re-exec'd
+/// subreaper. Foreground terminal targets retain a direct parent so the
+/// terminal waiter can observe WUNTRACED and implement the shell job-control
+/// contract.
 #[must_use]
 pub fn should_wrap() -> bool {
     // Library unit tests execute the test harness rather than this CLI
@@ -76,12 +119,13 @@ pub fn should_wrap() -> bool {
     }
     #[cfg(not(test))]
     {
-        !io::stdin().is_terminal()
+        true
     }
 }
 
 /// Run the re-exec'd helper and return the program's conventional exit code.
-/// No error text is written because the control protocol only carries status.
+/// The control protocol carries only status; an exceptional leftover report is
+/// printed with the fixed evidence-preserving wording after cleanup.
 pub fn run_internal() -> i32 {
     let Some(fd) = std::env::args_os()
         .nth(2)
@@ -93,31 +137,18 @@ pub fn run_internal() -> i32 {
     let Ok(mut control) = aw_platform::take_watchdog_control(fd) else {
         return 1;
     };
-    let parent_pid = parent_pid_from_control(&control);
     let died = Arc::new(AtomicBool::new(false));
     let Ok(signal_id) =
         signal_hook::flag::register(signal_hook::consts::signal::SIGUSR1, Arc::clone(&died))
     else {
         return 1;
     };
-    let result = run_inner(&mut control, parent_pid, &died);
+    let result = run_inner(&mut control, &died);
     let _ = signal_hook::low_level::unregister(signal_id);
     result
 }
 
-fn parent_pid_from_control(control: &UnixStream) -> u32 {
-    let _ = control;
-    std::fs::read_to_string("/proc/self/stat")
-        .ok()
-        .and_then(|text| text.rsplit_once(')').map(|(_, tail)| tail.to_owned()))
-        .and_then(|tail| tail.split_whitespace().nth(1)?.parse().ok())
-        .unwrap_or(0)
-}
-
-fn run_inner(control: &mut UnixStream, parent_pid: u32, died: &AtomicBool) -> i32 {
-    if aw_platform::prepare_watchdog(parent_pid).is_err() {
-        return 1;
-    }
+fn run_inner(control: &mut UnixStream, died: &AtomicBool) -> i32 {
     // This descriptor is inherited solely across the helper re-exec. Mark it
     // close-on-exec before the held target is forked, so neither the target nor
     // its descendants can keep the parent-liveness channel open.
@@ -127,6 +158,12 @@ fn run_inner(control: &mut UnixStream, parent_pid: u32, died: &AtomicBool) -> i3
     let Ok(request) = receive_config(control) else {
         return 1;
     };
+    // The creator supplies its pid through the authenticated private socket;
+    // reading the helper's own `/proc/self/stat` merely proves its current
+    // parent, not who is entitled to supervise this launch.
+    if aw_platform::prepare_watchdog(request.parent_pid, request.terminal_handoff).is_err() {
+        return 1;
+    }
     let Ok(mut held) = start_held_program(&request) else {
         return 1;
     };
@@ -137,8 +174,15 @@ fn run_inner(control: &mut UnixStream, parent_pid: u32, died: &AtomicBool) -> i3
     }
 
     let mut start = [0_u8; 1];
-    if control.read_exact(&mut start).is_err() || start[0] != START || died.load(Ordering::Relaxed)
-    {
+    if control.read_exact(&mut start).is_err() || died.load(Ordering::Relaxed) {
+        let _ = held.abort();
+        return 1;
+    }
+    if start[0] == ABORT {
+        let _ = held.abort();
+        return 1;
+    }
+    if start[0] != START {
         let _ = held.abort();
         return 1;
     }
@@ -154,37 +198,63 @@ fn run_inner(control: &mut UnixStream, parent_pid: u32, died: &AtomicBool) -> i3
         .and_then(|_| control.flush())
         .is_err()
     {
-        aw_platform::cleanup_watchdog_descendants();
-        return 1;
+        return finish_cleanup(control, 1);
     }
 
-    let (ended, events) = mpsc::channel();
+    let (events_tx, events) = mpsc::channel();
     if let Ok(mut watch) = control.try_clone() {
         std::thread::spawn(move || {
             let mut byte = [0_u8; 1];
-            let _ = watch.read(&mut byte);
-            let _ = ended.send(());
+            loop {
+                match watch.read(&mut byte) {
+                    Ok(0) | Err(_) => {
+                        let _ = events_tx.send(SupervisorEvent::Closed);
+                        return;
+                    }
+                    Ok(_) if byte[0] == ABORT => {
+                        let _ = events_tx.send(SupervisorEvent::Abort);
+                    }
+                    Ok(_) => {
+                        if let Ok(signal) = Signal::try_from(i32::from(byte[0])) {
+                            let _ = events_tx.send(SupervisorEvent::Signal(signal));
+                        }
+                    }
+                }
+            }
         });
     }
 
     loop {
-        if died.load(Ordering::Relaxed) || events.try_recv().is_ok() {
-            aw_platform::cleanup_watchdog_descendants();
-            return 1;
+        // Reap adopted short-lived descendants continuously. Waiting only
+        // after the root exits lets zombies accumulate under the subreaper.
+        aw_platform::reap_watchdog_children();
+        if died.load(Ordering::Relaxed) {
+            return finish_cleanup(control, 1);
+        }
+        match events.try_recv() {
+            Ok(SupervisorEvent::Signal(signal)) => {
+                if forward_group(pid, signal).is_err() {
+                    return finish_cleanup(control, 1);
+                }
+            }
+            Ok(SupervisorEvent::Abort | SupervisorEvent::Closed) => {
+                return finish_cleanup(control, 1);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return finish_cleanup(control, 1);
+            }
         }
         match released.try_reap() {
             Ok(ReapOutcome::Exited(code)) => {
-                aw_platform::cleanup_watchdog_descendants();
-                return code;
+                return finish_cleanup(control, code);
             }
             Ok(ReapOutcome::Signaled(signal)) => {
-                aw_platform::cleanup_watchdog_descendants();
-                return 128 + signal;
+                return finish_cleanup(control, 128 + signal);
             }
             Ok(ReapOutcome::StillRunning) => std::thread::sleep(SIGNAL_POLL),
             Err(_) => {
-                aw_platform::cleanup_watchdog_descendants();
-                return 1;
+                return finish_cleanup(control, 1);
             }
         }
     }
@@ -246,23 +316,28 @@ struct Request {
     command: Vec<String>,
     cwd: Option<String>,
     env: Vec<(String, String)>,
+    parent_pid: u32,
+    terminal_handoff: bool,
 }
 
-impl From<&RunSpec> for Request {
-    fn from(spec: &RunSpec) -> Self {
+impl Request {
+    fn from_run(spec: &RunSpec, terminal_handoff: bool) -> Self {
         Self {
             command: spec.command.clone(),
             cwd: spec.cwd.clone(),
             env: spec.env.clone(),
+            parent_pid: std::process::id(),
+            terminal_handoff,
         }
     }
 }
 
 impl Watchdog {
     /// Spawn a held watchdog. Its target exists but cannot exec until release.
-    pub fn spawn(spec: &RunSpec) -> Result<Self, WatchdogError> {
-        let bytes =
-            serde_json::to_vec(&Request::from(spec)).map_err(|_| WatchdogError::Unavailable)?;
+    pub fn spawn(spec: &RunSpec, terminal_handoff: bool) -> Result<Self, WatchdogError> {
+        aw_platform::prepare_watchdog_fallback().map_err(|_| WatchdogError::Unavailable)?;
+        let bytes = serde_json::to_vec(&Request::from_run(spec, terminal_handoff))
+            .map_err(|_| WatchdogError::Unavailable)?;
         let (mut parent, child_control) =
             UnixStream::pair().map_err(|_| WatchdogError::Unavailable)?;
         clear_cloexec(child_control.as_fd()).map_err(|_| WatchdogError::Unavailable)?;
@@ -286,12 +361,29 @@ impl Watchdog {
             control: parent,
             program_pid: u32::from_be_bytes(reply[1..].try_into().unwrap_or([0; 4])),
             released: false,
+            cleanup: None,
         })
     }
 
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.program_pid
+    }
+
+    /// The direct helper process owned by the CLI.  This differs from
+    /// [`Self::pid`], which deliberately reports the program pid to daemon
+    /// adoption and terminal process-group control.
+    #[must_use]
+    pub(crate) fn process_pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// A terminal waiter forwards signals over this private socket.  The
+    /// watchdog, never the parent CLI, owns `killpg` for the program group.
+    pub(crate) fn control_clone(&self) -> Result<UnixStream, WatchdogError> {
+        self.control
+            .try_clone()
+            .map_err(|_| WatchdogError::Unavailable)
     }
 
     /// Release the held program after its daemon session has adopted the pid.
@@ -320,29 +412,56 @@ impl Watchdog {
     /// target group. Terminal Ctrl-C is not used here: interactive launches
     /// retain the terminal-specific path instead.
     pub fn wait(&mut self) -> Result<i32, WatchdogError> {
-        let pending = Arc::new(AtomicUsize::new(0));
+        let pending = PendingSignals::new();
         let mut registrations = Vec::new();
-        for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP] {
-            let id = signal_hook::flag::register_usize(
-                signal as i32,
-                Arc::clone(&pending),
-                signal as usize,
-            )
-            .map_err(|_| WatchdogError::Unavailable)?;
-            registrations.push(id);
-        }
+        // No controlling terminal means a SIGHUP can be a shell/job-control
+        // notification, not a terminal disconnect.  Only the terminal waiter
+        // forwards real SIGHUP events to the watchdog.
+        registrations.push(
+            signal_hook::flag::register(Signal::SIGINT as i32, Arc::clone(&pending.interrupt))
+                .map_err(|_| WatchdogError::Unavailable)?,
+        );
+        registrations.push(
+            signal_hook::flag::register(Signal::SIGTERM as i32, Arc::clone(&pending.terminate))
+                .map_err(|_| WatchdogError::Unavailable)?,
+        );
         let result = loop {
-            if let Some(signal) = take_signal(&pending) {
-                if let Err(error) = forward_group(self.program_pid, signal) {
-                    break Err(error);
+            let mut relay_error = None;
+            for signal in pending.take_all().into_iter().flatten() {
+                if let Err(error) = self.forward(signal) {
+                    relay_error = Some(error);
+                    break;
                 }
+            }
+            if let Some(error) = relay_error {
+                break Err(error);
             }
             match self
                 .child
                 .try_wait()
                 .map_err(|_| WatchdogError::Unavailable)?
             {
-                Some(status) => break Ok(status_code(status)),
+                Some(status) => {
+                    use std::os::unix::process::ExitStatusExt;
+                    if status.signal().is_some() {
+                        // The helper did not send a conventional program
+                        // result.  It may have been killed by `killall aw`; as
+                        // the fallback subreaper, clean the adopted tree and
+                        // do not misreport that helper signal as the target's.
+                        self.record_fallback_cleanup();
+                        break Ok(1);
+                    }
+                    if self.read_cleanup_report().is_err() {
+                        // A helper that exits without its terminal report is
+                        // not trusted to have completed cleanup. The CLI is
+                        // already the fallback subreaper, so it takes over
+                        // and never reports the helper's status as the
+                        // program's status.
+                        self.record_fallback_cleanup();
+                        break Ok(1);
+                    }
+                    break Ok(status_code(status));
+                }
                 None => std::thread::sleep(SIGNAL_POLL),
             }
         };
@@ -355,12 +474,56 @@ impl Watchdog {
     /// Abort a held target, or end a released target through the helper so it
     /// can still reap descendants before it exits.
     pub fn abort(&mut self) {
-        if self.released {
-            let _ = forward_group(self.program_pid, Signal::SIGKILL);
-        } else {
+        if self
+            .control
+            .write_all(&[ABORT])
+            .and_then(|_| self.control.flush())
+            .is_err()
+        {
+            // The helper died before it could consume the control request.
+            // The parent is also a subreaper and takes over descendant cleanup.
             let _ = self.child.kill();
         }
         let _ = self.child.wait();
+        if self.released {
+            if self.read_cleanup_report().is_err() {
+                self.record_fallback_cleanup();
+            }
+        }
+    }
+
+    fn forward(&mut self, signal: Signal) -> Result<(), WatchdogError> {
+        self.control
+            .write_all(&[signal as u8])
+            .and_then(|_| self.control.flush())
+            .map_err(|_| WatchdogError::Unavailable)
+    }
+
+    /// Consume the cleanup status exactly once after `wait`. A missing value
+    /// means the cleanup completed within its budget; callers must not invent
+    /// a zero-count report.
+    pub(crate) fn cleanup_leftovers(&mut self) -> Option<crate::cmd::attach::CleanupLeftovers> {
+        self.cleanup
+            .take()
+            .map(|report| crate::cmd::attach::CleanupLeftovers {
+                count: report.count,
+                pids: report.pids,
+                eperm_pid: report.eperm_pid,
+            })
+    }
+
+    fn read_cleanup_report(&mut self) -> Result<(), WatchdogError> {
+        let report =
+            receive_cleanup_report(&mut self.control).map_err(|_| WatchdogError::Unavailable)?;
+        self.cleanup = report;
+        Ok(())
+    }
+
+    fn record_fallback_cleanup(&mut self) {
+        self.cleanup = cleanup_report(aw_platform::cleanup_watchdog_descendants());
+        if let Some(report) = &self.cleanup {
+            report_leftovers(report);
+        }
     }
 }
 
@@ -382,21 +545,135 @@ fn spawn_failure(kind: u8) -> Option<SpawnFailure> {
     }
 }
 
-fn take_signal(pending: &AtomicUsize) -> Option<Signal> {
-    match pending.swap(0, Ordering::SeqCst) {
-        number if number == Signal::SIGINT as usize => Some(Signal::SIGINT),
-        number if number == Signal::SIGTERM as usize => Some(Signal::SIGTERM),
-        number if number == Signal::SIGHUP as usize => Some(Signal::SIGHUP),
-        _ => None,
-    }
-}
-
 fn forward_group(pid: u32, signal: Signal) -> Result<(), WatchdogError> {
     let pid = i32::try_from(pid).map_err(|_| WatchdogError::Unavailable)?;
     match killpg(Pid::from_raw(pid), signal) {
         Ok(()) | Err(Errno::ESRCH) => Ok(()),
         Err(_) => Err(WatchdogError::Unavailable),
     }
+}
+
+fn finish_cleanup(control: &mut UnixStream, code: i32) -> i32 {
+    let report = cleanup_report(aw_platform::cleanup_watchdog_descendants());
+    let _ = send_cleanup_report(control, report.as_ref());
+    if let Some(report) = &report {
+        report_leftovers(report);
+    }
+    code
+}
+
+fn cleanup_report(cleanup: aw_platform::WatchdogCleanup) -> Option<CleanupReport> {
+    if cleanup.survivors.is_empty() {
+        return None;
+    }
+    let pids = cleanup
+        .survivors
+        .iter()
+        .copied()
+        .filter_map(|pid| u32::try_from(pid).ok())
+        .take(5)
+        .collect();
+    let eperm_pid = cleanup
+        .eperm_survivors
+        .into_iter()
+        .find_map(|pid| u32::try_from(pid).ok());
+    Some(CleanupReport {
+        count: u32::try_from(cleanup.survivors.len()).unwrap_or(u32::MAX),
+        pids,
+        eperm_pid,
+    })
+}
+
+fn report_leftovers(report: &CleanupReport) {
+    if report.count == 0 {
+        return;
+    }
+    let listed = report
+        .pids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("、");
+    let suffix = if usize::try_from(report.count).unwrap_or(usize::MAX) > report.pids.len() {
+        "等"
+    } else {
+        ""
+    };
+    if let Some(pid) = report.eperm_pid {
+        eprintln!(
+            "程序已经结束，但它启动的 {} 个子程序没能结束，可能还在运行（进程号：{listed}{suffix}）。其中进程号 {pid} 属于别的用户，需要用 `sudo kill -9 {pid}` 结束。",
+            report.count
+        );
+    } else {
+        eprintln!(
+            "程序已经结束，但它启动的 {} 个子程序没能结束，可能还在运行（进程号：{listed}{suffix}）。可以用 `kill -9 进程号` 手动结束。",
+            report.count
+        );
+    }
+}
+
+fn send_cleanup_report(control: &mut UnixStream, report: Option<&CleanupReport>) -> io::Result<()> {
+    let report = report.cloned().unwrap_or(CleanupReport {
+        count: 0,
+        pids: Vec::new(),
+        eperm_pid: None,
+    });
+    let listed = u8::try_from(report.pids.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many cleanup pids"))?;
+    control.write_all(&[CLEANUP])?;
+    control.write_all(&report.count.to_be_bytes())?;
+    control.write_all(&[listed])?;
+    for pid in report.pids {
+        control.write_all(&pid.to_be_bytes())?;
+    }
+    control.write_all(&report.eperm_pid.unwrap_or(0).to_be_bytes())?;
+    control.flush()
+}
+
+fn receive_cleanup_report(control: &mut UnixStream) -> io::Result<Option<CleanupReport>> {
+    let mut header = [0_u8; 6];
+    control.read_exact(&mut header)?;
+    if header[0] != CLEANUP {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing cleanup report",
+        ));
+    }
+    let count = u32::from_be_bytes(header[1..5].try_into().unwrap_or([0; 4]));
+    let listed = usize::from(header[5]);
+    if listed > 5
+        || (count == 0 && listed != 0)
+        || u32::try_from(listed).unwrap_or(u32::MAX) > count
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid cleanup report",
+        ));
+    }
+    let mut pids = Vec::with_capacity(listed);
+    for _ in 0..listed {
+        let mut raw = [0_u8; 4];
+        control.read_exact(&mut raw)?;
+        let pid = u32::from_be_bytes(raw);
+        if pid == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid cleanup pid",
+            ));
+        }
+        pids.push(pid);
+    }
+    let mut raw = [0_u8; 4];
+    control.read_exact(&mut raw)?;
+    let eperm_pid = u32::from_be_bytes(raw);
+    if count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(CleanupReport {
+        count,
+        pids,
+        eperm_pid: (eperm_pid != 0).then_some(eperm_pid),
+    }))
 }
 
 fn status_code(status: ExitStatus) -> i32 {

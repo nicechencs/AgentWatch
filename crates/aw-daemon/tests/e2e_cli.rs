@@ -618,6 +618,31 @@ fn aw_run_attach_stop_against_a_real_daemon() {
     let _ = sleeper.wait();
 }
 
+/// A caller-side exec failure must not briefly create and then race to delete
+/// an empty durable session. The reservation is in memory until the held
+/// child's close-on-exec report succeeds, so even repeated real CLI launches
+/// leave the original database cardinality unchanged.
+#[test]
+fn two_hundred_missing_aw_runs_leave_no_sessions() {
+    let daemon = Daemon::start(As::Me);
+    let before = daemon.sessions().len();
+    for round in 0..200 {
+        let out = daemon.aw(&["run", "-q", "--", "/no/such/aw-e2e-program"]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "missing launch {round}: {} / {}",
+            String::from_utf8_lossy(&out.stderr),
+            daemon.log()
+        );
+    }
+    assert_eq!(
+        daemon.sessions().len(),
+        before,
+        "failed execs must not leave empty launch sessions"
+    );
+}
+
 fn assert_root_exit_code(daemon: &Daemon, sid: &str) {
     let procs = daemon.procs(sid);
     let roots: Vec<&Value> = procs["processes"]

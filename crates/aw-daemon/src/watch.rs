@@ -134,29 +134,23 @@ impl Watches {
 
     /// Drain the queue, expire adopts, sample every root, end finished ones.
     pub(crate) fn tick(&mut self, shared: &Arc<Mutex<ApiState>>) {
-        let (requests, expired) = match shared.lock() {
+        let requests = match shared.lock() {
             Ok(mut state) => {
                 // A client may disappear after its 201 was committed. Retry
                 // its attach_failed close before beginning any new scans.
                 crate::api::watch_routes::retry_undelivered_sessions(&mut state);
                 let requests = std::mem::take(&mut state.watch_requests);
                 let now = now_ns();
-                let expired: Vec<i64> = state
-                    .pending_launches
-                    .iter()
-                    .filter(|(_, pending)| pending.deadline_ns <= now)
-                    .map(|(_, pending)| pending.target.db_id)
-                    .collect();
+                // Uncommitted run reservations have no database row.  Expiry
+                // simply drops them; it must not create then close an empty
+                // session solely to represent a program that never exec'd.
                 state
                     .pending_launches
                     .retain(|_, pending| pending.deadline_ns > now);
-                (requests, expired)
+                requests
             }
-            Err(_) => (Vec::new(), Vec::new()),
+            Err(_) => Vec::new(),
         };
-        for db_id in expired {
-            self.end(db_id, "adopt_timeout", None);
-        }
         for request in requests {
             match request {
                 WatchRequest::Start {

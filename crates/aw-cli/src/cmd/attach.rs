@@ -103,6 +103,21 @@ pub(crate) struct LaunchSession {
     pub ticket: String,
 }
 
+/// Bounded cleanup status supplied by an `aw run` supervisor.
+///
+/// `count` is the real number still present when its five-second cleanup
+/// budget ended. `pids` contains at most the first five safe-to-display ids;
+/// it is deliberately not a process list or command-line capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CleanupLeftovers {
+    /// Actual number of remaining descendants.
+    pub count: u32,
+    /// At most five process ids.
+    pub pids: Vec<u32>,
+    /// One remaining pid that rejected the signal with `EPERM`, when known.
+    pub eperm_pid: Option<u32>,
+}
+
 /// A session the daemon opened or stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionHandle {
@@ -285,6 +300,16 @@ pub(crate) trait DaemonSessions {
     /// Give the daemon a caller-created root process.
     fn adopt(&mut self, session: &LaunchSession, pid: u32) -> Result<(), ControlError>;
 
+    /// Commit a held launch only after its close-on-exec report proved that the
+    /// program successfully executed.  Until this point `/sessions/run` is an
+    /// in-memory reservation, so a missing executable never writes then
+    /// deletes an empty session row.
+    fn commit_run(&mut self, _: &LaunchSession) -> Result<(), ControlError> {
+        Err(ControlError::BadReply {
+            detail: "这个会话控制器没有实现启动提交".to_owned(),
+        })
+    }
+
     /// Report the numeric target exit code after a caller-created child exits.
     /// The daemon preserves a code it already recorded itself.
     fn record_exit(&mut self, session: &LaunchSession, exit_code: i32) -> Result<(), ControlError>;
@@ -297,6 +322,16 @@ pub(crate) trait DaemonSessions {
         Err(ControlError::BadReply {
             detail: "这个会话控制器没有实现启动失败清理".to_owned(),
         })
+    }
+
+    /// Store bounded cleanup status on an already committed launch session so
+    /// the App can show the same truth-preserving wording as the terminal.
+    fn record_leftovers(
+        &mut self,
+        _: &LaunchSession,
+        _: &CleanupLeftovers,
+    ) -> Result<(), ControlError> {
+        Ok(())
     }
 
     /// Create a session for an existing root process.
@@ -462,6 +497,15 @@ impl<T: Transport> DaemonSessions for HttpDaemonSessions<T> {
         Ok(())
     }
 
+    fn commit_run(&mut self, session: &LaunchSession) -> Result<(), ControlError> {
+        let path = format!(
+            "/api/v1/sessions/{}/commit",
+            encode_path_segment(&session.public_id)
+        );
+        let _ = self.call(&ApiRequest::post_json(&path, &json!({})))?;
+        Ok(())
+    }
+
     fn record_exit(&mut self, session: &LaunchSession, exit_code: i32) -> Result<(), ControlError> {
         let path = format!(
             "/api/v1/sessions/{}/exit",
@@ -480,6 +524,26 @@ impl<T: Transport> DaemonSessions for HttpDaemonSessions<T> {
             encode_path_segment(&session.public_id)
         );
         let _ = self.call(&ApiRequest::post_json(&path, &json!({})))?;
+        Ok(())
+    }
+
+    fn record_leftovers(
+        &mut self,
+        session: &LaunchSession,
+        leftovers: &CleanupLeftovers,
+    ) -> Result<(), ControlError> {
+        let path = format!(
+            "/api/v1/sessions/{}/leftovers",
+            encode_path_segment(&session.public_id)
+        );
+        let _ = self.call(&ApiRequest::post_json(
+            &path,
+            &json!({
+                "count": leftovers.count,
+                "pids": leftovers.pids,
+                "eperm_pid": leftovers.eperm_pid,
+            }),
+        ))?;
         Ok(())
     }
 
@@ -551,6 +615,10 @@ impl DaemonSessions for UnwiredControl {
     }
 
     fn adopt(&mut self, _: &LaunchSession, _: u32) -> Result<(), ControlError> {
+        Err(unwired())
+    }
+
+    fn commit_run(&mut self, _: &LaunchSession) -> Result<(), ControlError> {
         Err(unwired())
     }
 
@@ -823,6 +891,12 @@ mod tests {
         fn adopt(&mut self, _: &LaunchSession, _: u32) -> Result<(), ControlError> {
             Err(ControlError::BadReply {
                 detail: "attach test must not adopt".to_owned(),
+            })
+        }
+
+        fn commit_run(&mut self, _: &LaunchSession) -> Result<(), ControlError> {
+            Err(ControlError::BadReply {
+                detail: "attach test must not commit a launch".to_owned(),
             })
         }
 

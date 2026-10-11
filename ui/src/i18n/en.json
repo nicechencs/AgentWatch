@@ -84,6 +84,8 @@
   "session.stop": "Stop recording",
   "session.stopping": "Stopping recording…",
   "session.stopNotice": "The program is still running; it is just no longer recorded",
+  "session.cleanupLeftovers": "The program has ended, but {count} child processes it started could not be ended and may still be running (process IDs: {pids}{suffix}). You can end them manually with `kill -9 PID`.",
+  "session.cleanupLeftoversEperm": "The program has ended, but {count} child processes it started could not be ended and may still be running (process IDs: {pids}{suffix}). Process ID {pid} belongs to another user; end it with `sudo kill -9 {pid}`.",
   "export.savedTo": "Saved to {path}",
   "export.failed": "Export failed: {reason}",
   "session.export": "Export",

@@ -134,8 +134,21 @@ export function toSession(raw: unknown): Session {
     collectors: arr(r.collectors).map(toCollector).filter((c): c is Session["collectors"][number] => c !== null),
     pinned: Boolean(r.pinned),
     scan_pending: r.scan_pending === true,
+    cleanup_leftovers: toCleanupLeftovers(r.cleanup_leftovers),
     stats: stats ? { ...(stats as object), proc_count: numOrNull(stats.proc_count ?? stats.process_count) } : null,
   } as Session;
+}
+
+function toCleanupLeftovers(raw: unknown): Session["cleanup_leftovers"] {
+  if (!isObj(raw) || typeof raw.count !== "number" || raw.count <= 0) return null;
+  const pids = arr(raw.pids)
+    .filter((pid): pid is number => typeof pid === "number" && Number.isInteger(pid) && pid > 0)
+    .slice(0, 5);
+  if (pids.length > raw.count) return null;
+  const eperm = typeof raw.eperm_pid === "number" && Number.isInteger(raw.eperm_pid) && raw.eperm_pid > 0
+    ? raw.eperm_pid
+    : null;
+  return { count: raw.count, pids, eperm_pid: eperm };
 }
 
 /**

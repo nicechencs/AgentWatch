@@ -37,6 +37,15 @@ describe("daemon shape adapters", () => {
     const session = toSession({ id: "s-pending", session_id: 2, scan_pending: true });
     expect(session.scan_pending).toBe(true);
   });
+  it("keeps the supervisor's bounded leftover report for the session detail", () => {
+    const session = toSession({
+      id: "s-cleanup",
+      session_id: 3,
+      cleanup_leftovers: { count: 7, pids: [11, 12, 13, 14, 15, 16], eperm_pid: 12 },
+    });
+    expect(session.cleanup_leftovers).toEqual({ count: 7, pids: [11, 12, 13, 14, 15], eperm_pid: 12 });
+    expect(toSession({ cleanup_leftovers: { count: 0, pids: [] } }).cleanup_leftovers).toBeNull();
+  });
   it("maps timeline rows and summary", () => {
     const row = toTimelineItem({ cat: "proc", evidence: "S", id: 9, proc_uid: "u", session_id: 1, ts_ns: 1 });
     expect(row).toMatchObject({ kind: "proc", summary: "", fields: {}, proc: null });

@@ -21,7 +21,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-    SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+    SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
 };
 use windows::Win32::Security::{
     GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
@@ -1950,9 +1950,82 @@ pub fn verify_pipe_server_with_service_status(
     handle: std::os::windows::io::RawHandle,
     service_status: &PipeServiceStatus,
 ) -> Result<(), PipeServerVerificationError> {
+    if matches!(service_status, PipeServiceStatus::NotInstalled) {
+        // No installed service means no service image to compare against:
+        // this is a foreground/dev daemon run by the caller. Trust only a
+        // pipe whose owner is the calling account itself; a LocalSystem or
+        // other-account pipe is refused before any request byte is sent.
+        let owner_sid = pipe_owner_sid(HANDLE(handle as isize))?;
+        let current_sid = current_pipe_client_sid()?;
+        return if not_installed_pipe_owner_trusted(&owner_sid, &current_sid) {
+            Ok(())
+        } else {
+            Err(PipeServerVerificationError::NotDaemon {
+                detail: Some(
+                    "AgentWatch service is not installed and the pipe is not owned by the calling account"
+                        .to_owned(),
+                ),
+            })
+        };
+    }
     let installed_image = service_image_from_status(service_status)?;
     let server_image = pipe_server_image_path(HANDLE(handle as isize))?;
     verify_pipe_server_images(&server_image, installed_image)
+}
+
+/// Without an installed service, only a pipe owned by the calling account is
+/// a daemon this caller started itself.
+fn not_installed_pipe_owner_trusted(owner_sid: &str, current_sid: &str) -> bool {
+    owner_sid == current_sid
+}
+
+fn current_pipe_client_sid() -> Result<String, PipeServerVerificationError> {
+    match current_token_owner() {
+        Ok(Owner::Windows { sid, .. }) => Ok(sid),
+        Ok(Owner::Unix { .. }) | Err(_) => Err(PipeServerVerificationError::CannotQuery {
+            operation: "GetTokenInformation(current process)",
+            win32_error: 0,
+            detail: None,
+        }),
+    }
+}
+
+fn pipe_owner_sid(pipe: HANDLE) -> Result<String, PipeServerVerificationError> {
+    let mut owner = PSID::default();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `pipe` is this process's open client handle. The output pointers
+    // are writable and the returned LocalAlloc descriptor is freed below.
+    #[allow(unsafe_code)]
+    let status = unsafe {
+        GetSecurityInfo(
+            pipe,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    let result = if status.is_err() {
+        Err(PipeServerVerificationError::CannotQuery {
+            operation: "GetSecurityInfo(pipe owner)",
+            win32_error: status.0,
+            detail: None,
+        })
+    } else {
+        sid_text(owner).map_err(|_| PipeServerVerificationError::CannotQuery {
+            operation: "ConvertSidToStringSidW(pipe owner)",
+            win32_error: 0,
+            detail: None,
+        })
+    };
+    // SAFETY: GetSecurityInfo allocates the descriptor with LocalAlloc on
+    // success; the default/null value is safe to pass to LocalFree too.
+    #[allow(unsafe_code)]
+    let _ = unsafe { LocalFree(HLOCAL(descriptor.0.cast())) };
+    result
 }
 
 fn service_status_from_scm() -> PipeServiceStatus {
@@ -2411,10 +2484,10 @@ mod tests {
     use super::{
         account_base_env, account_base_env_from_profile, account_base_env_name, close,
         current_token_owner, data_dir_policy_for_token, environment_from,
-        filter_profile_environment_entries, fixed_path, open_data_object,
-        secure_data_dir_with_policy, service_image_from_command, set_data_dir_dacl, sid_text,
-        verify_pipe_server_images, windows_reserved_env_name, CurrentPlatform, DataDirAcl,
-        DataDirPolicy, ADMINISTRATORS_SID, SYSTEM_SID,
+        filter_profile_environment_entries, fixed_path, not_installed_pipe_owner_trusted,
+        open_data_object, secure_data_dir_with_policy, service_image_from_command,
+        set_data_dir_dacl, sid_text, verify_pipe_server_images, windows_reserved_env_name,
+        CurrentPlatform, DataDirAcl, DataDirPolicy, ADMINISTRATORS_SID, SYSTEM_SID,
     };
     use crate::{
         platform, Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner,
@@ -3283,6 +3356,15 @@ mod tests {
             ));
         }
         Ok(())
+    }
+
+    #[test]
+    fn not_installed_service_trusts_only_a_pipe_owned_by_the_caller() {
+        let user = "S-1-5-21-10-20-30-1001";
+        let other = "S-1-5-21-10-20-30-1002";
+        assert!(not_installed_pipe_owner_trusted(user, user));
+        assert!(!not_installed_pipe_owner_trusted(other, user));
+        assert!(!not_installed_pipe_owner_trusted(SYSTEM_SID, user));
     }
 
     #[test]

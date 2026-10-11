@@ -1054,6 +1054,11 @@ pub fn search(
     limit: Option<i64>,
 ) -> Result<Vec<SearchHit>, QueryError> {
     let page = clamp_page(limit)?;
+    // A pre-FTS database can retain `storage.fts = true` (or be opened by a
+    // caller which cached that setting) while its optional 0005 table is
+    // absent. Search remains usable by using the `instr` query rather than
+    // preparing a statement against the missing table.
+    let fts = fts && fts_table_present(conn)?;
     let needle_param = if fts {
         StoreParam::Text(crate::fts::match_query(needle))
     } else {
@@ -1123,6 +1128,15 @@ pub fn search(
         hits.retain(|hit| hit.ts_ns.unwrap_or(i64::MIN) >= since);
     }
     Ok(hits)
+}
+
+fn fts_table_present(conn: &Connection) -> Result<bool, QueryError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fts_text')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(|err| QueryError::sqlite("probe_fts_text", err))
 }
 
 /// The caller's newest session: the greatest `started_ns`, then the greatest
@@ -2841,6 +2855,21 @@ mod tests {
         assert!(search(&conn, "other", "node", false, None, None)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn search_falls_back_when_fts_is_enabled_but_its_table_is_missing() {
+        // An old database can retain `storage.fts = true` while migration
+        // 0005 was skipped. Passing true reproduces the caller's setting.
+        let conn = conn();
+        conn.execute_batch(include_str!("../../migrations/0003_file_access.sql"))
+            .unwrap();
+        session(&conn, 1, "u", 10);
+        image(&conn, 1, 7, 1_000, Some("/usr/bin/node"));
+
+        let hits = search(&conn, "u", "node", true, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text.as_deref(), Some("/usr/bin/node"));
     }
 
     /// UI review of #143, detail 7: the list said 「不可得」 where the

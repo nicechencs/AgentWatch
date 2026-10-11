@@ -496,6 +496,7 @@
   "error.noDatabase": "The service has no writable database, so it cannot record sessions.",
   "error.writeFailed": "Could not write the export to the chosen location. Try another location.",
   "error.sessionEnded": "This session has ended; nothing more can be attached.",
+  "error.dbBusy": "The session database is busy (the service is writing). Waited {seconds} s and still couldn't get in; try again later.",
   "coverage.kinds.proc": "processes",
   "coverage.kinds.file": "files",
   "coverage.kinds.net": "network traffic",

@@ -215,23 +215,26 @@ fn db_path(state: &ApiState) -> Result<std::path::PathBuf, ApiResponse> {
 
 /// Allocate `sessions.id` and insert the row. Id 1 stays the daemon sample's.
 fn insert_session(path: &std::path::Path, target: &mut SampleTarget) -> Result<(), ApiResponse> {
-    let store_error = |what: &str| error_response(500, "store", what);
-    let mut store =
-        aw_store::Store::open(path).map_err(|_| store_error("cannot open the database"))?;
+    let store_error = |err: &aw_store::StoreError, what: &str| {
+        super::routes::database_busy_response(err)
+            .unwrap_or_else(|| error_response(500, "store", what))
+    };
+    let mut store = aw_store::Store::open_runtime(path)
+        .map_err(|err| store_error(&err, "cannot open the database"))?;
     let max: i64 = store
         .connection()
         .query_row("SELECT COALESCE(MAX(id), 1) FROM sessions", [], |row| {
             row.get(0)
         })
-        .map_err(|_| store_error("cannot read session ids"))?;
+        .map_err(|_| error_response(500, "store", "cannot read session ids"))?;
     target.db_id = max.max(1).saturating_add(1);
     let mut batch = aw_store::WriteBatch::default();
     batch.sessions.push(target.session_row(now_ns()));
-    let mut sink =
-        aw_store::SqliteSink::new(&mut store).map_err(|_| store_error("cannot open the writer"))?;
+    let mut sink = aw_store::SqliteSink::new(&mut store)
+        .map_err(|err| store_error(&err, "cannot open the writer"))?;
     use aw_store::RecordSink;
     sink.write_batch(&batch)
-        .map_err(|_| store_error("cannot write the session row"))?;
+        .map_err(|err| store_error(&err, "cannot write the session row"))?;
     target.write_session_row = false;
     Ok(())
 }
@@ -582,7 +585,7 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
                 })?;
         let path = db_path(state)?;
         let root_proc_uid = i64::from_ne_bytes(root_hint.uid.0.to_ne_bytes());
-        rusqlite::Connection::open(&path)
+        aw_store::open_connection(&path)
             .and_then(|conn| {
                 conn.execute(
                     "UPDATE sessions SET root_proc_uid = ?1 WHERE id = ?2",
@@ -641,7 +644,7 @@ pub(super) fn record_exit(
                 error_response(400, "bad_argument", "exit_code: expected a signed integer")
             })?;
         let path = db_path(state)?;
-        let conn = rusqlite::Connection::open(&path)
+        let conn = aw_store::open_connection(&path)
             .map_err(|_| error_response(500, "store", "cannot open the database"))?;
         let row: Option<(i64, String, Option<i64>)> = conn
             .query_row(
@@ -700,11 +703,9 @@ pub(super) fn attach(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u
         let value = parse(body)?;
         let path = db_path(state)?;
         let pid = pid_field(&value)?;
-        let conn = rusqlite::Connection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|_| error_response(500, "store", "cannot open the database"))?;
+        let conn =
+            aw_store::open_connection_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|_| error_response(500, "store", "cannot open the database"))?;
         type Row = (
             i64,
             String,
@@ -776,7 +777,7 @@ pub(super) fn stopped(state: &mut ApiState, sid: &str) {
         return;
     };
     let Ok(conn) =
-        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        aw_store::open_connection_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {
         return;
     };
@@ -853,6 +854,78 @@ mod attach_target_name_tests {
             Some("from-argv".to_owned())
         );
         assert_eq!(attach_target_name(None, None), None);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod database_busy_tests {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use rusqlite::{Transaction, TransactionBehavior};
+
+    use super::{insert_session, SampleTarget};
+
+    #[test]
+    fn lock_past_busy_timeout_returns_db_busy_with_measured_wait() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aw-db-busy-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let path = dir.join("agentwatch.db");
+        drop(aw_store::Store::open_runtime(&path).expect("runtime store"));
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || {
+            let conn = aw_store::open_connection(&writer_path).expect("writer connection");
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("begin immediate");
+            tx.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('busy-test', '1')",
+                [],
+            )
+            .expect("writer row");
+            ready_tx.send(()).expect("signal writer");
+            thread::sleep(aw_store::BUSY_TIMEOUT + Duration::from_secs(1));
+            tx.commit().expect("writer commit");
+        });
+        ready_rx.recv().expect("writer ready");
+
+        let mut target = SampleTarget {
+            db_id: 0,
+            public_id: "s-busy".to_owned(),
+            name: None,
+            mode: "attach",
+            root_pid: 1,
+            user_id: "test".to_owned(),
+            argv_json: None,
+            agent: None,
+            write_session_row: true,
+            root_hint: None,
+        };
+        let response = insert_session(&path, &mut target).expect_err("busy response");
+        assert_eq!(response.status, 503);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).expect("busy JSON");
+        assert_eq!(body["error"]["code"], "db_busy");
+        let waited = body["error"]["waited_seconds"]
+            .as_u64()
+            .expect("measured seconds");
+        assert!(waited >= aw_store::BUSY_TIMEOUT.as_secs());
+        assert_eq!(
+            body["error"]["message"],
+            format!("The session database is busy (the service is writing). Waited {waited} s and still couldn't get in; try again later.")
+        );
+        assert!(body["error"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("database is locked")
+                || detail.contains("database is busy")));
+        writer.join().expect("writer thread");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

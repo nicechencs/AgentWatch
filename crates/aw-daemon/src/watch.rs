@@ -113,7 +113,7 @@ impl Watches {
 
     /// Close sessions a previous daemon run left open (not the daemon sample).
     pub(crate) fn recover(&self) {
-        if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
+        if let Ok(conn) = aw_store::open_connection(&self.db_path) {
             let _ = conn.execute(
                 "UPDATE sessions SET ended_ns = ?1, end_reason = 'daemon_restart' \
                  WHERE ended_ns IS NULL AND id <> 1",
@@ -287,7 +287,7 @@ impl Watches {
     }
 
     fn end(&self, db_id: i64, reason: &str, exit_code: Option<i32>) {
-        let Ok(conn) = rusqlite::Connection::open(&self.db_path) else {
+        let Ok(conn) = aw_store::open_connection(&self.db_path) else {
             return;
         };
         let _ = conn.execute(
@@ -327,7 +327,7 @@ pub(crate) fn record_root_exit(
     root: &crate::sample::RootHint,
     code: i32,
 ) {
-    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+    let Ok(conn) = aw_store::open_connection(db_path) else {
         return;
     };
     let code = i64::from(code);

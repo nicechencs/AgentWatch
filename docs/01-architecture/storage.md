@@ -9,8 +9,9 @@
 - **数据库**：单个 SQLite 文件 `agentwatch.db`，使用 `rusqlite`，并开启 bundled 特性以自带固定版本的 SQLite。
 - **PRAGMA**：
   - `journal_mode=WAL`、`synchronous=NORMAL`、`foreign_keys=ON`、`temp_store=MEMORY`、`mmap_size=268435456`；
-  - `auto_vacuum=INCREMENTAL`，在建库时设置。
-- **连接**：一个写连接，由 Batcher 线程独占；另有 N 个只读连接（默认 4 个）供 API 查询使用。
+  - `auto_vacuum=INCREMENTAL`，在建库时设置。`journal_mode` 与 `auto_vacuum` 都是持久设置：已有数据库只读取并验证 WAL，不在每次打开时重写，以免与活动写者争锁。
+- **连接**：所有连接在执行其他 SQL 前先设置 8 秒 `busy_timeout`。一个写连接，由 Batcher 线程独占；另有 N 个只读连接（默认 4 个）供 API 查询使用。
+- **写入**：写事务以 `BEGIN IMMEDIATE` 开始；批量写按最多 500 行提交，避免长事务阻塞 attach、查询和采样快照。
 - **文件权限**：见 security-privacy §4。
 - **为什么不按会话分库**：跨会话查询（历史搜索）是刚需。会话级删除改用 `DELETE ... WHERE session_id = ?` 加增量 vacuum。【待验证】大会话删除的耗时见 [SPIKE-06](../06-research/SPIKE-06-sqlite-throughput.md)。如果不可接受，就改为按月分库，用 `ATTACH` 联合查询。
 

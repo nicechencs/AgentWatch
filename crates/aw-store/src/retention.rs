@@ -29,7 +29,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::error::StoreError;
 use crate::migrate::Store;
@@ -494,7 +494,7 @@ fn purge_session(
     }
     // The session row is one row. Children are already gone, so CASCADE is a no-op.
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| StoreError::sqlite("begin_purge_session", err))?;
     tx.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
         .map_err(|err| StoreError::sqlite("delete_session", err))?;
@@ -521,7 +521,7 @@ fn delete_children_in_batches(
     );
     loop {
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| StoreError::sqlite("begin_purge_batch", err))?;
         let n = tx
             .execute(&sql, params![session_id])
@@ -1063,9 +1063,7 @@ mod tests {
         let path_writer = path.clone();
         let barrier_writer = Arc::clone(&barrier);
         let writer = thread::spawn(move || {
-            let conn = Connection::open(&path_writer).expect("writer open");
-            conn.busy_timeout(std::time::Duration::from_secs(5))
-                .expect("busy");
+            let conn = crate::open_connection(&path_writer).expect("writer open");
             conn.execute_batch("PRAGMA foreign_keys = ON").expect("fk");
             barrier_writer.wait();
             conn.execute(
@@ -1085,10 +1083,6 @@ mod tests {
             .expect("concurrent insert");
         });
 
-        store
-            .connection()
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .expect("busy");
         barrier.wait();
         let purged = Retention::new(&mut store, &path, RetentionConfig::default())
             .purge(PurgeScope::All)
@@ -1112,7 +1106,7 @@ mod tests {
         {
             let conn = store.connection();
             insert_session(conn, 1, "wide", 10, Some(20), 0, "[]");
-            let tx = conn.unchecked_transaction().expect("tx");
+            let tx = crate::migrate::immediate_transaction(conn).expect("tx");
             for i in 0..(BATCH_ROWS + 10) {
                 tx.execute(
                     "INSERT INTO dns (id, session_id, proc_uid, ts_ns, qname, qtype, rcode, answers, ttl_min, server, evidence, source)

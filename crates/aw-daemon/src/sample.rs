@@ -644,7 +644,7 @@ impl HostSampler {
         if batch_is_empty(&batch) {
             return Ok(());
         }
-        let mut store = Store::open(&self.db_path).map_err(|err| store_io(&err))?;
+        let mut store = Store::open_runtime(&self.db_path).map_err(|err| store_io(&err))?;
         let mut writer = SqliteSink::new(&mut store).map_err(|err| store_io(&err))?;
         match writer.write_batch(&batch) {
             Ok(()) => {
@@ -709,7 +709,7 @@ fn sample_session_state(db_path: &std::path::Path, db_id: i64) -> SampleSessionS
         return SampleSessionState::Absent;
     }
     let Ok(conn) =
-        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        aw_store::open_connection_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {
         return SampleSessionState::Absent;
     };

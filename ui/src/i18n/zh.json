@@ -496,6 +496,7 @@
   "error.noDatabase": "后台服务没有可写的数据库，无法记录会话。",
   "error.writeFailed": "没能把导出文件写到所选位置，请换一个位置再试。",
   "error.sessionEnded": "这个会话已经结束，不能再附着。",
+  "error.dbBusy": "会话数据库正忙（后台在写入），等了 {seconds} 秒还是没轮到，请稍后再试。",
   "coverage.kinds.proc": "进程",
   "coverage.kinds.file": "文件",
   "coverage.kinds.net": "网络",

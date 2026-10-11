@@ -1792,6 +1792,29 @@ pub fn error_response(status: u16, code: &str, message: &str) -> ApiResponse {
     )
 }
 
+/// A measured SQLite lock timeout. The human message deliberately says only
+/// that the service is writing; SQLite's English diagnostic stays in a log and
+/// the structured JSON `detail`, never in a localized UI/CLI sentence.
+pub(crate) fn database_busy_response(err: &aw_store::StoreError) -> Option<ApiResponse> {
+    let waited_seconds = err.busy_waited_seconds()?;
+    let detail = err.busy_detail().unwrap_or_default();
+    tracing::warn!(waited_seconds, sqlite_detail = %detail, "session database remained busy");
+    let message = format!(
+        "The session database is busy (the service is writing). Waited {waited_seconds} s and still couldn't get in; try again later."
+    );
+    Some(ApiResponse::json(
+        503,
+        &json!({
+            "error": {
+                "code": "db_busy",
+                "message": message,
+                "waited_seconds": waited_seconds,
+                "detail": detail,
+            }
+        }),
+    ))
+}
+
 fn error_at(status: u16, code: &str, message: &str, offset: Option<usize>) -> ApiResponse {
     let mut body = json!({ "error": { "code": code, "message": message } });
     if let Some(offset) = offset {
@@ -1815,6 +1838,26 @@ fn from_backend(err: QueryBackendError) -> ApiResponse {
             error_response(404, "no_sessions", "this account has no sessions")
         }
         QueryBackendError::Unimplemented { what } => not_implemented(what),
+        QueryBackendError::Busy {
+            waited_seconds,
+            detail,
+        } => {
+            tracing::warn!(waited_seconds, sqlite_detail = %detail, "session database remained busy");
+            let message = format!(
+                "The session database is busy (the service is writing). Waited {waited_seconds} s and still couldn't get in; try again later."
+            );
+            ApiResponse::json(
+                503,
+                &json!({
+                    "error": {
+                        "code": "db_busy",
+                        "message": message,
+                        "waited_seconds": waited_seconds,
+                        "detail": detail,
+                    }
+                }),
+            )
+        }
         QueryBackendError::Store(message) => error_response(500, "store", &message),
     }
 }
@@ -2184,7 +2227,7 @@ fn add_row_details(state: &ApiState, body: &mut serde_json::Value) {
         return;
     };
     let Ok(conn) =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        aw_store::open_connection_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {
         return;
     };
@@ -2796,7 +2839,7 @@ mod tests {
 
     /// Session row `(mode, ended_ns, end_reason, exit_code)` by public id.
     fn session_end(db: &std::path::Path, sid: &str) -> Option<SessionEnd> {
-        rusqlite::Connection::open(db)
+        aw_store::open_connection(db)
             .and_then(|c| {
                 c.query_row(
                     "SELECT mode, ended_ns, end_reason, exit_code FROM sessions WHERE public_id = ?1",
@@ -2808,7 +2851,7 @@ mod tests {
     }
 
     fn proc_rows(db: &std::path::Path, sid: &str, pid: u32) -> i64 {
-        rusqlite::Connection::open(db)
+        aw_store::open_connection(db)
             .and_then(|c| {
                 c.query_row(
                     "SELECT COUNT(*) FROM processes p JOIN sessions s ON s.id = p.session_id \
@@ -2825,7 +2868,7 @@ mod tests {
         sid: &str,
         pid: u32,
     ) -> Option<(Option<i64>, Option<i64>)> {
-        rusqlite::Connection::open(db)
+        aw_store::open_connection(db)
             .and_then(|c| {
                 c.query_row(
                     "SELECT p.exit_ns, p.exit_code FROM processes p JOIN sessions s ON s.id = p.session_id \
@@ -3066,11 +3109,11 @@ mod tests {
         let (dir, db) = seeded_db("null-platform", "");
         // New rows require a platform, but a query must remain useful for an
         // imported older row whose column is nullable.
-        let legacy_schema = rusqlite::Connection::open(&db).and_then(|connection| {
+        let legacy_schema = aw_store::open_connection(&db).and_then(|connection| {
             connection.execute_batch(
                 "
                 PRAGMA foreign_keys = OFF;
-                BEGIN;
+                BEGIN IMMEDIATE;
                 CREATE TABLE sessions_legacy (
                   id INTEGER PRIMARY KEY,
                   public_id TEXT NOT NULL UNIQUE,
@@ -3294,7 +3337,7 @@ mod tests {
             child.try_wait().ok().flatten().is_none(),
             "target still running"
         );
-        let argv: String = rusqlite::Connection::open(&db)
+        let argv: String = aw_store::open_connection(&db)
             .and_then(|c| {
                 c.query_row(
                     "SELECT argv FROM sessions WHERE public_id = ?1",
@@ -3310,7 +3353,7 @@ mod tests {
     }
 
     fn session_count(db: &std::path::Path) -> i64 {
-        rusqlite::Connection::open(db)
+        aw_store::open_connection(db)
             .and_then(|c| c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)))
             .unwrap_or(-1)
     }
@@ -3424,7 +3467,7 @@ mod tests {
             let (status, response) = post(state, &token, "/api/v1/sessions/run", body);
             assert_eq!(status, 201, "{response}");
             let sid = response["id"].as_str().unwrap_or_default().to_owned();
-            rusqlite::Connection::open(&db)
+            aw_store::open_connection(&db)
                 .and_then(|c| {
                     c.query_row(
                         "SELECT name FROM sessions WHERE public_id = ?1",
@@ -3503,7 +3546,7 @@ mod tests {
 
         // A pid can be reused. Seed another depth-0 row with this pid but a
         // different identity; `/exit` must only update the adopted root row.
-        let (db_id, root_proc_uid, start_ns): (i64, i64, i64) = rusqlite::Connection::open(&db)
+        let (db_id, root_proc_uid, start_ns): (i64, i64, i64) = aw_store::open_connection(&db)
             .and_then(|conn| {
                 let db_id: i64 = conn.query_row(
                     "SELECT id FROM sessions WHERE public_id = ?1",
@@ -3524,7 +3567,7 @@ mod tests {
             })
             .expect("adopted root row");
         let reused_proc_uid = root_proc_uid.wrapping_add(1);
-        rusqlite::Connection::open(&db)
+        aw_store::open_connection(&db)
             .and_then(|conn| {
                 conn.execute(
                     "INSERT INTO processes \
@@ -3547,7 +3590,7 @@ mod tests {
         );
         assert_eq!(status, 200, "{body}");
         let root_code = |db: &std::path::Path| -> Vec<Option<i64>> {
-            let conn = rusqlite::Connection::open(db).expect("db");
+            let conn = aw_store::open_connection(db).expect("db");
             let mut stmt = conn
                 .prepare(
                     "SELECT p.exit_code FROM processes p JOIN sessions s ON s.id = p.session_id \
@@ -3560,7 +3603,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(root_code(&db), vec![Some(7)], "before any poll");
-        let reused_code: Option<i64> = rusqlite::Connection::open(&db)
+        let reused_code: Option<i64> = aw_store::open_connection(&db)
             .and_then(|conn| {
                 conn.query_row(
                     "SELECT exit_code FROM processes WHERE session_id = ?1 AND proc_uid = ?2",
@@ -3654,7 +3697,7 @@ mod tests {
         assert_eq!(body["id"], sid);
         assert_eq!(body["exit_code"], 7);
         assert_eq!(session_end(&db, &sid).and_then(|row| row.3), Some(7));
-        let root_code: Option<i64> = rusqlite::Connection::open(&db)
+        let root_code: Option<i64> = aw_store::open_connection(&db)
             .and_then(|c| {
                 c.query_row(
                     "SELECT p.exit_code FROM processes p JOIN sessions s ON s.id = p.session_id \
@@ -4032,7 +4075,7 @@ mod tests {
             .map(|rows| rows.iter().filter_map(|r| r["id"].as_str()).collect())
             .unwrap_or_default();
         assert_eq!(ids, vec!["s-usersess"], "{body}");
-        let ended: Option<i64> = rusqlite::Connection::open(&db)
+        let ended: Option<i64> = aw_store::open_connection(&db)
             .and_then(|c| {
                 c.query_row("SELECT ended_ns FROM sessions WHERE id = 2", [], |r| {
                     r.get(0)
@@ -4071,7 +4114,7 @@ mod tests {
             (response.status, json_body(&response))
         };
         let count = || {
-            rusqlite::Connection::open(&db)
+            aw_store::open_connection(&db)
                 .and_then(|c| {
                     c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
                 })

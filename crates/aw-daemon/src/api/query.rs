@@ -73,6 +73,14 @@ pub enum QueryBackendError {
         /// Short name, for the 501 body. Not a SQL statement.
         what: &'static str,
     },
+    /// SQLite waited for a writer for the measured interval and did not obtain
+    /// the lock. The diagnostic is retained for structured detail/logging only.
+    Busy {
+        /// Real elapsed whole seconds reported by the store.
+        waited_seconds: u64,
+        /// SQLite's English diagnostic.
+        detail: String,
+    },
     /// SQLite or the store rejected the call. Display text only.
     Store(String),
 }
@@ -90,6 +98,10 @@ impl std::fmt::Display for QueryBackendError {
             Self::NotFound => write!(f, "session not found"),
             Self::NoSessions => write!(f, "this account has no sessions"),
             Self::Unimplemented { what } => write!(f, "{what} is not available"),
+            Self::Busy { waited_seconds, .. } => write!(
+                f,
+                "session database remained busy after {waited_seconds} seconds"
+            ),
             Self::Store(msg) => write!(f, "{msg}"),
         }
     }
@@ -419,7 +431,7 @@ impl StoreQuery {
         if !path.exists() {
             return Ok(None);
         }
-        Store::open(path).map(Some).map_err(map_store)
+        Store::open_runtime(path).map(Some).map_err(map_store)
     }
 
     /// Integer id already remembered for `sid`. A numeric `sid` is the id itself.
@@ -981,7 +993,7 @@ impl SessionQuery for StoreQuery {
                 "reason": "per-user db stats is not exported by aw-store",
             }));
         }
-        let mut store = Store::open(&path).map_err(map_store)?;
+        let mut store = Store::open_runtime(&path).map_err(map_store)?;
         let retention = Retention::new(&mut store, &path, RetentionConfig::default());
         let stats = retention.stats().map_err(map_store)?;
         Ok(serde_json::json!({
@@ -1160,7 +1172,7 @@ impl StoreQuery {
     /// unlike [`StoreQuery::open`], which treats absence as "no database".
     fn open_mut(&self) -> Result<Store, QueryBackendError> {
         let path = self.db_path.as_ref().ok_or_else(missing_db)?;
-        Store::open(path).map_err(map_store)
+        Store::open_runtime(path).map_err(map_store)
     }
 }
 
@@ -1217,7 +1229,13 @@ fn map_query(err: QueryError) -> QueryBackendError {
 }
 
 fn map_store(err: StoreError) -> QueryBackendError {
-    QueryBackendError::Store(err.to_string())
+    match (err.busy_waited_seconds(), err.busy_detail()) {
+        (Some(waited_seconds), Some(detail)) => QueryBackendError::Busy {
+            waited_seconds,
+            detail,
+        },
+        _ => QueryBackendError::Store(err.to_string()),
+    }
 }
 
 /// `step` uses the same `<n>`, `<n>s`, `<n>ms`, `<n>ns` forms as `window`.

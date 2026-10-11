@@ -2350,7 +2350,7 @@ mod tests {
     use super::*;
 
     fn conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = crate::open_in_memory_connection().unwrap();
         conn.execute_batch(include_str!("../../migrations/0001_init.sql"))
             .unwrap();
         conn.execute(
@@ -2809,7 +2809,7 @@ mod tests {
         let conn = conn();
         session(&conn, 1, "user-a", 1);
         proc_row(&conn, 1, 7, 100, None, 1);
-        let tx = conn.unchecked_transaction().unwrap();
+        let tx = crate::migrate::immediate_transaction(&conn).unwrap();
         for i in 0..20_000_i64 {
             let domain = if i % 50 == 0 {
                 "hit.example.com"

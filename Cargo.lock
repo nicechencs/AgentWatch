@@ -1632,6 +1632,7 @@ dependencies = [
 name = "sim"
 version = "0.1.0"
 dependencies = [
+ "aw-store",
  "httparse",
  "rcgen",
  "rusqlite",

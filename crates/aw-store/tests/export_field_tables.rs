@@ -35,7 +35,7 @@ const PROCESSES_JSONL_EXTRA: &str = "exe_name";
 const GAPS_EVIDENCE: &str = "evidence";
 
 fn open_db() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = aw_store::open_in_memory_connection().unwrap();
     conn.execute_batch(SCHEMA).unwrap();
     ensure_timeline(&conn).unwrap();
     conn

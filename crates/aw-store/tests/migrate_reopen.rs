@@ -3,13 +3,15 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aw_store::{
     apply_agent_schema, apply_file_schema, apply_http_schema, apply_inter_agent_schema,
     apply_proxy_schema, OpenStatus, Store, StoreError,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 const MIGRATION_0001_OLD: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_timeline_view.sql");
@@ -242,7 +244,14 @@ fn old_v9_database_opens_with_null_exit_codes() {
     // A v9 database written by a release before exit codes were recorded:
     // the column exists (0001) but no row ever had a value.
     let old_init = MIGRATION_0001_OLD.to_owned();
-    let conn = Connection::open(&db.path).expect("legacy database");
+    let conn = aw_store::open_connection(&db.path).expect("legacy database");
+    // Historical product files were created in WAL mode. This fixture is
+    // assembled directly rather than by the migrator, so establish that
+    // persistent creation-time setting explicitly before its first table.
+    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+        .expect("legacy auto vacuum");
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .expect("legacy journal mode");
     for sql in [
         old_init.as_str(),
         MIGRATION_0002,
@@ -388,6 +397,183 @@ fn future_v11_is_read_only_and_unchanged_even_with_extra_scripts() {
             Some("store.db" | "store.db-wal" | "store.db-shm")
         ));
     }
+}
+
+#[test]
+fn fresh_runtime_database_has_file_search_schema_on_every_os() {
+    let db = TestDb::new();
+    let store = Store::open_runtime(&db.path).expect("fresh runtime store");
+    let names: Vec<String> = store
+        .connection()
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .expect("table query")
+        .query_map([], |row| row.get(0))
+        .expect("table rows")
+        .collect::<Result<_, _>>()
+        .expect("table names");
+    for required in [
+        "schema_meta",
+        "sessions",
+        "processes",
+        "process_images",
+        "net_flows",
+        "net_flow_buckets",
+        "dns",
+        "gaps",
+        "file_access",
+        "fts_text",
+    ] {
+        assert!(
+            names.iter().any(|name| name == required),
+            "missing {required}: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn reopen_current_database_never_writes_persistent_pragmas_while_reserved() {
+    let db = TestDb::new();
+    drop(Store::open_runtime(&db.path).expect("fresh runtime store"));
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let path = db.path.clone();
+    let writer = thread::spawn(move || {
+        let conn = aw_store::open_connection(&path).expect("writer connection");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin immediate");
+        tx.execute(
+            "UPDATE schema_meta SET value = value WHERE key = 'schema_version'",
+            [],
+        )
+        .expect("hold reserved lock");
+        ready_tx.send(()).expect("signal reserved lock");
+        thread::sleep(Duration::from_millis(250));
+        tx.commit().expect("writer commit");
+    });
+    ready_rx.recv().expect("writer ready");
+
+    // This would immediately fail in the old reopen path because it tried to
+    // write auto_vacuum (and journal_mode) while the writer held RESERVED.
+    let reopened = Store::open(&db.path).expect("reopen under reserved lock");
+    assert_eq!(reopened.status(), &OpenStatus::Current);
+    drop(reopened);
+    writer.join().expect("writer thread");
+}
+
+#[test]
+fn large_database_reopens_during_batched_writer_activity() {
+    let db = TestDb::new();
+    {
+        let store = Store::open_runtime(&db.path).expect("runtime store");
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TABLE lock_probe (id INTEGER PRIMARY KEY, payload BLOB NOT NULL); \
+                 CREATE TABLE writer_batches (id INTEGER PRIMARY KEY, value INTEGER NOT NULL);",
+            )
+            .expect("probe tables");
+        let tx = Transaction::new_unchecked(store.connection(), TransactionBehavior::Immediate)
+            .expect("large insert transaction");
+        for id in 0..8_192_i64 {
+            tx.execute(
+                "INSERT INTO lock_probe (id, payload) VALUES (?1, zeroblob(4096))",
+                [id],
+            )
+            .expect("large row");
+        }
+        tx.commit().expect("large insert commit");
+        store
+            .connection()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint");
+    }
+    assert!(fs::metadata(&db.path).expect("large db metadata").len() >= 30 * 1024 * 1024);
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let path = db.path.clone();
+    let writer = thread::spawn(move || {
+        let conn = aw_store::open_connection(&path).expect("writer connection");
+        for id in 0..4_i64 {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("begin batched writer");
+            tx.execute(
+                "INSERT INTO writer_batches (id, value) VALUES (?1, ?1)",
+                [id],
+            )
+            .expect("writer row");
+            if id == 0 {
+                ready_tx.send(()).expect("signal writer");
+            }
+            thread::sleep(Duration::from_millis(60));
+            tx.commit().expect("writer batch commit");
+        }
+    });
+    ready_rx.recv().expect("writer ready");
+
+    let reopened = Store::open_runtime(&db.path).expect("reopen large busy database");
+    let rows: i64 = reopened
+        .connection()
+        .query_row("SELECT COUNT(*) FROM lock_probe", [], |row| row.get(0))
+        .expect("large rows still readable");
+    assert_eq!(rows, 8_192);
+    drop(reopened);
+    writer.join().expect("writer thread");
+}
+
+#[test]
+fn attach_session_write_waits_for_a_batched_writer_then_succeeds() {
+    let db = TestDb::new();
+    {
+        let store = Store::open_runtime(&db.path).expect("fresh runtime store");
+        store
+            .connection()
+            .execute(
+                "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors) \
+                 VALUES (1, 'sampler', 'attach', 'test', 1, 'test', '[]')",
+                [],
+            )
+            .expect("sampler session");
+    }
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let path = db.path.clone();
+    let writer = thread::spawn(move || {
+        let conn = aw_store::open_connection(&path).expect("writer connection");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin writer batch");
+        for proc_uid in 1..=aw_store::MAX_ROWS_PER_TRANSACTION {
+            tx.execute(
+                "INSERT INTO processes \
+                 (session_id, proc_uid, pid, depth, start_ns, how, evidence, source) \
+                 VALUES (1, ?1, ?2, 0, ?3, 'snapshot', 'S', 'daemon/sampler')",
+                rusqlite::params![
+                    i64::try_from(proc_uid).expect("proc uid"),
+                    i64::try_from(proc_uid + 10_000).expect("pid"),
+                    i64::try_from(proc_uid).expect("start"),
+                ],
+            )
+            .expect("sampler batch row");
+        }
+        ready_tx.send(()).expect("signal writer");
+        thread::sleep(Duration::from_millis(250));
+        tx.commit().expect("writer commit");
+    });
+    ready_rx.recv().expect("writer ready");
+
+    let started = Instant::now();
+    let mut attaching = Store::open_runtime(&db.path).expect("attach store open");
+    let tx = attaching
+        .connection_mut()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .expect("attach waits for writer");
+    tx.execute(
+        "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors) \
+         VALUES (2, 'attach-after-batch', 'attach', 'test', 2, 'test', '[]')",
+        [],
+    )
+    .expect("attach session row");
+    tx.commit().expect("attach commit");
+    assert!(started.elapsed() >= Duration::from_millis(150));
+    writer.join().expect("writer thread");
 }
 
 #[test]

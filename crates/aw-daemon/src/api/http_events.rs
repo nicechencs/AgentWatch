@@ -360,7 +360,10 @@ pub(crate) fn open_owned(
     let Some(path) = state.query.db_path.as_deref() else {
         return Ok(None);
     };
-    let store = Store::open(path).map_err(|err| error_response(500, "store", &err.to_string()))?;
+    let store = Store::open_runtime(path).map_err(|err| {
+        super::routes::database_busy_response(&err)
+            .unwrap_or_else(|| error_response(500, "store", &err.to_string()))
+    })?;
     match state.query.resolve_id(&store, user_id, sid) {
         Ok(Some(id)) => Ok(Some((store, id))),
         Ok(None) => Ok(None),

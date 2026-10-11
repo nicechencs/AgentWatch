@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod agent_events;
+mod connection;
 mod error;
 mod export;
 mod file_access;
@@ -31,6 +32,10 @@ pub use retention::{
 pub use agent_events::{
     insert_agent_event, insert_self_report_gap, session_id_by_public, store_agent_event,
     AgentEventInsert,
+};
+pub use connection::{
+    configure_connection, open_connection, open_connection_with_flags, open_in_memory_connection,
+    BUSY_TIMEOUT,
 };
 pub use error::StoreError;
 pub use export::{
@@ -70,7 +75,7 @@ pub use query::{
 };
 pub use sink::{
     apply_file_schema, DnsRow, GapRow, NetFlowBucketRow, NetFlowRow, ProcessImageRow, ProcessRow,
-    RecordSink, SessionRow, SqliteSink, WriteBatch,
+    RecordSink, SessionRow, SqliteSink, WriteBatch, MAX_ROWS_PER_TRANSACTION,
 };
 
 /// Empty marker so the daemon can name this crate before it constructs a [`Store`].

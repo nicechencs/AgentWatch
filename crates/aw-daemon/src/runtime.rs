@@ -74,6 +74,9 @@ const SHUTDOWN_STOP_COLLECTORS: &str = "shutdown: stop collectors";
 const SHUTDOWN_FLUSH: &str = "shutdown: flush pipeline";
 const SHUTDOWN_CLOSE_STORE: &str = "shutdown: close store";
 const BATCHER_STOP: &str = "batcher: received stop signal";
+/// Emitted only after the foreground process has completed its startup work
+/// and is about to poll for a stop request.
+pub const FOREGROUND_READY: &str = "agentwatchd foreground ready";
 
 /// Honest status: core dumps are still enabled because no platform API is called.
 pub fn core_dump_guard_status() -> &'static str {
@@ -638,6 +641,7 @@ pub fn run_foreground(
     let mut sampler = HostSampler::new(data_dir.join("agentwatch.db"));
     sampler.start();
     report_collectors(&shared, &sampler, &watches);
+    tracing::info!("{FOREGROUND_READY}");
     let mut polls_until_sample: u32 = SAMPLE_EVERY_POLLS;
 
     while !stop.is_set() {

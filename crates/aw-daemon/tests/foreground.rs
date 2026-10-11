@@ -104,6 +104,23 @@ fn wait_for_lock(lock: &Path, timeout: Duration) -> bool {
     false
 }
 
+/// The instance lock is acquired before database, listener, and sampler
+/// startup. Wait for the final bootstrap log before asserting the two-second
+/// shutdown bound; a lock by itself is not a foreground-ready signal.
+fn wait_for_foreground_ready(log: &Path, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if fs::read_to_string(log)
+            .map(|text| text.contains("agentwatchd foreground ready"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
 fn kill(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
@@ -128,17 +145,18 @@ fn minimal_toml_parses_via_foreground_config() -> io::Result<()> {
     let mut child = spawn(&["--foreground", "--config", &config.display().to_string()])?;
     let lock = data.join("agentwatchd.lock");
     let started = wait_for_lock(&lock, Duration::from_secs(5));
+    let ready = wait_for_foreground_ready(&data.join("agentwatchd.log"), Duration::from_secs(5));
     fs::write(data.join("agentwatchd.stop"), b"stop\n")?;
     let finished = child.wait_timeout_ms(2_000).unwrap_or_default();
     if !finished {
         kill(&mut child);
     }
     let _ = fs::remove_dir_all(&root);
-    if started && finished {
+    if started && ready && finished {
         Ok(())
     } else {
         Err(io::Error::other(format!(
-            "minimal.toml foreground started={started} finished={finished}"
+            "minimal.toml foreground started={started} ready={ready} finished={finished}"
         )))
     }
 }
@@ -152,6 +170,7 @@ fn unknown_key_is_warned_and_illegal_value_refuses_startup() -> io::Result<()> {
     let mut child = spawn(&["--foreground", "--config", &unknown.display().to_string()])?;
     let lock = data.join("agentwatchd.lock");
     let started = wait_for_lock(&lock, Duration::from_secs(5));
+    let ready = wait_for_foreground_ready(&data.join("agentwatchd.log"), Duration::from_secs(5));
     fs::write(data.join("agentwatchd.stop"), b"stop\n")?;
     let finished = child.wait_timeout_ms(2_000).unwrap_or_default();
     if !finished {
@@ -173,11 +192,11 @@ fn unknown_key_is_warned_and_illegal_value_refuses_startup() -> io::Result<()> {
     let refused = !out.status.success()
         && stderr.contains("invalid config value for key `proxy.on_tls_reject`");
     let _ = fs::remove_dir_all(&root);
-    if started && finished && warned && refused {
+    if started && ready && finished && warned && refused {
         Ok(())
     } else {
         Err(io::Error::other(format!(
-            "unknown/illegal started={started} finished={finished} warned={warned} refused={refused} stderr={stderr}"
+            "unknown/illegal started={started} ready={ready} finished={finished} warned={warned} refused={refused} stderr={stderr}"
         )))
     }
 }

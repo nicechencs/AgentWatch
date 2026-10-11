@@ -24,20 +24,20 @@ use windows::Win32::Security::Authorization::{
     SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
 };
 use windows::Win32::Security::{
-    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetSidSubAuthority,
-    GetSidSubAuthorityCount, GetTokenInformation, RevertToSelf, TokenElevation,
-    TokenIntegrityLevel, TokenOwner, TokenUser, ACL, DACL_SECURITY_INFORMATION,
+    GetAce, GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, RevertToSelf, TokenElevation,
+    TokenIntegrityLevel, TokenOwner, TokenUser, ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_OWNER, TOKEN_QUERY,
-    TOKEN_USER,
+    SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_OWNER,
+    TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FindClose, FindFirstFileW, FindNextFileW,
     GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
-    WIN32_FIND_DATAW, WRITE_DAC, WRITE_OWNER,
+    FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING, READ_CONTROL, WIN32_FIND_DATAW, WRITE_DAC, WRITE_OWNER,
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -61,8 +61,8 @@ use windows::Win32::System::Services::{
 #[allow(unused_imports)] // Kept with the named-pipe-fix import set for its boot-time helpers.
 use windows::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
 use windows::Win32::System::SystemServices::{
-    SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_RID,
-    SECURITY_MANDATORY_SYSTEM_RID,
+    ACCESS_ALLOWED_ACE_TYPE, SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID,
+    SECURITY_MANDATORY_MEDIUM_RID, SECURITY_MANDATORY_SYSTEM_RID,
 };
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetCurrentThread,
@@ -444,6 +444,123 @@ fn set_data_dir_dacl(handle: HANDLE, policy: DataDirAcl<'_>) -> Result<(), Platf
     .map_err(io_error)
 }
 
+/// Return whether `handle` already carries the complete policy.  An inherited
+/// child ACE is just as restrictive as the explicit equivalent, so it is
+/// deliberately accepted here.  Reapplying an identical descriptor to a
+/// locked child can fail with `ACCESS_DENIED` on Windows; more importantly,
+/// there is no security benefit to changing an already-correct descriptor.
+fn data_dir_security_is_current(
+    handle: HANDLE,
+    policy: &DataDirPolicy,
+    require_protected_dacl: bool,
+) -> Result<bool, PlatformError> {
+    let mut owner = PSID::default();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `handle` is live, every output location is writable, and the
+    // returned LocalAlloc descriptor remains live until it is released below.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            Some(&mut dacl),
+            None,
+            Some(&mut descriptor),
+        )
+    }
+    .ok()
+    .map_err(io_error)
+    .and_then(|()| {
+        if dacl.is_null() || !policy.accepts_owner(&sid_text(owner)?) {
+            return Ok(false);
+        }
+
+        let mut control = 0_u16;
+        let mut revision = 0_u32;
+        // SAFETY: `descriptor` came from GetSecurityInfo and remains live;
+        // both output locations are writable.
+        #[allow(unsafe_code)]
+        unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }
+            .map_err(io_error)?;
+        if require_protected_dacl && (control & SE_DACL_PROTECTED.0) == 0 {
+            return Ok(false);
+        }
+
+        let expected_ace_count = match policy {
+            DataDirPolicy::Machine => 2,
+            DataDirPolicy::Owner { .. } => 1,
+        };
+        // SAFETY: `dacl` points into the still-live security descriptor.
+        #[allow(unsafe_code)]
+        let ace_count = unsafe { (*dacl).AceCount };
+        if usize::from(ace_count) != expected_ace_count {
+            return Ok(false);
+        }
+
+        let mut system_seen = false;
+        let mut administrators_seen = false;
+        let mut owner_seen = false;
+        for index in 0..u32::from(ace_count) {
+            let mut ace = std::ptr::null_mut();
+            // SAFETY: `index` is below AceCount and `ace` is writable storage
+            // for the pointer owned by the live DACL.
+            #[allow(unsafe_code)]
+            unsafe { GetAce(dacl, index, &mut ace) }.map_err(io_error)?;
+            // SAFETY: the fields below are read only after checking the ACE
+            // type, so this is an ACCESS_ALLOWED_ACE layout.
+            #[allow(unsafe_code)]
+            let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            // 0x03 is OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE. Windows
+            // can add 0x10 (INHERITED_ACE) and can remove inheritance bits
+            // on a file child; all of those describe the same full-access
+            // policy for the current object. A directory must keep 0x03 so
+            // future children inherit the restricted DACL too.
+            let ace_flags_match = if require_protected_dacl {
+                allowed.Header.AceFlags == 0x03
+            } else {
+                allowed.Header.AceFlags & !0x13_u8 == 0
+            };
+            if u32::from(allowed.Header.AceType) != ACCESS_ALLOWED_ACE_TYPE
+                || allowed.Mask != FILE_ALL_ACCESS.0
+                || !ace_flags_match
+            {
+                return Ok(false);
+            }
+            // SAFETY: SidStart is the first u32 of the variable-length SID
+            // immediately following the fixed ACCESS_ALLOWED_ACE header.
+            let sid = PSID(std::ptr::addr_of!(allowed.SidStart).cast_mut().cast());
+            let sid = sid_text(sid)?;
+            match policy {
+                DataDirPolicy::Machine if sid == SYSTEM_SID && !system_seen => {
+                    system_seen = true;
+                }
+                DataDirPolicy::Machine if sid == ADMINISTRATORS_SID && !administrators_seen => {
+                    administrators_seen = true;
+                }
+                DataDirPolicy::Owner { token_user_sid, .. }
+                    if sid == *token_user_sid && !owner_seen =>
+                {
+                    owner_seen = true;
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(match policy {
+            DataDirPolicy::Machine => system_seen && administrators_seen,
+            DataDirPolicy::Owner { .. } => owner_seen,
+        })
+    });
+    // SAFETY: GetSecurityInfo allocates this descriptor with LocalAlloc. A
+    // null descriptor from an unsuccessful call is safe to pass to LocalFree.
+    #[allow(unsafe_code)]
+    let _ = unsafe { LocalFree(HLOCAL(descriptor.0.cast())) };
+    result
+}
+
 /// Create every missing component with its protected descriptor already in
 /// place. There is no inherited-ACL interval in which another user can seed a
 /// junction or a file beneath the new directory.
@@ -476,7 +593,7 @@ fn create_missing_directories(
                 // its owner or changing a DACL; never trust a path query here.
                 let (handle, directory) = open_data_object(&current)?;
                 let result = if directory {
-                    secure_entry_handle(handle, policy)
+                    secure_entry_handle(handle, policy, true)
                 } else {
                     invalid("data directory path contains a non-directory")
                 };
@@ -633,9 +750,16 @@ fn directory_children(path: &Path) -> Result<Vec<OsString>, PlatformError> {
     Ok(names)
 }
 
-fn secure_entry_handle(handle: HANDLE, policy: &DataDirPolicy) -> Result<(), PlatformError> {
+fn secure_entry_handle(
+    handle: HANDLE,
+    policy: &DataDirPolicy,
+    require_protected_dacl: bool,
+) -> Result<(), PlatformError> {
     if !policy.accepts_owner(&owner_sid_for_handle(handle)?) {
         return invalid("data directory owner is not trusted");
+    }
+    if data_dir_security_is_current(handle, policy, require_protected_dacl)? {
+        return Ok(());
     }
     set_data_dir_dacl(handle, policy.acl())
 }
@@ -645,7 +769,7 @@ fn secure_directory_tree(
     canonical_path: &Path,
     policy: &DataDirPolicy,
 ) -> Result<(), PlatformError> {
-    secure_entry_handle(handle, policy)?;
+    secure_entry_handle(handle, policy, true)?;
     // The root descriptor is now protected, so an ordinary user cannot
     // substitute children while their individual handles are opened below.
     for name in directory_children(canonical_path)? {
@@ -655,7 +779,9 @@ fn secure_directory_tree(
             let child_canonical = final_path_for_handle(child)?;
             secure_directory_tree(child, &child_canonical, policy)
         } else {
-            secure_entry_handle(child, policy)
+            // New files inherit the protected root DACL. They need no rewrite
+            // when that inherited descriptor still grants exactly the policy.
+            secure_entry_handle(child, policy, false)
         };
         close(child);
         result?;
@@ -2868,6 +2994,40 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// A second daemon must validate the first daemon's inherited lock-file
+    /// DACL without trying to write it. Windows can reject a DACL replacement
+    /// while that file has the first daemon's exclusive instance lock.
+    #[test]
+    fn matching_inherited_dacl_is_not_rewritten_while_locked() -> Result<(), PlatformError> {
+        let root = temp_dir("locked-inherited-dacl");
+        let data = root.join("data");
+        std::fs::create_dir_all(&data)?;
+        set_fixture_owner(&data, ADMINISTRATORS_SID)?;
+        let policy = data_dir_policy_for_token(
+            "S-1-5-21-10-20-30-1001".to_owned(),
+            ADMINISTRATORS_SID.to_owned(),
+            true,
+        );
+        secure_data_dir_with_policy(&data, &root.join("official"), policy.clone())?;
+
+        let lock_path = data.join("agentwatchd.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        lock.try_lock().map_err(|_| PlatformError::Invalid {
+            capability: "secure_data_dir",
+            detail: "test fixture could not lock the instance file",
+        })?;
+
+        let second_start = secure_data_dir_with_policy(&data, &root.join("official"), policy);
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&root);
+        second_start.map(|_| ())
     }
 
     #[test]

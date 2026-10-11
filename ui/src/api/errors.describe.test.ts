@@ -19,11 +19,10 @@ describe("error text", () => {
     expect(describeError(new ApiError(500, null, ""), t)).toContain("500");
   });
 
-  it("a wrong program is worded in Chinese, not the daemon's English", () => {
-    const err = new ApiError(400, { error: { code: "program_not_found", message: "the program or the working directory was not found" } }, "x");
+  it("a launch error keeps the daemon sentence that names the failed input", () => {
+    const err = new ApiError(400, { error: { code: "program_not_found", message: "找不到程序「tool」，请检查名字或路径" } }, "x");
     const text = describeError(err, t);
-    expect(text).toBe(ZH["error.programNotFound"]);
-    expect(text).not.toMatch(/entity|not found/u);
+    expect(text).toBe("找不到程序「tool」，请检查名字或路径");
     // Launch refusals are 403s with their own plain Chinese sentence, never
     // the daemon's English and never "open a terminal".
     for (const code of ["launch_other_user", "caller_unidentified", "caller_unknown", "drop_failed"]) {

@@ -1059,11 +1059,9 @@ fn close_undelivered_session(state: &mut ApiState, public_id: &str) {
     state.undelivered_sessions.remove(public_id);
 }
 
-/// A failed `spawn` as an error the UI can word. The code says what went
-/// wrong (`program_not_found` covers a missing program and a missing working
-/// directory, which the OS reports alike); the message stays plain English for
-/// API callers. It used to be `spawn_failed` with the raw `ErrorKind` text
-/// ("entity not found"), which the page printed as is.
+/// A failed `spawn` as a reviewed API error. The hold/error pipe tells us
+/// whether `chdir` or `exec` failed, so the code and sentence always name the
+/// program or the requested directory rather than combining both causes.
 fn spawn_error(
     step: &str,
     cwd: Option<&str>,
@@ -1078,7 +1076,7 @@ fn spawn_error(
         return match err.kind() {
             std::io::ErrorKind::PermissionDenied => error_response(
                 400,
-                "program_not_permitted",
+                "cwd_not_permitted",
                 &format!("没有权限进入工作目录「{dir}」，请换一个目录或检查权限。"),
             ),
             _ => error_response(400, "cwd_not_found", &format!("找不到工作目录「{dir}」")),
@@ -1126,7 +1124,7 @@ fn typed_spawn_error(
         ),
         aw_platform::SpawnFailure::CwdNotPermitted => error_response(
             400,
-            "program_not_permitted",
+            "cwd_not_permitted",
             &format!(
                 "没有权限进入工作目录「{}」，请换一个目录或检查权限。",
                 cwd.unwrap_or(".")
@@ -1137,7 +1135,7 @@ fn typed_spawn_error(
 
 #[cfg(test)]
 mod spawn_error_tests {
-    use super::spawn_error;
+    use super::{spawn_error, typed_spawn_error};
 
     fn code(kind: std::io::ErrorKind) -> String {
         let response = spawn_error(
@@ -1151,10 +1149,8 @@ mod spawn_error_tests {
         body["error"]["code"].as_str().unwrap_or("").to_owned()
     }
 
-    /// UI re-review #144 new-1: a wrong program showed
-    /// 「could not start the program: entity not found」.
     #[test]
-    fn spawn_failures_carry_a_code_the_ui_can_word() {
+    fn app_launch_route_reports_the_four_precise_spawn_sentences() {
         assert_eq!(code(std::io::ErrorKind::NotFound), "program_not_found");
         assert_eq!(
             code(std::io::ErrorKind::PermissionDenied),
@@ -1185,6 +1181,33 @@ mod spawn_error_tests {
             serde_json::from_slice(&missing_dir.body).unwrap_or(serde_json::Value::Null);
         assert_eq!(body["error"]["code"], "cwd_not_found");
         assert_eq!(body["error"]["message"], "找不到工作目录「/no/such/work」");
+
+        let denied_dir = spawn_error(
+            "chdir",
+            Some("/private/work"),
+            &["tool".to_owned()],
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&denied_dir.body).unwrap_or(serde_json::Value::Null);
+        assert_eq!(body["error"]["code"], "cwd_not_permitted");
+        assert_eq!(
+            body["error"]["message"],
+            "没有权限进入工作目录「/private/work」，请换一个目录或检查权限。"
+        );
+
+        let denied_program = typed_spawn_error(
+            aw_platform::SpawnFailure::ProgramNotPermitted,
+            None,
+            &["/private/tool".to_owned()],
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&denied_program.body).unwrap_or(serde_json::Value::Null);
+        assert_eq!(body["error"]["code"], "program_not_permitted");
+        assert_eq!(
+            body["error"]["message"],
+            "程序「/private/tool」没有执行权限，请检查文件权限后再试。"
+        );
     }
 }
 

@@ -553,8 +553,7 @@ pub fn verify_pipe_server(
 /// Product callers use [`verify_pipe_server`], whose observation comes from
 /// the local SCM. This hook keeps the same production decision path testable
 /// without installing a service.
-#[cfg(windows)]
-#[doc(hidden)]
+#[cfg(all(windows, any(test, feature = "test-support")))]
 pub fn verify_pipe_server_with_service_status(
     handle: std::os::windows::io::RawHandle,
     service_status: &PipeServiceStatus,
@@ -564,8 +563,7 @@ pub fn verify_pipe_server_with_service_status(
 
 /// Testable owner-allowlist form retained for the existing reverse tests.
 /// Product callers must use [`verify_pipe_server`] or the service-status hook.
-#[cfg(windows)]
-#[doc(hidden)]
+#[cfg(all(windows, any(test, feature = "test-support")))]
 pub fn verify_pipe_server_for_owners(
     handle: std::os::windows::io::RawHandle,
     trusted_owners: &[&str],

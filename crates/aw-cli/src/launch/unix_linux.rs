@@ -285,8 +285,13 @@ pub enum AdoptWait {
 pub enum LaunchError {
     /// [`LaunchRequest::new`] was given no command.
     EmptyCommand,
-    /// `fork` failed. No child exists; nothing else ran.
-    ForkFailed { detail: String },
+    /// `fork` failed. No child exists; nothing else ran. When the failed
+    /// operation was `Command::spawn`, `kind` retains its OS classification
+    /// for the CLI boundary without retaining an unredacted OS message.
+    ForkFailed {
+        detail: String,
+        kind: Option<std::io::ErrorKind>,
+    },
     /// The host is cgroup v1, or the version is unknown. No session directory
     /// was created. [`V1_DOCTOR_HINT`] is the doctor sentence.
     CgroupV1NoLaunch,
@@ -317,7 +322,7 @@ impl std::fmt::Display for LaunchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyCommand => f.write_str("启动命令为空"),
-            Self::ForkFailed { detail } => write!(f, "fork 失败：{detail}"),
+            Self::ForkFailed { detail, .. } => write!(f, "fork 失败：{detail}"),
             Self::CgroupV1NoLaunch => f.write_str(V1_DOCTOR_HINT),
             Self::CreateFailed { detail } => write!(f, "未创建会话 cgroup：{detail}"),
             Self::WriteProcsFailed { detail } => {
@@ -449,6 +454,7 @@ pub fn run_launch<L: CgroupLaunch>(
         // cannot silently become a root launch.
         return Err(LaunchError::ForkFailed {
             detail: "只能以调用用户身份启动；root 不是路径".to_owned(),
+            kind: None,
         });
     }
     if request.command.is_empty() {
@@ -766,6 +772,7 @@ impl LocalCgroupHost {
                 let _ = std::fs::remove_dir(&session);
                 return Err(LaunchError::ForkFailed {
                     detail: format!("移入 cgroup 前启动失败：{err}"),
+                    kind: Some(err.kind()),
                 });
             }
         };
@@ -1042,6 +1049,7 @@ mod launch_tests {
             if pid != self.pid {
                 return Err(LaunchError::ForkFailed {
                     detail: "pid mismatch".to_owned(),
+                    kind: None,
                 });
             }
             Ok(())

@@ -4176,7 +4176,11 @@ mod tests {
             r#"{"mode":"launch","argv":["true"],"cwd":"/root"}"#,
         );
         assert_eq!(status, 400, "{body}");
-        assert_eq!(body["error"]["code"], "program_not_permitted");
+        assert_eq!(body["error"]["code"], "cwd_not_permitted");
+        assert_eq!(
+            body["error"]["message"],
+            "没有权限进入工作目录「/root」，请换一个目录或检查权限。"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

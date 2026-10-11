@@ -64,6 +64,9 @@ signal-hook = { version = "=0.3.18", default-features = false }
 [dev-dependencies]
 # insta is MIT OR Apache-2.0. Same pin as aw-core. Snapshots record `aw --help`.
 insta = { version = "1.49.0", default-features = false }
+# Test-only socket and pipe helpers; the regular dependency does not expose
+# these seams in release builds.
+aw-channel = { workspace = true, features = ["test-support"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # The Windows integration test hosts a real temporary named pipe and spawns

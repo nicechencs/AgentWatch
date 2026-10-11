@@ -78,6 +78,16 @@ impl RunSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum LaunchDispatchError {
+    /// The target or its requested working directory could not be started.
+    ///
+    /// The code is retained for `--json`; the human sentence identifies the
+    /// program or directory and never combines the two possibilities.
+    Spawn {
+        /// Stable API/CLI error code.
+        code: &'static str,
+        /// Reviewed human-facing sentence.
+        detail: String,
+    },
     /// The platform launcher stopped before the target finished.
     Platform { detail: String },
     /// The supplied run request is invalid before a launcher is called.
@@ -89,8 +99,21 @@ pub enum LaunchDispatchError {
 impl std::fmt::Display for LaunchDispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Platform { detail } | Self::Invalid { detail } => write!(f, "{detail}"),
+            Self::Spawn { detail, .. } | Self::Platform { detail } | Self::Invalid { detail } => {
+                write!(f, "{detail}")
+            }
             Self::NotImplemented { detail } => write!(f, "{detail}"),
+        }
+    }
+}
+
+impl LaunchDispatchError {
+    /// Stable code for a typed target-start failure, if one was available.
+    #[must_use]
+    pub const fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::Spawn { code, .. } => Some(code),
+            Self::Platform { .. } | Self::Invalid { .. } | Self::NotImplemented { .. } => None,
         }
     }
 }

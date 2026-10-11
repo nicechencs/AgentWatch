@@ -77,6 +77,9 @@ struct Prepared {
     env: Vec<std::ffi::CString>,
     /// Read end of the gate pipe. Closed in the child before exec.
     gate_read: std::os::fd::RawFd,
+    /// Test-only stdout capture. Production launchers leave this `None`; the
+    /// target otherwise inherits the caller's standard output unchanged.
+    stdout: Option<std::os::fd::RawFd>,
     /// Write end of the failure pipe. The child writes one record here and
     /// `_exit`s; a successful `execve` closes it (it is `CLOEXEC`) and the parent
     /// sees EOF. The parent keeps the read end.
@@ -92,6 +95,23 @@ struct PreparedSwitch {
 pub(crate) fn spawn(
     caller: &IdentifiedCaller,
     request: &SpawnRequest,
+) -> Result<Box<dyn HeldChild>, PlatformError> {
+    spawn_inner(caller, request, None)
+}
+
+#[cfg(test)]
+fn spawn_capturing_stdout(
+    caller: &IdentifiedCaller,
+    request: &SpawnRequest,
+    stdout: std::os::fd::OwnedFd,
+) -> Result<Box<dyn HeldChild>, PlatformError> {
+    spawn_inner(caller, request, Some(stdout))
+}
+
+fn spawn_inner(
+    caller: &IdentifiedCaller,
+    request: &SpawnRequest,
+    stdout: Option<std::os::fd::OwnedFd>,
 ) -> Result<Box<dyn HeldChild>, PlatformError> {
     let Owner::Unix {
         euid, egid, groups, ..
@@ -191,6 +211,7 @@ pub(crate) fn spawn(
         argv,
         env,
         gate_read: std::os::fd::AsRawFd::as_raw_fd(&gate_read),
+        stdout: stdout.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
         report: std::os::fd::AsRawFd::as_raw_fd(&report_write),
     };
     // SAFETY: the child calls only async-signal-safe functions, then `_exit`
@@ -215,6 +236,7 @@ pub(crate) fn spawn(
     drop(gate_read);
     drop(_pipe_lock);
     drop(report_write);
+    drop(stdout);
     Ok(Box::new(MacHeld {
         pid: Some(pid as u32),
         gate: Some(gate_write),
@@ -513,6 +535,9 @@ mod ffi {
             // SAFETY: closing the inherited write end. The parent keeps its own.
             libc::close(gate_write);
         }
+        if let Some(stdout) = prepared.stdout {
+            redirect_stdout_or_exit(stdout, prepared.report);
+        }
         // A caller-controlled loader must not be in force while this process
         // is still privileged. The target receives its own env at execve.
         clear_preload();
@@ -533,6 +558,24 @@ mod ffi {
             libc::close(prepared.gate_read);
         }
         exec(prepared);
+    }
+
+    fn redirect_stdout_or_exit(stdout: RawFd, prepared_report: RawFd) {
+        let duplicated = unsafe {
+            // SAFETY: `stdout` is an inherited pipe descriptor created before
+            // fork. `dup2` changes only this hold child and is async-signal-safe.
+            libc::dup2(stdout, libc::STDOUT_FILENO)
+        };
+        if duplicated != libc::STDOUT_FILENO {
+            report_and_exit(prepared_report, GateStep::Spec, errno_now());
+        }
+        if stdout != libc::STDOUT_FILENO {
+            unsafe {
+                // SAFETY: stdout now refers to the duplicated descriptor; this
+                // closes only the inherited source descriptor in the child.
+                libc::close(stdout);
+            }
+        }
     }
 
     /// `execve` errno that means "not this candidate, try the next". `execvp`
@@ -1231,9 +1274,8 @@ mod tests {
     #[test]
     fn exact_env_is_only_the_base_five_plus_the_request() {
         use crate::{EnvSource, IdentifiedCaller, SpawnRequest};
+        use std::io::Read;
         let caller = IdentifiedCaller::current_user().expect("current user");
-        let dir = private_dir("env");
-        let out = dir.join("env");
         // A name this process has and the target must not. The value is a
         // sentinel, not a real secret; the assertion is that the name is absent
         // and that the printed set equals the requested set.
@@ -1242,36 +1284,25 @@ mod tests {
         let base = account_base_env(caller_uid(&caller));
         let mut env = base.clone();
         env.push(("AW_RV".to_owned(), "1".to_owned()));
-        // `sh` writes the env it was exec'd with into the file. Redirecting this
-        // process's own stdout would be inherited by any other test that forked
-        // at the same moment, so the target writes the file itself.
+        let (out, capture) = super::ffi::pipe_cloexec().expect("stdout pipe");
         let request = SpawnRequest {
-            command: vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                format!("env > '{}'", out.display()),
-            ],
+            command: vec!["/usr/bin/env".to_owned()],
             cwd: None,
             env,
             env_source: EnvSource::Exact,
         };
-        let held = super::spawn(&caller, &request).expect("held");
+        let held = super::spawn_capturing_stdout(&caller, &request, capture).expect("held");
         let released = held.release().expect("release");
         assert_eq!(
             released.wait().expect("wait"),
             crate::ReapOutcome::Exited(0)
         );
-        let text = std::fs::read_to_string(&out).expect("env file");
+        let mut text = String::new();
+        std::fs::File::from(out)
+            .read_to_string(&mut text)
+            .expect("env output");
         let mut got: Vec<String> = text.lines().map(str::to_owned).collect();
         got.sort();
-        // `sh` inserts `PWD` (its own working directory) into a command it runs.
-        // That is the shell, not the environment it was exec'd with. Everything
-        // else must be exactly the base five plus the one requested name.
-        // macOS's `sh` (bash) also adds `SHLVL` and `_`; those come from the
-        // shell too, not from the environment it was exec'd with.
-        got.retain(|line| {
-            !line.starts_with("PWD=") && !line.starts_with("SHLVL=") && !line.starts_with("_=")
-        });
         let mut want: Vec<String> = base
             .iter()
             .map(|(key, value)| format!("{key}={value}"))
@@ -1283,7 +1314,6 @@ mod tests {
         assert!(!got.iter().any(|line| line.starts_with("LD_PRELOAD=")));
         std::env::remove_var("AW_HOLD_SENTINEL");
         std::env::remove_var("LD_PRELOAD");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The five names a privileged launch builds from the target account, the

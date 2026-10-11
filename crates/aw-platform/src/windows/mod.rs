@@ -1,9 +1,9 @@
 //! Windows process identity.  FFI stays in the smallest functions that need it.
 
 use crate::{
-    is_reserved_env_name, Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner,
-    PeerIdentity, PipeServerVerificationError, PipeServiceStatus, Platform, PlatformError,
-    ProcessEntry, ProcessKey, SamplingProcess, SpawnRequest, UnsupportedKind,
+    Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner, PeerIdentity,
+    PipeServerVerificationError, PipeServiceStatus, Platform, PlatformError, ProcessEntry,
+    ProcessKey, SamplingProcess, SpawnRequest, UnsupportedKind,
 };
 use std::collections::BTreeMap;
 use std::ffi::{c_void, OsStr, OsString};
@@ -1116,7 +1116,7 @@ pub fn account_base_env() -> Result<Vec<(String, String)>, PlatformError> {
 /// Windows treats environment variable names case-insensitively.
 #[must_use]
 pub fn windows_reserved_env_name(name: &str) -> bool {
-    is_reserved_env_name(name, true)
+    account_base_env_name(name) || name.eq_ignore_ascii_case("Path")
 }
 
 fn image_for_process(process: HANDLE) -> Option<PathBuf> {
@@ -2400,9 +2400,30 @@ mod tests {
 
     #[test]
     fn windows_reserved_environment_names_are_case_insensitive() {
-        for name in ["Path", "path", "PATH", "Home"] {
+        for name in [
+            "SystemRoot",
+            "windir",
+            "SystemDrive",
+            "ComSpec",
+            "PATHEXT",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "USERNAME",
+            "USERDOMAIN",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "ProgramData",
+            "ProgramFiles",
+            "Path",
+            "path",
+            "PATH",
+        ] {
             assert!(windows_reserved_env_name(name), "{name} must be reserved");
         }
+        assert!(!windows_reserved_env_name("Home"));
         for name in ["LANG", "TZ", "LC_ALL"] {
             assert!(!windows_reserved_env_name(name), "{name} is not reserved");
         }

@@ -73,8 +73,9 @@ const ROWS: &[Row] = &[
     },
     Row {
         code: "program_not_found",
-        zh: "找不到这个程序或工作目录",
-        en: Some("the program or the working directory was not found"),
+        // The daemon's sentence includes the requested program name.
+        zh: "找不到程序",
+        en: None,
     },
     Row {
         code: "cwd_not_found",
@@ -84,8 +85,15 @@ const ROWS: &[Row] = &[
     },
     Row {
         code: "program_not_permitted",
-        zh: "没有权限运行这个程序或进入工作目录",
-        en: Some("the program or the working directory is not accessible to this account"),
+        // The daemon's sentence includes the requested program path.
+        zh: "程序没有执行权限",
+        en: None,
+    },
+    Row {
+        code: "cwd_not_permitted",
+        // The daemon's sentence includes the requested directory path.
+        zh: "没有权限进入工作目录",
+        en: None,
     },
     Row {
         code: "collector_unavailable",
@@ -319,12 +327,16 @@ pub(crate) fn write_status(
             "会话数据库正忙（后台在写入），等了 {waited} 秒还是没轮到，请稍后再试。"
         );
     }
-    // The daemon's message is already the sentence a person reads, with the
-    // variable's name filled in. Showing the stock line and then the same
-    // sentence again would name the variable twice.
-    // Both messages already name the thing they are about. Showing the stock
-    // line and then the same sentence again would name it twice.
-    if code == "env_reserved" || code == "cwd_not_found" {
+    // These daemon messages already name the failed program or directory.
+    // Showing a stock line and then the same sentence again would duplicate it.
+    if matches!(
+        code,
+        "env_reserved"
+            | "program_not_found"
+            | "cwd_not_found"
+            | "program_not_permitted"
+            | "cwd_not_permitted"
+    ) {
         return f.write_str(message);
     }
     let Some(row) = ROWS.iter().find(|row| row.code == code) else {
@@ -363,6 +375,30 @@ mod tests {
     use std::fmt;
 
     use super::{explain, write_status, ROWS};
+
+    #[test]
+    fn legacy_combined_launch_wording_is_absent_from_cli_daemon_and_app_tables() {
+        let legacy = [
+            concat!("程序或", "工作目录"),
+            concat!("运行它或", "进入"),
+            concat!("运行这个程序或", "进入"),
+        ];
+        let tables = [
+            include_str!("cmd/run.rs"),
+            include_str!("daemon_errors.rs"),
+            include_str!("../../aw-daemon/src/api/watch_routes.rs"),
+            include_str!("../../aw-daemon/src/api/openapi.rs"),
+            include_str!("../../../app/src-tauri/src/main.rs"),
+            include_str!("../../../ui/src/api/errors.ts"),
+            include_str!("../../../ui/src/i18n/zh.json"),
+            include_str!("../../../ui/src/i18n/en.json"),
+        ];
+        for table in tables {
+            for phrase in legacy {
+                assert!(!table.contains(phrase), "legacy launch wording: {phrase}");
+            }
+        }
+    }
 
     /// Daemon sources, relative to this crate. A code that appears as the
     /// second argument of `error_response(` in any of them must have a row.

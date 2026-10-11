@@ -133,8 +133,10 @@ pub enum ClientError {
     Unreachable { detail: String },
     /// The socket or pipe exists but this account may not open it. Exit 4.
     Forbidden { detail: String },
-    /// The Windows pipe was opened, but the server was not LocalSystem or the
-    /// current user. The client sent no request bytes. Exit 4.
+    /// The Windows pipe was opened, but its owner failed the service rule:
+    /// LocalSystem is required when the service is installed or SCM is
+    /// unavailable; a same-user owner is accepted only when SCM confirms no
+    /// service exists. The client sent no request bytes. Exit 4.
     UntrustedServer { detail: String },
     /// The Windows pipe owner could not be queried before any bytes were sent.
     /// This must stay distinct from a queried but untrusted owner. Exit 4.

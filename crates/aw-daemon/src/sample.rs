@@ -9,8 +9,8 @@
 //! nothing (`host.rs`: `Some([])` does not scan). [`Scope::attach`] of an
 //! unresolved root does one full-table refresh (`set_restrict(None)`), turns
 //! the [`ProcUid`] into a pid, then keeps that pid and its children. This
-//! sampler attaches to pid 1. Pid 1 is init; the children are the processes
-//! the host source returns. The [`ProcUid`] is `ProcessIdentity::from_parts`
+//! sampler attaches to the platform's host-process anchor. Linux and macOS use
+//! pid 1; Windows uses the System process (pid 4). The [`ProcUid`] is `ProcessIdentity::from_parts`
 //! over the boot id, pid, and the `/proc` start time rounded down to seconds.
 //! Stored process start times remain precise (`btime_ns + starttime * 1e9 / clk_tck`).
 //!
@@ -53,9 +53,6 @@ const SAMPLE_EVERY: Duration = Duration::from_millis(250);
 /// collector; this process does not drop the rest quietly.
 const SINK_CAPACITY: usize = 8_192;
 
-/// `snapshot` walks this pid and its descendants. Pid 1 is init.
-const SAMPLE_ROOT_PID: u32 = 1;
-
 const PROC_SOURCE: &str = "poll/sysinfo";
 
 /// One process read from `/proc`, enough to pair with a `ProcessStart`.
@@ -87,7 +84,7 @@ pub(crate) struct RootHint {
 /// Which session a sampler writes and which process subtree it watches.
 ///
 /// The daemon-wide sample is [`SampleTarget::daemon`]: session 1, rooted at
-/// pid 1. `POST /sessions` (attach) and `/sessions/{sid}/adopt` (run) build
+/// the OS host anchor. `POST /sessions` (attach) and `/sessions/{sid}/adopt` (run) build
 /// one per watched root ([`crate::watch`]).
 #[derive(Debug, Clone)]
 pub struct SampleTarget {
@@ -116,14 +113,14 @@ pub struct SampleTarget {
 }
 
 impl SampleTarget {
-    /// The daemon-wide attach sample (pid 1, session 1).
+    /// The daemon-wide attach sample (the platform host anchor, session 1).
     pub fn daemon() -> Self {
         Self {
             db_id: SESSION_DB_ID,
             public_id: SESSION_PUBLIC_ID.to_owned(),
             name: Some("daemon-wide attach sample".to_owned()),
             mode: "attach",
-            root_pid: SAMPLE_ROOT_PID,
+            root_pid: aw_platform::platform().host_anchor_pid(),
             user_id: current_user_id(),
             argv_json: None,
             agent: None,
@@ -260,7 +257,7 @@ impl HostSampler {
         let wall_ns = wall_now_ns();
         // `start_at` is the baseline. It does not emit the processes already
         // running. `snapshot` does: it clears the restrict list, refreshes
-        // every process, and returns pid 1 plus its descendants as
+        // every process, and returns the host anchor plus its descendants as
         // `StartHow::Snapshot` at evidence S. `ProcessStart` has no pid and
         // no `ProcUid`, so the rows are paired with `/proc` below.
         let starts = self.collector.snapshot(self.target.root_pid);
@@ -430,8 +427,8 @@ impl HostSampler {
     /// Turn `snapshot`'s starts into events the pipeline can replay.
     ///
     /// `ProcessStart` does not carry the pid or the [`ProcUid`]. Both are
-    /// required to write a `processes` row. They are read from `/proc` for
-    /// pid 1 and its descendants and paired by `(ppid, start_time_ns)`,
+    /// required to write a `processes` row. They are read from the platform
+    /// process table for the host anchor and its descendants and paired by `(ppid, start_time_ns)`,
     /// which is what `snapshot` kept. A start that matches no `/proc` row
     /// is not given a pid of 0; it is counted in one gap.
     fn events_from_snapshot(&mut self, starts: &[ProcessStart], wall_ns: i64) -> Vec<RawEvent> {
@@ -443,15 +440,15 @@ impl HostSampler {
         let mut used = BTreeSet::new();
         let mut events = Vec::new();
         let mut unmatched = 0_u64;
-        // `snapshot` drops a row whose ppid sysinfo reported as absent. Pid 1's
-        // parent is 0, and sysinfo stores that as `None`, so init never comes
+        // `snapshot` drops a row whose ppid sysinfo reported as absent. A host
+        // anchor has no parent, and sysinfo stores that as `None`, so it never comes
         // back. The row is still in `table`. It is added here, evidence S,
         // with no parent uid (not observed as a ProcUid) and ppid 0, which is
         // the ppid `/proc/1/stat` reported.
-        let root_is_init = self.target.root_pid == SAMPLE_ROOT_PID;
+        let root_is_host_anchor = self.target.root_pid == aw_platform::platform().host_anchor_pid();
         if let Some(init) = table
             .iter()
-            .find(|row| root_is_init && row.pid == SAMPLE_ROOT_PID)
+            .find(|row| root_is_host_anchor && row.pid == self.target.root_pid)
         {
             if let Some(event) = self.init_event(init, wall_ns) {
                 used.insert(init.pid);

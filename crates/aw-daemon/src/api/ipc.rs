@@ -459,13 +459,15 @@ mod unix {
 mod pipe {
     use std::ffi::OsString;
     use std::io;
+    use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
-    use aw_collector_windows::pipe::{client_identity, create_server, pipe_sddl};
+    use aw_collector_windows::pipe::{create_server, is_admin, pipe_sddl};
+    use aw_platform::{identify_pipe_peer, Owner};
     use tokio::net::windows::named_pipe::NamedPipeServer;
 
     use super::super::auth::Caller;
@@ -578,10 +580,13 @@ mod pipe {
         state: SharedState,
         control: Arc<Control>,
     ) -> io::Result<()> {
-        let caller = match client_identity(&pipe) {
-            Ok(client) => Caller {
-                user_id: client.sid,
-                admin: client.admin,
+        let caller = match identify_pipe_peer(pipe.as_raw_handle()) {
+            Ok(peer) => match peer.owner() {
+                Owner::Windows { sid, elevated, .. } => Caller {
+                    user_id: sid.clone(),
+                    admin: is_admin(sid, *elevated),
+                },
+                Owner::Unix { .. } => unreachable!("Windows pipe peer has a Windows owner"),
             },
             Err(err) => {
                 tracing::warn!(target: "aw_daemon::ipc", error = %err, "pipe client not identified");

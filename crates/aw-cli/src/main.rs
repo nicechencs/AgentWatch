@@ -24,6 +24,14 @@ fn main() -> ExitCode {
                 let _ = writeln!(io::stderr(), "aw: 写出结果失败：{err}");
                 return ExitCode::from(1);
             }
+            #[cfg(windows)]
+            {
+                // Windows process statuses are signed 32-bit values, including
+                // values above 255 and NTSTATUS failures such as 0xC0000005.
+                // ExitCode truncates to u8, so hand the raw child code to the OS.
+                std::process::exit(code);
+            }
+            #[cfg(not(windows))]
             exit_code(code)
         }
         Err(err) => {
@@ -42,6 +50,7 @@ fn write_outcome(outcome: &cmd::Outcome) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn exit_code(code: i32) -> ExitCode {
     u8::try_from(code).map_or(ExitCode::from(1), ExitCode::from)
 }

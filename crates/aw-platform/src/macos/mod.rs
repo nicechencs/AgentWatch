@@ -77,6 +77,9 @@ impl Platform for CurrentPlatform {
     fn os(&self) -> &'static str {
         "macos"
     }
+    fn host_anchor_pid(&self) -> u32 {
+        1
+    }
 
     fn capability(&self, capability: Capability) -> CapabilityStatus {
         match capability {

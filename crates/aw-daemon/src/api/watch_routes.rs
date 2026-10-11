@@ -11,8 +11,9 @@
 //!   dropped to the caller's uid, gid and login group list when the daemon
 //!   runs as root ([`super::launch_as`]). The account comes only from the OS peer
 //!   credential; an unknown one is refused, never run as root.
-//! - Only Linux reads process identity for the poll sampler today; elsewhere
-//!   these routes answer 503 `collector_unavailable` and create nothing.
+//! - A route is available only when `aw-platform` exposes both process identity
+//!   and a process table to the sampler; otherwise it answers 503
+//!   `collector_unavailable` and creates nothing.
 
 use serde_json::{json, Value};
 
@@ -124,34 +125,35 @@ fn daemon_uid() -> u32 {
 }
 
 fn collector_available() -> Result<(), ApiResponse> {
-    if cfg!(target_os = "linux") {
+    let available = |capability| {
+        aw_platform::platform().capability(capability) == aw_platform::CapabilityStatus::Available
+    };
+    if available(aw_platform::Capability::ProcessIdentity)
+        && available(aw_platform::Capability::ProcessTable)
+    {
         Ok(())
     } else {
         Err(error_response(
             503,
             "collector_unavailable",
-            "the poll sampler reads process identity only on Linux in this build",
+            "the poll sampler process identity is not available in this build",
         ))
     }
 }
 
-/// Real, effective, and saved uids of `pid` from `/proc/<pid>/status`.
-/// `/proc/<pid>` itself is root-owned, so its directory owner is not useful.
-/// `None` means the three identity fields could not be read.
-fn pid_owner(pid: u32) -> Option<[u32; 3]> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        let line = status.lines().find(|line| line.starts_with("Uid:"))?;
-        let mut uids = line[4..]
-            .split_whitespace()
-            .map(|uid| uid.parse::<u32>().ok());
-        Some([uids.next()??, uids.next()??, uids.next()??])
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
+/// Whether the process identity the platform just read belongs to this
+/// authenticated peer.  A failure to read an owner is never treated as a
+/// match, and Windows compares a SID rather than a daemon account or pid.
+fn caller_owns_process(caller: &Caller, process: &aw_platform::ProcessEntry) -> bool {
+    match process.owner.as_ref() {
+        Some(aw_platform::Owner::Unix {
+            ruid, euid, suid, ..
+        }) => caller
+            .user_id
+            .parse::<u32>()
+            .is_ok_and(|uid| [ruid, euid, suid].iter().all(|actual| **actual == uid)),
+        Some(aw_platform::Owner::Windows { sid, .. }) => sid == &caller.user_id,
+        None => false,
     }
 }
 
@@ -172,9 +174,13 @@ fn check_pid_owner(
             "pid is not running (or its identity cannot be read)",
         )
     })?;
-    let caller_uid = caller.user_id.parse::<u32>().ok();
-    let owner = pid_owner(pid);
+    let process = aw_platform::platform().process_identity(pid).ok().flatten();
     let after = crate::sample::proc_uid_of(pid);
+    let after_key = aw_platform::platform()
+        .sampling_process(pid)
+        .ok()
+        .flatten()
+        .map(|sample| sample.key);
     if after != Some(before) {
         return Err(error_response(
             400,
@@ -182,8 +188,9 @@ fn check_pid_owner(
             "pid changed while its identity was being checked",
         ));
     }
-    let owned_by_caller = owner
-        .is_some_and(|uids| caller_uid.is_some_and(|uid| uids.iter().all(|actual| *actual == uid)));
+    let owned_by_caller = process.is_some_and(|process| {
+        after_key == Some(process.key) && caller_owns_process(caller, &process)
+    });
     if owned_by_caller || (allow_admin && caller.admin) {
         return Ok(before);
     }
@@ -359,106 +366,122 @@ fn create_inner(
             Ok(response)
         }
         Some("launch") => {
-            let argv = argv_field(&value)?;
-            collector_available()?;
-            // Whose account: only the OS-verified caller (see `launch_as`).
-            // A `uid` / `user` in the body is never read.
-            let who = super::launch_as::identity_for(&caller.user_id, daemon_uid())?;
-            let cwd = opt_text(&value, "cwd");
-            let env: Vec<(String, String)> = value
-                .get("env")
-                .and_then(Value::as_object)
-                .map(|env| {
-                    env.iter()
-                        .filter_map(|(key, val)| val.as_str().map(|v| (key.clone(), v.to_owned())))
-                        .collect()
-                })
-                .unwrap_or_default();
-            // Linux and macOS both map `SpawnAsError::Drop` here. Windows never
-            // reaches it: a different account is refused before spawn.
-            #[cfg(unix)]
-            let drop_failed = |uid: u32, step: &str| {
-                tracing::error!(uid, step, "account switch failed");
-                error_response(
-                    500,
-                    "drop_failed",
-                    "the program did not switch to the caller's account and was stopped",
-                )
-            };
-            // macOS: `aw-platform` returns the released child, not a bare pid.
-            // The gate switches accounts before exec and exits 125 if it cannot.
-            // The watcher reaps this handle; dropping it would leave a zombie.
-            #[cfg(target_os = "macos")]
-            let (pid, child) = match &who {
-                Some(who) => {
-                    let released = super::launch_as::spawn_as(who, &argv, cwd.as_deref(), &env)
-                        .map_err(|err| match err {
-                            super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
-                            super::launch_as::SpawnAsError::Drop(step) => {
-                                drop_failed(who.uid, &step)
-                            }
-                        })?;
-                    (released.pid(), ChildHandoff::Released(released))
-                }
-                None => {
-                    let child = spawn_as_self(&argv, cwd.as_deref(), &env)?;
-                    (child.id(), ChildHandoff::Process(child))
-                }
-            };
-            #[cfg(not(target_os = "macos"))]
-            #[allow(unused_mut)]
-            let (pid, mut child) = match &who {
+            // App/API launch creation has no Windows token-to-user launch path
+            // yet. `aw run` is different: its CLI creates a held child as the
+            // current user and this daemon only adopts it through `/adopt`.
+            #[cfg(windows)]
+            {
+                Err(error_response(
+                    503,
+                    "collector_unavailable",
+                    "daemon session creation is not wired on Windows in this build",
+                ))
+            }
+            #[cfg(not(windows))]
+            {
+                let argv = argv_field(&value)?;
+                collector_available()?;
+                // Whose account: only the OS-verified caller (see `launch_as`).
+                // A `uid` / `user` in the body is never read.
+                let who = super::launch_as::identity_for(&caller.user_id, daemon_uid())?;
+                let cwd = opt_text(&value, "cwd");
+                let env: Vec<(String, String)> = value
+                    .get("env")
+                    .and_then(Value::as_object)
+                    .map(|env| {
+                        env.iter()
+                            .filter_map(|(key, val)| {
+                                val.as_str().map(|v| (key.clone(), v.to_owned()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Linux and macOS both map `SpawnAsError::Drop` here. Windows never
+                // reaches it: a different account is refused before spawn.
                 #[cfg(unix)]
-                Some(who) => {
-                    let child = super::launch_as::spawn_as(who, &argv, cwd.as_deref(), &env)
-                        .map_err(|err| match err {
-                            super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
-                            super::launch_as::SpawnAsError::Drop(step) => {
-                                drop_failed(who.uid, &step)
-                            }
-                        })?;
-                    (child.id(), child)
-                }
-                // No account switch here: never start it as the service account.
-                #[cfg(not(unix))]
-                Some(_) => return Err(super::launch_as::no_account_switch()),
-                None => {
-                    let child = spawn_as_self(&argv, cwd.as_deref(), &env)?;
-                    (child.id(), child)
-                }
-            };
-            #[cfg(target_os = "linux")]
-            if let Some(who) = &who {
-                if !super::launch_as::verify_dropped(pid, who) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    tracing::error!(
-                        pid,
-                        uid = who.uid,
-                        "launched child did not drop to the caller; killed"
-                    );
-                    return Err(error_response(
+                let drop_failed = |uid: u32, step: &str| {
+                    tracing::error!(uid, step, "account switch failed");
+                    error_response(
                         500,
                         "drop_failed",
                         "the program did not switch to the caller's account and was stopped",
-                    ));
-                }
-            }
-            let mut target = target_for(caller, &value, "launch", pid, Some(&argv))?;
-            target.root_hint =
-                crate::sample::root_hint(pid, argv0_basename(target.argv_json.as_deref()));
-            insert_session(&path, &mut target)?;
-            let response = created(&target, json!({}));
-            state.watch_requests.push(WatchRequest::Start {
-                target: Box::new(target),
-                // Both the platform launch and a same-account spawn hand over a
-                // released handle. The watcher reaps it; nothing is left as a pid.
+                    )
+                };
+                // macOS: `aw-platform` returns the released child, not a bare pid.
+                // The gate switches accounts before exec and exits 125 if it cannot.
+                // The watcher reaps this handle; dropping it would leave a zombie.
                 #[cfg(target_os = "macos")]
-                child: Some(child.into_released()),
+                let (pid, child) = match &who {
+                    Some(who) => {
+                        let released = super::launch_as::spawn_as(who, &argv, cwd.as_deref(), &env)
+                            .map_err(|err| match err {
+                                super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
+                                super::launch_as::SpawnAsError::Drop(step) => {
+                                    drop_failed(who.uid, &step)
+                                }
+                            })?;
+                        (released.pid(), ChildHandoff::Released(released))
+                    }
+                    None => {
+                        let child = spawn_as_self(&argv, cwd.as_deref(), &env)?;
+                        (child.id(), ChildHandoff::Process(child))
+                    }
+                };
                 #[cfg(not(target_os = "macos"))]
-                child: Some(crate::watch::released_child(child)),
-            });
-            Ok(response)
+                #[allow(unused_mut)]
+                let (pid, mut child) = match &who {
+                    #[cfg(unix)]
+                    Some(who) => {
+                        let child = super::launch_as::spawn_as(who, &argv, cwd.as_deref(), &env)
+                            .map_err(|err| match err {
+                                super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
+                                super::launch_as::SpawnAsError::Drop(step) => {
+                                    drop_failed(who.uid, &step)
+                                }
+                            })?;
+                        (child.id(), child)
+                    }
+                    // No account switch here: never start it as the service account.
+                    #[cfg(not(unix))]
+                    Some(_) => return Err(super::launch_as::no_account_switch()),
+                    None => {
+                        let child = spawn_as_self(&argv, cwd.as_deref(), &env)?;
+                        (child.id(), child)
+                    }
+                };
+                #[cfg(target_os = "linux")]
+                if let Some(who) = &who {
+                    if !super::launch_as::verify_dropped(pid, who) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        tracing::error!(
+                            pid,
+                            uid = who.uid,
+                            "launched child did not drop to the caller; killed"
+                        );
+                        return Err(error_response(
+                            500,
+                            "drop_failed",
+                            "the program did not switch to the caller's account and was stopped",
+                        ));
+                    }
+                }
+                let mut target = target_for(caller, &value, "launch", pid, Some(&argv))?;
+                target.root_hint =
+                    crate::sample::root_hint(pid, argv0_basename(target.argv_json.as_deref()));
+                insert_session(&path, &mut target)?;
+                let response = created(&target, json!({}));
+                state.watch_requests.push(WatchRequest::Start {
+                    target: Box::new(target),
+                    // Both the platform launch and a same-account spawn hand over a
+                    // released handle. The watcher reaps it; nothing is left as a pid.
+                    #[cfg(target_os = "macos")]
+                    child: Some(child.into_released()),
+                    #[cfg(not(target_os = "macos"))]
+                    child: Some(crate::watch::released_child(child)),
+                });
+                Ok(response)
+            }
         }
         _ => Err(error_response(
             400,

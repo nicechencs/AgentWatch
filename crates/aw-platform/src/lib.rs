@@ -317,6 +317,9 @@ pub enum CapabilityStatus {
 
 pub trait Platform: Send + Sync {
     fn os(&self) -> &'static str;
+    /// Existing root of the OS process tree used by the daemon-wide sampler.
+    /// This is not a universal numeric constant: Windows has no pid 1.
+    fn host_anchor_pid(&self) -> u32;
     fn capability(&self, capability: Capability) -> CapabilityStatus;
     fn spawn_suspended(
         &self,

@@ -5,19 +5,24 @@ use crate::{
     PlatformError, ProcessEntry, ProcessKey, SamplingProcess, SpawnRequest, UnsupportedKind,
 };
 use std::collections::BTreeMap;
-use std::ffi::{c_void, OsString};
+use std::ffi::{c_void, OsStr, OsString};
 use std::mem::{size_of, zeroed};
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use windows::core::{Error, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, LocalFree, FILETIME, HANDLE, HLOCAL, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, FILETIME, HANDLE, HLOCAL,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, RevertToSelf, TokenElevation,
     TokenIntegrityLevel, TokenUser, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
     TOKEN_USER,
+};
+use windows::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -28,15 +33,19 @@ use windows::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
+use windows::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
 use windows::Win32::System::SystemServices::{
     SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_RID,
     SECURITY_MANDATORY_SYSTEM_RID,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetCurrentThread, GetExitCodeProcess, GetProcessTimes, OpenProcess,
+    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetCurrentThread,
+    GetExitCodeProcess, GetProcessTimes, InitializeProcThreadAttributeList, OpenProcess,
     OpenProcessToken, OpenThreadToken, QueryFullProcessImageNameW, ResumeThread, TerminateProcess,
-    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_CREATION_FLAGS,
-    PROCESS_INFORMATION, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+    UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_CREATION_FLAGS,
+    PROCESS_INFORMATION, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
 pub(crate) struct CurrentPlatform;
@@ -75,6 +84,38 @@ fn creation_time(process: HANDLE) -> Result<u64, PlatformError> {
     unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) }
         .map_err(io_error)?;
     Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+}
+
+fn filetime_value(time: FILETIME) -> u64 {
+    (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+}
+
+/// A process-lifetime boot discriminator. The first reading derives the boot
+/// FILETIME from the system clock and monotonic tick count; retaining it avoids
+/// clock adjustments changing process identities during a daemon run. Its
+/// decimal Unix-seconds encoding intentionally matches `aw-collector-poll`'s
+/// Windows `System::boot_time()` discriminator, so sampler/root identities
+/// join rather than looking like different processes.
+fn sampling_boot_id() -> &'static Vec<u8> {
+    static BOOT_ID: OnceLock<Vec<u8>> = OnceLock::new();
+    BOOT_ID.get_or_init(|| {
+        // SAFETY: this Windows API returns a FILETIME value directly.
+        #[allow(unsafe_code)]
+        let now = unsafe { GetSystemTimeAsFileTime() };
+        // SAFETY: reads the system monotonic uptime counter without pointers.
+        #[allow(unsafe_code)]
+        let uptime_100ns = unsafe { GetTickCount64() }.saturating_mul(10_000);
+        unix_ns_from_filetime(filetime_value(now).saturating_sub(uptime_100ns))
+            .map(|ns| (ns / 1_000_000_000).to_string().into_bytes())
+            .unwrap_or_default()
+    })
+}
+
+fn unix_ns_from_filetime(filetime: u64) -> Option<u64> {
+    const WINDOWS_TO_UNIX_100NS: u64 = 116_444_736_000_000_000;
+    filetime
+        .checked_sub(WINDOWS_TO_UNIX_100NS)
+        .and_then(|ticks| ticks.checked_mul(100))
 }
 
 fn sid_for_token(token: HANDLE) -> Result<String, PlatformError> {
@@ -253,6 +294,65 @@ fn entry(pid: u32, ppid: Option<u32>) -> Result<Option<ProcessEntry>, PlatformEr
     Ok(Some(row))
 }
 
+fn snapshot_pids() -> Result<Vec<(u32, u32)>, PlatformError> {
+    // SAFETY: the returned snapshot handle is owned here and closed below.
+    #[allow(unsafe_code)]
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(io_error)?;
+    let mut raw = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut pids = Vec::new();
+    // SAFETY: `snapshot` and `raw` are valid for the ToolHelp enumeration.
+    #[allow(unsafe_code)]
+    let mut next = unsafe { Process32FirstW(snapshot, &mut raw) };
+    while next.is_ok() {
+        pids.push((raw.th32ProcessID, raw.th32ParentProcessID));
+        raw = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: same snapshot/output contract as Process32FirstW.
+        #[allow(unsafe_code)]
+        {
+            next = unsafe { Process32NextW(snapshot, &mut raw) };
+        }
+    }
+    close(snapshot);
+    Ok(pids)
+}
+
+fn sampling_entry(
+    pid: u32,
+    ppid: u32,
+    boot_id: &[u8],
+) -> Result<Option<SamplingProcess>, PlatformError> {
+    // SAFETY: requests limited query access and closes the owned result below.
+    #[allow(unsafe_code)]
+    let process = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => handle,
+        Err(_) => return Ok(None),
+    };
+    let created = creation_time(process);
+    close(process);
+    let created = match created {
+        Ok(created) => created,
+        Err(_) => return Ok(None),
+    };
+    let Some(start_ns) = unix_ns_from_filetime(created) else {
+        return Ok(None);
+    };
+    Ok(Some(SamplingProcess {
+        key: ProcessKey {
+            pid,
+            start_time: created,
+        },
+        ppid,
+        start_ns,
+        boot_id: boot_id.to_vec(),
+    }))
+}
+
 fn command_line(command: &[String]) -> Result<Vec<u16>, PlatformError> {
     let Some(program) = command.first() else {
         return Err(PlatformError::Invalid {
@@ -304,17 +404,162 @@ fn command_line(command: &[String]) -> Result<Vec<u16>, PlatformError> {
 /// Build an environment block for the target only.  This buffer is never
 /// sent to a daemon, logged, or persisted.
 fn environment(extra: &[(String, String)]) -> Vec<u16> {
-    let mut vars: BTreeMap<String, String> = std::env::vars().collect();
+    environment_from(std::env::vars_os(), extra)
+}
+
+fn environment_from(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    extra: &[(String, String)],
+) -> Vec<u16> {
+    let mut vars: BTreeMap<Vec<u16>, (OsString, OsString)> = inherited
+        .into_iter()
+        .map(|(key, value)| (environment_key(&key), (key, value)))
+        .collect();
     for (key, value) in extra {
-        vars.insert(key.clone(), value.clone());
+        let key = OsString::from(key);
+        vars.insert(environment_key(&key), (key, OsString::from(value)));
     }
     let mut block = Vec::new();
-    for (key, value) in vars {
-        block.extend(format!("{key}={value}").encode_utf16());
+    for (_, (key, value)) in vars {
+        block.extend(key.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(value.encode_wide());
         block.push(0);
     }
     block.push(0);
     block
+}
+
+/// Windows environment variable names are case-insensitive.  The actual
+/// spelling remains in the block, but this key makes an explicit `--env`
+/// replace inherited `Path`, `PATH`, or any other case variant.
+fn environment_key(key: &OsStr) -> Vec<u16> {
+    String::from_utf16_lossy(&key.encode_wide().collect::<Vec<_>>())
+        .to_uppercase()
+        .encode_utf16()
+        .collect()
+}
+
+/// Inheritable duplicates of precisely the three standard handles.  Duplicating
+/// instead of changing the inheritable flag on the originals prevents a
+/// concurrent `CreateProcess` in this process from inheriting them by accident.
+struct InheritedStdHandles {
+    handles: [HANDLE; 3],
+}
+
+impl InheritedStdHandles {
+    fn for_current_process() -> Result<Self, PlatformError> {
+        let std_handles = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+        let mut handles = [HANDLE::default(); 3];
+        for (slot, which) in handles.iter_mut().zip(std_handles) {
+            // SAFETY: `which` names one of the current process's standard handles.
+            #[allow(unsafe_code)]
+            let source = unsafe { GetStdHandle(which) }.map_err(io_error)?;
+            if source.is_invalid() {
+                for handle in handles {
+                    close(handle);
+                }
+                return Err(PlatformError::Invalid {
+                    capability: "spawn_suspended",
+                    detail: "a standard handle is unavailable",
+                });
+            }
+            // SAFETY: both process pseudo-handles are the current process and
+            // `slot` is writable storage for one owned duplicate.
+            #[allow(unsafe_code)]
+            if let Err(error) = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    source,
+                    GetCurrentProcess(),
+                    slot,
+                    0,
+                    true,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } {
+                for handle in handles {
+                    close(handle);
+                }
+                return Err(io_error(error));
+            }
+        }
+        Ok(Self { handles })
+    }
+}
+
+impl Drop for InheritedStdHandles {
+    fn drop(&mut self) {
+        for handle in self.handles {
+            close(handle);
+        }
+    }
+}
+
+/// Owns the opaque backing allocation used by `STARTUPINFOEXW`.
+struct AttributeList {
+    storage: Vec<usize>,
+    list: LPPROC_THREAD_ATTRIBUTE_LIST,
+}
+
+impl AttributeList {
+    fn with_handles(handles: &[HANDLE; 3]) -> Result<Self, PlatformError> {
+        let mut bytes = 0_usize;
+        // SAFETY: Windows documents a null first call as the sizing query.
+        #[allow(unsafe_code)]
+        let _ = unsafe {
+            InitializeProcThreadAttributeList(
+                LPPROC_THREAD_ATTRIBUTE_LIST::default(),
+                1,
+                0,
+                &mut bytes,
+            )
+        };
+        if bytes == 0 {
+            return Err(io_error(Error::from_win32()));
+        }
+        let words = bytes.div_ceil(size_of::<usize>());
+        let mut storage = vec![0_usize; words];
+        let list = LPPROC_THREAD_ATTRIBUTE_LIST(storage.as_mut_ptr().cast());
+        // SAFETY: `storage` is suitably aligned and has at least the requested
+        // byte count, and remains live until Drop deletes the list.
+        #[allow(unsafe_code)]
+        unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut bytes) }.map_err(io_error)?;
+        // SAFETY: `handles` stays live until CreateProcessW returns, and its
+        // byte length precisely describes the three inheritable duplicates.
+        #[allow(unsafe_code)]
+        if let Err(error) = unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                Some(handles.as_ptr().cast()),
+                size_of_val(handles),
+                None,
+                None,
+            )
+        } {
+            // SAFETY: initialization above succeeded, so Windows owns list metadata.
+            #[allow(unsafe_code)]
+            unsafe {
+                DeleteProcThreadAttributeList(list)
+            };
+            return Err(io_error(error));
+        }
+        Ok(Self { storage, list })
+    }
+}
+
+impl Drop for AttributeList {
+    fn drop(&mut self) {
+        // SAFETY: only a successfully initialized list constructs AttributeList;
+        // its backing allocation is still live while this destructor runs.
+        #[allow(unsafe_code)]
+        unsafe {
+            DeleteProcThreadAttributeList(self.list)
+        };
+        let _ = self.storage.len();
+    }
 }
 
 fn set_kill_on_close(job: HANDLE, enabled: bool) -> Result<(), PlatformError> {
@@ -344,6 +589,10 @@ struct WindowsHeldChild {
     key: ProcessKey,
 }
 
+/// Termination is best-effort during Drop/abort. Never let a stuck kernel wait
+/// block daemon shutdown indefinitely.
+const KILL_REAP_TIMEOUT_MS: u32 = 5_000;
+
 impl WindowsHeldChild {
     fn kill_reap_close(&mut self) {
         if !self.process.is_invalid() {
@@ -352,7 +601,7 @@ impl WindowsHeldChild {
             let _ = unsafe { TerminateProcess(self.process, 1) };
             // SAFETY: wait uses that still-owned process handle before it closes.
             #[allow(unsafe_code)]
-            let _ = unsafe { WaitForSingleObject(self.process, u32::MAX) };
+            let _ = unsafe { WaitForSingleObject(self.process, KILL_REAP_TIMEOUT_MS) };
         }
         close(self.thread);
         close(self.process);
@@ -535,6 +784,12 @@ impl Platform for CurrentPlatform {
         "windows"
     }
 
+    fn host_anchor_pid(&self) -> u32 {
+        // PID 4 is the System process, the Windows process-tree root. Unlike
+        // Unix, PID 1 is normally absent and must never be used as an anchor.
+        4
+    }
+
     fn capability(&self, capability: Capability) -> CapabilityStatus {
         match capability {
             Capability::SpawnSuspended
@@ -552,15 +807,29 @@ impl Platform for CurrentPlatform {
 
     fn spawn_suspended(
         &self,
-        _: &IdentifiedCaller,
+        caller: &IdentifiedCaller,
         request: &SpawnRequest,
     ) -> Result<Box<dyn crate::HeldChild>, PlatformError> {
+        // `CreateProcessW` always uses this process's token.  It must never
+        // turn a named-pipe caller into a process running as the daemon (for
+        // example, LocalSystem).  Launch-as-caller needs a token-aware path;
+        // until that exists, refuse any different OS-authenticated owner.
+        if caller.owner() != &self.current_owner()? {
+            return Err(no("spawn_suspended_for_other_user"));
+        }
         let mut command = command_line(&request.command)?;
         let mut env = environment(&request.env);
-        // SAFETY: STARTUPINFOW is documented as zero-initialized before cb is set.
+        let inherited = InheritedStdHandles::for_current_process()?;
+        let attributes = AttributeList::with_handles(&inherited.handles)?;
+        // SAFETY: STARTUPINFOEXW is documented as zero-initialized before cb is set.
         #[allow(unsafe_code)]
-        let mut startup: STARTUPINFOW = unsafe { zeroed() };
-        startup.cb = size_of::<STARTUPINFOW>() as u32;
+        let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = inherited.handles[0];
+        startup.StartupInfo.hStdOutput = inherited.handles[1];
+        startup.StartupInfo.hStdError = inherited.handles[2];
+        startup.lpAttributeList = attributes.list;
         // SAFETY: CreateProcessW fills this output structure.
         #[allow(unsafe_code)]
         let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
@@ -571,9 +840,12 @@ impl Platform for CurrentPlatform {
                 .chain(Some(0))
                 .collect::<Vec<_>>()
         });
-        let flags = PROCESS_CREATION_FLAGS(CREATE_SUSPENDED.0 | CREATE_UNICODE_ENVIRONMENT.0);
+        let flags = PROCESS_CREATION_FLAGS(
+            CREATE_SUSPENDED.0 | CREATE_UNICODE_ENVIRONMENT.0 | EXTENDED_STARTUPINFO_PRESENT.0,
+        );
         // SAFETY: command/environment/cwd buffers are live for the synchronous
-        // call; direct CLI launch inherits no handles and starts suspended.
+        // call; handle inheritance is constrained by the explicit attribute list
+        // to the three inheritable standard-handle duplicates, and it starts suspended.
         #[allow(unsafe_code)]
         let created = unsafe {
             CreateProcessW(
@@ -581,13 +853,13 @@ impl Platform for CurrentPlatform {
                 PWSTR(command.as_mut_ptr()),
                 None,
                 None,
-                false,
+                true,
                 flags,
                 Some(env.as_mut_ptr().cast()),
                 cwd.as_ref().map_or(windows::core::PCWSTR::null(), |value| {
                     windows::core::PCWSTR(value.as_ptr())
                 }),
-                &startup,
+                &startup.StartupInfo,
                 &mut info,
             )
         };
@@ -652,41 +924,30 @@ impl Platform for CurrentPlatform {
     }
 
     fn process_table(&self) -> Result<Vec<ProcessEntry>, PlatformError> {
-        // SAFETY: snapshot is an owned handle that is closed before return.
-        #[allow(unsafe_code)]
-        let snapshot =
-            unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(io_error)?;
-        let mut raw = PROCESSENTRY32W {
-            dwSize: size_of::<PROCESSENTRY32W>() as u32,
-            ..Default::default()
-        };
         let mut rows = Vec::new();
-        // SAFETY: snapshot and output structure are valid.
-        #[allow(unsafe_code)]
-        let mut next = unsafe { Process32FirstW(snapshot, &mut raw) };
-        while next.is_ok() {
-            if let Some(row) = entry(raw.th32ProcessID, Some(raw.th32ParentProcessID))? {
+        for (pid, ppid) in snapshot_pids()? {
+            if let Some(row) = entry(pid, Some(ppid))? {
                 rows.push(row);
             }
-            raw = PROCESSENTRY32W {
-                dwSize: size_of::<PROCESSENTRY32W>() as u32,
-                ..Default::default()
-            };
-            // SAFETY: same valid snapshot/output contract as Process32FirstW.
-            #[allow(unsafe_code)]
-            {
-                next = unsafe { Process32NextW(snapshot, &mut raw) };
-            }
         }
-        close(snapshot);
         Ok(rows)
     }
 
-    fn sampling_process(&self, _: u32) -> Result<Option<SamplingProcess>, PlatformError> {
-        Err(no("sampling_process"))
+    fn sampling_process(&self, pid: u32) -> Result<Option<SamplingProcess>, PlatformError> {
+        let Some((_, ppid)) = snapshot_pids()?.into_iter().find(|(item, _)| *item == pid) else {
+            return Ok(None);
+        };
+        sampling_entry(pid, ppid, sampling_boot_id())
     }
     fn sampling_process_table(&self) -> Result<Vec<SamplingProcess>, PlatformError> {
-        Err(no("sampling_process_table"))
+        let boot_id = sampling_boot_id();
+        let mut rows = Vec::new();
+        for (pid, ppid) in snapshot_pids()? {
+            if let Some(process) = sampling_entry(pid, ppid, boot_id)? {
+                rows.push(process);
+            }
+        }
+        Ok(rows)
     }
     fn secure_data_dir(&self, _: &Path) -> Result<(), PlatformError> {
         Err(no("secure_data_dir"))
@@ -728,10 +989,10 @@ pub fn os_version() -> Option<String> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::CurrentPlatform;
+    use super::{close, environment_from, CurrentPlatform};
     use crate::{
-        platform, Capability, CapabilityStatus, IdentifiedCaller, Platform, ReapOutcome,
-        SpawnRequest,
+        platform, Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner,
+        PeerIdentity, Platform, PlatformError, ReapOutcome, SpawnRequest, UnsupportedKind,
     };
 
     #[test]
@@ -767,5 +1028,142 @@ mod tests {
             .expect("held Windows child");
         let released = held.release().expect("released Windows child");
         assert_eq!(released.wait().expect("reap child"), ReapOutcome::Exited(7));
+    }
+
+    #[test]
+    fn sampler_reads_the_current_process_with_a_stable_boot_discriminator() {
+        let first = platform()
+            .sampling_process(std::process::id())
+            .expect("sample current process")
+            .expect("current process exists");
+        let second = platform()
+            .sampling_process(std::process::id())
+            .expect("sample current process again")
+            .expect("current process exists again");
+        assert_eq!(first.key, second.key);
+        assert_eq!(first.boot_id, second.boot_id);
+        assert!(first.start_ns > 0);
+    }
+
+    #[test]
+    fn environment_override_is_case_insensitive_and_preserves_other_values() {
+        let block = environment_from(
+            [
+                ("Path".into(), "old-path".into()),
+                ("KEEP".into(), "still-here".into()),
+            ],
+            &[("path".to_owned(), "new-path".to_owned())],
+        );
+        let values: Vec<String> = block
+            .split(|unit| *unit == 0)
+            .filter(|part| !part.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect();
+        assert!(values.iter().any(|value| value == "path=new-path"));
+        assert!(values.iter().any(|value| value == "KEEP=still-here"));
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| value
+                    .split_once('=')
+                    .is_some_and(|(key, _)| key.eq_ignore_ascii_case("path")))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn refuses_to_launch_a_different_pipe_owner_as_the_daemon() {
+        let caller = IdentifiedCaller::from_peer(PeerIdentity::new(
+            Owner::Windows {
+                sid: "S-1-5-21-424242".to_owned(),
+                elevated: false,
+                integrity: Some(IntegrityLevel::Medium),
+            },
+            Some(42),
+        ));
+        let request = SpawnRequest {
+            command: vec!["cmd".to_owned(), "/c".to_owned(), "exit 0".to_owned()],
+            cwd: None,
+            env: Vec::new(),
+        };
+
+        let error = match CurrentPlatform.spawn_suspended(&caller, &request) {
+            Ok(_) => panic!("another owner must not be launched with our token"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            PlatformError::Unsupported {
+                capability: "spawn_suspended_for_other_user",
+                os: "windows",
+                kind: UnsupportedKind::NotInThisBuild,
+            }
+        ));
+    }
+
+    struct StdoutRestore(windows::Win32::Foundation::HANDLE);
+
+    impl Drop for StdoutRestore {
+        fn drop(&mut self) {
+            // SAFETY: the saved handle came from GetStdHandle and remains owned
+            // by the process; this restores the test process's prior setting.
+            #[allow(unsafe_code)]
+            let _ = unsafe {
+                windows::Win32::System::Console::SetStdHandle(
+                    windows::Win32::System::Console::STD_OUTPUT_HANDLE,
+                    self.0,
+                )
+            };
+        }
+    }
+
+    #[test]
+    #[ignore = "changes the process stdout handle; run on a real Windows host"]
+    fn suspended_child_writes_to_the_explicit_stdout_pipe() {
+        use std::io::Read;
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use std::sync::Mutex;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_OUTPUT_HANDLE};
+        use windows::Win32::System::Pipes::CreatePipe;
+
+        static STDOUT_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = STDOUT_LOCK.lock().expect("stdout test lock");
+        // SAFETY: STD_OUTPUT_HANDLE asks Windows for this process's stdout.
+        #[allow(unsafe_code)]
+        let previous = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }.expect("stdout handle");
+        let mut reader = HANDLE::default();
+        let mut writer = HANDLE::default();
+        // SAFETY: both output pointers are valid writable HANDLE storage.
+        #[allow(unsafe_code)]
+        unsafe { CreatePipe(&mut reader, &mut writer, None, 0) }.expect("stdout pipe");
+        let restore = StdoutRestore(previous);
+        // SAFETY: `writer` remains open until after the child has inherited its
+        // duplicate, and restore's Drop reinstates the prior process stdout.
+        #[allow(unsafe_code)]
+        unsafe { SetStdHandle(STD_OUTPUT_HANDLE, writer) }.expect("redirect stdout");
+
+        let caller = IdentifiedCaller::current_user().expect("current user");
+        let request = SpawnRequest {
+            command: vec!["cmd".to_owned(), "/c".to_owned(), "echo hello".to_owned()],
+            cwd: None,
+            env: Vec::new(),
+        };
+        let held = platform()
+            .spawn_suspended(&caller, &request)
+            .expect("held Windows child");
+        let released = held.release().expect("released child");
+        drop(restore);
+        close(writer);
+        assert_eq!(released.wait().expect("reap child"), ReapOutcome::Exited(0));
+
+        // SAFETY: this test owns `reader` exactly once after CreatePipe.
+        #[allow(unsafe_code)]
+        let owned = unsafe { OwnedHandle::from_raw_handle(reader.0 as *mut _) };
+        let mut output = String::new();
+        let mut file = std::fs::File::from(owned);
+        file.read_to_string(&mut output).expect("read child stdout");
+        assert!(output.contains("hello"));
     }
 }

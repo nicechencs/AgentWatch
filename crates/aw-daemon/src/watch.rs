@@ -15,13 +15,16 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+#[cfg(not(windows))]
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 
 use crate::api::ApiState;
 use crate::sample::{HostSampler, SampleTarget};
 
-use aw_platform::{PlatformError, ReapOutcome, ReleasedChild};
+#[cfg(not(windows))]
+use aw_platform::PlatformError;
+use aw_platform::{ReapOutcome, ReleasedChild};
 
 /// How long `POST /sessions/run` waits for `/adopt`. Same as the orchestrator.
 pub(crate) const ADOPT_TIMEOUT_NS: i64 = 5_000_000_000;
@@ -52,14 +55,17 @@ struct Running {
 
 /// Wrap the daemon's already-launched child in the interface-v2 ownership
 /// type. The watcher only ever reaps this owned handle, never a PID lookup.
+#[cfg(not(windows))]
 pub(crate) fn released_child(child: Child) -> Box<dyn ReleasedChild> {
     Box::new(DaemonReleasedChild { child })
 }
 
+#[cfg(not(windows))]
 struct DaemonReleasedChild {
     child: Child,
 }
 
+#[cfg(not(windows))]
 fn child_outcome(status: std::process::ExitStatus) -> ReapOutcome {
     match status.code() {
         Some(code) => ReapOutcome::Exited(code),
@@ -73,6 +79,7 @@ fn child_outcome(status: std::process::ExitStatus) -> ReapOutcome {
     }
 }
 
+#[cfg(not(windows))]
 impl ReleasedChild for DaemonReleasedChild {
     fn pid(&self) -> u32 {
         self.child.id()

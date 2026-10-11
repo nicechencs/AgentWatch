@@ -110,7 +110,7 @@ macOS 崩溃兜底用看门狗管道，不用「另起一个小看门狗发 `SIG
 
 能力是一个固定枚举 `Capability`，查询结果三选一：`Available` / `NotInThisBuild` / `NotSupportedOnThisOs`。`aw doctor` 逐项通过这个接口问，不自己猜。两种「还不支持」一律带上 `os` 和 `capability` 返回，绝不静默给空结果：
 
-每个枚举值只有一个稳定英文 `as_str()` 名称，供 JSON 使用；人读的中文名称由 `zh()` 提供。当前名称依次是 `spawn_suspended`（挂起启动）、`spawn_as_caller`（以连接方身份启动）、`process_identity`（进程身份）、`process_table`（进程表）、`peer_identity`（认出连接方）、`secure_data_dir`（数据目录权限）、`exit_code`（退出码）。Linux 的 `spawn_suspended` 仅代表同一后台用户；`spawn_as_caller` 在 `aw-platform` 接入 launch-as 前报告 `NotInThisBuild`。
+每个枚举值只有一个稳定英文 `as_str()` 名称，供 JSON 使用；人读的中文名称由 `zh()` 提供。当前名称依次是 `spawn_suspended`（挂起启动）、`spawn_as_caller`（以连接方身份启动）、`process_identity`（进程身份）、`process_table`（进程表）、`peer_identity`（认出连接方）、`secure_data_dir`（数据目录权限）、`exit_code`（退出码）。Linux 的 `spawn_suspended` 仅代表同一后台用户；Linux 上平台层的 `spawn_suspended` 目前只按后台自身用户启动，App 新建会话的以连接方身份启动仍走既有 daemon `launch_as` 路径，直到按下方搬走清单移入平台层。
 
 - `NotInThisBuild`：界面显示「本版本未接入」
 - `NotSupportedOnThisOs`：界面显示「这个系统不支持」

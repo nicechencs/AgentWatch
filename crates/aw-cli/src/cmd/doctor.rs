@@ -372,7 +372,7 @@ pub(crate) fn report_json(report: &DoctorReport) -> Value {
     let platform_capabilities: Vec<Value> = platform_capabilities()
         .into_iter()
         .map(|(capability, status)| {
-            json!({ "capability": capability.as_str(), "status": capability_text(status) })
+            json!({ "capability": capability.as_str(), "status": capability_status_text(status) })
         })
         .collect();
     json!({
@@ -448,7 +448,7 @@ fn report_text(report: &DoctorReport) -> String {
         out.push_str(&format!(
             "{}  {}\n",
             capability.zh(),
-            capability_text(status)
+            capability_text(capability, status)
         ));
     }
     out
@@ -490,7 +490,18 @@ fn platform_capabilities() -> [(PlatformCapability, CapabilityStatus); 7] {
     ]
 }
 
-const fn capability_text(status: CapabilityStatus) -> &'static str {
+const fn capability_text(capability: PlatformCapability, status: CapabilityStatus) -> &'static str {
+    match (capability, status) {
+        (PlatformCapability::SpawnAsCaller, CapabilityStatus::Available)
+            if cfg!(target_os = "linux") =>
+        {
+            "可用（Linux 上由后台按你的身份启动程序）"
+        }
+        (_, status) => capability_status_text(status),
+    }
+}
+
+const fn capability_status_text(status: CapabilityStatus) -> &'static str {
     match status {
         CapabilityStatus::Available => "可用",
         CapabilityStatus::NotInThisBuild => "本版本未接入",
@@ -666,6 +677,17 @@ mod tests {
             .collect();
         assert!(names.contains(&"spawn_suspended"), "{names:?}");
         assert!(names.contains(&"spawn_as_caller"), "{names:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_spawn_as_caller_uses_the_launch_as_doctor_wording() {
+        let text = super::report_text(&Fixed.report());
+        assert!(
+            text.contains("以连接方身份启动  可用（Linux 上由后台按你的身份启动程序）"),
+            "{text}"
+        );
+        assert!(!text.contains("spawn_suspended"), "{text}");
     }
 
     #[test]

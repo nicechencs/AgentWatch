@@ -367,13 +367,12 @@ impl Platform for CurrentPlatform {
     fn capability(&self, capability: Capability) -> CapabilityStatus {
         match capability {
             Capability::SpawnSuspended
+            | Capability::SpawnAsCaller
             | Capability::ProcessIdentity
             | Capability::ProcessTable
             | Capability::PeerIdentity
             | Capability::ExitCode => CapabilityStatus::Available,
-            Capability::SpawnAsCaller | Capability::SecureDataDir => {
-                CapabilityStatus::NotInThisBuild
-            }
+            Capability::SecureDataDir => CapabilityStatus::NotInThisBuild,
         }
     }
     fn spawn_suspended(

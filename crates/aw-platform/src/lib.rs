@@ -325,8 +325,18 @@ mod tests {
     #[test]
     fn capability_names_are_stable() {
         assert_eq!(Capability::SpawnSuspended.as_str(), "spawn_suspended");
+        assert_eq!(Capability::SpawnAsCaller.as_str(), "spawn_as_caller");
         assert_eq!(Capability::SpawnAsCaller.zh(), "以连接方身份启动");
         assert_eq!(Capability::ExitCode.zh(), "退出码");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reports_spawn_as_caller_available() {
+        assert_eq!(
+            platform().capability(Capability::SpawnAsCaller),
+            CapabilityStatus::Available
+        );
     }
 
     #[cfg(unix)]

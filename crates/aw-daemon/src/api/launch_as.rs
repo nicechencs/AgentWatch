@@ -390,28 +390,41 @@ fn root_gid_regained(primary_gid: u32, setgid_succeeded: bool) -> bool {
     primary_gid != 0 && setgid_succeeded
 }
 
-/// macOS (root daemon): std's `uid`/`gid` (std clears supplementary groups),
-/// clean environment, `cwd` entered after the switch.
-#[cfg(all(unix, not(target_os = "linux")))]
+/// macOS (root daemon): `aw-platform` spawns a suspended gate that switches
+/// with `initgroups` / `setgid` / `setuid`, checks the switch stuck and that
+/// `setuid(0)` now fails, then execs the program. A failed switch exits 125 and
+/// the program never runs as root. The platform owns the child; this returns
+/// its pid. 【待验证】not run on a real Mac.
+#[cfg(target_os = "macos")]
 pub(crate) fn spawn_as(
     who: &Identity,
     argv: &[String],
     cwd: Option<&str>,
     extra_env: &[(String, String)],
-) -> Result<std::process::Child, SpawnAsError> {
-    use std::os::unix::process::CommandExt;
-    let mut command = std::process::Command::new(&argv[0]);
-    command
-        .args(&argv[1..])
-        .uid(who.uid)
-        .gid(who.gid)
-        .env_clear()
-        .envs(base_env(who, extra_env))
-        .current_dir(cwd.map_or_else(|| who.home.clone(), PathBuf::from))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    command.spawn().map_err(SpawnAsError::Program)
+) -> Result<u32, SpawnAsError> {
+    // `who` came from the OS peer credential, not from the request body.
+    let caller = aw_platform::IdentifiedCaller::from_unix_ids(who.uid, who.gid);
+    let request = aw_platform::SpawnRequest {
+        command: argv.to_vec(),
+        cwd: Some(cwd.map_or_else(|| who.home.clone(), PathBuf::from)),
+        env: base_env(who, extra_env),
+    };
+    let mut held = aw_platform::platform()
+        .spawn_suspended(&caller, &request)
+        .map_err(platform_spawn_error)?;
+    let pid = held.pid();
+    // Release consumes the hold. A failure here aborts through Drop, so the
+    // suspended program does not keep running unmonitored.
+    held.release().map_err(platform_spawn_error)?;
+    Ok(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_spawn_error(error: aw_platform::PlatformError) -> SpawnAsError {
+    match error {
+        aw_platform::PlatformError::Io(inner) => SpawnAsError::Program(inner),
+        other => SpawnAsError::Drop(other.to_string()),
+    }
 }
 
 /// After spawn: real, effective, saved and filesystem uid/gid of `pid` are all

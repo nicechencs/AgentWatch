@@ -355,39 +355,56 @@ fn create_inner(
                         .collect()
                 })
                 .unwrap_or_default();
+            let drop_failed = |uid: u32, step: &str| {
+                tracing::error!(uid, step, "account switch failed");
+                error_response(
+                    500,
+                    "drop_failed",
+                    "the program did not switch to the caller's account and was stopped",
+                )
+            };
+            // macOS: `aw-platform` owns the child and returns only its pid. The
+            // gate switches accounts before exec and exits 125 if it cannot, so
+            // there is no handle here to kill afterwards.
+            #[cfg(target_os = "macos")]
+            let (pid, child) = match &who {
+                Some(who) => {
+                    let pid = super::launch_as::spawn_as(who, &argv, cwd.as_deref(), &env)
+                        .map_err(|err| match err {
+                            super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
+                            super::launch_as::SpawnAsError::Drop(step) => {
+                                drop_failed(who.uid, &step)
+                            }
+                        })?;
+                    (pid, None)
+                }
+                None => {
+                    let child = spawn_as_self(&argv, cwd.as_deref(), &env)?;
+                    (child.id(), Some(child))
+                }
+            };
+            #[cfg(not(target_os = "macos"))]
             #[allow(unused_mut)]
-            let mut child = match &who {
+            let (pid, mut child) = match &who {
                 #[cfg(unix)]
-                Some(who) => super::launch_as::spawn_as(who, &argv, cwd.as_deref(), &env)
-                    .map_err(|err| match err {
-                        super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
-                        super::launch_as::SpawnAsError::Drop(step) => {
-                            tracing::error!(uid = who.uid, step, "account switch failed");
-                            error_response(
-                                500,
-                                "drop_failed",
-                                "the program did not switch to the caller's account and was stopped",
-                            )
-                        }
-                    })?,
+                Some(who) => {
+                    let child = super::launch_as::spawn_as(who, &argv, cwd.as_deref(), &env)
+                        .map_err(|err| match err {
+                            super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
+                            super::launch_as::SpawnAsError::Drop(step) => {
+                                drop_failed(who.uid, &step)
+                            }
+                        })?;
+                    (child.id(), child)
+                }
                 // No account switch here: never start it as the service account.
                 #[cfg(not(unix))]
                 Some(_) => return Err(super::launch_as::no_account_switch()),
                 None => {
-                    let mut command = std::process::Command::new(&argv[0]);
-                    command
-                        .args(&argv[1..])
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null());
-                    if let Some(cwd) = &cwd {
-                        command.current_dir(cwd);
-                    }
-                    command.envs(env.iter().map(|(k, v)| (k, v)));
-                    command.spawn().map_err(|err| spawn_error(&err))?
+                    let child = spawn_as_self(&argv, cwd.as_deref(), &env)?;
+                    (child.id(), child)
                 }
             };
-            let pid = child.id();
             #[cfg(target_os = "linux")]
             if let Some(who) = &who {
                 if !super::launch_as::verify_dropped(pid, who) {
@@ -412,6 +429,11 @@ fn create_inner(
             let response = created(&target, json!({}));
             state.watch_requests.push(WatchRequest::Start {
                 target: Box::new(target),
+                // macOS `spawn_as` returns a pid: the platform already released
+                // and owns the reap. The sampler notices the exit.
+                #[cfg(target_os = "macos")]
+                child: child.map(crate::watch::released_child),
+                #[cfg(not(target_os = "macos"))]
                 child: Some(crate::watch::released_child(child)),
             });
             Ok(response)
@@ -422,6 +444,26 @@ fn create_inner(
             "mode: expected \"attach\" or \"launch\"",
         )),
     }
+}
+
+/// Start `argv` as the daemon's own account. Used only when the caller is that
+/// same account, so there is nothing to switch.
+fn spawn_as_self(
+    argv: &[String],
+    cwd: Option<&str>,
+    env: &[(String, String)],
+) -> Result<std::process::Child, ApiResponse> {
+    let mut command = std::process::Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command.envs(env.iter().map(|(k, v)| (k, v)));
+    command.spawn().map_err(|err| spawn_error(&err))
 }
 
 /// `POST /sessions/run`: record the session and hand back an adopt ticket.

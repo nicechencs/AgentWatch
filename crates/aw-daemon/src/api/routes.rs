@@ -2335,6 +2335,7 @@ fn doctor(state: &ApiState) -> ApiResponse {
             "capabilities": crate::collector_state::doctor_capabilities(&caps),
             "host": {
                 "os": std::env::consts::OS,
+                "version": aw_platform::os_version(),
                 "privileged": crate::privilege::current(),
                 "privileged_note": "poll collector only in this build; eBPF, ETW, and eslogger are not attached even when privileged",
             },

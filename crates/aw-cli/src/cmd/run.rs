@@ -506,13 +506,83 @@ fn keep_gate_read_fd_for_child(command: &mut Command, read_fd: OwnedFd) {
     }
 }
 
-#[cfg(unix)]
+/// macOS `aw run` child. `aw-platform` starts it with
+/// `POSIX_SPAWN_START_SUSPENDED` and holds the watchdog pipe, so this CLI is
+/// the creator: dropping the hold before `release` kills the program. After
+/// `release` the returned handle reaps only this child. 【待验证】not run on a
+/// real Mac.
+#[cfg(target_os = "macos")]
+struct PlatformChild {
+    held: Option<Box<dyn aw_platform::HeldChild>>,
+    released: Option<Box<dyn aw_platform::ReleasedChild>>,
+}
+
+#[cfg(target_os = "macos")]
+impl PlatformChild {
+    fn fail(error: &aw_platform::PlatformError) -> String {
+        match error {
+            aw_platform::PlatformError::Io(inner) => spawn_error_text(inner),
+            other => format!("无法启动程序（spawn_failed，{other}）"),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl SpawnedChild for PlatformChild {
+    fn pid(&self) -> u32 {
+        self.held
+            .as_ref()
+            .map(|child| child.pid())
+            .or_else(|| self.released.as_ref().map(|child| child.pid()))
+            .unwrap_or(0)
+    }
+
+    fn wait(&mut self) -> Result<i32, String> {
+        let Some(child) = self.released.take() else {
+            return Err("程序还被挂住，不能等待它结束".to_owned());
+        };
+        match child.wait() {
+            Ok(aw_platform::ReapOutcome::Exited(code)) => Ok(code),
+            // A signal death has no exit code. That is not success.
+            Ok(aw_platform::ReapOutcome::Signaled(_)) => Ok(exit::GENERAL),
+            Ok(aw_platform::ReapOutcome::StillRunning) => {
+                Err("等待结束，但程序仍在运行".to_owned())
+            }
+            Err(aw_platform::PlatformError::Io(error)) => Err(wait_error_text(&error)),
+            Err(error) => Err(format!("等待程序结束失败（{error}）")),
+        }
+    }
+
+    fn release(&mut self) -> Result<(), String> {
+        let Some(held) = self.held.take() else {
+            return Ok(());
+        };
+        match held.release() {
+            Ok(released) => {
+                self.released = Some(released);
+                Ok(())
+            }
+            Err(error) => Err(Self::fail(&error)),
+        }
+    }
+
+    fn kill_and_reap(&mut self) {
+        if let Some(mut held) = self.held.take() {
+            let _ = held.abort();
+        }
+        if let Some(mut released) = self.released.take() {
+            let _ = released.try_reap();
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 struct GatedChild {
     child: Child,
     release_fd: Option<OwnedFd>,
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 impl SpawnedChild for GatedChild {
     fn pid(&self) -> u32 {
         self.child.id()
@@ -556,7 +626,24 @@ impl Spawner for CommandSpawner {
         let Some((program, args)) = spec.command.split_first() else {
             return Err("程序名为空".to_owned());
         };
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
+        {
+            let caller = aw_platform::IdentifiedCaller::current_user()
+                .map_err(|error| format!("无法确认当前用户（spawn_failed，{error}）"))?;
+            let request = aw_platform::SpawnRequest {
+                command: spec.command.clone(),
+                cwd: spec.cwd.clone().map(std::path::PathBuf::from),
+                env: spec.env.clone(),
+            };
+            let held = aw_platform::platform()
+                .spawn_suspended(&caller, &request)
+                .map_err(|error| PlatformChild::fail(&error))?;
+            Ok(Box::new(PlatformChild {
+                held: Some(held),
+                released: None,
+            }))
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             // The gate shell's own `exec` would report a missing program in
             // English (`exec: not found`) after the session was adopted. Resolve
@@ -866,10 +953,10 @@ impl Launcher for PlatformLauncher {
 
 /// macOS production launcher.
 ///
-/// [`launch::production`] spawns the child with `Command`. Suspension is not
-/// applied: `POSIX_SPAWN_START_SUSPENDED` is not available without `unsafe` or
-/// an extra crate. The returned note says so. This is not E1 scope, and
-/// grandchild tracking is left to the collector.
+/// `aw-platform` starts the child with `POSIX_SPAWN_START_SUSPENDED` as the
+/// current user and releases it here. `--no-daemon` waits for it; there is no
+/// daemon to adopt. 【待验证】not run on a real Mac. Grandchild tracking is
+/// left to the collector.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 pub(crate) struct PlatformLauncher;
@@ -877,18 +964,21 @@ pub(crate) struct PlatformLauncher;
 #[cfg(target_os = "macos")]
 impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
-        let mut api = launch::production();
-        let (code, pid, note, sampling) =
-            launch::launch_command(&mut api, spec.command.clone(), spec.no_daemon).map_err(
-                |err| LaunchDispatchError::NotImplemented {
-                    detail: err.to_string(),
-                },
-            )?;
+        let mut child = CommandSpawner
+            .spawn(spec)
+            .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
+        let pid = child.pid();
+        child
+            .release()
+            .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
+        let code = child
+            .wait()
+            .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
         Ok(Launched {
             code,
             pid,
-            note,
-            sampling,
+            note: None,
+            sampling: spec.no_daemon,
         })
     }
 

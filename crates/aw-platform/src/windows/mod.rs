@@ -66,3 +66,8 @@ impl Platform for CurrentPlatform {
         Err(no("current_owner"))
     }
 }
+
+/// Not read in this build. The caller prints 「不可得」.
+pub fn os_version() -> Option<String> {
+    None
+}

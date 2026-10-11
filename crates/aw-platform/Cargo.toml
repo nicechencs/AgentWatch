@@ -16,9 +16,22 @@ aw-collector-linux = { path = "../aw-collector-linux" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 aw-collector-macos = { path = "../aw-collector-macos" }
+# libc 0.2.189 is already in Cargo.lock (via sysinfo). Pinned so `--locked`
+# resolves it. Used for proc_pidinfo / proc_listallpids / posix_spawn FFI.
+libc = "=0.2.189"
+# getpeereid and LOCAL_PEERPID. `user` + `socket` are the features aw-daemon
+# already enables; no new crate version.
+nix = { version = "0.30", default-features = false, features = ["user", "socket"] }
 
 [target.'cfg(windows)'.dependencies]
 aw-collector-windows = { path = "../aw-collector-windows" }
 
-[lints]
-workspace = true
+# Not `workspace = true`. Inheriting the workspace table forces
+# `--forbid=unsafe_code` on the rustc command line, and a command-line forbid
+# cannot be relaxed by `#![deny]` / `#[allow]` (rust-lang/cargo#13157). The
+# workspace lint table is unchanged. This crate restates the clippy lints and
+# leaves `unsafe_code` to the crate-level `#![deny]` in `src/lib.rs`, which the
+# macOS FFI module opts out of. Same approach as aw-collector-windows.
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

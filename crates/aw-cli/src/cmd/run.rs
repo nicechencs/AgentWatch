@@ -4,9 +4,8 @@
 //! [`Launcher`], then prints a session summary. The default daemon path first
 //! records `/sessions/run`, starts the child held (at a Unix pipe gate or with
 //! Windows `CREATE_SUSPENDED`), and hands it over through `/adopt` before
-//! releasing it. On Windows the local `--no-daemon` production launcher is
-//! [`launch::production`]: Job assignment is unavailable, so no process is
-//! created. On macOS it spawns with `Command` and says suspension was not
+//! releasing it. On Windows `aw-platform` owns the suspended Job and process
+//! handles; release returns the sole reap handle. On macOS it spawns with `Command` and says suspension was not
 //! applied. On Linux [`launch::LocalCgroupHost`] places the child in a delegated
 //! cgroup v2 directory, or returns an error and starts nothing. Tests pass a
 //! fake and assert the target's exit code comes back unchanged.
@@ -31,10 +30,13 @@ use std::io::{self, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(target_os = "macos")]
 use std::os::unix::process::CommandExt;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 use std::process::{Child, Command};
+
+#[cfg(any(target_os = "linux", windows))]
+use aw_platform::{
+    platform, HeldChild, IdentifiedCaller, PlatformError, ReapOutcome, ReleasedChild, SpawnRequest,
+};
 
 #[cfg(target_os = "macos")]
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
@@ -43,10 +45,6 @@ use nix::unistd::pipe;
 #[cfg(target_os = "macos")]
 use nix::unistd::write;
 
-#[cfg(target_os = "linux")]
-use aw_platform::{
-    platform, HeldChild, IdentifiedCaller, PlatformError, ReleasedChild, SpawnRequest,
-};
 use aw_proxy::{plan_injection, Injection, ProxyOnReject};
 
 use serde_json::{json, Value};
@@ -296,6 +294,7 @@ pub(crate) fn spawn_error_text(error: &std::io::Error) -> String {
 }
 
 /// Plain Chinese sentence when waiting for the started program failed.
+#[cfg(any(not(windows), test))]
 pub(crate) fn wait_error_text(error: &std::io::Error) -> String {
     format!("等待程序结束失败（{}）", os_code(error))
 }
@@ -310,14 +309,12 @@ fn os_code(error: &std::io::Error) -> String {
 #[derive(Debug, Default)]
 pub(crate) struct CommandSpawner;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 struct ProcessChild {
     child: Child,
-    #[cfg(windows)]
-    suspended: bool,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl SpawnedChild for ProcessChild {
     fn pid(&self) -> u32 {
         self.child.id()
@@ -331,117 +328,12 @@ impl SpawnedChild for ProcessChild {
     }
 
     fn release(&mut self) -> Result<(), String> {
-        #[cfg(windows)]
-        {
-            if !self.suspended {
-                return Ok(());
-            }
-            windows_release::resume_primary_thread(self.child.id())
-                .map_err(|code| format!("无法放行被挂起的程序（系统错误码 {code}）"))?;
-            // Only clear this after ResumeThread succeeds, so repeated calls
-            // are harmless and never raise the thread's suspend count again.
-            self.suspended = false;
-        }
         Ok(())
     }
 
     fn kill_and_reap(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-    }
-}
-
-/// Windows-specific FFI for releasing exactly one `CREATE_SUSPENDED` child.
-///
-/// `std::process::Child` exposes the PID but not the primary-thread handle, so
-/// locate that thread in a Toolhelp snapshot. A just-created suspended process
-/// has not executed target code, therefore its sole process-owned thread is
-/// the primary thread to resume.
-#[cfg(windows)]
-#[allow(unsafe_code)]
-mod windows_release {
-    use std::mem::size_of;
-
-    use windows::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_NOT_FOUND, ERROR_NO_MORE_FILES, HANDLE,
-    };
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-    };
-    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
-
-    /// Resume the single primary thread which `CREATE_SUSPENDED` stopped.
-    ///
-    /// The returned number is a Win32 system error code suitable for the
-    /// user-facing Chinese error at the caller.
-    pub(super) fn resume_primary_thread(pid: u32) -> Result<(), u32> {
-        // SAFETY: the requested snapshot flag and PID are plain values; the
-        // returned handle is closed exactly once below on every result path.
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
-            .map_err(|error| error_code(&error))?;
-        let result = resume_from_snapshot(snapshot, pid);
-        close_handle(snapshot);
-        result
-    }
-
-    fn resume_from_snapshot(snapshot: HANDLE, pid: u32) -> Result<(), u32> {
-        let mut entry = THREADENTRY32 {
-            dwSize: size_of::<THREADENTRY32>() as u32,
-            ..THREADENTRY32::default()
-        };
-        // SAFETY: `entry` is initialized with the ABI-required `dwSize` and
-        // remains valid for the synchronous Toolhelp call.
-        unsafe { Thread32First(snapshot, &mut entry) }.map_err(|error| error_code(&error))?;
-
-        loop {
-            if entry.th32OwnerProcessID == pid {
-                return resume_thread(entry.th32ThreadID);
-            }
-
-            entry.dwSize = size_of::<THREADENTRY32>() as u32;
-            // SAFETY: as above, `snapshot` remains open and `entry` points to
-            // writable initialized storage with the ABI-required size.
-            match unsafe { Thread32Next(snapshot, &mut entry) } {
-                Ok(()) => {}
-                Err(error) if error_code(&error) == ERROR_NO_MORE_FILES.0 => {
-                    return Err(ERROR_NOT_FOUND.0);
-                }
-                Err(error) => return Err(error_code(&error)),
-            }
-        }
-    }
-
-    fn resume_thread(thread_id: u32) -> Result<(), u32> {
-        // SAFETY: `thread_id` came from the current Toolhelp snapshot. The
-        // returned handle is closed exactly once before this function returns.
-        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, thread_id) }
-            .map_err(|error| error_code(&error))?;
-        // SAFETY: `thread` is a valid handle opened with THREAD_SUSPEND_RESUME.
-        let prior_suspend_count = unsafe { ResumeThread(thread) };
-        // ResumeThread reports failure only with u32::MAX. Read the thread's
-        // last-error value before CloseHandle can alter it.
-        let resume_error = (prior_suspend_count == u32::MAX).then(last_error);
-        close_handle(thread);
-        resume_error.map_or(Ok(()), Err)
-    }
-
-    fn error_code(error: &windows::core::Error) -> u32 {
-        // Win32 APIs above create HRESULT_FROM_WIN32 values. Their low word is
-        // the original system error code shown to the user.
-        error.code().0 as u32 & 0xffff
-    }
-
-    fn last_error() -> u32 {
-        // SAFETY: GetLastError reads the calling thread's error state only.
-        unsafe { GetLastError().0 }
-    }
-
-    fn close_handle(handle: HANDLE) {
-        // SAFETY: every caller passes one handle returned by the corresponding
-        // successful Win32 open/create call, and calls this helper once.
-        let _ = unsafe { CloseHandle(handle) };
-        // A close failure cannot reverse a successful ResumeThread. Retrying
-        // `release` to report it would resume the target more than once.
     }
 }
 
@@ -545,16 +437,16 @@ impl SpawnedChild for GatedChild {
     }
 }
 
-/// Linux's held child is owned by `aw-platform`.  This thin CLI adapter only
+/// Linux and Windows held children are owned by `aw-platform`. This thin CLI adapter only
 /// translates the pre-existing `Spawner` state machine to its ownership API;
 /// it deliberately does not contain a second pipe gate implementation.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 struct PlatformGatedChild {
     held: Option<Box<dyn HeldChild>>,
     released: Option<Box<dyn ReleasedChild>>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 impl SpawnedChild for PlatformGatedChild {
     fn pid(&self) -> u32 {
         self.held
@@ -570,10 +462,8 @@ impl SpawnedChild for PlatformGatedChild {
             .take()
             .ok_or_else(|| "无法等待尚未放行的程序".to_owned())?;
         match child.wait().map_err(platform_child_error)? {
-            aw_platform::ReapOutcome::Exited(code) => Ok(code),
-            aw_platform::ReapOutcome::Signaled(_) | aw_platform::ReapOutcome::StillRunning => {
-                Ok(exit::GENERAL)
-            }
+            ReapOutcome::Exited(code) => Ok(code),
+            ReapOutcome::Signaled(_) | ReapOutcome::StillRunning => Ok(exit::GENERAL),
         }
     }
 
@@ -593,7 +483,7 @@ impl SpawnedChild for PlatformGatedChild {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 fn platform_child_error(error: PlatformError) -> String {
     match error {
         PlatformError::Io(error) => spawn_error_text(&error),
@@ -603,11 +493,11 @@ fn platform_child_error(error: PlatformError) -> String {
 
 impl Spawner for CommandSpawner {
     fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, String> {
-        let Some((program, args)) = spec.command.split_first() else {
-            return Err("程序名为空".to_owned());
-        };
         #[cfg(target_os = "linux")]
         {
+            let Some((program, args)) = spec.command.split_first() else {
+                return Err("程序名为空".to_owned());
+            };
             // Keep the pre-flight lookup: the gate shell would otherwise emit
             // an English error only after the daemon had adopted the session.
             let path_env = spec
@@ -637,6 +527,9 @@ impl Spawner for CommandSpawner {
         }
         #[cfg(target_os = "macos")]
         {
+            let Some((program, args)) = spec.command.split_first() else {
+                return Err("程序名为空".to_owned());
+            };
             // The gate shell's own `exec` would report a missing program in
             // English (`exec: not found`) after the session was adopted. Resolve
             // it here, the way exec would, and fail with the Chinese message
@@ -667,22 +560,33 @@ impl Spawner for CommandSpawner {
                 release_fd: Some(write_fd),
             }))
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
         {
+            let caller = IdentifiedCaller::current_user().map_err(platform_child_error)?;
+            let request = SpawnRequest {
+                command: spec.command.clone(),
+                cwd: spec.cwd.as_ref().map(Into::into),
+                env: spec.env.clone(),
+            };
+            let held = platform()
+                .spawn_suspended(&caller, &request)
+                .map_err(platform_child_error)?;
+            Ok(Box::new(PlatformGatedChild {
+                held: Some(held),
+                released: None,
+            }))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let Some((program, args)) = spec.command.split_first() else {
+                return Err("程序名为空".to_owned());
+            };
             let mut command = Command::new(program);
             command.args(args);
             configure_command(&mut command, spec);
-            #[cfg(windows)]
-            command.creation_flags(0x0000_0004); // CREATE_SUSPENDED
             command
                 .spawn()
-                .map(|child| {
-                    Box::new(ProcessChild {
-                        child,
-                        #[cfg(windows)]
-                        suspended: true,
-                    }) as Box<dyn SpawnedChild>
-                })
+                .map(|child| Box::new(ProcessChild { child }) as Box<dyn SpawnedChild>)
                 .map_err(|error| spawn_error_text(&error))
         }
     }
@@ -745,7 +649,7 @@ pub(crate) fn resolve_program(
     }))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 fn configure_command(command: &mut Command, spec: &RunSpec) {
     if let Some(cwd) = spec.cwd.as_deref() {
         command.current_dir(cwd);
@@ -760,13 +664,8 @@ fn nix_spawn_error_text(error: nix::errno::Errno) -> String {
     spawn_error_text(&std::io::Error::from_raw_os_error(error as i32))
 }
 
-/// Windows production launcher.
-///
-/// Uses [`launch::production`]. Job assignment is unavailable in this crate
-/// (`forbid(unsafe_code)`, no `windows` dependency), so no process is created.
-/// The error is [`crate::launch::LaunchError::JobFailed`] and does not claim a
-/// Job. A real suspended `CreateProcess` needs the `windows` crate, which is
-/// out of scope for `aw-cli`.
+/// Windows production launcher. `aw-platform` holds the target in a Job until
+/// release and returns the owning reap handle after release.
 #[cfg(target_os = "windows")]
 #[derive(Debug, Default)]
 pub(crate) struct PlatformLauncher;
@@ -774,16 +673,46 @@ pub(crate) struct PlatformLauncher;
 #[cfg(target_os = "windows")]
 impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
-        let mut api = launch::production();
-        launch::dispatch_windows(&mut api, spec)
+        let caller =
+            IdentifiedCaller::current_user().map_err(|error| LaunchDispatchError::Platform {
+                detail: error.to_string(),
+            })?;
+        let request = SpawnRequest {
+            command: spec.command.clone(),
+            cwd: spec.cwd.as_ref().map(Into::into),
+            env: spec.env.clone(),
+        };
+        let held = platform()
+            .spawn_suspended(&caller, &request)
+            .map_err(|error| LaunchDispatchError::Platform {
+                detail: error.to_string(),
+            })?;
+        let pid = held.pid();
+        let released = held
+            .release()
+            .map_err(|error| LaunchDispatchError::Platform {
+                detail: error.to_string(),
+            })?;
+        let code = match released
+            .wait()
+            .map_err(|error| LaunchDispatchError::Platform {
+                detail: error.to_string(),
+            })? {
+            ReapOutcome::Exited(code) => code,
+            ReapOutcome::Signaled(_) | ReapOutcome::StillRunning => exit::GENERAL,
+        };
+        Ok(Launched {
+            code,
+            pid,
+            note: None,
+            sampling: spec.no_daemon,
+        })
     }
 
     fn forward_interrupt(&mut self, _pid: u32) -> Result<(), LaunchDispatchError> {
-        Err(LaunchDispatchError::Windows(
-            crate::launch::LaunchError::NotVerified {
-                step: "GenerateConsoleCtrlEvent",
-            },
-        ))
+        Err(LaunchDispatchError::NotImplemented {
+            detail: "中断转发不可用；Windows 启动器未创建控制台进程组".to_owned(),
+        })
     }
 }
 
@@ -1452,13 +1381,11 @@ fn split_env(raw: &[String]) -> Result<Vec<(String, String)>, String> {
     Ok(pairs)
 }
 
-fn mentions_daemon(err: &LaunchDispatchError) -> bool {
-    matches!(
-        err,
-        LaunchDispatchError::Windows(crate::launch::LaunchError::AdoptTimeout)
-            | LaunchDispatchError::Windows(crate::launch::LaunchError::AdoptFailed { .. })
-            | LaunchDispatchError::Windows(crate::launch::LaunchError::HandleHandoffFailed { .. })
-    )
+fn mentions_daemon(_: &LaunchDispatchError) -> bool {
+    // The Windows Job launch no longer performs the retired local
+    // handoff/adopt state machine. Daemon-path errors arrive through
+    // `daemon_run`, not through this local launcher.
+    false
 }
 
 fn write_summary(
@@ -1655,6 +1582,9 @@ mod tests {
     };
     use crate::exit;
     use crate::launch::{LaunchDispatchError, Launched, RunSpec, UnixLauncher};
+
+    #[cfg(windows)]
+    use super::{Launcher, PlatformLauncher};
 
     struct FakeLaunch {
         code: i32,
@@ -2782,6 +2712,15 @@ mod tests {
         assert_eq!(outcome.code, 7);
         assert!(sessions.seen_begin.is_none());
         assert!(sessions.stops.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_no_daemon_releases_the_held_child_and_keeps_exit_7() {
+        let spec = RunSpec::new(vec!["cmd".to_owned(), "/c".to_owned(), "exit 7".to_owned()])
+            .expect("spec");
+        let launched = PlatformLauncher.launch(&spec).expect("Windows launch");
+        assert_eq!(launched.code, 7);
     }
 
     fn sample_summary() -> Summary {

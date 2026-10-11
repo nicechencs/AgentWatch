@@ -1,8 +1,7 @@
 //! Platform launchers for `aw run` (P1-WIN-04, P1-CLI-02).
 //!
-//! Windows calls [`windows::run_launch`]. Production on Windows is
-//! [`windows::production`]: Job assignment is unavailable in this crate, so no
-//! process is created. macOS uses [`unix_macos`] (cfg-gated); that launcher
+//! Windows launch lives in `aw-platform`, so this crate has no Win32 FFI.
+//! macOS uses [`unix_macos`] (cfg-gated); that launcher
 //! spawns with `Command` and does not claim suspension. Linux production uses
 //! [`unix_linux::LocalCgroupHost`] (cfg-gated): a delegated cgroup v2 directory,
 //! or a structured error and no child. [`UnsupportedUnixLauncher`] remains the
@@ -10,11 +9,6 @@
 //!
 //! Ctrl-C forwarding lives on the launcher trait (`forward_interrupt`). Tests
 //! pass a fake and never send a real signal.
-
-// The state machine's public items are the contract for later cards. Not every
-// variant is constructed by this binary yet; that is not a dead-code defect.
-#[allow(dead_code)]
-mod windows;
 
 // P1-MAC-03. macOS `aw run` needs [`unix_macos::production`], which does not
 // exist on other targets, so the module is cfg-gated to macOS. Linux is the
@@ -31,18 +25,6 @@ mod unix_macos;
 #[allow(dead_code)]
 #[path = "unix_linux.rs"]
 mod unix_linux;
-
-#[allow(unused_imports)]
-pub use windows::{
-    run_launch, JobApi, LaunchError, LaunchRequest, LaunchStep, SessionAnnotation, TargetExit,
-    ADOPT_TIMEOUT, BREAKAWAY_INCOMPLETE_NOTE,
-};
-
-/// Present only on Windows. [`windows::production`] is the `Command` launcher.
-/// Job assignment is unavailable; see that function.
-#[cfg(target_os = "windows")]
-#[allow(unused_imports)]
-pub use windows::production;
 
 /// Present only on macOS. [`unix_macos::production`] spawns with `Command` and
 /// records that suspension was not applied. It does not claim E1 scope.
@@ -88,10 +70,12 @@ impl RunSpec {
     ///
     /// # Errors
     ///
-    /// [`LaunchError::EmptyCommand`] when `command` is empty.
-    pub fn new(command: Vec<String>) -> Result<Self, LaunchError> {
+    /// [`LaunchDispatchError::Invalid`] when `command` is empty.
+    pub fn new(command: Vec<String>) -> Result<Self, LaunchDispatchError> {
         if command.is_empty() {
-            return Err(LaunchError::EmptyCommand);
+            return Err(LaunchDispatchError::Invalid {
+                detail: "启动命令为空".to_owned(),
+            });
         }
         Ok(Self {
             command,
@@ -108,8 +92,10 @@ impl RunSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum LaunchDispatchError {
-    /// The Windows state machine stopped before the target finished.
-    Windows(LaunchError),
+    /// The platform launcher stopped before the target finished.
+    Platform { detail: String },
+    /// The supplied run request is invalid before a launcher is called.
+    Invalid { detail: String },
     /// This target has no launcher yet. Named so the message can say which card.
     NotImplemented { detail: String },
 }
@@ -117,7 +103,7 @@ pub enum LaunchDispatchError {
 impl std::fmt::Display for LaunchDispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Windows(err) => write!(f, "{err}"),
+            Self::Platform { detail } | Self::Invalid { detail } => write!(f, "{detail}"),
             Self::NotImplemented { detail } => write!(f, "{detail}"),
         }
     }
@@ -199,37 +185,9 @@ impl UnixLauncher for UnsupportedUnixLauncher {
     }
 }
 
-/// Run `spec` on Windows through [`run_launch`].
-///
-/// Uses `api` for every Win32 step. The production caller passes
-/// [`windows::production`], which refuses before `CreateProcess` because Job
-/// assignment is unavailable. [`windows::UnverifiedJobApi`] remains the test stub.
-/// The target identity is always [`windows::LaunchIdentity::CallingUser`].
-///
-/// # Errors
-///
-/// [`LaunchDispatchError::Windows`] when the state machine stops.
-#[cfg(target_os = "windows")]
-pub fn dispatch_windows<A: JobApi>(
-    api: &mut A,
-    spec: &RunSpec,
-) -> Result<Launched, LaunchDispatchError> {
-    let mut request =
-        LaunchRequest::new(spec.command.clone()).map_err(LaunchDispatchError::Windows)?;
-    request.allow_breakaway = spec.allow_breakaway;
-    let finished = run_launch(api, &request).map_err(LaunchDispatchError::Windows)?;
-    Ok(Launched {
-        code: finished.code,
-        pid: finished.pid,
-        note: finished.annotation.map(|item| item.note),
-        sampling: spec.no_daemon,
-    })
-}
-
 /// Hand `spec` to a [`UnixLauncher`].
 ///
-/// On Windows `aw run` does not call this: it calls [`dispatch_windows`]. The
-/// function stays available on every target so the trait contract can be tested
+/// The function stays available on every target so the trait contract can be tested
 /// without a Unix host. P1-LNX-04 and P1-MAC-03 supply the production impl.
 ///
 /// # Errors
@@ -251,9 +209,6 @@ mod dispatch_tests {
         dispatch_unix, LaunchDispatchError, Launched, RunSpec, UnixLauncher,
         UnsupportedUnixLauncher,
     };
-
-    #[cfg(target_os = "windows")]
-    use super::dispatch_windows;
 
     struct FakeUnix {
         code: i32,
@@ -307,64 +262,5 @@ mod dispatch_tests {
         fake.forward_interrupt(launched.pid).expect("forward");
         assert_eq!(fake.forwarded, vec![7]);
         assert_eq!(fake.saw_breakaway, Some(false));
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_dispatch_uses_the_calling_user_and_keeps_exit_7() {
-        use super::windows::{AdoptWait, JobApi, LaunchIdentity, LaunchStep};
-
-        struct FakeJob {
-            steps: Vec<LaunchStep>,
-        }
-
-        impl JobApi for FakeJob {
-            fn create_suspended(
-                &mut self,
-                request: &super::LaunchRequest,
-            ) -> Result<u32, super::LaunchError> {
-                assert_eq!(request.identity, LaunchIdentity::CallingUser);
-                self.steps.push(LaunchStep::CreateSuspended);
-                Ok(11)
-            }
-
-            fn create_job_and_assign(
-                &mut self,
-                _pid: u32,
-                allow_breakaway: bool,
-            ) -> Result<(), super::LaunchError> {
-                assert!(!allow_breakaway);
-                self.steps.push(LaunchStep::CreateJob);
-                self.steps.push(LaunchStep::AssignToJob);
-                Ok(())
-            }
-
-            fn handoff_and_adopt(&mut self, _pid: u32) -> Result<AdoptWait, super::LaunchError> {
-                self.steps.push(LaunchStep::HandOffHandle);
-                self.steps.push(LaunchStep::Adopt);
-                Ok(AdoptWait::Adopted)
-            }
-
-            fn resume(&mut self, _pid: u32) -> Result<(), super::LaunchError> {
-                self.steps.push(LaunchStep::ResumeThread);
-                Ok(())
-            }
-
-            fn terminate(&mut self, _pid: u32) -> Result<(), super::LaunchError> {
-                self.steps.push(LaunchStep::Terminate);
-                Ok(())
-            }
-
-            fn wait_exit(&mut self, _pid: u32) -> Result<i32, super::LaunchError> {
-                Ok(7)
-            }
-        }
-
-        let spec =
-            RunSpec::new(vec!["cmd".to_owned(), "/c".to_owned(), "exit".to_owned()]).expect("spec");
-        let mut api = FakeJob { steps: Vec::new() };
-        let launched = dispatch_windows(&mut api, &spec).expect("windows");
-        assert_eq!(launched.code, 7);
-        assert!(!api.steps.contains(&LaunchStep::Terminate));
     }
 }

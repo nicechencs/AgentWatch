@@ -185,6 +185,9 @@ mod imp {
         };
         let mut options = ServerOptions::new();
         options.first_pipe_instance(first);
+        // The API is local-only.  Do not allow a remote SMB client to reach an
+        // otherwise valid local DACL.
+        options.reject_remote_clients(true);
         // SAFETY: `attributes` is a valid SECURITY_ATTRIBUTES whose descriptor
         // stays allocated until after this call; the kernel copies it into the
         // pipe object, so freeing it afterwards is allowed.

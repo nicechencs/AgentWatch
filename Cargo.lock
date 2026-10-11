@@ -87,7 +87,6 @@ dependencies = [
  "nix",
  "serde",
  "serde_json",
- "windows 0.57.0",
 ]
 
 [[package]]
@@ -189,6 +188,7 @@ dependencies = [
  "aw-collector-macos",
  "aw-collector-windows",
  "nix",
+ "windows 0.57.0",
 ]
 
 [[package]]

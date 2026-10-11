@@ -22,6 +22,24 @@ aw-collector-macos = { path = "../aw-collector-macos" }
 
 [target.'cfg(windows)'.dependencies]
 aw-collector-windows = { path = "../aw-collector-windows" }
+# The pinned package and these feature flags are already represented in the
+# workspace lockfile.  Keep Win32 FFI at this OS boundary.
+windows = { version = "=0.57.0", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [lints]
-workspace = true
+[lints.rust]
+# The Windows implementation has narrowly-scoped, documented FFI exceptions.
+# `forbid` cannot be relaxed in that child module.
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

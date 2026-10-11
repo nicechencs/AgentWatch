@@ -1,5 +1,7 @@
 //! Explicit operating-system boundary for AgentWatch shared code.
-#![forbid(unsafe_code)]
+// OS modules retain narrowly-scoped, documented FFI exceptions.  Shared code
+// remains unsafe-free.
+#![deny(unsafe_code)]
 
 use std::fmt;
 use std::path::{Path, PathBuf};

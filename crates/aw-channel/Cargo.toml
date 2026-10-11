@@ -17,6 +17,12 @@ description = "Internal-channel client shared by aw and the desktop app: socket/
 [target.'cfg(windows)'.dependencies]
 aw-platform = { path = "../aw-platform" }
 
+[target.'cfg(windows)'.dev-dependencies]
+# Existing workspace crates, used only to create a real same-user named-pipe
+# server for the client-side owner-rule tests.
+aw-collector-windows = { path = "../aw-collector-windows" }
+tokio = { version = "1.24.2", default-features = false, features = ["rt", "net", "time"] }
+
 [lints.rust]
 unsafe_code = "forbid"
 

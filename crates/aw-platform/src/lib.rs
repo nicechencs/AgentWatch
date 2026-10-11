@@ -24,6 +24,22 @@ mod macos;
 // sibling spawn cannot inherit it.
 #[cfg(unix)]
 pub(crate) mod unix;
+
+/// The fixed `PATH` a from-scratch target environment starts with. See
+/// `unix/hold.rs`. Unix only: Windows does not build that environment here.
+#[cfg(unix)]
+pub const fn unix_default_path() -> &'static str {
+    unix::hold::DEFAULT_TARGET_PATH
+}
+
+/// Candidate paths for a program name, built as strings. No filesystem access.
+/// See [`unix::hold::program_candidates`]. Unix only: Windows does not search a
+/// `:`-separated PATH.
+#[cfg(unix)]
+#[must_use]
+pub fn unix_program_candidates(program: &str, search_path: Option<&str>) -> Vec<String> {
+    unix::hold::program_candidates(program, search_path)
+}
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "linux")]
@@ -255,6 +271,28 @@ pub struct SpawnRequest {
     pub command: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
+    /// Where the target's environment comes from.
+    ///
+    /// The privileged daemon path passes [`EnvSource::Exact`]: the child gets
+    /// exactly `env` and nothing of this process. `aw run` and `--no-daemon`
+    /// pass [`EnvSource::Inherit`]: they already run as the user, and the child
+    /// keeps this process's environment with `env` applied on top. There is no
+    /// default that inherits. A caller that forgets the field does not compile.
+    pub env_source: EnvSource,
+}
+
+/// Which environment `execve` hands the target. Built in the parent, before `fork`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvSource {
+    /// This process's environment, then `SpawnRequest::env` overrides. A name
+    /// that is not UTF-8 is skipped and logged in the parent; it is never a panic.
+    /// Loader names (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`) are dropped unless the
+    /// request names them. This is the `aw run` / `--no-daemon` path only.
+    Inherit,
+    /// Exactly `SpawnRequest::env`, built from scratch. The process environment
+    /// is not read. The privileged daemon path uses this so a root daemon cannot
+    /// hand its own variables to the target.
+    Exact,
 }
 impl fmt::Debug for SpawnRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -262,6 +300,7 @@ impl fmt::Debug for SpawnRequest {
             .field("command_len", &self.command.len())
             .field("has_cwd", &self.cwd.is_some())
             .field("env_len", &self.env.len())
+            .field("env_source", &self.env_source)
             .finish()
     }
 }

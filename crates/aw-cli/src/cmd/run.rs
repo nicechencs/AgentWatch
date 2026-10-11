@@ -414,6 +414,11 @@ impl SpawnedChild for PlatformChild {
 struct PlatformGatedChild {
     held: Option<Box<dyn HeldChild>>,
     released: Option<Box<dyn ReleasedChild>>,
+    /// The program name, for the one launch error that may repeat it. Not an
+    /// argument and not an environment value.
+    program: String,
+    /// The working directory the caller asked for, for the directory sentence.
+    cwd: Option<String>,
 }
 
 #[cfg(any(target_os = "linux", windows))]
@@ -455,10 +460,10 @@ impl SpawnedChild for PlatformGatedChild {
             .held
             .take()
             .ok_or_else(|| "启动闸门已经放行".to_owned())?;
-        self.released = Some(
-            held.release()
-                .map_err(|error| platform_child_error(error).1)?,
-        );
+        self.released =
+            Some(held.release().map_err(|error| {
+                platform_spawn_error(&self.program, self.cwd.as_deref(), error).1
+            })?);
         Ok(())
     }
 
@@ -496,14 +501,51 @@ fn platform_child_error(error: PlatformError) -> (&'static str, String) {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-fn platform_spawn_error(program: &str, error: PlatformError) -> (&'static str, String) {
+fn platform_spawn_error(
+    program: &str,
+    cwd: Option<&str>,
+    error: PlatformError,
+) -> (&'static str, String) {
     match error {
         PlatformError::Io(error) => (
-            spawn_error_code(&error),
-            spawn_error_text_for(program, &error),
+            spawn_step_code(&error),
+            spawn_step_text(program, cwd, &error),
         ),
         other => platform_child_error(other),
     }
+}
+
+/// Which sentence a failed launch gets. The hold stage reports the step in the
+/// error text (`chdir:` or `exec:`), so a missing working directory and a
+/// missing program are not the same sentence. `cwd` is the directory the caller
+/// asked for; it is a path, never an argument or an environment value.
+fn spawn_step_text(program: &str, cwd: Option<&str>, error: &std::io::Error) -> String {
+    let text = error.to_string();
+    if text.starts_with("chdir:") {
+        let dir = cwd.unwrap_or(".");
+        return match error.kind() {
+            std::io::ErrorKind::PermissionDenied => {
+                format!("没有权限进入工作目录「{dir}」，请换一个目录或检查权限。")
+            }
+            _ => format!("找不到工作目录「{dir}」"),
+        };
+    }
+    if text.starts_with("exec:") || error.kind() == std::io::ErrorKind::NotFound {
+        return spawn_error_text_for(program, &std::io::Error::from(std::io::ErrorKind::NotFound));
+    }
+    spawn_error_text(error)
+}
+
+/// Machine code for a failed launch step. A `chdir` failure is `cwd_not_found`;
+/// an `exec` failure keeps `program_not_found` / `program_not_permitted`.
+fn spawn_step_code(error: &std::io::Error) -> &'static str {
+    if error.to_string().starts_with("chdir:") {
+        return match error.kind() {
+            std::io::ErrorKind::PermissionDenied => "program_not_permitted",
+            _ => "cwd_not_found",
+        };
+    }
+    spawn_error_code(error)
 }
 
 /// A caller identity failure is distinct from a program spawn failure.  Keep
@@ -523,36 +565,26 @@ impl Spawner for CommandSpawner {
             let Some((program, args)) = spec.command.split_first() else {
                 return Err(("spawn_failed", "程序名为空".to_owned()));
             };
-            // Keep the pre-flight lookup: the gate shell would otherwise emit
-            // an English error only after the daemon had adopted the session.
-            let path_env = spec
-                .env
-                .iter()
-                .rev()
-                .find(|(key, _)| key == "PATH")
-                .map(|(_, value)| value.clone())
-                .or_else(|| std::env::var("PATH").ok());
-            let resolved = resolve_program(program, path_env.as_deref(), spec.cwd.as_deref())
-                .map_err(|error| {
-                    (
-                        spawn_error_code(&error),
-                        spawn_error_text_for(program, &error),
-                    )
-                })?;
+            // The program name is not resolved here. The hold stage's parent
+            // only builds candidate strings; the child tries them after it has
+            // switched identity, so this process never stats a PATH directory.
             let caller = IdentifiedCaller::current_user().map_err(|_| caller_identity_error())?;
             let request = SpawnRequest {
-                command: std::iter::once(resolved)
+                command: std::iter::once(program.clone())
                     .chain(args.iter().cloned())
                     .collect(),
                 cwd: spec.cwd.as_ref().map(std::path::PathBuf::from),
                 env: spec.env.clone(),
+                env_source: aw_platform::EnvSource::Inherit,
             };
             let held = platform()
                 .spawn_suspended(&caller, &request)
-                .map_err(|error| platform_spawn_error(program, error))?;
+                .map_err(|error| platform_spawn_error(program, spec.cwd.as_deref(), error))?;
             Ok(Box::new(PlatformGatedChild {
                 held: Some(held),
                 released: None,
+                program: program.clone(),
+                cwd: spec.cwd.clone(),
             }))
         }
         #[cfg(target_os = "macos")]
@@ -560,34 +592,21 @@ impl Spawner for CommandSpawner {
             let Some((program, args)) = spec.command.split_first() else {
                 return Err(("spawn_failed", "程序名为空".to_owned()));
             };
-            // Same pre-flight as Linux: a missing program fails in Chinese
-            // before the daemon has adopted the session.
-            let path_env = spec
-                .env
-                .iter()
-                .rev()
-                .find(|(key, _)| key == "PATH")
-                .map(|(_, value)| value.clone())
-                .or_else(|| std::env::var("PATH").ok());
-            let resolved = resolve_program(program, path_env.as_deref(), spec.cwd.as_deref())
-                .map_err(|error| {
-                    (
-                        spawn_error_code(&error),
-                        spawn_error_text_for(program, &error),
-                    )
-                })?;
+            // Same as Linux: the hold stage resolves the name in the child,
+            // after the identity switch. This process does not stat PATH.
             let caller = aw_platform::IdentifiedCaller::current_user()
                 .map_err(|_| caller_identity_error())?;
             let request = aw_platform::SpawnRequest {
-                command: std::iter::once(resolved)
+                command: std::iter::once(program.clone())
                     .chain(args.iter().cloned())
                     .collect(),
                 cwd: spec.cwd.clone().map(std::path::PathBuf::from),
                 env: spec.env.clone(),
+                env_source: aw_platform::EnvSource::Inherit,
             };
             let held = aw_platform::platform()
                 .spawn_suspended(&caller, &request)
-                .map_err(|error| platform_spawn_error(program, error))?;
+                .map_err(|error| platform_spawn_error(program, spec.cwd.as_deref(), error))?;
             Ok(Box::new(PlatformChild {
                 held: Some(held),
                 released: None,
@@ -604,13 +623,16 @@ impl Spawner for CommandSpawner {
                 command: spec.command.clone(),
                 cwd: spec.cwd.as_ref().map(Into::into),
                 env: spec.env.clone(),
+                env_source: aw_platform::EnvSource::Inherit,
             };
             let held = platform()
                 .spawn_suspended(&caller, &request)
-                .map_err(|error| platform_spawn_error(program, error))?;
+                .map_err(|error| platform_spawn_error(program, spec.cwd.as_deref(), error))?;
             Ok(Box::new(PlatformGatedChild {
                 held: Some(held),
                 released: None,
+                program: program.clone(),
+                cwd: spec.cwd.clone(),
             }))
         }
         #[cfg(not(any(unix, windows)))]
@@ -632,63 +654,6 @@ impl Spawner for CommandSpawner {
                 })
         }
     }
-}
-
-/// Absolute path of `program` the way `execvp` would pick it: a name with a
-/// `/` is taken relative to `cwd`; a bare name is searched in `path`. The hit
-/// must be a regular file with an execute bit. `NotFound` when nothing
-/// matches, `PermissionDenied` when only non-executable files match.
-#[cfg(unix)]
-pub(crate) fn resolve_program(
-    program: &str,
-    path: Option<&str>,
-    cwd: Option<&str>,
-) -> Result<String, std::io::Error> {
-    use std::io::{Error, ErrorKind};
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
-    let base = match cwd {
-        Some(dir) => PathBuf::from(dir),
-        None => std::env::current_dir()?,
-    };
-    let executable = |candidate: &Path| -> Option<bool> {
-        let meta = std::fs::metadata(candidate).ok()?;
-        Some(meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-    };
-    let absolute = |candidate: PathBuf| -> String {
-        let full = if candidate.is_absolute() {
-            candidate
-        } else {
-            base.join(candidate)
-        };
-        full.to_string_lossy().into_owned()
-    };
-    if program.is_empty() {
-        return Err(Error::from(ErrorKind::NotFound));
-    }
-    if program.contains('/') {
-        let candidate = base.join(program);
-        return match executable(&candidate) {
-            Some(true) => Ok(absolute(PathBuf::from(program))),
-            Some(false) => Err(Error::from(ErrorKind::PermissionDenied)),
-            None => Err(Error::from(ErrorKind::NotFound)),
-        };
-    }
-    let mut denied = false;
-    for dir in path.unwrap_or("/usr/local/bin:/usr/bin:/bin").split(':') {
-        let dir = if dir.is_empty() { "." } else { dir };
-        let candidate = Path::new(dir).join(program);
-        match executable(&base.join(&candidate)) {
-            Some(true) => return Ok(absolute(candidate)),
-            Some(false) => denied = true,
-            None => {}
-        }
-    }
-    Err(Error::from(if denied {
-        ErrorKind::PermissionDenied
-    } else {
-        ErrorKind::NotFound
-    }))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -718,12 +683,13 @@ impl Launcher for PlatformLauncher {
             command: spec.command.clone(),
             cwd: spec.cwd.as_ref().map(Into::into),
             env: spec.env.clone(),
+            env_source: aw_platform::EnvSource::Inherit,
         };
         let held = platform()
             .spawn_suspended(&caller, &request)
             .map_err(|error| LaunchDispatchError::Platform {
                 detail: match spec.command.first() {
-                    Some(program) => platform_spawn_error(program, error).1,
+                    Some(program) => platform_spawn_error(program, spec.cwd.as_deref(), error).1,
                     None => platform_child_error(error).1,
                 },
             })?;
@@ -2937,7 +2903,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn missing_or_non_executable_program_fails_in_chinese_before_spawn() {
-        use super::{resolve_program, spawn_error_text_for, CommandSpawner, Spawner};
+        use super::{spawn_error_text_for, CommandSpawner, Spawner};
         use crate::launch::RunSpec;
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("aw-resolve-{}", std::process::id()));
@@ -2946,28 +2912,31 @@ mod tests {
         std::fs::write(&plain, "x").expect("write");
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).expect("chmod");
         let path = format!("{}:/usr/bin:/bin", dir.display());
-        assert_eq!(
-            resolve_program("sh", Some(&path), None).expect("sh"),
-            if std::path::Path::new("/usr/bin/sh").exists() {
-                "/usr/bin/sh"
-            } else {
-                "/bin/sh"
-            }
+        // The parent only builds the candidate list. It does not stat, so a
+        // non-executable file is still a candidate; the child finds out.
+        let sh = aw_platform::unix_program_candidates("sh", Some(&path));
+        assert!(
+            sh.iter()
+                .any(|candidate| candidate == "/usr/bin/sh" || candidate == "/bin/sh"),
+            "sh is searched on the absolute PATH entries: {sh:?}"
         );
+        let missing = aw_platform::unix_program_candidates("aw-no-such-prog-xyz", Some(&path));
+        assert!(missing
+            .iter()
+            .any(|candidate| candidate.ends_with("/aw-no-such-prog-xyz")));
+        let plain_name = aw_platform::unix_program_candidates("plain", Some(&path));
+        assert!(plain_name
+            .iter()
+            .any(|candidate| candidate.ends_with("/plain")));
+        // A name containing `/` is one candidate, relative to the target cwd.
         assert_eq!(
-            resolve_program("aw-no-such-prog-xyz", Some(&path), None).map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::NotFound)
-        );
-        assert_eq!(
-            resolve_program("plain", Some(&path), None).map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
-        );
-        assert_eq!(
-            resolve_program("./plain", None, dir.to_str()).map_err(|e| e.kind()),
-            Err(std::io::ErrorKind::PermissionDenied)
+            aw_platform::unix_program_candidates("./plain", None),
+            vec!["./plain".to_owned()]
         );
 
-        // Through the real spawner: no child, a Chinese sentence, no English.
+        // Through the real spawner. The parent holds the child without looking
+        // at the filesystem; the child reports the miss when it is released,
+        // and that report is the Chinese sentence with no English in it.
         let spec = RunSpec {
             command: vec!["aw-no-such-prog-xyz".to_owned()],
             cwd: None,
@@ -2976,19 +2945,22 @@ mod tests {
             allow_breakaway: false,
             no_daemon: false,
         };
-        let error = match CommandSpawner.spawn(&spec) {
-            Ok(_) => panic!("a missing program must not spawn"),
-            Err(error) => error,
-        };
-        assert_eq!(error.0, "program_not_found");
+        let mut spawned = CommandSpawner
+            .spawn(&spec)
+            .expect("the parent holds the child; the miss is reported at release");
+        let error = spawned.release().expect_err("a missing program");
         assert_eq!(
-            error.1,
+            error,
             spawn_error_text_for(
                 "aw-no-such-prog-xyz",
                 &std::io::Error::from(std::io::ErrorKind::NotFound)
             )
         );
-        assert!(!error.1.contains("not found"), "{}", error.1);
+        assert!(!error.contains("not found"), "{error}");
+        assert!(
+            error.contains("找不到程序「aw-no-such-prog-xyz」"),
+            "{error}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

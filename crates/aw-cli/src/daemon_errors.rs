@@ -77,6 +77,12 @@ const ROWS: &[Row] = &[
         en: Some("the program or the working directory was not found"),
     },
     Row {
+        code: "cwd_not_found",
+        // The daemon's message already names the directory, so it is shown as is.
+        zh: "找不到工作目录",
+        en: None,
+    },
+    Row {
         code: "program_not_permitted",
         zh: "没有权限运行这个程序或进入工作目录",
         en: Some("the program or the working directory is not accessible to this account"),
@@ -132,6 +138,13 @@ const ROWS: &[Row] = &[
         code: "drop_failed",
         zh: "程序没能切换到调用者的账户，已被停止",
         en: Some("the program did not switch to the caller's account and was stopped"),
+    },
+    Row {
+        code: "env_reserved",
+        // The daemon's message already is this sentence, with the variable's name
+        // filled in, so it is shown as is rather than repeated after a stock line.
+        zh: "环境变量由系统按你的账户来填，不能在请求里改",
+        en: None,
     },
     Row {
         code: "store_unavailable",
@@ -300,6 +313,14 @@ pub(crate) fn write_status(
             f,
             "会话数据库正忙（后台在写入），等了 {waited} 秒还是没轮到，请稍后再试。"
         );
+    }
+    // The daemon's message is already the sentence a person reads, with the
+    // variable's name filled in. Showing the stock line and then the same
+    // sentence again would name the variable twice.
+    // Both messages already name the thing they are about. Showing the stock
+    // line and then the same sentence again would name it twice.
+    if code == "env_reserved" || code == "cwd_not_found" {
+        return f.write_str(message);
     }
     let Some(row) = ROWS.iter().find(|row| row.code == code) else {
         return write!(f, "后台返回错误 {code}（HTTP {status}）：{message}");

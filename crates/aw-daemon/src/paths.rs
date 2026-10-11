@@ -15,8 +15,9 @@ use std::path::{Path, PathBuf};
 ///
 /// # Errors
 ///
-/// On Windows, returns an error when `ProgramData` is unset. It does not invent
-/// a path under the user profile.
+/// On Windows, returns an error when the ProgramData known folder cannot be
+/// read. It does not read the `ProgramData` environment variable and does not
+/// invent a path under the user profile.
 pub fn default_data_dir() -> io::Result<PathBuf> {
     aw_platform::platform()
         .default_data_dir()
@@ -27,7 +28,7 @@ pub fn default_data_dir() -> io::Result<PathBuf> {
 ///
 /// # Errors
 ///
-/// On Windows, returns an error when `ProgramData` is unset.
+/// On Windows, returns an error when the ProgramData known folder cannot be read.
 pub fn default_config_path() -> io::Result<PathBuf> {
     aw_platform::platform()
         .default_config_path()

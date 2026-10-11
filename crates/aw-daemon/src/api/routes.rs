@@ -3950,6 +3950,52 @@ mod tests {
             .collect()
     }
 
+    /// A launch request that sets one of the five account variables is refused
+    /// before anything is started, and the response names the variable. An
+    /// ordinary variable is not refused. Nothing is written: a refused launch
+    /// leaves the session table empty.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn launch_refuses_a_reserved_environment_variable() {
+        let (dir, db) = seeded_db("reserved-env", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let me = crate::sample::current_user_id();
+        let token = token_for(&mut state, &me, false);
+        for name in ["HOME", "USER", "LOGNAME", "SHELL", "PATH"] {
+            let body =
+                format!(r#"{{"mode":"launch","argv":["true"],"env":{{"{name}":"caller-value"}}}}"#);
+            let (status, body) = post(&mut state, &token, "/api/v1/sessions", &body);
+            assert_eq!(status, 400, "{name}: {body}");
+            assert_eq!(body["error"]["code"], "env_reserved");
+            assert_eq!(body["error"]["detail"]["name"], name);
+            assert_eq!(
+                body["error"]["message"],
+                format!(
+                    "环境变量「{name}」由系统按你的账户来填，不能在请求里改。请去掉这个变量再试。"
+                )
+            );
+        }
+        // The five refusals wrote nothing. Counted here, before the two names
+        // that are allowed and do start.
+        let rows: i64 = aw_store::open_connection(&db)
+            .and_then(|c| c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)))
+            .expect("count");
+        assert_eq!(rows, 0, "a refused launch writes no session");
+        // A different case is a different variable on Linux, and a name the
+        // request is allowed to add goes through. Neither is this refusal.
+        for body in [
+            r#"{"mode":"launch","argv":["true"],"env":{"Home":"/tmp"}}"#,
+            r#"{"mode":"launch","argv":["true"],"env":{"AW_RV":"1"}}"#,
+        ] {
+            let (status, body) = post(&mut state, &token, "/api/v1/sessions", body);
+            assert_ne!(status, 400, "a non-reserved name was refused: {body}");
+            assert_ne!(body["error"]["code"], "env_reserved", "{body}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A `uid` / `user` in the body never chooses the account: the program
     /// runs as the verified caller.
     #[cfg(target_os = "linux")]
@@ -4008,10 +4054,25 @@ mod tests {
             vec![caller; 4],
             "dropped to the caller, cannot regain root"
         );
+        // The whole environment, not "the secret is absent": exactly the five
+        // account basics, nothing this root daemon was started with.
         let env = std::fs::read(format!("/proc/{pid}/environ")).expect("environ");
-        let env = String::from_utf8_lossy(&env);
-        assert!(env.contains(&format!("USER={}", nobody.name)), "{env}");
-        assert!(!env.contains("HOME=/root"), "{env}");
+        let mut got: Vec<String> = env
+            .split(|b| *b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect();
+        got.sort();
+        let mut want = vec![
+            format!("HOME={}", nobody.dir.display()),
+            format!("USER={}", nobody.name),
+            format!("LOGNAME={}", nobody.name),
+            format!("SHELL={}", nobody.shell.display()),
+            format!("PATH={}", aw_platform::unix_default_path()),
+        ];
+        want.sort();
+        assert_eq!(got, want, "target env is not exactly the base five");
+        assert!(!got.iter().any(|line| line.starts_with("AW_HOLD_SENTINEL=")));
         let _ = std::process::Command::new("kill")
             .arg(pid.to_string())
             .status();

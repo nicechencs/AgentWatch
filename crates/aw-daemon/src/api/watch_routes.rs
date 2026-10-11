@@ -405,6 +405,18 @@ fn create_inner(
                 // A `uid` / `user` in the body is never read.
                 let who = super::launch_as::identity_for(&caller.user_id, daemon_uid())?;
                 let cwd = opt_text(&value, "cwd");
+                // A relative working directory would be resolved against the
+                // daemon's own directory. The caller makes it absolute before
+                // sending; the daemon refuses one that is not.
+                if let Some(dir) = cwd.as_deref() {
+                    if !std::path::Path::new(dir).is_absolute() {
+                        return Err(error_response(
+                            400,
+                            "cwd_not_found",
+                            &format!("找不到工作目录「{dir}」"),
+                        ));
+                    }
+                }
                 let env: Vec<(String, String)> = value
                     .get("env")
                     .and_then(Value::as_object)
@@ -416,6 +428,13 @@ fn create_inner(
                             .collect()
                     })
                     .unwrap_or_default();
+                // HOME/USER/LOGNAME/SHELL/PATH come from the target account and the
+                // fixed base path. A request that sets one is refused, not started
+                // with the name dropped or overridden.
+                #[cfg(unix)]
+                if let Some(reserved) = super::launch_as::reserved_env_var(&env) {
+                    return Err(super::launch_as::reserved_env_response(&reserved.name));
+                }
                 // Linux and macOS both map `SpawnAsError::Drop` here. Windows never
                 // reaches it: a different account is refused before spawn.
                 #[cfg(unix)]
@@ -447,7 +466,9 @@ fn create_inner(
                         &env,
                     )
                     .map_err(|err| match err {
-                        super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
+                        super::launch_as::SpawnAsError::Program { step, error } => {
+                            spawn_error(step, cwd.as_deref(), &argv, &error)
+                        }
                         super::launch_as::SpawnAsError::Drop(step) => {
                             drop_failed(caller.user_id.parse().unwrap_or(0), &step)
                         }
@@ -461,7 +482,9 @@ fn create_inner(
                     Some(who) => {
                         let child = super::launch_as::spawn_as(who, &argv, cwd.as_deref(), &env)
                             .map_err(|err| match err {
-                                super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
+                                super::launch_as::SpawnAsError::Program { step, error } => {
+                                    spawn_error(step, cwd.as_deref(), &argv, &error)
+                                }
                                 super::launch_as::SpawnAsError::Drop(step) => {
                                     drop_failed(who.uid, &step)
                                 }
@@ -476,14 +499,21 @@ fn create_inner(
                         (child.id(), child)
                     }
                 };
+                // Both branches go through the helper, which switches even when the
+                // caller is this account. Check the result either way: a child
+                // that is not the caller's account is killed rather than recorded.
                 #[cfg(target_os = "linux")]
-                if let Some(who) = &who {
-                    if !super::launch_as::verify_dropped(pid, who) {
+                {
+                    let account = match &who {
+                        Some(who) => who.clone(),
+                        None => super::launch_as::own_account_of_self()?,
+                    };
+                    if !super::launch_as::verify_dropped(pid, &account) {
                         let _ = child.kill();
                         let _ = child.wait();
                         tracing::error!(
                             pid,
-                            uid = who.uid,
+                            uid = account.uid,
                             "launched child did not drop to the caller; killed"
                         );
                         return Err(error_response(
@@ -535,23 +565,48 @@ fn account_of(
 }
 
 /// Start `argv` as the daemon's own account. Used only when the caller is that
-/// same account, so there is nothing to switch.
+/// same account, so there is nothing to switch. The environment is still built
+/// from scratch for that account (`base_env`): a daemon that happens to be the
+/// caller must not hand over its own process environment.
+///
+/// A root daemon still goes through the helper, which switches and checks. A
+/// daemon that is not root cannot `setgroups` even to its own groups, so it
+/// execs directly; it is already the right account.
+#[cfg(target_os = "linux")]
 fn spawn_as_self(
     argv: &[String],
     cwd: Option<&str>,
     env: &[(String, String)],
 ) -> Result<std::process::Child, ApiResponse> {
-    let mut command = std::process::Command::new(&argv[0]);
-    command
-        .args(&argv[1..])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
+    let who = super::launch_as::own_account_of_self()?;
+    if nix::unistd::geteuid().as_raw() != 0 {
+        return super::launch_as::spawn_exact(&who, argv, cwd, env).map_err(|err| match err {
+            super::launch_as::SpawnAsError::Program { step, error } => {
+                spawn_error(step, cwd, argv, &error)
+            }
+            super::launch_as::SpawnAsError::Drop(step) => {
+                tracing::error!(step, "same-account launch failed");
+                error_response(
+                    500,
+                    "drop_failed",
+                    "the program did not switch to the caller's account and was stopped",
+                )
+            }
+        });
     }
-    command.envs(env.iter().map(|(k, v)| (k, v)));
-    command.spawn().map_err(|err| spawn_error(&err))
+    super::launch_as::spawn_as(&who, argv, cwd, env).map_err(|err| match err {
+        super::launch_as::SpawnAsError::Program { step, error } => {
+            spawn_error(step, cwd, argv, &error)
+        }
+        super::launch_as::SpawnAsError::Drop(step) => {
+            tracing::error!(step, "same-account launch failed");
+            error_response(
+                500,
+                "drop_failed",
+                "the program did not switch to the caller's account and was stopped",
+            )
+        }
+    })
 }
 
 /// `POST /sessions/run`: record the session and hand back an adopt ticket.
@@ -924,17 +979,37 @@ fn close_undelivered_session(state: &mut ApiState, public_id: &str) {
 /// directory, which the OS reports alike); the message stays plain English for
 /// API callers. It used to be `spawn_failed` with the raw `ErrorKind` text
 /// ("entity not found"), which the page printed as is.
-fn spawn_error(err: &std::io::Error) -> ApiResponse {
+fn spawn_error(
+    step: &str,
+    cwd: Option<&str>,
+    argv: &[String],
+    err: &std::io::Error,
+) -> ApiResponse {
+    // The step comes from the child, after it switched identity. A missing
+    // directory and a missing program are different sentences; the English
+    // message stays for the log, and the code is what the UI words.
+    if step == "chdir" {
+        let dir = cwd.unwrap_or(".");
+        return match err.kind() {
+            std::io::ErrorKind::PermissionDenied => error_response(
+                400,
+                "program_not_permitted",
+                &format!("没有权限进入工作目录「{dir}」，请换一个目录或检查权限。"),
+            ),
+            _ => error_response(400, "cwd_not_found", &format!("找不到工作目录「{dir}」")),
+        };
+    }
+    let program = argv.first().map(String::as_str).unwrap_or("");
     match err.kind() {
         std::io::ErrorKind::NotFound => error_response(
             400,
             "program_not_found",
-            "the program or the working directory was not found",
+            &format!("找不到程序「{program}」，请检查名字或路径"),
         ),
         std::io::ErrorKind::PermissionDenied => error_response(
             400,
             "program_not_permitted",
-            "the program or the working directory is not accessible to this account",
+            &format!("程序「{program}」没有执行权限，请检查文件权限后再试。"),
         ),
         _ => error_response(400, "spawn_failed", "the program could not be started"),
     }
@@ -945,7 +1020,12 @@ mod spawn_error_tests {
     use super::spawn_error;
 
     fn code(kind: std::io::ErrorKind) -> String {
-        let response = spawn_error(&std::io::Error::from(kind));
+        let response = spawn_error(
+            "exec",
+            None,
+            &["tool".to_owned()],
+            &std::io::Error::from(kind),
+        );
         let body: serde_json::Value =
             serde_json::from_slice(&response.body).unwrap_or(serde_json::Value::Null);
         body["error"]["code"].as_str().unwrap_or("").to_owned()
@@ -961,9 +1041,30 @@ mod spawn_error_tests {
             "program_not_permitted"
         );
         assert_eq!(code(std::io::ErrorKind::Other), "spawn_failed");
-        let response = spawn_error(&std::io::Error::from(std::io::ErrorKind::NotFound));
+        let response = spawn_error(
+            "exec",
+            None,
+            &["tool".to_owned()],
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
         assert_eq!(response.status, 400);
-        assert!(!String::from_utf8_lossy(&response.body).contains("entity"));
+        let text = String::from_utf8_lossy(&response.body);
+        assert!(!text.contains("entity"), "{text}");
+        assert!(
+            text.contains("找不到程序「tool」，请检查名字或路径"),
+            "{text}"
+        );
+        // A missing working directory is a different sentence and a different code.
+        let missing_dir = spawn_error(
+            "chdir",
+            Some("/no/such/work"),
+            &["tool".to_owned()],
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&missing_dir.body).unwrap_or(serde_json::Value::Null);
+        assert_eq!(body["error"]["code"], "cwd_not_found");
+        assert_eq!(body["error"]["message"], "找不到工作目录「/no/such/work」");
     }
 }
 

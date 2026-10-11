@@ -81,6 +81,7 @@ fn concurrent_gated_spawns_do_not_leak_gate_pipes_into_siblings() {
                         ],
                         cwd: None,
                         env: std::env::vars().collect(),
+                        env_source: aw_platform::EnvSource::Inherit,
                     };
                     barrier.wait();
                     let held = platform()
@@ -161,6 +162,7 @@ fn gated_spawn_works_when_the_gate_fd_number_is_ten_or_more() {
         command: vec!["true".into()],
         cwd: None,
         env: std::env::vars().collect(),
+        env_source: aw_platform::EnvSource::Inherit,
     };
     let held = platform().spawn_suspended(&caller, &request).unwrap();
     let outcome = held.release().unwrap().wait().unwrap();

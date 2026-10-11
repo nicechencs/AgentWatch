@@ -49,10 +49,11 @@ pub(crate) struct Identity {
 }
 
 #[cfg(unix)]
-/// Default `PATH` for a dropped launch. The caller's own shell `PATH` is not
-/// known to the daemon; the request's `env` can override it.
-pub(crate) const DEFAULT_PATH: &str =
-    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// Default `PATH` for a dropped launch. Defined once, in the shared launch
+/// code (`unix/hold.rs`): the caller's own shell `PATH` is not known to the
+/// daemon, and the daemon's own `PATH` is not copied. A request that sets
+/// `PATH` itself is refused (`env_reserved`), not applied over this.
+pub(crate) const DEFAULT_PATH: &str = aw_platform::unix_default_path();
 
 #[cfg(target_os = "linux")]
 /// First argument of the helper copy of `agentwatchd` (Linux root launch).
@@ -175,22 +176,83 @@ pub(crate) fn own_account(user_id: &str) -> Result<Identity, ApiResponse> {
     lookup(uid)
 }
 
-/// Environment a dropped launch starts with: `LANG`/`LC_ALL`/`TZ` from the
-/// daemon, the account's basics, then the request's `env`. Nothing else of the
-/// daemon's environment (root's HOME, sockets, tokens) leaks in.
+/// This daemon's own account, read from the process's real uid. Linux uses it
+/// when the caller is the daemon's own account: the launch still goes through
+/// the helper, so the environment is the account's five basics rather than
+/// whatever this process was started with.
+#[cfg(target_os = "linux")]
+pub(crate) fn own_account_of_self() -> Result<Identity, ApiResponse> {
+    lookup(nix::unistd::getuid().as_raw())
+}
+
+/// Names a launch request may not set. Each one is filled from the target
+/// account (`HOME`/`USER`/`LOGNAME`/`SHELL`) or from the fixed base path
+/// (`PATH`); letting the request replace them would make the "built from
+/// scratch" environment whatever the caller wrote. Compared exactly: on Unix
+/// environment names are case-sensitive, so `Home` is a different variable and
+/// is allowed through.
+#[cfg(unix)]
+const RESERVED_ENV: [&str; 5] = ["HOME", "USER", "LOGNAME", "SHELL", "PATH"];
+
+/// A request that names one of [`RESERVED_ENV`]. The launch is refused rather
+/// than started with the name silently dropped or quietly overridden.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReservedEnvVar {
+    pub name: String,
+}
+
+/// The first reserved name in `extra`, if the request sets one. `None` when
+/// every name is one the request is allowed to add.
+#[cfg(unix)]
+pub(crate) fn reserved_env_var(extra: &[(String, String)]) -> Option<ReservedEnvVar> {
+    extra.iter().find_map(|(key, _)| {
+        RESERVED_ENV
+            .iter()
+            .any(|reserved| reserved == key)
+            .then(|| ReservedEnvVar { name: key.clone() })
+    })
+}
+
+/// 400 for a launch request that sets a reserved variable. The sentence names
+/// the variable; the machine code carries it again under `detail.name`.
+#[cfg(unix)]
+pub(crate) fn reserved_env_response(name: &str) -> ApiResponse {
+    let mut response = error_response(
+        400,
+        "env_reserved",
+        &format!("环境变量「{name}」由系统按你的账户来填，不能在请求里改。请去掉这个变量再试。"),
+    );
+    if let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&response.body) {
+        body["error"]["detail"] = serde_json::json!({ "name": name });
+        response = ApiResponse::json(response.status, &body);
+    }
+    response
+}
+
+/// Environment a dropped launch starts with, built from scratch: the target
+/// account's `HOME`/`USER`/`LOGNAME`/`SHELL`, the fixed `PATH`, then the
+/// request's `env`. The daemon's own environment is not read. A root daemon's
+/// `LANG`, `HOME`, sockets, and tokens therefore cannot reach the child.
+///
+/// `extra` must already have been checked with [`reserved_env_var`]: this
+/// refuses to merge a reserved name rather than override the account's value.
 #[cfg(unix)]
 fn base_env(who: &Identity, extra: &[(String, String)]) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = ["LANG", "LC_ALL", "TZ"]
-        .iter()
-        .filter_map(|key| std::env::var(key).ok().map(|val| ((*key).to_owned(), val)))
-        .collect();
     let path = |p: &std::path::Path| p.display().to_string();
-    env.push(("HOME".to_owned(), path(&who.home)));
-    env.push(("USER".to_owned(), who.name.clone()));
-    env.push(("LOGNAME".to_owned(), who.name.clone()));
-    env.push(("SHELL".to_owned(), path(&who.shell)));
-    env.push(("PATH".to_owned(), DEFAULT_PATH.to_owned()));
+    let mut env = vec![
+        ("HOME".to_owned(), path(&who.home)),
+        ("USER".to_owned(), who.name.clone()),
+        ("LOGNAME".to_owned(), who.name.clone()),
+        ("SHELL".to_owned(), path(&who.shell)),
+        ("PATH".to_owned(), DEFAULT_PATH.to_owned()),
+    ];
     for (key, val) in extra {
+        // A reserved name never replaces the account's value. The route refuses
+        // the request before it gets here; skipping is the backstop.
+        if RESERVED_ENV.iter().any(|reserved| reserved == key) {
+            continue;
+        }
         env.retain(|(k, _)| k != key);
         env.push((key.clone(), val.clone()));
     }
@@ -204,9 +266,81 @@ fn base_env(who: &Identity, extra: &[(String, String)]) -> Vec<(String, String)>
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum SpawnAsError {
     /// The program or `cwd` (entered as the caller): the usual 400 codes.
-    Program(std::io::Error),
+    /// `step` is `chdir` or `exec`, so the two are not the same sentence.
+    Program {
+        step: &'static str,
+        error: std::io::Error,
+    },
     /// The account switch itself failed or could not be checked: 500.
     Drop(String),
+}
+
+/// Start `argv` as the current account with the from-scratch environment.
+///
+/// Used when the caller is already this account and this process is not root,
+/// so there is no switch to make and `setgroups` would fail. The candidate
+/// search is the same one the helper uses, and it runs as this account.
+#[cfg(target_os = "linux")]
+pub(crate) fn spawn_exact(
+    who: &Identity,
+    argv: &[String],
+    cwd: Option<&str>,
+    extra_env: &[(String, String)],
+) -> Result<std::process::Child, SpawnAsError> {
+    use std::process::{Command, Stdio};
+    let env = base_env(who, extra_env);
+    let dir = cwd.map_or_else(|| who.home.display().to_string(), str::to_owned);
+    // Already the right account, so this check is the caller's and not root's.
+    // It is what makes a missing directory a different error from a missing
+    // program: `Command` reports both as one spawn error.
+    if let Err(error) = std::fs::metadata(&dir) {
+        return Err(SpawnAsError::Program {
+            step: "chdir",
+            error,
+        });
+    }
+    let path = env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| value.clone());
+    let candidates = aw_platform::unix_program_candidates(&argv[0], path.as_deref());
+    if candidates.is_empty() {
+        return Err(SpawnAsError::Program {
+            step: "exec",
+            error: std::io::Error::from_raw_os_error(ENOENT),
+        });
+    }
+    let mut last = std::io::Error::from_raw_os_error(ENOENT);
+    for candidate in &candidates {
+        match Command::new(candidate)
+            .args(&argv[1..])
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k, v)))
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(error) => {
+                let errno = error.raw_os_error().unwrap_or(EIO);
+                if matches!(errno, ENOENT | ENOTDIR | ESTALE | ENODEV | ETIMEDOUT) {
+                    last = error;
+                    continue;
+                }
+                return Err(SpawnAsError::Program {
+                    step: "exec",
+                    error,
+                });
+            }
+        }
+    }
+    Err(SpawnAsError::Program {
+        step: "exec",
+        error: last,
+    })
 }
 
 /// Start `argv` as `who` (Linux, root daemon) through the helper. Returns once
@@ -265,9 +399,14 @@ pub(crate) fn spawn_as(
     }
     let value: serde_json::Value = serde_json::from_slice(&report).unwrap_or_default();
     let err = match value.get("errno").and_then(serde_json::Value::as_i64) {
-        Some(errno) => SpawnAsError::Program(std::io::Error::from_raw_os_error(
-            i32::try_from(errno).unwrap_or(EIO),
-        )),
+        Some(errno) => SpawnAsError::Program {
+            step: if value.get("step").and_then(serde_json::Value::as_str) == Some("chdir") {
+                "chdir"
+            } else {
+                "exec"
+            },
+            error: std::io::Error::from_raw_os_error(i32::try_from(errno).unwrap_or(EIO)),
+        },
         None => SpawnAsError::Drop(
             value
                 .get("drop")
@@ -280,9 +419,22 @@ pub(crate) fn spawn_as(
     Err(err)
 }
 
-/// `EIO`: the errno reported when the OS gave none.
+/// Errnos the candidate search uses. Same values `execvp` uses: "not here" tries
+/// the next candidate, `EACCES` is remembered, anything else stops.
+#[cfg(target_os = "linux")]
+const ENOENT: i32 = 2;
 #[cfg(target_os = "linux")]
 const EIO: i32 = 5;
+#[cfg(target_os = "linux")]
+const EACCES: i32 = 13;
+#[cfg(target_os = "linux")]
+const ENOTDIR: i32 = 20;
+#[cfg(target_os = "linux")]
+const ENODEV: i32 = 19;
+#[cfg(target_os = "linux")]
+const ESTALE: i32 = 116;
+#[cfg(target_os = "linux")]
+const ETIMEDOUT: i32 = 110;
 
 /// The helper binary: this `agentwatchd`. Unit tests run inside the test
 /// harness, so they use the `agentwatchd` cargo built next to it.
@@ -334,26 +486,81 @@ pub(crate) fn helper_main() -> std::process::ExitCode {
     // caller's environment applied, and only to the program being exec'd.
     // `execve` replaces the environment outright, so nothing this root stage
     // was started with (and nothing a caller put in `LD_PRELOAD`) is inherited.
+    // The program name is not resolved until here: this process is already the
+    // caller, so the search cannot see a directory the caller cannot see.
     let err = exec_as_caller(&spec);
-    fail(serde_json::json!({"errno": err}))
+    fail(serde_json::json!({"step": err.step, "errno": err.errno}))
+}
+
+/// Why the program did not start, after the account switch. `step` is `chdir`
+/// or `exec`, so the caller can tell a missing directory from a missing program.
+#[cfg(target_os = "linux")]
+struct ExecFailure {
+    step: &'static str,
+    errno: i32,
 }
 
 /// `execve` of the caller's program with the caller's environment. Runs only
 /// after [`switch_account`]. Does not return on success.
+///
+/// The candidate list is the same one the hold stage builds: strings only, no
+/// filesystem access. Each candidate is tried after `chdir`, with `execvp`'s
+/// errno rules.
 #[cfg(target_os = "linux")]
-fn exec_as_caller(spec: &HelperSpec) -> i32 {
+fn exec_as_caller(spec: &HelperSpec) -> ExecFailure {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    let err = Command::new(&spec.argv[0])
-        .args(&spec.argv[1..])
-        .env_clear()
-        .envs(spec.env.iter().map(|(k, v)| (k, v)))
-        .current_dir(&spec.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .exec();
-    err.raw_os_error().unwrap_or(EIO)
+    // Already the caller's account. Enter the directory as that account, so a
+    // directory the caller cannot see fails here and not as a missing program.
+    if let Err(error) = std::env::set_current_dir(&spec.cwd) {
+        return ExecFailure {
+            step: "chdir",
+            errno: error.raw_os_error().unwrap_or(ENOENT),
+        };
+    }
+    let path = spec
+        .env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| value.as_str());
+    let candidates = aw_platform::unix_program_candidates(&spec.argv[0], path);
+    if candidates.is_empty() {
+        return ExecFailure {
+            step: "exec",
+            errno: ENOENT,
+        };
+    }
+    let mut saw_eacces = false;
+    let mut last = ENOENT;
+    for candidate in &candidates {
+        let err = Command::new(candidate)
+            .args(&spec.argv[1..])
+            .env_clear()
+            .envs(spec.env.iter().map(|(k, v)| (k, v)))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .exec();
+        let errno = err.raw_os_error().unwrap_or(EIO);
+        if matches!(errno, ENOENT | ENOTDIR | ESTALE | ENODEV | ETIMEDOUT) {
+            last = errno;
+            continue;
+        }
+        if errno == EACCES {
+            saw_eacces = true;
+            last = errno;
+            continue;
+        }
+        return ExecFailure {
+            step: "exec",
+            errno,
+        };
+    }
+    ExecFailure {
+        step: "exec",
+        errno: if saw_eacces { EACCES } else { last },
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -446,6 +653,9 @@ pub(crate) fn spawn_as(
         command: argv.to_vec(),
         cwd: Some(cwd.map_or_else(|| who.home.clone(), PathBuf::from)),
         env: base_env(who, extra_env),
+        // The daemon may be root. The target gets this list and nothing of the
+        // daemon's own environment. `Inherit` is the `aw run` path, not this one.
+        env_source: aw_platform::EnvSource::Exact,
     };
     let held = aw_platform::platform()
         .spawn_suspended(&caller, &request)
@@ -458,7 +668,14 @@ pub(crate) fn spawn_as(
 #[cfg(target_os = "macos")]
 fn platform_spawn_error(error: aw_platform::PlatformError) -> SpawnAsError {
     match error {
-        aw_platform::PlatformError::Io(inner) => SpawnAsError::Program(inner),
+        aw_platform::PlatformError::Io(inner) => {
+            let step = if inner.to_string().starts_with("chdir:") {
+                "chdir"
+            } else {
+                "exec"
+            };
+            SpawnAsError::Program { step, error: inner }
+        }
         other => SpawnAsError::Drop(other.to_string()),
     }
 }
@@ -666,10 +883,14 @@ mod tests {
         assert_eq!(who.groups.first(), Some(&who.gid));
     }
 
-    /// A caller's `LD_PRELOAD` (or `DYLD_*`) is data in the spec, not the
-    /// environment the root stage is exec'd with. `spawn_as` starts the helper
-    /// with `env_clear` and `current_dir("/")`; the caller's variables are in
-    /// the stdin spec and reach only the program exec'd after the switch.
+    /// The helper's own environment is empty: `spawn_as` starts it with
+    /// `env_clear`. A caller's `LD_PRELOAD` is data in the spec, not an
+    /// environment the root stage runs with.
+    ///
+    /// The program the helper execs gets exactly the spec's `env` — the base
+    /// five plus what the request added — and nothing else. This used to assert
+    /// only that the root stage had no preload line; the assertion is now the
+    /// whole set, so a leaked daemon variable fails it.
     #[cfg(target_os = "linux")]
     #[test]
     fn caller_preload_does_not_reach_the_root_stage() {
@@ -678,6 +899,7 @@ mod tests {
         if me == 0 {
             return;
         }
+        std::env::set_var("AW_HOLD_SENTINEL", "present-in-daemon");
         let gid = nix::unistd::getgid().as_raw();
         let groups = nix::unistd::getgroups()
             .unwrap()
@@ -688,14 +910,21 @@ mod tests {
         // preload is in the spec on stdin, which the helper reads as data and
         // does not apply to itself. It then blocks in setgroups (this test is
         // not root), so its environ can be read while it is still the
-        // privileged stage.
+        // privileged stage. The env the spec carries is the whole set the
+        // target would be exec'd with: the base five, plus the two loader
+        // names, and nothing of this process.
+        let who = super::lookup(me).expect("this account");
+        std::env::set_var("LANG", "daemon-lang");
+        let mut env = super::base_env(&who, &[]);
+        env.push(("LD_PRELOAD".to_owned(), preload.to_owned()));
+        env.push(("DYLD_INSERT_LIBRARIES".to_owned(), preload.to_owned()));
         let spec = serde_json::json!({
             "uid": me,
             "gid": gid,
             "groups": super::login_groups(gid, &groups),
             "argv": ["/bin/true"],
             "cwd": "/",
-            "env": [["LD_PRELOAD", preload], ["DYLD_INSERT_LIBRARIES", preload]],
+            "env": env,
         });
         let exe = super::helper_exe().unwrap();
         let mut stage = std::process::Command::new(exe);
@@ -723,8 +952,173 @@ mod tests {
             !text.contains("LD_PRELOAD") && !text.contains("DYLD_"),
             "the root stage is running with a caller preload: {text:?}"
         );
+        // The stage is started with a cleared environment, so the whole set is
+        // empty: one leaked line would be one line too many.
+        assert!(
+            environ.is_empty(),
+            "the root stage was started with an environment: {environ:?}"
+        );
+        // And the set it would exec is exactly the base five plus the two
+        // loader names the request asked for. A sentinel set in this process,
+        // and the daemon's own LANG, are not in it.
+        let mut got: Vec<String> = env
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        got.sort();
+        let path = |p: &std::path::Path| p.display().to_string();
+        let mut want = vec![
+            format!("HOME={}", path(&who.home)),
+            format!("USER={}", who.name),
+            format!("LOGNAME={}", who.name),
+            format!("SHELL={}", path(&who.shell)),
+            format!("PATH={}", super::DEFAULT_PATH),
+            format!("LD_PRELOAD={preload}"),
+            format!("DYLD_INSERT_LIBRARIES={preload}"),
+        ];
+        want.sort();
+        assert_eq!(
+            got, want,
+            "the exec env is not exactly the base plus the request"
+        );
+        assert!(!got.iter().any(|line| line.starts_with("AW_HOLD_SENTINEL=")));
+        assert!(!got.iter().any(|line| line.starts_with("LANG=")));
+        std::env::remove_var("AW_HOLD_SENTINEL");
+        std::env::remove_var("LANG");
         let _ = stage.kill();
         let _ = stage.wait();
+    }
+
+    /// What the helper execs is exactly `base_env`: the account's five basics
+    /// plus the names the request added, and not one line of anything else.
+    /// A sentinel set in this process must be absent, and the comparison is the
+    /// whole set.
+    #[cfg(unix)]
+    #[test]
+    fn dropped_env_is_exactly_the_base_plus_the_request() {
+        std::env::set_var("AW_HOLD_SENTINEL", "present-in-daemon");
+        std::env::set_var("LANG", "daemon-lang");
+        let me = nix::unistd::getuid().as_raw();
+        let who = super::lookup(me).expect("this account");
+        let extra = [("AW_RV".to_owned(), "1".to_owned())];
+        let got = super::base_env(&who, &extra);
+        let mut got_lines: Vec<String> = got
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        got_lines.sort();
+        let path = |p: &std::path::Path| p.display().to_string();
+        let mut want = vec![
+            format!("HOME={}", path(&who.home)),
+            format!("USER={}", who.name),
+            format!("LOGNAME={}", who.name),
+            format!("SHELL={}", path(&who.shell)),
+            format!("PATH={}", super::DEFAULT_PATH),
+            "AW_RV=1".to_owned(),
+        ];
+        want.sort();
+        assert_eq!(
+            got_lines, want,
+            "base env is not exactly the five plus AW_RV"
+        );
+        assert!(!got.iter().any(|(key, _)| key == "AW_HOLD_SENTINEL"));
+        assert!(!got.iter().any(|(key, _)| key == "LANG"));
+        std::env::remove_var("AW_HOLD_SENTINEL");
+        std::env::remove_var("LANG");
+    }
+
+    /// A launch request that sets one of the five account variables is refused,
+    /// naming that variable. A name the request is allowed to add is not, and on
+    /// Unix the comparison is case-sensitive: `Home` is a different variable.
+    #[cfg(unix)]
+    #[test]
+    fn reserved_env_names_are_refused_and_named() {
+        for name in ["HOME", "USER", "LOGNAME", "SHELL", "PATH"] {
+            let found = super::reserved_env_var(&[
+                ("AW_RV".to_owned(), "1".to_owned()),
+                (name.to_owned(), "caller-value".to_owned()),
+            ]);
+            assert_eq!(found.map(|reserved| reserved.name), Some(name.to_owned()));
+            let response = super::reserved_env_response(name);
+            assert_eq!(response.status, 400);
+            let body: serde_json::Value = serde_json::from_slice(&response.body).expect("json");
+            assert_eq!(body["error"]["code"], "env_reserved");
+            assert_eq!(body["error"]["detail"]["name"], name);
+            assert_eq!(
+                body["error"]["message"],
+                format!(
+                    "环境变量「{name}」由系统按你的账户来填，不能在请求里改。请去掉这个变量再试。"
+                )
+            );
+        }
+        // An ordinary requested variable is not reserved, and neither is a
+        // different case of a reserved name: Unix environment names are
+        // case-sensitive, so `Path` is not `PATH`.
+        assert!(super::reserved_env_var(&[("AW_RV".to_owned(), "1".to_owned())]).is_none());
+        assert!(super::reserved_env_var(&[("Home".to_owned(), "/tmp".to_owned())]).is_none());
+        assert!(super::reserved_env_var(&[("Path".to_owned(), "/bin".to_owned())]).is_none());
+    }
+
+    /// A bare `sh` is a candidate list, not a failure. This test is not root, so
+    /// the helper stops at the account switch and never execs; what it must not
+    /// do is report the program missing. A root run would exec it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bare_sh_is_not_reported_missing() {
+        if nix::unistd::geteuid().as_raw() == 0 {
+            return;
+        }
+        let me = nix::unistd::getuid().as_raw();
+        let who = super::lookup(me).expect("this account");
+        let error = super::spawn_as(
+            &who,
+            &["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
+            Some("/"),
+            &[],
+        )
+        .expect_err("not root, so the switch fails");
+        match error {
+            super::SpawnAsError::Program { .. } => {
+                panic!("a bare sh was reported as a program error; the search did not find it")
+            }
+            super::SpawnAsError::Drop(step) => {
+                assert!(
+                    step.contains("setgroups")
+                        || step.contains("setuid")
+                        || step.contains("setgid"),
+                    "the switch is what stopped it, not the program: {step}"
+                );
+            }
+        }
+    }
+
+    /// Even if a reserved name reached `base_env`, it would not replace the
+    /// account's value. The route refuses first; this is the backstop.
+    #[cfg(unix)]
+    #[test]
+    fn base_env_does_not_let_a_reserved_name_override_the_account() {
+        let me = nix::unistd::getuid().as_raw();
+        let who = super::lookup(me).expect("this account");
+        let extra = [
+            ("HOME".to_owned(), "/not/the/account/home".to_owned()),
+            ("PATH".to_owned(), "/not/the/base/path".to_owned()),
+            ("AW_RV".to_owned(), "1".to_owned()),
+        ];
+        let got = super::base_env(&who, &extra);
+        let path = |p: &std::path::Path| p.display().to_string();
+        assert_eq!(
+            got.iter().find(|(key, _)| key == "HOME").map(|(_, v)| v),
+            Some(&path(&who.home))
+        );
+        assert_eq!(
+            got.iter()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, v)| v.as_str()),
+            Some(super::DEFAULT_PATH)
+        );
+        assert!(got
+            .iter()
+            .any(|(key, value)| key == "AW_RV" && value == "1"));
     }
 
     #[cfg(target_os = "linux")]

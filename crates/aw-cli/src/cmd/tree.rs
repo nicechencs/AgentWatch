@@ -129,8 +129,10 @@ pub(crate) enum Command {
         filter: Option<String>,
     },
     /// 查看和管理会话
-    #[command(subcommand)]
-    Sessions(SessionsCmd),
+    Sessions {
+        #[command(subcommand)]
+        command: Option<SessionsCmd>,
+    },
     /// 查看会话时间线
     Timeline {
         /// 会话号或 @last
@@ -551,7 +553,8 @@ pub(crate) fn command_label(command: &Command) -> &'static str {
         Command::Attach { .. } => "attach",
         Command::Stop { .. } => "stop",
         Command::Ps { .. } => "ps",
-        Command::Sessions(cmd) => match cmd {
+        Command::Sessions { command: None } => "sessions list",
+        Command::Sessions { command: Some(cmd) } => match cmd {
             SessionsCmd::List { .. } => "sessions list",
             SessionsCmd::Show { .. } => "sessions show",
             SessionsCmd::Rename { .. } => "sessions rename",

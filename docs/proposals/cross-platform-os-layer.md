@@ -32,7 +32,7 @@ App 新建会话，后台按系统认出连接方，再按那个身份启动：
 | macOS | 本地套接字上用 `getpeereid` / `LOCAL_PEERPID` 取出对端 uid，切到这个身份再启动；接口不提供附加组，字段为 `None` |
 | Linux | `SO_PEERCRED` 认出 uid，按这个 uid 启动（现有的 launch-as） |
 
-`aw run` 在 Windows 上：`aw` 自己拿着「关闭即杀」的 Job，放行或移交之前先清掉这个限制。
+`aw run` 在 Windows 上：daemon 接管路径在放行前清掉「关闭即杀」Job 的限制；`--no-daemon` 则把这个 Job 留到 `aw` 退出，使被终止的 CLI 关闭 Job 并结束目标及普通后代。
 
 挂起再放行的代码今天在 `crates/aw-cli/src/launch/windows.rs` 和 `unix_macos.rs`。这两份**搬进** `aw-platform/windows` 和 `aw-platform/macos`，不留第二份，搬完旧文件删掉。
 
@@ -50,7 +50,7 @@ App 新建会话，后台按系统认出连接方，再按那个身份启动：
 | 系统 | 怎么挂住 | 失败时 | 创建者崩溃时 |
 |---|---|---|---|
 | Linux | 现有的门：`exec` 前堵住读一根管道 | 门不 `exec`，直接退出 | 写端只在创建者手里；读到 EOF（创建者已死）则门不 `exec` 直接退出。和/或只在挂住阶段设 `PR_SET_PDEATHSIG`，`exec` 前清掉 |
-| Windows | `CREATE_SUSPENDED`；`ResumeThread` 之前先放进 Job Object，带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`。这个限制只在挂住期间有效 | `TerminateProcess` | Job 句柄随创建者关闭，作业里的进程被杀掉。`aw run` 这条路径上，`aw` 拿着这个 Job，放行或移交前清掉限制 |
+| Windows | `CREATE_SUSPENDED`；`ResumeThread` 之前先放进 Job Object，带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`。daemon 接管时放行前清除；`--no-daemon` 保留到 CLI 退出 | `TerminateProcess` | Job 句柄随创建者关闭，作业里的进程被杀掉；`--no-daemon` 覆盖仍在 Job 内的普通后代 |
 | macOS | `posix_spawn`，带 `POSIX_SPAWN_START_SUSPENDED`；放行发 `SIGCONT` | `SIGKILL`，再 `waitpid` | 看门狗管道只覆盖挂住阶段，见下 |
 
 macOS 崩溃兜底用看门狗管道，不用「另起一个小看门狗发 `SIGKILL`」：挂住期间门堵住读一根管道，写端只在创建者手里；读到 EOF（创建者已死）则门不 `exec` 直接退出。【待验证】这是原型，须在真机 macOS 上确认。

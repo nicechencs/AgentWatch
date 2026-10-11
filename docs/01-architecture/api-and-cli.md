@@ -72,6 +72,8 @@ CLI 和 UI 请求到达后走同一套 axum 路由。传输层不同，但请求
 
 `aw attach --name`、`--no-follow-children`、`--no-existing-children` 和 `--move-to-cgroup` 在当前 daemon 轮询采样器中没有对应能力，CLI 会明确拒绝这些参数；请用 `aw ps` 找到 pid 后传入 `--pid`。
 
+`aw run --no-daemon` 不连接后台、不创建会话，也不启动本地记录器；文本模式结束时固定输出「没连后台，这次只运行程序，不做记录，也没有摘要。」。Windows 保留 `KILL_ON_JOB_CLOSE` Job 到 CLI 生命周期结束；Linux/macOS 使用 CLI 自己的 pipe-EOF 看护结束目标进程组。后两者只能覆盖未自行 `setsid` / 改进程组的普通后代；Linux 有可委派 cgroup 时 cgroup 范围更强。Windows 的批处理目标由 CLI 显式以系统 `cmd.exe /c` 启动，按 PATH+PATHEXT 解析；不能安全表示的换行参数会拒绝，而不是交给 shell 猜测。
+
 ```text
 aw
 ├── run [OPTIONS] -- <CMD> [ARGS...]        启动程序并记录

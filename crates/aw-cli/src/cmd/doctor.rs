@@ -419,10 +419,10 @@ fn reason_code(reason: &NaReason) -> &'static str {
 fn report_text(report: &DoctorReport) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "os {} {} privileged={}\n",
+        "系统 {} {} 管理员={}\n",
         report.host.os, report.host.version, report.host.privileged
     ));
-    out.push_str("collectors\n");
+    out.push_str("采集器\n");
     for probe in &report.collectors {
         match &probe.detail {
             Some(detail) => {
@@ -431,7 +431,7 @@ fn report_text(report: &DoctorReport) -> String {
             None => out.push_str(&format!("  {} {}\n", probe.name, probe.status)),
         }
     }
-    out.push_str("category  source  evidence  fix\n");
+    out.push_str("类别  来源  证据  处理建议\n");
     for row in &report.categories {
         let source = row.source.as_deref().unwrap_or("-");
         let fix = row.fix.as_deref().unwrap_or("-");
@@ -443,7 +443,7 @@ fn report_text(report: &DoctorReport) -> String {
             fix
         ));
     }
-    out.push_str("platform capability  status\n");
+    out.push_str("平台能力  状态\n");
     for (capability, status) in platform_capabilities() {
         out.push_str(&format!(
             "{}  {}\n",

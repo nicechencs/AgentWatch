@@ -8,12 +8,10 @@ description = "Cross-platform polling fallback. Process and connection snapshots
 
 [dependencies]
 aw-core = { workspace = true }
+aw-platform = { workspace = true }
 # MIT. Pinned here, not in [workspace.dependencies], because only this crate lists processes.
 # 0.36.1 is edition 2021 (rust-version 1.75). 0.39+ needs Rust 1.95 and edition 2024.
 sysinfo = "=0.36.1"
-
-[target.'cfg(target_os = "windows")'.dependencies]
-aw-platform = { workspace = true }
 
 [lints]
 workspace = true

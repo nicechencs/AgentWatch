@@ -269,7 +269,7 @@ fn channel_command(cli: &Cli, env_token: Option<String>, json: bool) -> Option<O
 fn is_query(command: &Command) -> bool {
     matches!(
         command,
-        Command::Sessions(_)
+        Command::Sessions { .. }
             | Command::Timeline { .. }
             | Command::Procs { .. }
             | Command::Flows { .. }
@@ -819,7 +819,19 @@ fn query_command(
     source: &mut dyn QuerySource,
 ) -> io::Result<Option<Outcome>> {
     match command {
-        Command::Sessions(cmd) => Ok(Some(sessions::run(cmd, json, source)?)),
+        Command::Sessions { command } => {
+            let default = tree::SessionsCmd::List {
+                since: None,
+                agent: None,
+                active: false,
+                limit: None,
+            };
+            Ok(Some(sessions::run(
+                command.as_ref().unwrap_or(&default),
+                json,
+                source,
+            )?))
+        }
         Command::Timeline {
             session,
             filter,
@@ -1395,6 +1407,38 @@ mod tests {
         assert!(err.contains("未接通") || err.contains("占位实现"), "{err}");
         assert!(!err.contains(TOKEN), "{err}");
         assert_eq!(http.opened, 0);
+    }
+
+    #[test]
+    fn bare_sessions_is_the_list_alias() {
+        let mut http = script(200, r#"{"status":"ok"}"#);
+        let bare = run(
+            &[
+                "--http",
+                "http://localhost:7456",
+                "--token",
+                TOKEN,
+                "sessions",
+            ],
+            None,
+            &mut http,
+        );
+        let mut http = script(200, r#"{"status":"ok"}"#);
+        let explicit = run(
+            &[
+                "--http",
+                "http://localhost:7456",
+                "--token",
+                TOKEN,
+                "sessions",
+                "list",
+            ],
+            None,
+            &mut http,
+        );
+        assert_eq!(bare.code, explicit.code);
+        assert_eq!(bare.stdout, explicit.stdout);
+        assert_eq!(bare.stderr, explicit.stderr);
     }
 
     #[test]

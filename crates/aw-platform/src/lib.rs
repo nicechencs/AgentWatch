@@ -12,6 +12,11 @@
 /// the ordering and failure rules testable on every supported target.
 pub mod held_launch;
 
+// The batch-file escaper is pure and deliberately tested on every OS.  Only
+// the Windows process implementation calls it.
+#[cfg(any(windows, test))]
+mod cmd_escape;
+
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -115,6 +120,11 @@ pub enum PlatformError {
         capability: &'static str,
         detail: &'static str,
     },
+    /// `cmd.exe` cannot safely represent this exact argv item.  The CLI prints
+    /// the prescribed refusal instead of ever splicing it into a command line.
+    UnsafeBatchArgument {
+        argument: String,
+    },
 }
 impl fmt::Display for PlatformError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -139,6 +149,9 @@ impl fmt::Display for PlatformError {
             ),
             Self::Io(error) => write!(f, "platform I/O error: {error}"),
             Self::Invalid { capability, detail } => write!(f, "{capability}: {detail}"),
+            Self::UnsafeBatchArgument { .. } => {
+                f.write_str("a batch-file argument cannot be represented safely")
+            }
         }
     }
 }
@@ -255,14 +268,22 @@ pub struct SpawnRequest {
     pub command: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
+    /// Keep the Windows Job's `KILL_ON_JOB_CLOSE` rule after the launch gate
+    /// opens.  This is only used by `aw run --no-daemon`: closing the holder
+    /// then terminates the program and ordinary descendants as one tree.
+    #[cfg(windows)]
+    pub keep_job_on_release: bool,
 }
 impl fmt::Debug for SpawnRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SpawnRequest")
+        let mut debug = f.debug_struct("SpawnRequest");
+        debug
             .field("command_len", &self.command.len())
             .field("has_cwd", &self.cwd.is_some())
-            .field("env_len", &self.env.len())
-            .finish()
+            .field("env_len", &self.env.len());
+        #[cfg(windows)]
+        debug.field("keep_job_on_release", &self.keep_job_on_release);
+        debug.finish()
     }
 }
 

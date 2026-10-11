@@ -59,10 +59,19 @@ impl SourceError {
 /// a real instant and must be passed as [`ProcessStartTime::UnixSeconds`] if a
 /// source truly observed it. `sysinfo` reports `0` when it could not read the
 /// start time; that adapter maps `0` to `Unavailable` and does not hash it.
+/// Native platform readings retain their comparison tick as well as the Unix
+/// timestamp used in events: FILETIME and start ticks must not be reduced to
+/// seconds before a parent/child ordering check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProcessStartTime {
     /// Whole seconds since the unix epoch. Coarser than the 10 ms identity bucket.
     UnixSeconds(u64),
+    /// Windows FILETIME (100 ns ticks since 1601) and its Unix timestamp.
+    WindowsFiletime { ticks: u64, unix_ns: u64 },
+    /// Linux `/proc/<pid>/stat` start ticks and its Unix timestamp.
+    LinuxStartTicks { ticks: u64, unix_ns: u64 },
+    /// macOS `proc_bsdinfo` microseconds and its Unix timestamp.
+    MacMicroseconds { ticks: u64, unix_ns: u64 },
     /// The source listed the process and could not read when it started.
     Unavailable,
 }

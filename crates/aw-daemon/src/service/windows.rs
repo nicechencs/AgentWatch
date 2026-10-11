@@ -179,7 +179,7 @@ pub fn install_plan() -> ServicePlan {
 #[must_use]
 pub fn pipe_acl_plan() -> AclPlan {
     AclPlan {
-        path: r"\\.\pipe\agentwatch".to_owned(),
+        path: r"\\.\pipe\agentwatch-api".to_owned(),
         trustees: vec![
             Trustee::System,
             Trustee::Administrators,

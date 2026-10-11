@@ -1,5 +1,6 @@
 //! Windows process identity.  FFI stays in the smallest functions that need it.
 
+use crate::cmd_escape::{batch_command_line, is_batch_file_name};
 use crate::{
     Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner, PeerIdentity,
     PipeServerVerificationError, Platform, PlatformError, ProcessEntry, ProcessKey,
@@ -46,7 +47,9 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
 #[allow(unused_imports)] // Kept with the named-pipe-fix import set for its boot-time helpers.
-use windows::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
+use windows::Win32::System::SystemInformation::{
+    GetSystemDirectoryW, GetSystemTimeAsFileTime, GetTickCount64,
+};
 use windows::Win32::System::SystemServices::{
     SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_RID,
     SECURITY_MANDATORY_SYSTEM_RID,
@@ -585,7 +588,13 @@ fn sampling_entry(
     }))
 }
 
-fn command_line(command: &[String]) -> Result<Vec<u16>, PlatformError> {
+struct CreateProcessCommandLine {
+    application: Option<Vec<u16>>,
+    command: Vec<u16>,
+}
+
+fn command_line(request: &SpawnRequest) -> Result<CreateProcessCommandLine, PlatformError> {
+    let command = &request.command;
     let Some(program) = command.first() else {
         return Err(PlatformError::Invalid {
             capability: "spawn_suspended",
@@ -623,14 +632,128 @@ fn command_line(command: &[String]) -> Result<Vec<u16>, PlatformError> {
         out.push('"');
         out
     };
-    Ok(command
+    let normal = || {
+        command
+            .iter()
+            .map(|arg| quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect()
+    };
+
+    let path = batch_script_path(program, request.cwd.as_deref(), &request.env);
+    let Some(path) = path else {
+        return Ok(CreateProcessCommandLine {
+            application: None,
+            command: normal(),
+        });
+    };
+    let script = path.to_string_lossy();
+    let command = batch_command_line(&script, &command[1..]).map_err(|error| {
+        PlatformError::UnsafeBatchArgument {
+            argument: error.argument,
+        }
+    })?;
+    Ok(CreateProcessCommandLine {
+        application: Some(system_cmd_exe()?),
+        command,
+    })
+}
+
+/// Locate a `.cmd` / `.bat` target exactly once before spawning.  `CreateProcessW`
+/// searches `PATH` for executables but not `PATHEXT`; doing this explicitly
+/// means a PATH-resolved batch file cannot fall back to its unsafe implicit
+/// `cmd.exe` handling.
+fn batch_script_path(
+    program: &str,
+    cwd: Option<&Path>,
+    extra_env: &[(String, String)],
+) -> Option<PathBuf> {
+    let path_value = environment_value(extra_env, "PATH").or_else(|| std::env::var_os("PATH"));
+    let pathext = environment_value(extra_env, "PATHEXT")
+        .or_else(|| std::env::var_os("PATHEXT"))
+        .unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
+    let has_path = program.contains(['\\', '/']) || Path::new(program).is_absolute();
+    let current = cwd
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())?;
+    let directories = if has_path {
+        vec![PathBuf::new()]
+    } else {
+        std::iter::once(current.clone())
+            .chain(
+                path_value
+                    .into_iter()
+                    .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>()),
+            )
+            .collect()
+    };
+
+    let program_path = Path::new(program);
+    let has_extension = is_batch_file_name(program) || program_path.extension().is_some();
+    let extensions: Vec<OsString> = if has_extension {
+        vec![OsString::new()]
+    } else {
+        pathext
+            .to_string_lossy()
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(OsString::from)
+            .collect()
+    };
+    for directory in directories {
+        for extension in &extensions {
+            let candidate = if has_path {
+                current.join(program_path)
+            } else {
+                directory.join(program_path)
+            };
+            let candidate = if extension.is_empty() {
+                candidate
+            } else {
+                PathBuf::from(format!(
+                    "{}{}",
+                    candidate.to_string_lossy(),
+                    extension.to_string_lossy()
+                ))
+            };
+            if candidate.is_file() && is_batch_file_name(&candidate.to_string_lossy()) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn environment_value(extra_env: &[(String, String)], name: &str) -> Option<OsString> {
+    extra_env
         .iter()
-        .map(|arg| quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .encode_utf16()
-        .chain(Some(0))
-        .collect())
+        .rev()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| OsString::from(value))
+}
+
+/// Get the absolute system `cmd.exe` path, never a program found through the
+/// caller's working directory or PATH.
+fn system_cmd_exe() -> Result<Vec<u16>, PlatformError> {
+    let mut buffer = vec![0_u16; 32_768];
+    // SAFETY: `buffer` is writable UTF-16 storage for the documented system
+    // directory API. The static capacity exceeds the supported Windows path.
+    #[allow(unsafe_code)]
+    let length = unsafe { GetSystemDirectoryW(Some(buffer.as_mut_slice())) };
+    if length == 0
+        || usize::try_from(length)
+            .ok()
+            .is_none_or(|length| length >= buffer.len())
+    {
+        return Err(io_error(Error::from_win32()));
+    }
+    buffer.truncate(length as usize);
+    buffer.extend(r"\cmd.exe".encode_utf16());
+    buffer.push(0);
+    Ok(buffer)
 }
 
 /// Build an environment block for the target only.  This buffer is never
@@ -850,6 +973,7 @@ struct WindowsHeldChild {
     process: HANDLE,
     thread: HANDLE,
     key: ProcessKey,
+    keep_job_on_release: bool,
 }
 
 /// Termination is best-effort during Drop/abort. Never let a stuck kernel wait
@@ -884,6 +1008,9 @@ impl Drop for WindowsHeldChild {
 struct WindowsReleasedChild {
     process: HANDLE,
     pid: u32,
+    /// Present only for `aw run --no-daemon`. Closing it applies the Job's
+    /// KILL_ON_JOB_CLOSE rule to the root and descendants still in the Job.
+    job: HANDLE,
 }
 
 impl WindowsReleasedChild {
@@ -900,8 +1027,13 @@ impl WindowsReleasedChild {
 
 impl Drop for WindowsReleasedChild {
     fn drop(&mut self) {
-        // Released programs survive their holder. Only the handle is closed.
+        // A normal daemon-owned launch clears the Job rule and has no Job
+        // here. A local `--no-daemon` launch retains it deliberately: this
+        // holder is the lifetime boundary for the whole process tree.
+        close(self.job);
+        self.job = HANDLE::default();
         close(self.process);
+        self.process = HANDLE::default();
     }
 }
 
@@ -915,11 +1047,14 @@ impl crate::HeldChild for WindowsHeldChild {
         if let Some(delay) = hold_delay() {
             std::thread::sleep(std::time::Duration::from_millis(delay));
         }
-        // The limit must be removed before ResumeThread: after release, no
-        // holder death is allowed to terminate the program.
-        if let Err(error) = set_kill_on_close(self.job, false) {
-            self.kill_reap_close();
-            return Err(error);
+        if !self.keep_job_on_release {
+            // Daemon-owned launches outlive the hand-off. Remove the limit
+            // before resuming so closing the temporary Job cannot terminate
+            // the adopted program.
+            if let Err(error) = set_kill_on_close(self.job, false) {
+                self.kill_reap_close();
+                return Err(error);
+            }
         }
         // SAFETY: this retained primary thread is resumed exactly once here.
         #[allow(unsafe_code)]
@@ -929,14 +1064,19 @@ impl crate::HeldChild for WindowsHeldChild {
             return Err(error);
         }
         close(self.thread);
-        close(self.job);
         self.thread = HANDLE::default();
-        self.job = HANDLE::default();
         let released = WindowsReleasedChild {
             process: self.process,
             pid: self.key.pid,
+            job: if self.keep_job_on_release {
+                self.job
+            } else {
+                close(self.job);
+                HANDLE::default()
+            },
         };
         self.process = HANDLE::default();
+        self.job = HANDLE::default();
         Ok(Box::new(released))
     }
 
@@ -1237,7 +1377,7 @@ impl Platform for CurrentPlatform {
         if caller.owner() != &self.current_owner()? {
             return Err(no("spawn_suspended_for_other_user"));
         }
-        let mut command = command_line(&request.command)?;
+        let mut command = command_line(request)?;
         let mut env = environment(&request.env);
         let inherited = InheritedStdHandles::for_current_process()?;
         let attributes = AttributeList::with_handles(&inherited.handles)?;
@@ -1269,8 +1409,13 @@ impl Platform for CurrentPlatform {
         #[allow(unsafe_code)]
         let created = unsafe {
             CreateProcessW(
-                windows::core::PCWSTR::null(),
-                PWSTR(command.as_mut_ptr()),
+                command
+                    .application
+                    .as_ref()
+                    .map_or(windows::core::PCWSTR::null(), |path| {
+                        windows::core::PCWSTR(path.as_ptr())
+                    }),
+                PWSTR(command.command.as_mut_ptr()),
                 None,
                 None,
                 true,
@@ -1298,6 +1443,7 @@ impl Platform for CurrentPlatform {
                         pid: info.dwProcessId,
                         start_time: 0,
                     },
+                    keep_job_on_release: request.keep_job_on_release,
                 };
                 child.kill_reap_close();
                 return Err(error);
@@ -1313,6 +1459,7 @@ impl Platform for CurrentPlatform {
                     process: info.hProcess,
                     thread: info.hThread,
                     key,
+                    keep_job_on_release: request.keep_job_on_release,
                 };
                 child.kill_reap_close();
                 return Err(io_error(error));
@@ -1323,6 +1470,7 @@ impl Platform for CurrentPlatform {
             process: info.hProcess,
             thread: info.hThread,
             key,
+            keep_job_on_release: request.keep_job_on_release,
         };
         if let Err(error) = set_kill_on_close(child.job, true) {
             child.kill_reap_close();
@@ -1436,13 +1584,19 @@ mod tests {
     };
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::{HLOCAL, PSID};
+    use windows::Win32::Foundation::{HLOCAL, PSID, WAIT_OBJECT_0};
     use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows::Win32::Security::{
         GetAce, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
     };
+    use windows::Win32::System::Console::{
+        SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
     use windows::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+    use windows::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
 
     #[derive(Debug, PartialEq, Eq)]
     struct DaclReadback {
@@ -1627,6 +1781,7 @@ mod tests {
             command: vec!["cmd".to_owned(), "/c".to_owned(), "exit 7".to_owned()],
             cwd: None,
             env: Vec::new(),
+            keep_job_on_release: false,
         };
         let held = platform()
             .spawn_suspended(&caller, &request)
@@ -1642,6 +1797,7 @@ mod tests {
             command: vec!["cmd".to_owned(), "/c".to_owned(), "exit 300".to_owned()],
             cwd: None,
             env: Vec::new(),
+            keep_job_on_release: false,
         };
         let released = platform()
             .spawn_suspended(&caller, &request)
@@ -1665,6 +1821,7 @@ mod tests {
             ],
             cwd: None,
             env: Vec::new(),
+            keep_job_on_release: false,
         };
         let released = platform()
             .spawn_suspended(&caller, &request)
@@ -1733,6 +1890,7 @@ mod tests {
             command: vec!["cmd".to_owned(), "/c".to_owned(), "exit 0".to_owned()],
             cwd: None,
             env: Vec::new(),
+            keep_job_on_release: false,
         };
 
         let error = match CurrentPlatform.spawn_suspended(&caller, &request) {
@@ -1747,6 +1905,194 @@ mod tests {
                 kind: UnsupportedKind::NotInThisBuild,
             }
         ));
+    }
+
+    #[test]
+    fn current_owner_passes_the_adopt_ownership_check() {
+        let caller = IdentifiedCaller::current_user().expect("current user");
+        let request = SpawnRequest {
+            command: vec!["cmd".to_owned(), "/c".to_owned(), "exit 0".to_owned()],
+            cwd: None,
+            env: Vec::new(),
+            keep_job_on_release: false,
+        };
+        let released = CurrentPlatform
+            .spawn_suspended(&caller, &request)
+            .expect("this caller owns its own process")
+            .release()
+            .expect("release process");
+        assert_eq!(
+            released.wait().expect("reap process"),
+            ReapOutcome::Exited(0)
+        );
+    }
+
+    #[test]
+    fn retained_job_kills_a_grandchild_when_the_holder_is_dropped() {
+        let root = temp_dir("job-grandchild");
+        std::fs::create_dir_all(&root).expect("test dir");
+        let script = root.join("spawn-grandchild.ps1");
+        let marker = root.join("grandchild-pid.txt");
+        std::fs::write(
+            &script,
+            "$child = Start-Process -FilePath $env:ComSpec -ArgumentList '/d','/c','timeout /t 30 /nobreak > NUL' -PassThru\n[IO.File]::WriteAllText($args[0], $child.Id)\nStart-Sleep -Seconds 30\n",
+        )
+        .expect("PowerShell script");
+        let caller = IdentifiedCaller::current_user().expect("current user");
+        let request = SpawnRequest {
+            command: vec![
+                "powershell.exe".to_owned(),
+                "-NoProfile".to_owned(),
+                "-NonInteractive".to_owned(),
+                "-ExecutionPolicy".to_owned(),
+                "Bypass".to_owned(),
+                "-File".to_owned(),
+                script.to_string_lossy().into_owned(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            cwd: Some(root.clone()),
+            env: Vec::new(),
+            keep_job_on_release: true,
+        };
+        let released = platform()
+            .spawn_suspended(&caller, &request)
+            .expect("held parent")
+            .release()
+            .expect("released parent with retained Job");
+        let started = std::time::Instant::now();
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&marker) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "grandchild did not publish a pid"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        // SAFETY: asks only for synchronization on the process this test
+        // created, and the resulting owned handle is closed below.
+        #[allow(unsafe_code)]
+        let grandchild = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }
+            .expect("open running grandchild");
+        drop(released); // Models TerminateProcess of the CLI closing its Job.
+                        // SAFETY: wait uses the still-owned synchronization handle.
+        #[allow(unsafe_code)]
+        let result = unsafe { WaitForSingleObject(grandchild, 5_000) };
+        close(grandchild);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(result, WAIT_OBJECT_0, "Job close must kill grandchildren");
+    }
+
+    #[test]
+    fn batch_ampersand_stays_literal_and_does_not_run_a_second_command() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "windows::tests::batch_ampersand_stays_literal_in_child",
+                "--nocapture",
+            ])
+            .output()
+            .expect("run child test process");
+        assert!(
+            output.status.success(),
+            "child test stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("pwned"),
+            "an ampersand argument ran an extra command: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn batch_ampersand_stays_literal_in_child() {
+        let root = temp_dir("batch-argv");
+        std::fs::create_dir_all(&root).expect("batch dir");
+        let script = root.join("echoargs.cmd");
+        let marker = root.join("marker.txt");
+        std::fs::write(
+            &script,
+            "@echo off\r\nif not \"%~1\"==\"a&echo pwned\" exit /b 9\r\n> \"%~2\" echo literal\r\n",
+        )
+        .expect("batch script");
+        let caller = IdentifiedCaller::current_user().expect("current user");
+        let request = SpawnRequest {
+            // No extension: PATH + PATHEXT must discover the batch file before
+            // CreateProcess can apply its implicit, unsafe batch behaviour.
+            command: vec![
+                "echoargs".to_owned(),
+                "a&echo pwned".to_owned(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            cwd: Some(root.clone()),
+            env: vec![
+                ("PATH".to_owned(), root.to_string_lossy().into_owned()),
+                ("PATHEXT".to_owned(), ".CMD".to_owned()),
+            ],
+            keep_job_on_release: false,
+        };
+        let result = platform()
+            .spawn_suspended(&caller, &request)
+            .expect("held batch child")
+            .release()
+            .expect("released batch child")
+            .wait()
+            .expect("reap batch child");
+        assert_eq!(result, ReapOutcome::Exited(0));
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .expect("literal marker")
+                .trim(),
+            "literal"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_standard_handles_are_replaced_with_nul_at_runtime() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "windows::tests::missing_standard_handles_are_replaced_with_nul_in_child",
+                "--nocapture",
+            ])
+            .output()
+            .expect("run child test process");
+        assert!(
+            output.status.success(),
+            "child test stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn missing_standard_handles_are_replaced_with_nul_in_child() {
+        // This process is a disposable test child. Clearing its standard-handle
+        // table verifies the production fallback without changing the runner.
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: only the test child changes its own standard-handle table;
+            // it exits immediately after exercising the spawn path.
+            #[allow(unsafe_code)]
+            unsafe { SetStdHandle(which, windows::Win32::Foundation::HANDLE::default()) }
+                .expect("clear child std handle");
+        }
+        let caller = IdentifiedCaller::current_user().expect("current user");
+        let request = SpawnRequest {
+            command: vec!["cmd".to_owned(), "/c".to_owned(), "exit 0".to_owned()],
+            cwd: None,
+            env: Vec::new(),
+            keep_job_on_release: false,
+        };
+        let released = platform()
+            .spawn_suspended(&caller, &request)
+            .expect("held child with NUL std handles")
+            .release()
+            .expect("released child");
+        assert_eq!(released.wait().expect("reap child"), ReapOutcome::Exited(0));
     }
 
     #[test]
@@ -1780,6 +2126,7 @@ mod tests {
             command: vec!["cmd".to_owned(), "/c".to_owned(), "echo hello".to_owned()],
             cwd: None,
             env: Vec::new(),
+            keep_job_on_release: false,
         };
         let held = platform()
             .spawn_suspended(&caller, &request)

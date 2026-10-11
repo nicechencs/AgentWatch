@@ -129,10 +129,11 @@ P3-WIN-01（2026-10-08）没有在本机或 CI 上订阅 `Microsoft-Windows-PktM
 `aw-platform` 已实现 Windows 的本地两阶段启动【未在真机验证】：以
 `CREATE_SUSPENDED` 创建目标后，立即放入带
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job。持有阶段创建者退出会使目标
-结束；`release()` 先清除该限制再 `ResumeThread`，返回唯一持有进程句柄的
-`ReleasedChild`，由它负责等待和回收。`aw run --no-daemon -- cmd /c exit 7`
-有 Windows 条件测试断言退出码保持为 7。`--env` 只构成子进程环境块，不发送到
-daemon、日志或数据库。【未在真机验证】
+结束。daemon 接管用的临时 Job 在 `release()` 前清除该限制；但
+`aw run --no-daemon` 会把带该限制的 Job 连同唯一进程句柄保留到 `aw` 自身
+退出，因此 `aw` 被 `TerminateProcess` 时，Job 内的目标和普通后代一起结束。
+Windows 条件测试覆盖 `cmd /c exit 7`、批处理参数中的 `&`，以及一个孙进程。
+`--env` 只构成子进程环境块，不发送到 daemon、日志或数据库。【未在真机验证】
 
 命名管道创建时设置显式 DACL、拒绝远程客户端，并把 owner 显式写为服务模式的
 SYSTEM 或开发模式的当前用户。客户端以 `SECURITY_IDENTIFICATION` 打开管道，并在
@@ -147,22 +148,22 @@ CLI 放行。App 的「新建会话 / 后台直接启动」在 Windows 当前明
 
 当前实现的本地启动顺序是：
 
-1. CLI 用 `CREATE_SUSPENDED` 创建目标进程，并立即将其加入一个带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的临时 Job。
-2. CLI 通过 daemon 的 `/adopt` API 交出 PID；如果 daemon 拒绝，CLI 结束并回收这个仍被挂起的子进程。
-3. 接管成功后，CLI 清除临时 Job 的 kill-on-close 限制、恢复主线程，并保留唯一的进程回收句柄。
+1. CLI 用 `CREATE_SUSPENDED` 创建目标进程，并立即将其加入一个带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job。
+2. daemon 接管路径在放行前清除该限制；接管失败则结束并回收仍被挂起的子进程。
+3. `--no-daemon` 不清除限制：恢复主线程后仍由 CLI 持有 Job，直到 CLI 正常退出或被终止。关闭 Job 会结束其中的目标和未 breakaway 的后代。
 
-这个 Job 目前只实现“接管前不得执行、失败即结束”的启动闸门；释放时 CLI 会关闭 Job，daemon 不接收 Job 句柄，也没有 IOCP / `JobObjectAssociateCompletionPortInformation` 路由。因此它**尚不**是释放后子进程树的 Windows 范围追踪实现，不能声称已阻止 breakaway 或已覆盖后代进程。【待验证 SPIKE-05】
+该 Job 只保证 `--no-daemon` 的 CLI 存活期间范围；daemon 不接收 Job 句柄，也没有 IOCP / `JobObjectAssociateCompletionPortInformation` 路由，所以它不是后台会话的长期范围追踪。未设置 breakaway 权限的普通后代会留在 Job；通过服务、计划任务或其他会话创建的进程不在范围内，不能说成已经覆盖所有后代。【待验证 SPIKE-05】
 
 ### 4.1.1 当前 CLI 命令与限制
 
-- `aw run [选项] -- <命令> [参数…]` 是启动入口。已解析的选项为 `--agent`、`--name`、`--cwd`、重复的 `--env KEY=VALUE`、`--summary none|short|full`、`--pin`、`--no-daemon`、`--raw <file>` 与 `--no-follow-children`。`--raw` 当前只记录请求，不写原始事件文件；daemon 模式不支持 `--no-follow-children`。`--no-daemon` 走本地启动路径；Windows 上该路径使用上述挂起 Job 闸门，采集状态仍应按命令输出解释，不把未知值当作零。
+- `aw run [选项] -- <命令> [参数…]` 是启动入口。已解析的选项为 `--agent`、`--name`、`--cwd`、重复的 `--env KEY=VALUE`、`--summary none|short|full`、`--pin`、`--no-daemon`、`--raw <file>` 与 `--no-follow-children`。`--raw` 当前只记录请求，不写原始事件文件；daemon 模式不支持 `--no-follow-children`。`--no-daemon` 走本地启动路径并保留上述 Job 到 CLI 退出；它不建会话，结束时只输出「没连后台，这次只运行程序，不做记录，也没有摘要。」。
 - `--proxy`（可配 `--proxy-on-reject fail|tunnel`）当前只输出环境注入计划，**不会启动**代理或目标进程。`--self-report`、`--mcp-tap`、`--unsafe-no-redact`、`--include-proc`、`--group` 已被解析但在本构建中拒绝，不能把它们写成可用功能。
 - `aw stop <SESSION>` 只停止对该会话的监控，**不结束**目标进程；没有 Windows 专用 stop 标志。
 - `aw daemon status|start|stop|restart` 和 `aw daemon logs [-f|--follow] [-n|--lines <数量>]` 使用本地 daemon 通道。`aw daemon install [--yes]` 仅生成或打印给管理员执行的 `sc.exe` 文本，不注册服务；`aw daemon uninstall [--purge] [--check]` 也由当前构建的计划接口处理。全局可用的连接/输出选项是 `--json`、`--socket`、`--http`、`--token`、`--lang zh|en`、`-q|--quiet`、`-v|--verbose`。
 
 ### 4.2 附着模式
 
-- 用 `CreateToolhelp32Snapshot` 拿快照，按父 PID 建树。注意 Windows 的父 PID 可能已经被复用，要校验父进程的 CreateTime 是否早于子进程。
+- 用一次完整 `CreateToolhelp32Snapshot` 枚举所有进程，再按父 PID 建树，不从 pid 4 向下猜测。注意 Windows 的父 PID 可能已经被复用：以完整精度 FILETIME 校验父进程 CreateTime；只有父进程严格晚于子进程时才判为复用，时间相等仍是可能的父子关系。
 - 之后依靠 Kernel-Process 的 ProcessStart.ParentProcessID 增量维护。
 - 不对已在运行的进程加 Job，以免改变目标行为。
 

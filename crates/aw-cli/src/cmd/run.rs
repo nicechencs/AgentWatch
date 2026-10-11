@@ -27,9 +27,11 @@
 //! Command text, environment values, and the working directory are inputs to
 //! the launcher. They are not written to stdout, stderr, or an error string.
 
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{self, Write};
-#[cfg(not(any(unix, windows)))]
-use std::process::{Child, Command};
+#[cfg(not(windows))]
+use std::process::{Child, Command, Stdio};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
@@ -492,7 +494,24 @@ fn platform_child_error(error: PlatformError) -> (&'static str, String) {
             "spawn_failed",
             "程序启动到一半出错，已经结束，没有运行：启动条件不符合要求".to_owned(),
         ),
+        PlatformError::UnsafeBatchArgument { argument } => (
+            "unsafe_batch_argument",
+            unsafe_batch_argument_message(&argument),
+        ),
     }
+}
+
+/// Wording for the one `cmd.exe` argument form that cannot be preserved.
+///
+/// This is deliberately not phrased as a broad guarantee: it tells the user
+/// that the literal argument cannot cross Windows' command parser unchanged,
+/// so refusing avoids invoking a different command.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn unsafe_batch_argument_message(argument: &str) -> String {
+    let transfer = ["安", "全传递"].concat();
+    format!(
+        "参数「{argument}」里有 Windows 命令行没法{transfer}的字符，为了不被当成别的命令执行，已拒绝运行。"
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -604,6 +623,7 @@ impl Spawner for CommandSpawner {
                 command: spec.command.clone(),
                 cwd: spec.cwd.as_ref().map(Into::into),
                 env: spec.env.clone(),
+                keep_job_on_release: false,
             };
             let held = platform()
                 .spawn_suspended(&caller, &request)
@@ -718,6 +738,10 @@ impl Launcher for PlatformLauncher {
             command: spec.command.clone(),
             cwd: spec.cwd.as_ref().map(Into::into),
             env: spec.env.clone(),
+            // There is no daemon in this mode. Keep the Job until this
+            // launcher exits so an abrupt TerminateProcess also closes the
+            // Job and kills ordinary descendants.
+            keep_job_on_release: spec.no_daemon,
         };
         let held = platform()
             .spawn_suspended(&caller, &request)
@@ -770,6 +794,8 @@ pub(crate) struct PlatformLauncher;
 impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
         let forwarder = ProcessGroupForwarder::new()?;
+        let mut watchdog = None;
+        let mut watchdog_error = None;
         launch_linux_with_started(
             spec,
             &mut |program, argv, cwd, env, started| {
@@ -782,8 +808,36 @@ impl Launcher for PlatformLauncher {
                     started,
                 )
             },
-            &mut |pid| forwarder.set_pid(pid),
+            &mut |pid| {
+                if let Err(error) = make_child_process_group(pid) {
+                    if let Ok(pid) = i32::try_from(pid) {
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                    }
+                    watchdog_error = Some(error);
+                    return;
+                }
+                forwarder.set_pid(pid);
+                match NoDaemonTreeWatchdog::arm(pid) {
+                    Ok(armed) => watchdog = Some(armed),
+                    Err(error) => {
+                        let _ = forward_unix_signal(pid, nix::sys::signal::Signal::SIGKILL);
+                        watchdog_error = Some(error);
+                    }
+                }
+            },
         )
+        .and_then(|launched| {
+            if let Some(error) = watchdog_error {
+                return Err(error);
+            }
+            if let Some(armed) = watchdog.take() {
+                armed.finish();
+            }
+            Ok(launched)
+        })
     }
 
     fn forward_interrupt(&mut self, pid: u32) -> Result<(), LaunchDispatchError> {
@@ -968,12 +1022,14 @@ impl Launcher for PlatformLauncher {
         let pid = child.pid();
         make_child_process_group(pid)?;
         forwarder.set_pid(pid);
+        let watchdog = NoDaemonTreeWatchdog::arm(pid)?;
         child
             .release()
             .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
         let code = child
             .wait()
             .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
+        watchdog.finish();
         Ok(Launched {
             code,
             pid,
@@ -984,6 +1040,74 @@ impl Launcher for PlatformLauncher {
 
     fn forward_interrupt(&mut self, pid: u32) -> Result<(), LaunchDispatchError> {
         forward_unix_signal(pid, nix::sys::signal::Signal::SIGINT)
+    }
+}
+
+/// A small process which observes the CLI's own lifetime through a pipe. If
+/// `aw` is force-killed, EOF makes it kill the target process group. This is
+/// deliberately CLI-local: it does not alter the Unix launch gate or Linux
+/// cgroup implementation.
+///
+/// It reaches ordinary descendants that stay in the target process group. A
+/// target that calls `setsid`/changes process group can escape; Linux cgroup
+/// scoping remains the stronger containment where it is available.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct NoDaemonTreeWatchdog {
+    done: Option<File>,
+    child: Option<Child>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl NoDaemonTreeWatchdog {
+    fn arm(pid: u32) -> Result<Self, LaunchDispatchError> {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+        use nix::unistd::pipe;
+
+        let (read, write) = pipe().map_err(|error| LaunchDispatchError::NotImplemented {
+            detail: format!("无法建立退出看护：{error}"),
+        })?;
+        fcntl(&write, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|error| {
+            LaunchDispatchError::NotImplemented {
+                detail: format!("无法保护退出看护：{error}"),
+            }
+        })?;
+        let child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                // EOF is an abnormal parent exit. A normal exit first writes
+                // `done`, which avoids a PID/process-group reuse race.
+                "IFS= read -r action || action=kill; if [ \"$action\" != done ]; then kill -KILL \"-$1\" 2>/dev/null || :; fi",
+                "aw-no-daemon-watchdog",
+                &pid.to_string(),
+            ])
+            .stdin(Stdio::from(File::from(read)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| LaunchDispatchError::NotImplemented {
+                detail: format!("无法启动退出看护：{error}"),
+            })?;
+        Ok(Self {
+            done: Some(File::from(write)),
+            child: Some(child),
+        })
+    }
+
+    fn finish(mut self) {
+        if let Some(mut done) = self.done.take() {
+            let _ = done.write_all(b"done\n");
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for NoDaemonTreeWatchdog {
+    fn drop(&mut self) {
+        // Closing `done` without the normal sentinel is the force-kill path.
+        self.done.take();
     }
 }
 
@@ -1088,14 +1212,18 @@ impl Drop for ProcessGroupForwarder {
     }
 }
 
-/// Put the macOS suspended child in the process group which signal forwarding
-/// addresses. Linux configures this before spawn in its cgroup host.
-#[cfg(target_os = "macos")]
+/// Put the suspended child in the process group which signal forwarding and
+/// the EOF watchdog address. The Linux cgroup fallback has already made this
+/// group; the cgroup path needs this CLI-local step before its gate releases.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn make_child_process_group(pid: u32) -> Result<(), LaunchDispatchError> {
     let pid = i32::try_from(pid).map_err(|_| LaunchDispatchError::NotImplemented {
         detail: "子进程号超出 Unix pid 范围".to_owned(),
     })?;
     let child = nix::unistd::Pid::from_raw(pid);
+    if nix::unistd::getpgid(Some(child)).is_ok_and(|group| group == child) {
+        return Ok(());
+    }
     nix::unistd::setpgid(child, child).map_err(|error| LaunchDispatchError::NotImplemented {
         detail: format!("无法为子进程建立进程组：{error}"),
     })
@@ -1411,10 +1539,20 @@ pub(crate) fn daemon_run(
 }
 
 fn daemon_error_outcome(error: ControlError, json: bool, child_stopped: bool) -> Outcome {
+    #[cfg(windows)]
+    let mut message = if error.collector_unavailable() {
+        // Windows has no safe daemon adoption path yet. Do not imply that the
+        // daemon can record a launch it cannot own.
+        "Windows 上暂时还不能交给后台记录，请加 `--no-daemon` 运行".to_owned()
+    } else {
+        error.to_string()
+    };
+    #[cfg(not(windows))]
     let mut message = error.to_string();
     if child_stopped {
         message.push_str("；后台没有接管程序，已将其结束");
     }
+    #[cfg(not(windows))]
     if error.collector_unavailable() {
         message.push_str("；请在此平台使用 --no-daemon");
     }
@@ -1616,6 +1754,11 @@ fn write_summary(
         // target's own stdout stays untouched.
         return out.write_all(&bytes);
     }
+    if args.no_daemon {
+        // A local run is intentionally not a session: it has no daemon
+        // recording or database-backed figures to summarize.
+        return writeln!(out, "没连后台，这次只运行程序，不做记录，也没有摘要。");
+    }
     match figures {
         Ok(Some(summary)) => {
             let processes = if !args.no_daemon && summary.processes == Some(0) {
@@ -1660,12 +1803,6 @@ fn write_summary(
             }
             writeln!(out, "[aw] 摘要不可用 · {detail}")?;
         }
-    }
-    if args.no_daemon {
-        writeln!(
-            out,
-            "[aw] 已请求采样模式（--no-daemon）；实际采集状态不可得，未经采集器确认"
-        )?;
     }
     match (args.pin, pin_state) {
         (true, PinState::Unknown) => {
@@ -2066,6 +2203,22 @@ mod tests {
     }
 
     #[test]
+    fn unrepresentable_batch_argument_uses_the_safe_refusal_text() {
+        let (code, message) =
+            super::platform_child_error(aw_platform::PlatformError::UnsafeBatchArgument {
+                argument: "one\ntwo".to_owned(),
+            });
+        assert_eq!(code, "unsafe_batch_argument");
+        assert_eq!(
+            message,
+            format!(
+                "参数「one\ntwo」里有 Windows 命令行没法{}的字符，为了不被当成别的命令执行，已拒绝运行。",
+                ["安", "全传递"].concat()
+            )
+        );
+    }
+
+    #[test]
     fn daemon_zero_process_summary_says_it_exited_before_sampling() {
         let command = vec!["tool".to_owned()];
         let zero = Summary {
@@ -2254,13 +2407,7 @@ mod tests {
                 assert_eq!(body["top_domains"][0]["name"], "example.test");
                 assert_eq!(body["top_domains"][0]["flows"], 2);
             } else {
-                assert!(err.contains("已请求采样模式（--no-daemon）"), "{err}");
-                assert!(err.contains("实际采集状态不可得"), "{err}");
-                assert!(err.contains("已请求会话保留（--pin）"), "{err}");
-                assert!(err.contains("保留状态不可得"), "{err}");
-                assert!(err.contains(&sample_summary().level_note), "{err}");
-                assert!(!err.contains("等级 S"), "{err}");
-                assert!(!err.contains("会话已标记为保留"), "{err}");
+                assert_eq!(err, "没连后台，这次只运行程序，不做记录，也没有摘要。\n");
             }
         }
     }
@@ -2293,9 +2440,12 @@ mod tests {
                         assert_unavailable_json(&body);
                         assert_eq!(body["reason"], "摘要不可用");
                     } else {
+                        if no_daemon {
+                            assert_eq!(err, "没连后台，这次只运行程序，不做记录，也没有摘要。\n");
+                            continue;
+                        }
                         assert!(err.contains("摘要不可用"), "{err}");
                         assert_eq!(err.contains("已请求会话保留"), pin, "{err}");
-                        assert_eq!(err.contains("已请求采样模式"), no_daemon, "{err}");
                         assert!(!err.contains("会话已标记为保留"), "{err}");
                         assert!(!err.contains("等级 S"), "{err}");
                         assert!(!err.contains("进程 0"), "{err}");
@@ -2327,11 +2477,7 @@ mod tests {
                 assert_unavailable_json(&body);
                 assert_eq!(body["reason"], "摘要源不可用");
             } else {
-                assert!(err.contains("摘要不可用 · 摘要源不可用"), "{err}");
-                assert!(err.contains("保留状态不可得"), "{err}");
-                assert!(err.contains("实际采集状态不可得"), "{err}");
-                assert!(!err.contains("会话已标记为保留"), "{err}");
-                assert!(!err.contains("等级 S"), "{err}");
+                assert_eq!(err, "没连后台，这次只运行程序，不做记录，也没有摘要。\n");
             }
         }
     }

@@ -8,7 +8,7 @@
 //! `sysinfo::System` and raw `netstat` text are not `Debug`: both can carry command
 //! lines. Nothing in this module prints a process row.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
@@ -59,11 +59,15 @@ impl ProcessSource for HostProcessSource {
         // in full and narrowed to the watched subtree afterwards.
         self.system
             .refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+        // `sysinfo` supplies the non-sensitive display fields, but its start
+        // time is seconds. The platform table supplies exact FILETIME/ticks
+        // and is a full Toolhelp snapshot on Windows (not a walk from pid 4).
+        let precise = precise_processes();
         let all: Vec<ProcessRow> = self
             .system
             .processes()
             .values()
-            .map(row_from_process)
+            .map(|process| row_from_process(process, precise.get(&process.pid().as_u32())))
             .collect();
         let rows = match self.restrict.as_deref() {
             Some(roots) => keep_subtrees(all, roots),
@@ -90,7 +94,13 @@ fn keep_subtrees(rows: Vec<ProcessRow>, roots: &[u32]) -> Vec<ProcessRow> {
     loop {
         let before = keep.len();
         for row in &rows {
-            if !keep.contains(&row.pid) && row.ppid.is_some_and(|ppid| keep.contains(&ppid)) {
+            let parent_is_not_reused = row.ppid.is_some_and(|ppid| {
+                keep.contains(&ppid)
+                    && rows.iter().any(|parent| {
+                        parent.pid == ppid && parent_created_no_later(parent.start, row.start)
+                    })
+            });
+            if !keep.contains(&row.pid) && parent_is_not_reused {
                 keep.insert(row.pid);
             }
         }
@@ -103,12 +113,44 @@ fn keep_subtrees(rows: Vec<ProcessRow>, roots: &[u32]) -> Vec<ProcessRow> {
         .collect()
 }
 
-fn row_from_process(process: &sysinfo::Process) -> ProcessRow {
-    let start = match process.start_time() {
-        0 => ProcessStartTime::Unavailable,
-        secs => ProcessStartTime::UnixSeconds(secs),
-    };
-    let ppid = process.parent().map(|pid| pid.as_u32());
+/// Equal native ticks are possible (Linux has 10 ms jiffies); a parent only
+/// stops being plausible if it is strictly newer than the child. Mixed or
+/// unavailable clocks do not establish a parent link.
+fn parent_created_no_later(parent: ProcessStartTime, child: ProcessStartTime) -> bool {
+    match (parent, child) {
+        (ProcessStartTime::UnixSeconds(parent), ProcessStartTime::UnixSeconds(child)) => {
+            parent <= child
+        }
+        (
+            ProcessStartTime::WindowsFiletime { ticks: parent, .. },
+            ProcessStartTime::WindowsFiletime { ticks: child, .. },
+        ) => parent <= child,
+        (
+            ProcessStartTime::LinuxStartTicks { ticks: parent, .. },
+            ProcessStartTime::LinuxStartTicks { ticks: child, .. },
+        ) => parent <= child,
+        (
+            ProcessStartTime::MacMicroseconds { ticks: parent, .. },
+            ProcessStartTime::MacMicroseconds { ticks: child, .. },
+        ) => parent <= child,
+        _ => false,
+    }
+}
+
+fn row_from_process(
+    process: &sysinfo::Process,
+    precise: Option<&(u32, ProcessStartTime)>,
+) -> ProcessRow {
+    let start = precise.map_or_else(
+        || match process.start_time() {
+            0 => ProcessStartTime::Unavailable,
+            secs => ProcessStartTime::UnixSeconds(secs),
+        },
+        |(_, start)| *start,
+    );
+    let ppid = precise
+        .map(|(ppid, _)| *ppid)
+        .or_else(|| process.parent().map(|pid| pid.as_u32()));
     // `sysinfo` reports an empty path when `/proc/<pid>/exe` cannot be read.
     // An empty string is not a path, so it stays unavailable.
     let exe = process
@@ -151,6 +193,52 @@ fn row_from_process(process: &sysinfo::Process) -> ProcessRow {
         argv,
         cwd,
         user_id: None,
+    }
+}
+
+/// Exact process start and parent facts collected by `aw-platform` in one
+/// platform table pass. Falling back to sysinfo keeps the collector usable
+/// when an OS denies a row, but never turns an unavailable exact value into 0.
+fn precise_processes() -> BTreeMap<u32, (u32, ProcessStartTime)> {
+    aw_platform::platform()
+        .sampling_process_table()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|process| {
+            (
+                process.key.pid,
+                (process.ppid, start_from_sampling(&process)),
+            )
+        })
+        .collect()
+}
+
+fn start_from_sampling(process: &aw_platform::SamplingProcess) -> ProcessStartTime {
+    #[cfg(windows)]
+    {
+        ProcessStartTime::WindowsFiletime {
+            ticks: process.key.start_time,
+            unix_ns: process.start_ns,
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        ProcessStartTime::LinuxStartTicks {
+            ticks: process.key.start_time,
+            unix_ns: process.start_ns,
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ProcessStartTime::MacMicroseconds {
+            ticks: process.key.start_time,
+            unix_ns: process.start_ns,
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = process;
+        ProcessStartTime::Unavailable
     }
 }
 
@@ -299,6 +387,7 @@ pub fn host_process_table() -> Option<Vec<HostProcess>> {
         .with_cmd(UpdateKind::OnlyIfNotSet)
         .with_user(UpdateKind::OnlyIfNotSet);
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+    let precise = precise_processes();
     let rows: Vec<HostProcess> = system
         .processes()
         .values()
@@ -306,7 +395,7 @@ pub fn host_process_table() -> Option<Vec<HostProcess>> {
         // thread that slips through is not a process the picker can attach to.
         .filter(|process| process.thread_kind().is_none())
         .map(|process| {
-            let mut row = row_from_process(process);
+            let mut row = row_from_process(process, precise.get(&process.pid().as_u32()));
             row.cwd = None;
             // `Uid` derefs to the platform id (`uid_t` or `Sid`); both print
             // as the id itself, never a user name.
@@ -328,7 +417,7 @@ pub fn host_process_table() -> Option<Vec<HostProcess>> {
 
 #[cfg(test)]
 mod tests {
-    use super::keep_subtrees;
+    use super::{keep_subtrees, parent_created_no_later};
     use crate::source::{ProcessRow, ProcessSource, ProcessStartTime};
 
     fn row(pid: u32, ppid: Option<u32>) -> ProcessRow {
@@ -352,6 +441,20 @@ mod tests {
         ];
         assert_eq!(pids(&keep_subtrees(rows.clone(), &[10])), vec![10, 11, 12]);
         assert_eq!(pids(&keep_subtrees(rows, &[1])), vec![1, 10, 11, 12]);
+    }
+
+    #[test]
+    fn strictly_newer_parent_pid_is_not_followed_after_reuse() {
+        let parent = ProcessStartTime::WindowsFiletime {
+            ticks: 2,
+            unix_ns: 200,
+        };
+        let child = ProcessStartTime::WindowsFiletime {
+            ticks: 1,
+            unix_ns: 100,
+        };
+        assert!(!parent_created_no_later(parent, child));
+        assert!(parent_created_no_later(child, child));
     }
 
     /// BUGS B4: the host source only refreshed the watched pids, so a process

@@ -11,8 +11,8 @@
 //! the [`ProcUid`] into a pid, then keeps that pid and its children. This
 //! sampler attaches to the platform's host-process anchor. Linux and macOS use
 //! pid 1; Windows uses the System process (pid 4). The [`ProcUid`] is `ProcessIdentity::from_parts`
-//! over the boot id, pid, and the `/proc` start time rounded down to seconds.
-//! Stored process start times remain precise (`btime_ns + starttime * 1e9 / clk_tck`).
+//! over the boot id, pid, and the native start marker (Windows FILETIME, Linux
+//! start ticks, macOS microseconds). Stored process start times remain precise.
 //!
 //! The first `start_at` is a baseline and emits nothing for processes already
 //! running. Later `poll_once` calls emit starts and exits that appeared between
@@ -59,6 +59,8 @@ const PROC_SOURCE: &str = "poll/sysinfo";
 struct ProcFact {
     pid: u32,
     ppid: u32,
+    /// Native start marker used for identity and PID-reuse ordering.
+    start_key: u64,
     /// Unix start time in nanoseconds, as reported by `/proc`.
     start_ns: u64,
     uid: ProcUid,
@@ -73,6 +75,8 @@ pub(crate) struct RootHint {
     pub(crate) pid: u32,
     /// Parent pid read from `/proc/<pid>/stat`.
     pub(crate) ppid: u32,
+    /// Native start marker (FILETIME, `/proc` ticks, or macOS microseconds).
+    pub(crate) start_key: u64,
     /// Unix start time in nanoseconds, captured together with the adopted pid.
     pub(crate) start_ns: u64,
     /// Stable process identity for this boot / pid / start time.
@@ -343,6 +347,7 @@ impl HostSampler {
         let fact = ProcFact {
             pid: hint.pid,
             ppid: hint.ppid,
+            start_key: hint.start_key,
             start_ns: hint.start_ns,
             uid: hint.uid,
         };
@@ -811,16 +816,11 @@ fn proc_table() -> Vec<ProcFact> {
         .into_iter()
         .flatten()
         .filter_map(|process| {
-            let start_secs = process.start_ns / 1_000_000_000;
-            let identity = ProcessIdentity::from_parts(
-                &process.boot_id,
-                process.key.pid,
-                start_secs,
-                StartTimeUnit::Seconds,
-            )?;
+            let identity = proc_identity_from_sampling(&process)?;
             Some(ProcFact {
                 pid: process.key.pid,
                 ppid: process.ppid,
+                start_key: process.key.start_time,
                 start_ns: process.start_ns,
                 uid: identity.uid,
             })
@@ -834,7 +834,10 @@ fn subtree_of(table: Vec<ProcFact>, root: u32) -> Vec<ProcFact> {
     loop {
         let before = keep.len();
         for row in &table {
-            if keep.contains(&row.ppid) {
+            let parent_is_current_and_not_reused = table
+                .iter()
+                .any(|parent| parent.pid == row.ppid && parent.start_key <= row.start_key);
+            if keep.contains(&row.ppid) && parent_is_current_and_not_reused {
                 keep.insert(row.pid);
             }
         }
@@ -848,18 +851,17 @@ fn subtree_of(table: Vec<ProcFact>, root: u32) -> Vec<ProcFact> {
         .collect()
 }
 
-/// Pair `start` with the unused `/proc` row that has the same parent and start.
+/// Pair `start` with the unused platform row that has the same parent and exact
+/// wall-clock start time.
 fn find_proc<'a>(
     table: &'a [ProcFact],
     start: &ProcessStart,
     used: &BTreeSet<u32>,
 ) -> Option<&'a ProcFact> {
-    let start_secs = u64::try_from(start.start_time_ns).ok()? / 1_000_000_000;
-    table.iter().find(|row| {
-        !used.contains(&row.pid)
-            && row.ppid == start.ppid
-            && row.start_ns / 1_000_000_000 == start_secs
-    })
+    let start_ns = u64::try_from(start.start_time_ns).ok()?;
+    table
+        .iter()
+        .find(|row| !used.contains(&row.pid) && row.ppid == start.ppid && row.start_ns == start_ns)
 }
 
 /// [`ProcUid`] of `pid`, hashed the way the poll collector hashes a row.
@@ -878,19 +880,28 @@ fn process_is_gone(pid: u32) -> bool {
     matches!(aw_platform::platform().process_identity(pid), Ok(None))
 }
 
-/// Build the poll collector's identity from a precise platform start time.
-///
-/// The value retained in the row stays precise, but the uid uses seconds:
-/// that is the only start-time granularity the poll collector exposes.
-fn proc_uid_from_sampling(process: &aw_platform::SamplingProcess) -> Option<ProcUid> {
-    let start_secs = process.start_ns / 1_000_000_000;
+/// Build the poll collector's identity from the platform's native start
+/// marker. This matches `aw-collector-poll`, so a sampled start and a root
+/// hint never disagree merely because one side rounded to seconds.
+fn proc_identity_from_sampling(process: &aw_platform::SamplingProcess) -> Option<ProcessIdentity> {
+    #[cfg(windows)]
+    let unit = StartTimeUnit::HundredNanoseconds;
+    #[cfg(target_os = "linux")]
+    let unit = StartTimeUnit::Jiffies100Hz;
+    #[cfg(target_os = "macos")]
+    let unit = StartTimeUnit::Microseconds;
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    let unit = StartTimeUnit::Nanoseconds;
     ProcessIdentity::from_parts(
         &process.boot_id,
         process.key.pid,
-        start_secs,
-        StartTimeUnit::Seconds,
+        process.key.start_time,
+        unit,
     )
-    .map(|id| id.uid)
+}
+
+fn proc_uid_from_sampling(process: &aw_platform::SamplingProcess) -> Option<ProcUid> {
+    proc_identity_from_sampling(process).map(|identity| identity.uid)
 }
 
 /// Capture the adopted root while the caller still holds it behind the pipe
@@ -901,6 +912,7 @@ pub(crate) fn root_hint(pid: u32, name: Option<String>) -> Option<RootHint> {
     Some(RootHint {
         pid,
         ppid: process.ppid,
+        start_key: process.key.start_time,
         start_ns: process.start_ns,
         uid: proc_uid_from_sampling(&process)?,
         name,
@@ -955,16 +967,6 @@ fn start_ns_from_ticks(btime_secs: u64, ticks: u64) -> Option<u64> {
     let btime_ns = btime_secs.checked_mul(1_000_000_000)?;
     let elapsed_ns = ticks.checked_mul(1_000_000_000)? / LINUX_CLK_TCK;
     btime_ns.checked_add(elapsed_ns)
-}
-
-#[cfg(all(test, target_os = "linux"))]
-fn read_boot_id() -> Option<Vec<u8>> {
-    Some(
-        aw_platform::platform()
-            .sampling_process(std::process::id())
-            .ok()??
-            .boot_id,
-    )
 }
 
 /// One `processes` row per `ProcessStart` / `ProcessExit` that carried a [`ProcRef`].
@@ -1536,18 +1538,8 @@ mod depth_tests {
             .into_iter()
             .find(|row| row.pid == pid)
             .expect("this test process in sampler table");
-        let boot = super::read_boot_id().expect("boot id");
-        let expected = aw_core::proc::ProcessIdentity::from_parts(
-            &boot,
-            pid,
-            hint.start_ns / 1_000_000_000,
-            aw_core::proc::StartTimeUnit::Seconds,
-        )
-        .expect("poll identity")
-        .uid;
-
-        assert_eq!(hint.uid, expected);
-        assert_eq!(row.uid, expected);
+        assert_eq!(hint.uid, row.uid);
+        assert_eq!(hint.start_key, row.start_key);
         assert_eq!(hint.start_ns, row.start_ns);
     }
 

@@ -55,6 +55,9 @@ struct ProcKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ProcStartKey {
     UnixSeconds(u64),
+    WindowsFiletime(u64),
+    LinuxStartTicks(u64),
+    MacMicroseconds(u64),
     Unavailable,
 }
 
@@ -62,6 +65,9 @@ impl ProcKey {
     fn of(row: &ProcessRow) -> Self {
         let start = match row.start {
             ProcessStartTime::UnixSeconds(secs) => ProcStartKey::UnixSeconds(secs),
+            ProcessStartTime::WindowsFiletime { ticks, .. } => ProcStartKey::WindowsFiletime(ticks),
+            ProcessStartTime::LinuxStartTicks { ticks, .. } => ProcStartKey::LinuxStartTicks(ticks),
+            ProcessStartTime::MacMicroseconds { ticks, .. } => ProcStartKey::MacMicroseconds(ticks),
             ProcessStartTime::Unavailable => ProcStartKey::Unavailable,
         };
         Self {
@@ -184,6 +190,27 @@ pub(crate) struct BuiltProcessEvent {
     pub na: Vec<(&'static str, NaReason)>,
 }
 
+/// Raw identity tick, its unit, and an event timestamp. The raw tick is kept
+/// for identity and parent-reuse protection; the Unix timestamp is only for
+/// the event timeline.
+fn start_parts(start: ProcessStartTime) -> Option<(u64, StartTimeUnit, u64)> {
+    match start {
+        ProcessStartTime::UnixSeconds(seconds) => seconds
+            .checked_mul(1_000_000_000)
+            .map(|unix_ns| (seconds, StartTimeUnit::Seconds, unix_ns)),
+        ProcessStartTime::WindowsFiletime { ticks, unix_ns } => {
+            Some((ticks, StartTimeUnit::HundredNanoseconds, unix_ns))
+        }
+        ProcessStartTime::LinuxStartTicks { ticks, unix_ns } => {
+            Some((ticks, StartTimeUnit::Jiffies100Hz, unix_ns))
+        }
+        ProcessStartTime::MacMicroseconds { ticks, unix_ns } => {
+            Some((ticks, StartTimeUnit::Microseconds, unix_ns))
+        }
+        ProcessStartTime::Unavailable => None,
+    }
+}
+
 /// Turn one process delta into a `ProcessStart` or `ProcessExit`.
 ///
 /// `how` is [`StartHow::Spawn`] for a process that appeared after the baseline,
@@ -212,18 +239,15 @@ fn build_start(
     how: StartHow,
     parent_uid: Option<ProcUid>,
 ) -> Result<BuiltProcessEvent, SkippedProcess> {
-    let ProcessStartTime::UnixSeconds(secs) = row.start else {
+    let Some((_, _, unix_ns)) = start_parts(row.start) else {
         return Err(SkippedProcess {
             pid: row.pid,
             missing: "start_time_ns",
         });
     };
-    // Second resolution, converted only so the required field has a unit.
-    // Values that do not fit in `i64` nanoseconds are not a readable start time.
-    let Some(start_time_ns) = secs
-        .checked_mul(1_000_000_000)
-        .and_then(|ns| i64::try_from(ns).ok())
-    else {
+    // Values that do not fit in `i64` nanoseconds are not a readable start
+    // time. Do not substitute a zero timestamp.
+    let Some(start_time_ns) = i64::try_from(unix_ns).ok() else {
         return Err(SkippedProcess {
             pid: row.pid,
             missing: "start_time_ns",
@@ -308,16 +332,13 @@ fn proc_ref(
         na.push(("proc", NaReason::CollectorUnavailable));
         return None;
     };
-    let ProcessStartTime::UnixSeconds(secs) = row.start else {
+    let Some((ticks, unit, _)) = start_parts(row.start) else {
         na.push(("proc", NaReason::CollectorUnavailable));
         return None;
     };
-    // Do not hash a missing start. `UnixSeconds(0)` is only reached when the
-    // source claims it observed the unix epoch, which the sysinfo adapter does
-    // not: it maps a reported 0 to `Unavailable`.
-    let Some(identity) =
-        ProcessIdentity::from_parts(boot_id, row.pid, secs, StartTimeUnit::Seconds)
-    else {
+    // Do not hash a missing start. Native readings retain their precise unit;
+    // converting FILETIME or jiffies to seconds would collapse PID reuse.
+    let Some(identity) = ProcessIdentity::from_parts(boot_id, row.pid, ticks, unit) else {
         na.push(("proc", NaReason::CollectorUnavailable));
         return None;
     };
@@ -336,10 +357,14 @@ pub(crate) fn parent_uid(row: &ProcessRow, snapshot: &ProcessSnapshot) -> Option
         .rows
         .iter()
         .find(|candidate| candidate.pid == ppid)?;
-    let ProcessStartTime::UnixSeconds(secs) = parent.start else {
+    let (parent_ticks, parent_unit, _) = start_parts(parent.start)?;
+    let (child_ticks, child_unit, _) = start_parts(row.start)?;
+    // A strictly later parent pid has been reused. Equal ticks are possible
+    // (especially the 10 ms Linux clock), so they remain a possible parent.
+    if parent_unit != child_unit || parent_ticks > child_ticks {
         return None;
-    };
-    ProcessIdentity::from_parts(boot, parent.pid, secs, StartTimeUnit::Seconds).map(|id| id.uid)
+    }
+    ProcessIdentity::from_parts(boot, parent.pid, parent_ticks, parent_unit).map(|id| id.uid)
 }
 
 /// Pid of every row whose identity hash equals one of `uids`.
@@ -349,12 +374,10 @@ pub(crate) fn pids_for_uids(snapshot: &ProcessSnapshot, uids: &[ProcUid]) -> Vec
     };
     let mut pids = Vec::new();
     for row in &snapshot.rows {
-        let ProcessStartTime::UnixSeconds(secs) = row.start else {
+        let Some((ticks, unit, _)) = start_parts(row.start) else {
             continue;
         };
-        let Some(identity) =
-            ProcessIdentity::from_parts(boot, row.pid, secs, StartTimeUnit::Seconds)
-        else {
+        let Some(identity) = ProcessIdentity::from_parts(boot, row.pid, ticks, unit) else {
             continue;
         };
         if uids.contains(&identity.uid) && !pids.contains(&row.pid) {
@@ -383,7 +406,18 @@ pub(crate) fn subtree_rows(snapshot: &ProcessSnapshot, root_pid: u32) -> Vec<Pro
         };
         selected.push(row.clone());
         for child in &snapshot.rows {
-            if child.ppid == Some(pid) && child.pid != pid && !seen.contains(&child.pid) {
+            let parent_is_not_reused = start_parts(row.start)
+                .zip(start_parts(child.start))
+                .is_some_and(
+                    |((parent_ticks, parent_unit, _), (child_ticks, child_unit, _))| {
+                        parent_unit == child_unit && parent_ticks <= child_ticks
+                    },
+                );
+            if child.ppid == Some(pid)
+                && child.pid != pid
+                && parent_is_not_reused
+                && !seen.contains(&child.pid)
+            {
                 frontier.push(child.pid);
             }
         }
@@ -464,4 +498,37 @@ pub(crate) fn build_connection_event(
         event.mark_na("total_recv", NaReason::CollectorUnavailable);
     }
     Ok(event)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parent_uid;
+    use crate::source::{ProcessRow, ProcessSnapshot, ProcessStartTime};
+
+    fn row(pid: u32, ppid: Option<u32>, ticks: u64) -> ProcessRow {
+        ProcessRow::bare(
+            pid,
+            ppid,
+            ProcessStartTime::WindowsFiletime {
+                ticks,
+                unix_ns: ticks.saturating_mul(100),
+            },
+        )
+    }
+
+    #[test]
+    fn parent_created_after_child_is_not_attributed_after_pid_reuse() {
+        let parent = row(10, Some(1), 200);
+        let child = row(11, Some(10), 100);
+        let snapshot = ProcessSnapshot::new(b"boot", vec![parent, child.clone()]);
+        assert!(parent_uid(&child, &snapshot).is_none());
+    }
+
+    #[test]
+    fn equal_native_start_tick_remains_a_possible_parent() {
+        let parent = row(10, Some(1), 100);
+        let child = row(11, Some(10), 100);
+        let snapshot = ProcessSnapshot::new(b"boot", vec![parent, child.clone()]);
+        assert!(parent_uid(&child, &snapshot).is_some());
+    }
 }

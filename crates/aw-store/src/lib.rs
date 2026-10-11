@@ -21,6 +21,7 @@ mod inter_agent;
 mod merge;
 mod migrate;
 mod query;
+mod replay;
 mod retention;
 mod sink;
 
@@ -57,8 +58,8 @@ pub use merge::{merge_exports, ClockSkew, MergeError, MergeReport, MergeRequest}
 pub use migrate::FILE_SCHEMA_VERSION;
 pub use migrate::{
     apply_agent_schema, apply_http_schema, apply_inter_agent_schema, apply_proxy_schema,
-    OpenStatus, Store, AGENT_SCHEMA_VERSION, HTTP_SCHEMA_VERSION, INTER_AGENT_SCHEMA_VERSION,
-    PROXY_SCHEMA_VERSION, SCHEMA_VERSION,
+    apply_replay_schema, OpenStatus, Store, AGENT_SCHEMA_VERSION, HTTP_SCHEMA_VERSION,
+    INTER_AGENT_SCHEMA_VERSION, PROXY_SCHEMA_VERSION, REPLAY_SCHEMA_VERSION, SCHEMA_VERSION,
 };
 pub use query::{
     around, around_sql, compile_predicate, compile_store_expr, delete_session, dns_events,

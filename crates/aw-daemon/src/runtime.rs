@@ -135,6 +135,13 @@ pub enum RuntimeError {
         #[source]
         source: io::Error,
     },
+
+    /// The session database could not be opened safely at daemon startup.
+    #[error("{message}")]
+    Database {
+        /// Localized operator-facing explanation.
+        message: String,
+    },
 }
 
 /// Exclusive lock held for the life of the process.
@@ -572,6 +579,12 @@ pub fn run_foreground(
         tracing::warn!("{}", warning.message());
     }
 
+    // Open before any listener or collector can claim that recording is live.
+    // In particular, an old rollback-journal database must become WAL here or
+    // the daemon refuses to start with an actionable, localized instruction.
+    let session_db = data_dir.join("agentwatch.db");
+    aw_store::Store::open_runtime(&session_db).map_err(database_startup_error)?;
+
     let stop = StopFlag::new();
     // Stop the batcher only after collectors have stopped. Sharing the runtime
     // flag would let it exit as soon as the stop file is seen.
@@ -667,6 +680,21 @@ pub fn run_foreground(
     drop(otlp);
     drop(lock);
     Ok(())
+}
+
+fn database_startup_error(err: aw_store::StoreError) -> RuntimeError {
+    if let Some((path, reason)) = err.legacy_wal_conversion() {
+        RuntimeError::Database {
+            message: format!(
+                "没法转换旧版的会话数据库，后台没有启动。原因：{reason}。可以先备份「{}」再删掉它，后台会新建一份。",
+                path.display()
+            ),
+        }
+    } else {
+        RuntimeError::Database {
+            message: format!("无法打开会话数据库：{err}"),
+        }
+    }
 }
 
 /// Publish what the samplers are doing for `GET /doctor` (Settings, new
@@ -805,9 +833,21 @@ pub fn signal_stop(data_dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        core_dump_guard_status, is_sensitive_field, rfc3339_utc, InstanceLock, RollingFile,
-        RuntimeError, LOG_MAX_BYTES,
+        core_dump_guard_status, database_startup_error, is_sensitive_field, rfc3339_utc,
+        InstanceLock, RollingFile, RuntimeError, LOG_MAX_BYTES,
     };
+
+    #[test]
+    fn legacy_wal_conversion_startup_error_is_actionable_and_localized() {
+        let err = database_startup_error(aw_store::StoreError::LegacyWalConversion {
+            path: std::path::PathBuf::from("/tmp/agentwatch.db"),
+            reason: "database is locked".to_owned(),
+        });
+        assert_eq!(
+            err.to_string(),
+            "没法转换旧版的会话数据库，后台没有启动。原因：database is locked。可以先备份「/tmp/agentwatch.db」再删掉它，后台会新建一份。"
+        );
+    }
 
     #[test]
     fn log_timestamp_is_rfc3339_utc() {

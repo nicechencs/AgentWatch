@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -349,7 +350,7 @@ fn helpers_preserve_higher_versions() {
 }
 
 #[test]
-fn future_v11_is_read_only_and_unchanged_even_with_extra_scripts() {
+fn future_v12_is_read_only_and_unchanged_even_with_extra_scripts() {
     let db = TestDb::new();
     {
         let store = Store::open(&db.path).expect("base");
@@ -357,7 +358,7 @@ fn future_v11_is_read_only_and_unchanged_even_with_extra_scripts() {
         store
             .connection()
             .execute(
-                "UPDATE schema_meta SET value = '11' WHERE key = 'schema_version'",
+                "UPDATE schema_meta SET value = '12' WHERE key = 'schema_version'",
                 [],
             )
             .expect("future version");
@@ -366,18 +367,18 @@ fn future_v11_is_read_only_and_unchanged_even_with_extra_scripts() {
     for extra in [
         &[][..],
         &[(2, "CREATE TABLE must_not_run (id INTEGER)")][..],
-        &[(12, "CREATE TABLE must_not_run (id INTEGER)")][..],
+        &[(13, "CREATE TABLE must_not_run (id INTEGER)")][..],
     ] {
         let mut store = Store::open_with_scripts(&db.path, extra).expect("future open");
         assert_eq!(
             store.status(),
             &OpenStatus::ReadOnlyNewer {
-                found: 11,
-                supported: 10
+                found: 12,
+                supported: 11
             }
         );
         assert!(store.is_read_only());
-        assert_eq!(store.schema_version().expect("future version"), 11);
+        assert_eq!(store.schema_version().expect("future version"), 12);
         assert!(store.connection().execute("DELETE FROM dns", []).is_err());
         assert!(matches!(
             apply_agent_schema(&mut store),
@@ -385,6 +386,16 @@ fn future_v11_is_read_only_and_unchanged_even_with_extra_scripts() {
         ));
         assert!(!present(store.connection(), "must_not_run"));
     }
+    let runtime = Store::open_runtime(&db.path).expect("future runtime open");
+    assert!(
+        runtime.is_read_only(),
+        "runtime keeps future databases readable"
+    );
+    let dns: i64 = runtime
+        .connection()
+        .query_row("SELECT COUNT(*) FROM dns", [], |row| row.get(0))
+        .expect("read-only query works");
+    assert_eq!(dns, 1);
     assert_eq!(
         fs::read(&db.path).expect("unchanged database bytes"),
         before
@@ -422,12 +433,54 @@ fn fresh_runtime_database_has_file_search_schema_on_every_os() {
         "gaps",
         "file_access",
         "fts_text",
+        "replay_writes",
     ] {
         assert!(
             names.iter().any(|name| name == required),
             "missing {required}: {names:?}"
         );
     }
+}
+
+#[test]
+fn concurrent_runtime_creation_and_file_backfill_are_safe() {
+    let db = TestDb::new();
+    let barrier = Arc::new(Barrier::new(2));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let path = db.path.clone();
+        let barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            Store::open_runtime(path)
+        }));
+    }
+    for worker in workers {
+        let store = worker.join().expect("worker joins").expect("runtime open");
+        assert!(!store.is_read_only());
+    }
+    let store = Store::open_runtime(&db.path).expect("reopen");
+    for table in ["schema_meta", "file_access", "fts_text", "replay_writes"] {
+        assert!(present(store.connection(), table), "missing {table}");
+    }
+}
+
+#[test]
+fn legacy_rollback_journal_database_is_converted_to_wal() {
+    let db = TestDb::new();
+    {
+        let store = Store::open(&db.path).expect("base");
+        store
+            .connection()
+            .pragma_update(None, "journal_mode", "DELETE")
+            .expect("make legacy journal");
+    }
+    let store = Store::open(&db.path).expect("convert legacy journal");
+    let mode: String = store
+        .connection()
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("journal mode");
+    assert_eq!(mode.to_ascii_lowercase(), "wal");
 }
 
 #[test]

@@ -13,11 +13,13 @@ use rusqlite::{params, Connection};
 
 use crate::error::StoreError;
 use crate::fts::{self, FtsSource};
+use crate::replay::{self, KeyBuilder};
 
 /// One `http` row. Not `Debug`: `url` and the header JSON are sensitive.
 #[derive(Clone)]
 pub struct HttpRow {
-    /// Caller-assigned id. `None` lets SQLite allocate one.
+    /// Caller-assigned id. `None` derives a deterministic negative id from
+    /// the already-redacted request metadata.
     pub id: Option<i64>,
     /// Owning session.
     pub session_id: i64,
@@ -89,6 +91,11 @@ pub fn insert_http(conn: &Connection, row: &HttpRow) -> Result<(), StoreError> {
             ),
         ));
     }
+    let key = replay_key(row);
+    if !replay::claim(conn, "http", &key, Some(row.session_id))? {
+        return Ok(());
+    }
+    let id = row.id.unwrap_or_else(|| replay::deterministic_id(&key));
     conn.execute(
         "INSERT INTO http (
             id, session_id, proc_uid, flow_id, ts_ns, method, url, host,
@@ -100,9 +107,9 @@ pub fn insert_http(conn: &Connection, row: &HttpRow) -> Result<(), StoreError> {
             ?9, ?10, ?11, ?12,
             ?13, ?14, ?15, ?16, ?17,
             ?18, ?19, ?20, ?21
-         )",
+         ) ON CONFLICT(id) DO NOTHING",
         params![
-            row.id,
+            id,
             row.session_id,
             row.proc_uid,
             row.flow_id,
@@ -127,15 +134,37 @@ pub fn insert_http(conn: &Connection, row: &HttpRow) -> Result<(), StoreError> {
     )
     .map_err(|err| StoreError::sqlite("insert_http", err))?;
     if fts_text_present(conn)? {
-        let src_id = match row.id {
-            Some(id) => id,
-            None => conn.last_insert_rowid(),
-        };
+        let src_id = id;
         let text = Some(row.url.as_str());
         let fts = fts::read_mode(conn)?;
         fts::upsert(conn, fts, FtsSource::Http, src_id, text)?;
     }
     Ok(())
+}
+
+fn replay_key(row: &HttpRow) -> String {
+    let mut key = KeyBuilder::new("http");
+    key.i64(row.session_id);
+    key.opt_i64(row.proc_uid);
+    key.opt_i64(row.flow_id);
+    key.i64(row.ts_ns);
+    key.text(&row.method);
+    key.text(&row.url);
+    key.text(&row.host);
+    key.opt_text(row.http_version.as_deref());
+    key.opt_i64(row.status);
+    key.opt_text(row.req_headers.as_deref());
+    key.opt_text(row.resp_headers.as_deref());
+    key.opt_i64(row.req_body_bytes);
+    key.opt_i64(row.resp_body_bytes);
+    key.opt_text(row.content_type.as_deref());
+    key.opt_i64(row.duration_ms);
+    key.opt_text(row.error.as_deref());
+    key.text(&row.evidence);
+    key.opt_text(row.field_evidence.as_deref());
+    key.opt_text(row.na_reason.as_deref());
+    key.text(&row.source);
+    key.finish()
 }
 
 fn fts_text_present(conn: &Connection) -> Result<bool, StoreError> {

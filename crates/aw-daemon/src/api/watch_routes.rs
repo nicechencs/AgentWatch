@@ -213,14 +213,25 @@ fn db_path(state: &ApiState) -> Result<std::path::PathBuf, ApiResponse> {
     })
 }
 
+fn require_writable_database(path: &std::path::Path) -> Result<(), ApiResponse> {
+    let store = aw_store::Store::open_runtime(path)
+        .map_err(|err| super::routes::database_store_response(&err, "cannot open the database"))?;
+    if store.is_read_only() {
+        Err(super::routes::database_read_only_newer_response())
+    } else {
+        Ok(())
+    }
+}
+
 /// Allocate `sessions.id` and insert the row. Id 1 stays the daemon sample's.
 fn insert_session(path: &std::path::Path, target: &mut SampleTarget) -> Result<(), ApiResponse> {
-    let store_error = |err: &aw_store::StoreError, what: &str| {
-        super::routes::database_busy_response(err)
-            .unwrap_or_else(|| error_response(500, "store", what))
-    };
+    let store_error =
+        |err: &aw_store::StoreError, what: &str| super::routes::database_store_response(err, what);
     let mut store = aw_store::Store::open_runtime(path)
         .map_err(|err| store_error(&err, "cannot open the database"))?;
+    if store.is_read_only() {
+        return Err(super::routes::database_read_only_newer_response());
+    }
     let max: i64 = store
         .connection()
         .query_row("SELECT COALESCE(MAX(id), 1) FROM sessions", [], |row| {
@@ -605,6 +616,7 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
                     )
                 })?;
         let path = db_path(state)?;
+        require_writable_database(&path)?;
         let root_proc_uid = i64::from_ne_bytes(root_hint.uid.0.to_ne_bytes());
         aw_store::open_connection(&path)
             .and_then(|conn| {
@@ -665,6 +677,7 @@ pub(super) fn record_exit(
                 error_response(400, "bad_argument", "exit_code: expected a signed integer")
             })?;
         let path = db_path(state)?;
+        require_writable_database(&path)?;
         let conn = aw_store::open_connection(&path)
             .map_err(|_| error_response(500, "store", "cannot open the database"))?;
         let row: Option<(i64, String, Option<i64>)> = conn
@@ -939,7 +952,7 @@ mod database_busy_tests {
         assert!(waited >= aw_store::BUSY_TIMEOUT.as_secs());
         assert_eq!(
             body["error"]["message"],
-            format!("The session database is busy (the service is writing). Waited {waited} s and still couldn't get in; try again later.")
+            format!("会话数据库正忙（后台在写入），等了 {waited} 秒还是没轮到，请稍后再试。")
         );
         assert!(body["error"]["detail"]
             .as_str()

@@ -623,7 +623,9 @@ pub fn run_foreground(
     // See `sample.rs`. A machine where pid 1's identity cannot be hashed does
     // not start sampling — that is logged, and the stop loop still runs.
     let mut sampler = HostSampler::new(data_dir.join("agentwatch.db"));
-    sampler.start();
+    if std::env::var_os("AW_PROBE_NO_HOST_SAMPLE").is_none() {
+        sampler.start();
+    }
     report_collectors(&shared, &sampler, &watches);
     let mut polls_until_sample: u32 = SAMPLE_EVERY_POLLS;
 

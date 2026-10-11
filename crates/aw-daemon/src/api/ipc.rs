@@ -136,18 +136,29 @@ fn answer(
     if let Some(reply) = super::control::handle(control, request, caller) {
         return reply;
     }
+    let awt_lock = std::time::Instant::now();
     let (reply, slow) = {
         let mut guard = match state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        match super::routes::take_slow(&mut guard, request, Some(caller)) {
+        crate::awt::mark("state_lock_wait", awt_lock);
+        let awt_held = std::time::Instant::now();
+        let out = match super::routes::take_slow(&mut guard, request, Some(caller)) {
             Some(job) => (None, Some(job)),
             None => (
                 Some(super::routes::dispatch_peer(&mut guard, request, caller)),
                 None,
             ),
-        }
+        };
+        eprintln!(
+            "AWREQ {} {} lock_wait_ms={:.1} held_lock_ms={:.1}",
+            request.method,
+            request.path,
+            awt_held.duration_since(awt_lock).as_secs_f64() * 1000.0,
+            awt_held.elapsed().as_secs_f64() * 1000.0
+        );
+        out
     };
     // An export is built after the lock is released (see `take_slow`).
     let reply = match (reply, slow) {
@@ -409,10 +420,22 @@ mod unix {
     }
 
     fn serve(mut stream: UnixStream, state: &SharedState, control: &Control) -> io::Result<()> {
+        crate::awt::begin();
+        let awt_t = std::time::Instant::now();
+        let r = serve_inner(&mut stream, state, control);
+        crate::awt::mark("total_serve", awt_t);
+        crate::awt::flush();
+        r
+    }
+    fn serve_inner(stream: &mut UnixStream, state: &SharedState, control: &Control) -> io::Result<()> {
+        let mut stream = stream;
         stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
-        let caller = match peer_caller(&stream) {
+        let awt_id = std::time::Instant::now();
+        let caller_r = peer_caller(&stream);
+        crate::awt::mark("identify_peer", awt_id);
+        let caller = match caller_r {
             Ok(caller) => caller,
             Err(_) => {
                 let response = error_response(

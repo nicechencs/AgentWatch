@@ -374,8 +374,17 @@ impl<'a> SqliteSink<'a> {
 impl RecordSink for SqliteSink<'_> {
     fn write_batch(&mut self, batch: &WriteBatch) -> Result<(), StoreError> {
         let started = Instant::now();
-        self.write_batch_inner(batch)
-            .map_err(|err| err.with_busy_elapsed(started))
+        let r = self.write_batch_inner(batch)
+            .map_err(|err| err.with_busy_elapsed(started));
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        if ms > 50.0 {
+            eprintln!(
+                "AWSINK thread={:?} ms={ms:.1} ok={} sessions={} processes={} images={} gaps={}",
+                std::thread::current().name(), r.is_ok(), batch.sessions.len(), batch.processes.len(),
+                batch.process_images.len(), batch.gaps.len()
+            );
+        }
+        r
     }
 }
 
@@ -726,7 +735,17 @@ fn write_images(
         // searchable text; neither known means nothing is indexed (not "").
         let text = row.argv.as_deref().or(row.exe.as_deref());
         if file_schema_present(tx)? {
-            fts::upsert(tx, fts, FtsSource::ProcessImage, id, text)?;
+            // PROBE: a freshly inserted image has no FTS row yet; skip the
+            // full-scan DELETE (src_id is UNINDEXED in fts5).
+            if fts.enabled() {
+                if let Some(text) = text.filter(|t| !t.is_empty()) {
+                    tx.execute(
+                        "INSERT INTO fts_text (src, src_id, body) VALUES (?1, ?2, ?3)",
+                        params!["process_images", id, text],
+                    )
+                    .map_err(|err| StoreError::sqlite("fts_insert", err))?;
+                }
+            }
         }
     }
     Ok(())

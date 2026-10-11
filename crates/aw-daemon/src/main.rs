@@ -18,6 +18,7 @@ use std::process::ExitCode;
 use config::{config_schema_pretty, load_selected, ConfigError};
 use runtime::{emit_sensitive_probe, run_foreground, RuntimeError};
 
+mod awt;
 mod api;
 // Markdown export (P3-DAEMON-01). Routes call it; it uses `api::share`.
 mod export;

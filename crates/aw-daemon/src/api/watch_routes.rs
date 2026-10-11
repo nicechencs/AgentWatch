@@ -219,22 +219,30 @@ fn insert_session(path: &std::path::Path, target: &mut SampleTarget) -> Result<(
         super::routes::database_busy_response(err)
             .unwrap_or_else(|| error_response(500, "store", what))
     };
+    let t = std::time::Instant::now();
     let mut store = aw_store::Store::open_runtime(path)
         .map_err(|err| store_error(&err, "cannot open the database"))?;
+    crate::awt::mark("  store_open_runtime", t);
+    let t = std::time::Instant::now();
     let max: i64 = store
         .connection()
         .query_row("SELECT COALESCE(MAX(id), 1) FROM sessions", [], |row| {
             row.get(0)
         })
         .map_err(|_| error_response(500, "store", "cannot read session ids"))?;
+    crate::awt::mark("  select_max_id", t);
     target.db_id = max.max(1).saturating_add(1);
+    let t = std::time::Instant::now();
     let mut batch = aw_store::WriteBatch::default();
     batch.sessions.push(target.session_row(now_ns()));
     let mut sink = aw_store::SqliteSink::new(&mut store)
         .map_err(|err| store_error(&err, "cannot open the writer"))?;
+    crate::awt::mark("  sink_new", t);
+    let t = std::time::Instant::now();
     use aw_store::RecordSink;
     sink.write_batch(&batch)
         .map_err(|err| store_error(&err, "cannot write the session row"))?;
+    crate::awt::mark("  write_session_row", t);
     target.write_session_row = false;
     Ok(())
 }
@@ -294,7 +302,10 @@ fn attach_target_name(exe: Option<&str>, argv: Option<&[String]>) -> Option<Stri
 /// The table is live, so a target that exits during creation may not have a
 /// label to retain.
 fn attach_target_name_for_pid(pid: u32) -> Option<String> {
-    let process = aw_collector_poll::host_process_table()?
+    let t = std::time::Instant::now();
+    let table = aw_collector_poll::host_process_table();
+    crate::awt::mark("host_process_table_scan", t);
+    let process = table?
         .into_iter()
         .find(|process| process.row.pid == pid)?;
     attach_target_name(process.row.exe.as_deref(), process.row.argv.as_deref())
@@ -358,9 +369,15 @@ fn create_inner(
     match value.get("mode").and_then(Value::as_str) {
         Some("attach") => {
             let pid = pid_field(&value)?;
+            let t = std::time::Instant::now();
             let _ = check_pid_owner(caller, pid, true)?;
+            crate::awt::mark("check_pid_owner", t);
+            let t = std::time::Instant::now();
             let mut target = target_for(caller, &value, "attach", pid, None)?;
+            crate::awt::mark("target_for(incl name scan)", t);
+            let t = std::time::Instant::now();
             insert_session(&path, &mut target)?;
+            crate::awt::mark("insert_session(total)", t);
             let response = created(&target, json!({}));
             state.watch_requests.push(WatchRequest::Start {
                 target: Box::new(target),

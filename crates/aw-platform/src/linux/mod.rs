@@ -3,7 +3,7 @@ use crate::{
     PlatformError, ProcessEntry, ProcessKey, ReapOutcome, ReleasedChild, SamplingProcess,
     SpawnRequest, UnsupportedKind,
 };
-use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+use nix::fcntl::OFlag;
 use nix::unistd::{pipe2, write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -300,6 +300,8 @@ fn sampling_entry(
 }
 
 const GATE_FD_ENV: &str = "AW_PLATFORM_GATE_FD";
+/// The fd the gate read end occupies in the held shell (single digit for dash).
+const GATE_CHILD_FD: i32 = 3;
 
 struct LinuxHeldChild {
     child: Option<Child>,
@@ -396,14 +398,14 @@ impl ReleasedChild for LinuxReleasedChild {
 }
 
 fn spawn_gate(request: &SpawnRequest) -> Result<Box<dyn HeldChild>, PlatformError> {
+    // Both ends stay CLOEXEC in this process for their whole life, so a
+    // concurrent spawn on another thread can never inherit them. Only the
+    // child, between fork and exec, moves the read end to fd 3 (dup2 clears
+    // CLOEXEC on the copy). fd 3 is a single digit: dash rejects `<&10`.
     let (read_fd, write_fd) =
         pipe2(OFlag::O_CLOEXEC).map_err(|error| io::Error::from_raw_os_error(error as i32))?;
-    let fd_number = read_fd.as_raw_fd();
-    let flags = fcntl(&read_fd, FcntlArg::F_GETFD)
-        .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
-    let flags = FdFlag::from_bits_truncate(flags) & !FdFlag::FD_CLOEXEC;
-    fcntl(&read_fd, FcntlArg::F_SETFD(flags))
-        .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    let source_fd = read_fd.as_raw_fd();
+    let fd_number = GATE_CHILD_FD;
     let (program, args) = request
         .command
         .split_first()
@@ -427,6 +429,25 @@ fn spawn_gate(request: &SpawnRequest) -> Result<Box<dyn HeldChild>, PlatformErro
     }
     command.envs(request.env.iter().map(|(key, value)| (key, value)));
     command.env_remove(GATE_FD_ENV);
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only async-signal-safe libc calls (dup2, fcntl) on fds that
+        // stay open in the parent until after spawn returns.
+        #[allow(unsafe_code)]
+        unsafe {
+            command.pre_exec(move || {
+                if source_fd == GATE_CHILD_FD {
+                    let flags = libc::fcntl(source_fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(source_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                } else if libc::dup2(source_fd, GATE_CHILD_FD) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     let child = command.spawn()?;
     drop(read_fd);
     Ok(Box::new(LinuxHeldChild {

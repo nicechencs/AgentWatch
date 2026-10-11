@@ -96,6 +96,7 @@ fn platform_error(error: aw_platform::PlatformError) -> io::Error {
         aw_platform::PlatformError::Invalid { .. }
         | aw_platform::PlatformError::PeerNotIdentified { .. }
         | aw_platform::PlatformError::PipePeerNotIdentified { .. }
+        | aw_platform::PlatformError::UnsafeBatchArgument { .. }
         | aw_platform::PlatformError::Spawn(_) => {
             io::Error::new(io::ErrorKind::InvalidInput, error)
         }

@@ -171,6 +171,11 @@ pub enum PlatformError {
         capability: &'static str,
         detail: &'static str,
     },
+    /// `cmd.exe` cannot safely represent this exact argv item. The CLI prints
+    /// the prescribed refusal instead of ever splicing it into a command line.
+    UnsafeBatchArgument {
+        argument: String,
+    },
 }
 impl fmt::Display for PlatformError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -196,6 +201,11 @@ impl fmt::Display for PlatformError {
             Self::Spawn(kind) => write!(f, "held target could not start: {}", kind.code()),
             Self::Io(error) => write!(f, "platform I/O error: {error}"),
             Self::Invalid { capability, detail } => write!(f, "{capability}: {detail}"),
+            // The argument itself is not printed: it can carry a secret, and the
+            // CLI has its own sentence for the user.
+            Self::UnsafeBatchArgument { .. } => {
+                f.write_str("a batch-file argument cannot be represented safely")
+            }
         }
     }
 }

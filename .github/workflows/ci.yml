@@ -44,6 +44,8 @@ jobs:
         shell: bash
         run: scripts/check-daemon-current-user.sh
       - name: cargo test
+        env:
+          AW_MACRED_DIAG: ${{ runner.os == 'macOS' && '1' || '' }}
         run: cargo test --workspace --no-fail-fast
       # Review 14:40: `aw daemon uninstall --purge --data-dir` exists only in
       # test builds (feature test-purge-data-dir). Run its own tests with the

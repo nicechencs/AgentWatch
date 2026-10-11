@@ -29,6 +29,23 @@ use nix::unistd::{getpgrp, isatty, tcsetpgrp, Pid};
 /// `waitpid` would not necessarily return after the handler records a signal.
 const SIGNAL_POLL: Duration = Duration::from_millis(10);
 
+// Temporary CI diagnosis for the macOS terminal-job-control regression.  The
+// dispatch workflow enables it only while collecting the failing wait order.
+// Keep the production expansion empty so this cannot add CLI output.
+#[cfg(test)]
+macro_rules! macred_diag {
+    ($($arg:tt)*) => {
+        if std::env::var_os("AW_MACRED_DIAG").is_some() {
+            eprintln!("macred-diag: {}", format_args!($($arg)*));
+        }
+    };
+}
+
+#[cfg(not(test))]
+macro_rules! macred_diag {
+    ($($arg:tt)*) => {};
+}
+
 /// A released child and the terminal state that belongs to the foreground
 /// `aw run` invocation.  Dropping it restores `aw`'s group before unregistering
 /// signal handlers, including during unwinding on an error path.
@@ -131,6 +148,11 @@ impl TerminalChild {
         loop {
             if let Some(signal) = self.take_pending_signal() {
                 saw_hup |= signal == Signal::SIGHUP;
+                macred_diag!(
+                    "forward sender_pid={} target_group={} signal={signal:?}",
+                    std::process::id(),
+                    self.child_group
+                );
                 // A terminal close can make `tcsetpgrp` fail because there is
                 // no longer a terminal to restore. The guard still attempted
                 // restoration with SIGTTOU masked; continue relaying SIGHUP so
@@ -152,16 +174,26 @@ impl TerminalChild {
                 self.child_group,
                 Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED),
             ) {
-                Ok(WaitStatus::Exited(_, code)) => {
+                Ok(_status @ WaitStatus::Exited(_, code)) => {
+                    macred_diag!(
+                        "target_group={} wait_status={_status:?} group_exists_before_cleanup={}",
+                        self.child_group,
+                        killpg(self.child_group, Option::<Signal>::None).is_ok()
+                    );
                     self.finish_after_exit();
                     return Ok(code);
                 }
-                Ok(WaitStatus::Signaled(_, signal, _)) => {
+                Ok(_status @ WaitStatus::Signaled(_, signal, _)) => {
                     // With a real terminal, Ctrl+C is delivered by the tty
                     // driver straight to the foreground child group, rather
                     // than to aw's relay.  Clean the group in that case too:
                     // a descendant that ignored SIGINT must not survive after
                     // its group leader has ended.
+                    macred_diag!(
+                        "target_group={} wait_status={_status:?} group_exists_before_cleanup={}",
+                        self.child_group,
+                        killpg(self.child_group, Option::<Signal>::None).is_ok()
+                    );
                     self.finish_after_exit();
                     return Ok(128 + signal as i32);
                 }
@@ -220,6 +252,11 @@ impl TerminalChild {
         // while an in-group descendant remains. ESRCH just means the target
         // already ended every group member. Run this even after normal exit:
         // a shell may otherwise leave a direct background child behind.
+        macred_diag!(
+            "cleanup sender_pid={} target_group={} signal=SIGKILL",
+            std::process::id(),
+            self.child_group
+        );
         let _ = killpg(self.child_group, Signal::SIGKILL);
     }
 
@@ -336,6 +373,12 @@ mod tests {
         terminal
             .pending_signal
             .store(Signal::SIGINT as usize, std::sync::atomic::Ordering::SeqCst);
+        macred_diag!(
+            "test_pid={} root_pid={} grandchild_pid={} queued_signal=SIGINT",
+            std::process::id(),
+            child.id(),
+            grandchild
+        );
         drop(child);
         assert_eq!(terminal.wait().expect("wait target"), 130);
         let gone_by = Instant::now() + Duration::from_secs(2);

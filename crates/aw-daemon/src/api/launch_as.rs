@@ -653,6 +653,9 @@ pub(crate) fn spawn_as(
         command: argv.to_vec(),
         cwd: Some(cwd.map_or_else(|| who.home.clone(), PathBuf::from)),
         env: base_env(who, extra_env),
+        // Daemon- and App-originated launches do not own the client's
+        // controlling terminal, so the platform must never hand it over.
+        terminal_handoff: false,
         // The daemon may be root. The target gets this list and nothing of the
         // daemon's own environment. `Inherit` is the `aw run` path, not this one.
         env_source: aw_platform::EnvSource::Exact,

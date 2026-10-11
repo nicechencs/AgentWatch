@@ -45,6 +45,14 @@ pub use unix::signals::{ignore_terminal_interrupts, TerminalInterruptIgnore};
 pub fn unix_program_candidates(program: &str, search_path: Option<&str>) -> Vec<String> {
     unix::hold::program_candidates(program, search_path)
 }
+
+/// Observe whether a direct Unix child has exited without reaping it.  Callers
+/// use this to clean a still-owned process group before the leader pid can be
+/// reused, then perform the one blocking reap themselves.
+#[cfg(unix)]
+pub fn unix_peek_exit(pid: u32) -> Result<Option<ReapOutcome>, std::io::Error> {
+    unix::hold::peek_exit_without_reaping(pid)
+}
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "linux")]
@@ -360,6 +368,11 @@ pub struct SpawnRequest {
     pub command: Vec<String>,
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
+    /// Whether the caller already established that it owns stdin's foreground
+    /// terminal.  The platform launch implementation must only perform a
+    /// foreground handoff when this is true; it must not infer that from its
+    /// own `isatty` check.
+    pub terminal_handoff: bool,
     /// Where the target's environment comes from.
     ///
     /// The privileged daemon path passes [`EnvSource::Exact`] or, on Windows,
@@ -394,6 +407,7 @@ impl fmt::Debug for SpawnRequest {
             .field("command_len", &self.command.len())
             .field("has_cwd", &self.cwd.is_some())
             .field("env_len", &self.env.len())
+            .field("terminal_handoff", &self.terminal_handoff)
             .field("env_source", &self.env_source)
             .finish()
     }

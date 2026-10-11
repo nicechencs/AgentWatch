@@ -923,8 +923,11 @@ fn move_and_wait(
     session: &std::path::Path,
 ) -> Result<LaunchResult, LaunchError> {
     let pid = spawned.id();
-    let mut terminal =
-        super::terminal::TerminalChild::new(pid).map_err(|_| LaunchError::WaitFailed {
+    let mut terminal = super::terminal::TerminalChild::new(
+        pid,
+        super::terminal::TerminalDecision::before_fork(),
+    )
+    .map_err(|_| LaunchError::WaitFailed {
             detail: "无法安装程序信号转发".to_owned(),
         })?;
     terminal

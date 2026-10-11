@@ -3666,6 +3666,7 @@ mod tests {
             command: vec!["cmd".to_owned(), "/c".to_owned(), "exit 7".to_owned()],
             cwd: None,
             env: Vec::new(),
+            terminal_handoff: false,
             env_source: crate::EnvSource::Inherit,
         };
         let held = platform()
@@ -3682,6 +3683,7 @@ mod tests {
             command: vec!["cmd".to_owned(), "/c".to_owned(), "exit 300".to_owned()],
             cwd: None,
             env: Vec::new(),
+            terminal_handoff: false,
             env_source: crate::EnvSource::Inherit,
         };
         let released = platform()
@@ -3706,6 +3708,7 @@ mod tests {
             ],
             cwd: None,
             env: Vec::new(),
+            terminal_handoff: false,
             env_source: crate::EnvSource::Inherit,
         };
         let released = platform()
@@ -3775,6 +3778,7 @@ mod tests {
             command: vec!["cmd".to_owned(), "/c".to_owned(), "exit 0".to_owned()],
             cwd: None,
             env: Vec::new(),
+            terminal_handoff: false,
             env_source: crate::EnvSource::Inherit,
         };
 
@@ -3823,6 +3827,7 @@ mod tests {
             command: vec!["cmd".to_owned(), "/c".to_owned(), "echo hello".to_owned()],
             cwd: None,
             env: Vec::new(),
+            terminal_handoff: false,
             env_source: crate::EnvSource::Inherit,
         };
         let held = platform()
@@ -3860,6 +3865,7 @@ mod tests {
                 ("aw_exact_env_value".to_owned(), "first".to_owned()),
                 ("AW_EXACT_ENV_VALUE".to_owned(), "only-this".to_owned()),
             ],
+            terminal_handoff: false,
             env_source: crate::EnvSource::Exact,
         };
         let held = platform()

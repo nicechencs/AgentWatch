@@ -198,6 +198,7 @@ fn start_held_program(request: &Request) -> Result<Box<dyn HeldChild>, PlatformE
             command: request.command.clone(),
             cwd: request.cwd.clone().map(Into::into),
             env: request.env.clone(),
+            terminal_handoff: false,
             env_source: EnvSource::Inherit,
         },
     )

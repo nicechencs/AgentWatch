@@ -18,11 +18,19 @@
 #[path = "unix_linux.rs"]
 mod unix_linux;
 
+<<<<<<< Updated upstream
 // The foreground terminal belongs to the CLI, not to a collector or the
 // suspended-launch implementation.  Both Unix launch paths use this one
 // waiter after the target has its own process group.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) mod terminal;
+=======
+// The Linux cleanup watchdog is a re-exec'd CLI helper. Keeping it separate
+// from `cmd/run.rs` lets terminal handoff and signal forwarding evolve without
+// coupling them to the subreaper/`/proc` cleanup implementation.
+#[cfg(target_os = "linux")]
+pub mod watchdog;
+>>>>>>> Stashed changes
 
 /// Present only on Linux. [`unix_linux::LocalCgroupHost`] creates a cgroup v2
 /// session directory when the caller is delegated, and refuses otherwise.

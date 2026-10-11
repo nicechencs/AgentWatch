@@ -194,12 +194,59 @@ impl Daemon {
         (status, serde_json::from_str(body).unwrap_or(Value::Null))
     }
 
+<<<<<<< Updated upstream
     /// Make one request as the original non-root caller when this ignored test
     /// is itself invoked through sudo in CI. The root daemon must not see the
     /// test runner's root credential as the launch caller.
     fn http_as_caller(&self, method: &str, path: &str, body: &str) -> (u16, Value) {
         if !(self.as_root && my_uid() == 0) {
             return self.http(method, path, body);
+=======
+    fn marker_pid(marker: &Path) -> u32 {
+        let started = Instant::now();
+        loop {
+            if let Ok(text) = std::fs::read_to_string(marker) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    return pid;
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "watchdog descendant did not start"
+            );
+            sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn assert_reaped(pid: u32) {
+        let started = Instant::now();
+        loop {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "watchdog descendant {pid} survived cleanup"
+            );
+            sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn my_uid() -> u32 {
+        proc_ids(u64::from(std::process::id()), "Uid:")[0]
+    }
+
+    /// The ordinary account that called `sudo` for the CI root-test command. When
+    /// this test binary itself is not root, it is already that account.
+    fn caller_uid() -> u32 {
+        if my_uid() == 0 {
+            std::env::var("SUDO_UID")
+                .expect("run root tests through sudo so SUDO_UID names the caller")
+                .parse()
+                .expect("SUDO_UID is numeric")
+        } else {
+            my_uid()
+>>>>>>> Stashed changes
         }
         let out = Command::new("sudo")
             .args(["-n", "-u"])
@@ -295,6 +342,7 @@ fn daemon_restart_releases_locks_before_every_replacement() {
             String::from_utf8_lossy(&status.stderr)
         );
     }
+<<<<<<< Updated upstream
     let out = daemon.aw(&["daemon", "stop"]);
     assert!(
         out.status.success(),
@@ -303,11 +351,445 @@ fn daemon_restart_releases_locks_before_every_replacement() {
     );
     let started = Instant::now();
     while UnixStream::connect(daemon.socket()).is_ok() {
+=======
+
+    /// A program the daemon launches (the App's `POST /sessions` launch) starts
+    /// as the caller and is tracked to its end by the poll sampler. That path has
+    /// no cgroup step at all, so it works on a machine without cgroup v2
+    /// delegation; this test runs on both and asserts the same thing either way.
+    #[test]
+    fn daemon_launch_starts_and_tracks_without_cgroup() {
+        let delegated = std::fs::read_to_string("/sys/fs/cgroup/cgroup.subtree_control")
+            .map(|controllers| !controllers.trim().is_empty())
+            .unwrap_or(false);
+        eprintln!("cgroup v2 controllers delegated at the root: {delegated}");
+        let daemon = Daemon::start(As::Me);
+        let (status, body) = daemon.http(
+            "POST",
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["sh","-c","sleep 1; exit 7"]}"#,
+        );
+        assert_eq!(status, 201, "{body} / {}", daemon.log());
+        let pid = body["root_pid"].as_u64().expect("root_pid");
+        let sid = body["id"].as_str().expect("id").to_owned();
+        assert_eq!(
+            proc_ids(pid, "Uid:"),
+            vec![my_uid(); 4],
+            "runs as the caller"
+        );
+        assert_eq!(
+            proc_ids(pid, "PPid:")[0],
+            daemon.child.id(),
+            "a daemon-launched program is not wrapped in the CLI watchdog"
+        );
+        // Recording while the program runs: not ended before it exits.
+        let (_, live) = daemon.http("GET", &format!("/api/v1/sessions/{sid}"), "");
+>>>>>>> Stashed changes
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "replacement did not stop"
         );
+<<<<<<< Updated upstream
         sleep(Duration::from_millis(50));
+=======
+        assert!(
+            Path::new(&format!("/proc/{pid}")).exists(),
+            "program still running"
+        );
+        let alive_ns = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap();
+        let ended = daemon.wait_ended(&sid, Duration::from_secs(15));
+        assert!(
+            ended["ended_ns"].as_i64().unwrap_or(0) > alive_ns,
+            "ended only after the program was seen running: {ended}"
+        );
+        let modes: Vec<&str> = ended["collectors"]
+            .as_array()
+            .map(|c| c.iter().filter_map(|c| c["mode"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            modes.contains(&"poll"),
+            "tracked by the poll sampler: {ended}"
+        );
+        assert!(
+            ended["stats"]["process_count"].as_u64().unwrap_or(0) >= 1,
+            "the root process is recorded: {ended}"
+        );
+        assert_eq!(ended["exit_code"], 7, "exit code recorded: {ended}");
+    }
+
+    /// A session created by the very first request after the daemon starts is
+    /// not swept up by the startup recovery of the last run's open sessions.
+    #[test]
+    fn a_session_created_right_after_start_stays_recording() {
+        let mut sleeper = Command::new("sleep").arg("30").spawn().expect("sleep");
+        let daemon = Daemon::start(As::Me);
+        let (status, body) = daemon.http(
+            "POST",
+            "/api/v1/sessions",
+            &format!(r#"{{"mode":"attach","pid":{}}}"#, sleeper.id()),
+        );
+        assert_eq!(status, 201, "{body} / {}", daemon.log());
+        let sid = body["id"].as_str().expect("id").to_owned();
+        sleep(Duration::from_millis(1_500));
+        let (_, now) = daemon.http("GET", &format!("/api/v1/sessions/{sid}"), "");
+        assert!(now["ended_ns"].is_null(), "still recording: {now}");
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
+
+    /// `timeline --follow` uses the daemon's bounded `/live` SSE snapshots rather
+    /// than the old unavailable stub.  The foreground CLI is interrupted like a
+    /// person pressing Ctrl-C: it finishes its current snapshot and exits cleanly.
+    /// This uses the same isolated foreground daemon as the other end-to-end
+    /// tests, never the installed daemon.
+    #[test]
+    fn timeline_follow_uses_temp_daemon_and_stops_cleanly_on_sigint() {
+        let mut sleeper = Command::new("sleep").arg("30").spawn().expect("sleep");
+        let daemon = Daemon::start(As::Me);
+        let (status, body) = daemon.http(
+            "POST",
+            "/api/v1/sessions",
+            &format!(r#"{{"mode":"attach","pid":{}}}"#, sleeper.id()),
+        );
+        assert_eq!(status, 201, "{body} / {}", daemon.log());
+        let sid = body["id"].as_str().expect("id").to_owned();
+
+        let follow = Command::new(aw_bin())
+            .envs(env_for(&daemon.root))
+            .env_remove("AW_TOKEN")
+            .env("AW_DAEMON_CONFIG", daemon.root.join("config.toml"))
+            .args(["timeline", &sid, "--follow", "--json"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn timeline follow");
+
+        // Give the CLI enough time to make one bounded `/live` request and install
+        // its Unix signal waiter before emulating Ctrl-C.
+        sleep(Duration::from_millis(1_300));
+        let signal = Command::new("kill")
+            .args(["-INT", &follow.id().to_string()])
+            .status()
+            .expect("send SIGINT to timeline follow");
+        assert!(signal.success(), "could not signal timeline follow");
+        let output = follow.wait_with_output().expect("wait for timeline follow");
+        assert!(
+            output.status.success(),
+            "timeline --follow: {} / daemon: {}",
+            String::from_utf8_lossy(&output.stderr),
+            daemon.log()
+        );
+        // The old implementation refused before dialing `/live`; a successful
+        // clean exit is the contract here because this foreground runtime has no
+        // live pipeline publisher yet and its snapshot may correctly be empty.
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("真实订阅未接通"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
+
+    /// The local runner owns no daemon state.  It must still relay a terminal
+    /// termination to the target process group and report the target's resulting
+    /// status, rather than dying first and leaving the shell behind.
+    #[test]
+    fn no_daemon_run_relays_sigterm_to_the_target_process_group() {
+        let child = Command::new(aw_bin())
+            .args([
+                "run",
+                "--no-daemon",
+                "-q",
+                "--",
+                "sh",
+                "-c",
+                "trap 'exit 23' TERM; while :; do sleep 0.1; done",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn local aw run");
+
+        // Allow the child group and the relay thread to be established before
+        // emulating a supervisor's SIGTERM to the foreground `aw` process.
+        sleep(Duration::from_millis(1_000));
+        let signal = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("send SIGTERM to aw");
+        assert!(signal.success(), "could not signal local aw run");
+        let output = child.wait_with_output().expect("wait for local aw run");
+        assert_eq!(
+            output.status.code(),
+            Some(23),
+            "--no-daemon should return the target code: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn no_daemon_run_relays_sigint_and_sighup_to_the_target_process_group() {
+        for (signal, code) in [("INT", 24), ("HUP", 25)] {
+            let script = format!("trap 'exit {code}' {signal}; while :; do sleep 0.1; done");
+            let child = Command::new(aw_bin())
+                .args(["run", "--no-daemon", "-q", "--", "sh", "-c", &script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn local aw run");
+            sleep(Duration::from_millis(600));
+            assert!(Command::new("kill")
+                .args([&format!("-{signal}"), &child.id().to_string()])
+                .status()
+                .expect("signal aw")
+                .success());
+            let output = child.wait_with_output().expect("wait aw");
+            assert_eq!(
+                output.status.code(),
+                Some(code),
+                "{signal}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn no_daemon_normal_exit_reaps_a_setsid_grandchild() {
+        let root = PathBuf::from(format!("/tmp/aw-normal-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("tree test dir");
+        let marker = root.join("setsid.pid");
+        let child = Command::new(aw_bin())
+            .env("AW_E2E_GRANDCHILD_PID", &marker)
+            .args([
+                "run",
+                "--no-daemon",
+                "-q",
+                "--",
+                "sh",
+                "-c",
+                r#"setsid sh -c 'echo $$ > "$AW_E2E_GRANDCHILD_PID"; while :; do sleep 1; done' & exit 17"#,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn local aw run");
+        let pid = marker_pid(&marker);
+        let output = child.wait_with_output().expect("wait local aw");
+        assert_eq!(output.status.code(), Some(17));
+        assert_reaped(pid);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A supervisor can use SIGKILL, which leaves `aw` no opportunity to forward
+    /// a signal itself. The CLI-local EOF watchdog must still end the target group
+    /// and the grandchild the target started.
+    #[test]
+    fn no_daemon_force_kill_ends_the_target_grandchild() {
+        let root = PathBuf::from(format!("/tmp/aw-tree-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("tree test dir");
+        let marker = root.join("grandchild.pid");
+        let child = Command::new(aw_bin())
+            .env("AW_E2E_GRANDCHILD_PID", &marker)
+            .args([
+                "run",
+                "--no-daemon",
+                "-q",
+                "--",
+                "sh",
+                "-c",
+                r#"setsid sh -c 'echo $$ > "$AW_E2E_GRANDCHILD_PID"; while :; do sleep 1; done' & wait"#,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn local aw run");
+        let started = Instant::now();
+        let grandchild = loop {
+            if let Ok(text) = std::fs::read_to_string(&marker) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    break pid;
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "grandchild did not start"
+            );
+            sleep(Duration::from_millis(25));
+        };
+        let killed = Command::new("kill")
+            .args(["-KILL", &child.id().to_string()])
+            .status()
+            .expect("kill aw");
+        assert!(killed.success(), "could not SIGKILL aw");
+        let _ = child.wait_with_output();
+        let started = Instant::now();
+        loop {
+            let gone = !Path::new(&format!("/proc/{grandchild}")).exists();
+            let zombie = std::fs::read_to_string(format!("/proc/{grandchild}/stat"))
+                .ok()
+                .is_some_and(|stat| {
+                    stat.rsplit_once(") ")
+                        .is_some_and(|(_, tail)| tail.starts_with('Z'))
+                });
+            if gone || zombie {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "grandchild survived SIGKILL of aw"
+            );
+            sleep(Duration::from_millis(25));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_daemon_force_kill_reaps_bounded_forks_after_middle_exit() {
+        let root = PathBuf::from(format!("/tmp/aw-fork-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("fork test dir");
+        let marker = root.join("descendants.pid");
+        let child = Command::new(aw_bin())
+            .env("AW_E2E_GRANDCHILD_PID", &marker)
+            .args([
+                "run",
+                "--no-daemon",
+                "-q",
+                "--",
+                "sh",
+                "-c",
+                r#": > "$AW_E2E_GRANDCHILD_PID"; (i=0; while [ "$i" -lt 16 ]; do sh -c 'while :; do sleep 1; done' & echo $! >> "$AW_E2E_GRANDCHILD_PID"; i=$((i + 1)); done; setsid sh -c 'echo $$ >> "$AW_E2E_GRANDCHILD_PID"; while :; do sleep 1; done' & exit 0) & while :; do sleep 1; done"#,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bounded-fork run");
+        let started = Instant::now();
+        let descendants = loop {
+            let pids: Vec<u32> = std::fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.parse().ok())
+                .collect();
+            if pids.len() >= 17 {
+                break pids;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "bounded forker did not create all descendants"
+            );
+            sleep(Duration::from_millis(25));
+        };
+        assert!(Command::new("kill")
+            .args(["-KILL", &child.id().to_string()])
+            .status()
+            .expect("kill aw")
+            .success());
+        let _ = child.wait_with_output();
+        for pid in descendants {
+            assert_reaped(pid);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Root daemon (via `sudo -n`), this test's account as the caller: the
+    /// launched program's uid is the caller's and its group list is exactly the
+    /// caller's login groups (`id -G`), supplementary groups included. Needs
+    /// passwordless sudo and a caller in at least one supplementary group:
+    /// `cargo test -p aw-daemon --test e2e_cli -- --ignored root_daemon`.
+    #[test]
+    #[ignore = "needs passwordless sudo to start a root daemon"]
+    fn root_daemon_launch_carries_the_callers_login_groups() {
+        let me = caller_uid();
+        assert_ne!(
+            me, 0,
+            "run as an ordinary account; the daemon is the root one"
+        );
+        let name = caller_name();
+        let want = login_groups(&name);
+        let primary = caller_primary_gid();
+        assert!(
+            want.iter().any(|g| *g != primary),
+            "the caller must be in a supplementary group: {want:?}"
+        );
+        let daemon = Daemon::start(As::Root);
+        let (status, body) = daemon.http_as_caller(
+            "POST",
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["sleep","10"]}"#,
+        );
+        assert_eq!(status, 201, "{body} / {}", daemon.log());
+        let pid = body["root_pid"].as_u64().expect("root_pid");
+        assert_eq!(proc_ids(pid, "Uid:"), vec![me; 4]);
+        assert_eq!(proc_ids(pid, "Gid:"), vec![primary; 4]);
+        let mut have = proc_ids(pid, "Groups:");
+        have.push(primary);
+        have.sort_unstable();
+        have.dedup();
+        assert_eq!(have, want, "Groups of the launched program = id -G {name}");
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+
+    /// A root daemon samples a long-running program it launches for its caller.
+    /// This is root-only because the daemon's launch-as-caller path is the case
+    /// that previously only had coverage for credentials, not poll sampling.
+    #[test]
+    #[ignore = "needs root"]
+    fn root_daemon_samples_long_running_program() {
+        let daemon = Daemon::start(As::Root);
+        let (status, body) = daemon.http_as_caller(
+            "POST",
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["sleep","20"]}"#,
+        );
+        assert_eq!(status, 201, "{body} / {}", daemon.log());
+        let pid = body["root_pid"].as_u64().expect("root_pid");
+        let sid = body["id"].as_str().expect("id");
+
+        let started = Instant::now();
+        let mut sampled = false;
+        let mut last = Value::Null;
+        while started.elapsed() < Duration::from_secs(10) {
+            let (status, body) =
+                daemon.http_as_caller("GET", &format!("/api/v1/sessions/{sid}/processes"), "");
+            if status == 200 && process_tree_contains_pid(&body["processes"], pid) {
+                sampled = true;
+                break;
+            }
+            last = serde_json::json!({ "status": status, "body": body });
+            sleep(Duration::from_millis(100));
+        }
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+        assert!(
+            sampled,
+            "root daemon did not store a sampled row for pid {pid}: {last}; log: {}",
+            daemon.log()
+        );
+    }
+
+    fn process_tree_contains_pid(nodes: &Value, pid: u64) -> bool {
+        nodes.as_array().is_some_and(|nodes| {
+            nodes
+                .iter()
+                .any(|node| node["pid"] == pid || process_tree_contains_pid(&node["children"], pid))
+        })
+>>>>>>> Stashed changes
     }
 }
 

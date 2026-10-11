@@ -27,12 +27,32 @@
 //! Command text, environment values, and the working directory are inputs to
 //! the launcher. They are not written to stdout, stderr, or an error string.
 
+<<<<<<< Updated upstream
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use aw_platform::PlatformError;
 #[cfg(windows)]
 use aw_platform::ReapOutcome;
 #[cfg(any(target_os = "linux", windows))]
 use aw_platform::{platform, HeldChild, IdentifiedCaller, ReleasedChild, SpawnRequest};
+=======
+#[cfg(target_os = "macos")]
+use std::fs::File;
+use std::io::{self, Write};
+#[cfg(target_os = "macos")]
+use std::process::{Child, Command, Stdio};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::sync::{
+    atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
+    Arc,
+};
+
+#[cfg(any(target_os = "macos", windows, test))]
+use aw_platform::PlatformError;
+#[cfg(windows)]
+use aw_platform::{
+    platform, HeldChild, IdentifiedCaller, ReapOutcome, ReleasedChild, SpawnRequest,
+};
+>>>>>>> Stashed changes
 use aw_proxy::{plan_injection, Injection, ProxyOnReject};
 use std::io::{self, Write};
 #[cfg(not(any(unix, windows)))]
@@ -462,10 +482,10 @@ impl SpawnedChild for PlatformChild {
     }
 }
 
-/// Linux and Windows held children are owned by `aw-platform`. This thin CLI adapter only
+/// Windows held children are owned by `aw-platform`. This thin CLI adapter only
 /// translates the pre-existing `Spawner` state machine to its ownership API;
 /// it deliberately does not contain a second pipe gate implementation.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(windows)]
 struct PlatformGatedChild {
     held: Option<Box<dyn HeldChild>>,
     released: Option<Box<dyn ReleasedChild>>,
@@ -478,7 +498,7 @@ struct PlatformGatedChild {
     terminal: Option<crate::launch::terminal::TerminalChild>,
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(windows)]
 impl SpawnedChild for PlatformGatedChild {
     fn pid(&self) -> u32 {
         self.held
@@ -491,6 +511,7 @@ impl SpawnedChild for PlatformGatedChild {
     fn wait(&mut self) -> Result<i32, String> {
         #[cfg(unix)]
         {
+<<<<<<< Updated upstream
             let child = self
                 .released
                 .take()
@@ -517,6 +538,11 @@ impl SpawnedChild for PlatformGatedChild {
                 ReapOutcome::Exited(code) | ReapOutcome::Signaled(code) => Ok(code),
                 ReapOutcome::StillRunning => Ok(exit::GENERAL),
             }
+=======
+            ReapOutcome::Exited(code) => Ok(code),
+            ReapOutcome::Signaled(signo) => Ok(signo),
+            ReapOutcome::StillRunning => Ok(exit::GENERAL),
+>>>>>>> Stashed changes
         }
     }
 
@@ -565,7 +591,34 @@ impl SpawnedChild for PlatformGatedChild {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+/// Linux's CLI-created root is held by the private watchdog until daemon
+/// adopt. The daemon never owns this cleanup boundary; it only records that
+/// CLI-created root, while the watchdog starts and reaps the real program.
+#[cfg(target_os = "linux")]
+struct LinuxWatchdogChild {
+    watchdog: crate::launch::watchdog::Watchdog,
+}
+
+#[cfg(target_os = "linux")]
+impl SpawnedChild for LinuxWatchdogChild {
+    fn pid(&self) -> u32 {
+        self.watchdog.pid()
+    }
+
+    fn wait(&mut self) -> Result<i32, String> {
+        self.watchdog.wait()
+    }
+
+    fn release(&mut self) -> Result<(), String> {
+        self.watchdog.release().map(drop)
+    }
+
+    fn kill_and_reap(&mut self) {
+        self.watchdog.abort();
+    }
+}
+
+#[cfg(any(target_os = "macos", windows, test))]
 fn platform_child_error(error: PlatformError) -> (&'static str, String) {
     match error {
         PlatformError::Spawn(kind) => (
@@ -598,12 +651,30 @@ fn platform_child_error(error: PlatformError) -> (&'static str, String) {
     }
 }
 
+<<<<<<< Updated upstream
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn platform_spawn_error(
     program: &str,
     cwd: Option<&str>,
     error: PlatformError,
 ) -> (&'static str, String) {
+=======
+/// Wording for the one `cmd.exe` argument form that cannot be preserved.
+///
+/// This is deliberately not phrased as a broad guarantee: it tells the user
+/// that the literal argument cannot cross Windows' command parser unchanged,
+/// so refusing avoids invoking a different command.
+#[cfg(any(windows, test))]
+fn unsafe_batch_argument_message(argument: &str) -> String {
+    let transfer = ["安", "全传递"].concat();
+    format!(
+        "参数「{argument}」里有 Windows 命令行没法{transfer}的字符，为了不被当成别的命令执行，已拒绝运行。"
+    )
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn platform_spawn_error(program: &str, error: PlatformError) -> (&'static str, String) {
+>>>>>>> Stashed changes
     match error {
         PlatformError::Spawn(kind) => typed_spawn_error(program, cwd, kind),
         PlatformError::Io(error) => (
@@ -695,7 +766,7 @@ fn spawn_step_code(error: &std::io::Error) -> &'static str {
 
 /// A caller identity failure is distinct from a program spawn failure.  Keep
 /// its machine code in the tuple so text output never has to inspect a message.
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", windows))]
 fn caller_identity_error() -> (&'static str, String) {
     (
         "identity_unavailable",
@@ -710,6 +781,7 @@ impl Spawner for CommandSpawner {
             let Some((program, args)) = spec.command.split_first() else {
                 return Err(("spawn_failed", "程序名为空".to_owned()));
             };
+<<<<<<< Updated upstream
             // The program name is not resolved here. The hold stage's parent
             // only builds candidate strings; the child tries them after it has
             // switched identity, so this process never stats a PATH directory.
@@ -732,6 +804,31 @@ impl Spawner for CommandSpawner {
                 cwd: spec.cwd.clone(),
                 terminal: None,
             }))
+=======
+            // Keep the pre-flight lookup: the gate shell would otherwise emit
+            // an English error only after the daemon had adopted the session.
+            let path_env = spec
+                .env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value.clone())
+                .or_else(|| std::env::var("PATH").ok());
+            let resolved = resolve_program(program, path_env.as_deref(), spec.cwd.as_deref())
+                .map_err(|error| {
+                    (
+                        spawn_error_code(&error),
+                        spawn_error_text_for(program, &error),
+                    )
+                })?;
+            let mut protected = spec.clone();
+            protected.command = std::iter::once(resolved)
+                .chain(args.iter().cloned())
+                .collect();
+            crate::launch::watchdog::Watchdog::spawn(&protected)
+                .map(|watchdog| Box::new(LinuxWatchdogChild { watchdog }) as Box<dyn SpawnedChild>)
+                .map_err(|detail| ("spawn_failed", detail))
+>>>>>>> Stashed changes
         }
         #[cfg(target_os = "macos")]
         {
@@ -874,6 +971,7 @@ pub(crate) struct PlatformLauncher;
 #[cfg(target_os = "linux")]
 impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
+<<<<<<< Updated upstream
         // Use the same held-child launcher as the daemon-backed route. In
         // particular, the child gives itself the terminal before it reads the
         // gate; a `Command::spawn` plus parent-side handoff races an immediate
@@ -886,11 +984,25 @@ impl Launcher for PlatformLauncher {
             .release()
             .map_err(|(code, detail)| LaunchDispatchError::Spawn { code, detail })?;
         let code = child
+=======
+        let forwarder = ProcessGroupForwarder::new()?;
+        let mut watchdog = crate::launch::watchdog::Watchdog::spawn(spec)
+            .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
+        let program_pid = watchdog
+            .release()
+            .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
+        forwarder.set_pid(program_pid);
+        let code = watchdog
+>>>>>>> Stashed changes
             .wait()
             .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
         Ok(Launched {
             code,
+<<<<<<< Updated upstream
             pid,
+=======
+            pid: program_pid,
+>>>>>>> Stashed changes
             note: None,
             sampling: spec.no_daemon,
         })
@@ -1031,6 +1143,7 @@ pub(crate) const PID_TREE_FALLBACK_NOTE: &str =
 #[cfg(target_os = "linux")]
 const POST_SPAWN_MOVE_NOTE: &str = "子进程在写入 cgroup.procs 之前已经启动，这段窗口记为缺口";
 
+<<<<<<< Updated upstream
 /// Session directory suffix. Not a stored id; unique for one launch.
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
@@ -1042,6 +1155,8 @@ fn session_token() -> u64 {
         .unwrap_or(1)
 }
 
+=======
+>>>>>>> Stashed changes
 /// Non-Linux, non-Windows, non-macOS production launcher.
 ///
 /// Names the cards that will provide a real Unix launcher.
@@ -1099,6 +1214,212 @@ impl Launcher for PlatformLauncher {
     }
 }
 
+<<<<<<< Updated upstream
+=======
+/// A small process which observes the CLI's own lifetime through a pipe. If
+/// `aw` is force-killed, EOF makes it kill the target process group. This is
+/// deliberately CLI-local: it does not alter the Unix launch gate or Linux
+/// cgroup implementation.
+///
+/// It reaches ordinary descendants that stay in the target process group. A
+/// target that calls `setsid`/changes process group can escape; Linux cgroup
+/// scoping remains the stronger containment where it is available.
+#[cfg(target_os = "macos")]
+struct NoDaemonTreeWatchdog {
+    done: Option<File>,
+    child: Option<Child>,
+}
+
+#[cfg(target_os = "macos")]
+impl NoDaemonTreeWatchdog {
+    fn arm(pid: u32) -> Result<Self, LaunchDispatchError> {
+        use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+        use nix::unistd::pipe;
+
+        let (read, write) = pipe().map_err(|error| LaunchDispatchError::NotImplemented {
+            detail: format!("无法建立退出看护：{error}"),
+        })?;
+        fcntl(&write, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|error| {
+            LaunchDispatchError::NotImplemented {
+                detail: format!("无法保护退出看护：{error}"),
+            }
+        })?;
+        let child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                // EOF is an abnormal parent exit. A normal exit first writes
+                // `done`, which avoids a PID/process-group reuse race.
+                "IFS= read -r action || action=kill; if [ \"$action\" != done ]; then kill -KILL \"-$1\" 2>/dev/null || :; fi",
+                "aw-no-daemon-watchdog",
+                &pid.to_string(),
+            ])
+            .stdin(Stdio::from(File::from(read)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| LaunchDispatchError::NotImplemented {
+                detail: format!("无法启动退出看护：{error}"),
+            })?;
+        Ok(Self {
+            done: Some(File::from(write)),
+            child: Some(child),
+        })
+    }
+
+    fn finish(mut self) {
+        if let Some(mut done) = self.done.take() {
+            let _ = done.write_all(b"done\n");
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for NoDaemonTreeWatchdog {
+    fn drop(&mut self) {
+        // Closing `done` without the normal sentinel is the force-kill path.
+        self.done.take();
+    }
+}
+
+/// Safe foreground signal relay for a `--no-daemon` target.  The target gets
+/// its own process group before this is armed, so the relay reaches ordinary
+/// descendants too.  The registrations are removed before `aw` returns.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct ProcessGroupForwarder {
+    pid: Arc<AtomicI32>,
+    pending: Arc<AtomicUsize>,
+    done: Arc<AtomicBool>,
+    registrations: Vec<signal_hook::SigId>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl ProcessGroupForwarder {
+    fn new() -> Result<Self, LaunchDispatchError> {
+        use nix::sys::signal::Signal;
+
+        let pid = Arc::new(AtomicI32::new(0));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let mut registrations = Vec::new();
+        for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP] {
+            match signal_hook::flag::register_usize(
+                signal as i32,
+                Arc::clone(&pending),
+                signal as usize,
+            ) {
+                Ok(id) => registrations.push(id),
+                Err(error) => {
+                    for id in registrations {
+                        let _ = signal_hook::low_level::unregister(id);
+                    }
+                    return Err(LaunchDispatchError::NotImplemented {
+                        detail: format!("无法安装中断转发：{error}"),
+                    });
+                }
+            }
+        }
+        let worker_pid = Arc::clone(&pid);
+        let worker_pending = Arc::clone(&pending);
+        let worker_done = Arc::clone(&done);
+        let worker = std::thread::Builder::new()
+            .name("aw-run-signal-relay".to_owned())
+            .spawn(move || {
+                while !worker_done.load(Ordering::Relaxed) {
+                    let number = worker_pending.swap(0, Ordering::Relaxed);
+                    let child = worker_pid.load(Ordering::Relaxed);
+                    if number != 0 && child > 0 {
+                        let signal = match number {
+                            value if value == Signal::SIGTERM as usize => Signal::SIGTERM,
+                            value if value == Signal::SIGHUP as usize => Signal::SIGHUP,
+                            _ => Signal::SIGINT,
+                        };
+                        let _ = forward_unix_signal(child as u32, signal);
+                    } else if number != 0 {
+                        // A signal arriving during spawn is still delivered as
+                        // soon as the child process group has a pid.
+                        worker_pending.store(number, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            })
+            .map_err(|error| {
+                for id in registrations.drain(..) {
+                    let _ = signal_hook::low_level::unregister(id);
+                }
+                LaunchDispatchError::NotImplemented {
+                    detail: format!("无法启动中断转发：{error}"),
+                }
+            })?;
+        Ok(Self {
+            pid,
+            pending,
+            done,
+            registrations,
+            worker: Some(worker),
+        })
+    }
+
+    fn set_pid(&self, pid: u32) {
+        if let Ok(pid) = i32::try_from(pid) {
+            self.pid.store(pid, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for ProcessGroupForwarder {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        for id in self.registrations.drain(..) {
+            let _ = signal_hook::low_level::unregister(id);
+        }
+        // Keep the flag allocated until after unregistering its callbacks.
+        let _ = self.pending.load(Ordering::Relaxed);
+    }
+}
+
+/// Put the suspended child in the process group which signal forwarding and
+/// the EOF watchdog address on macOS. Linux's private subreaper creates the
+/// target process group itself.
+#[cfg(target_os = "macos")]
+fn make_child_process_group(pid: u32) -> Result<(), LaunchDispatchError> {
+    let pid = i32::try_from(pid).map_err(|_| LaunchDispatchError::NotImplemented {
+        detail: "子进程号超出 Unix pid 范围".to_owned(),
+    })?;
+    let child = nix::unistd::Pid::from_raw(pid);
+    if nix::unistd::getpgid(Some(child)).is_ok_and(|group| group == child) {
+        return Ok(());
+    }
+    nix::unistd::setpgid(child, child).map_err(|error| LaunchDispatchError::NotImplemented {
+        detail: format!("无法为子进程建立进程组：{error}"),
+    })
+}
+
+/// Forward one terminal signal to the spawned Unix process group. The signal
+/// number is never formatted from user input.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn forward_unix_signal(
+    pid: u32,
+    signal: nix::sys::signal::Signal,
+) -> Result<(), LaunchDispatchError> {
+    let pid = i32::try_from(pid).map_err(|_| LaunchDispatchError::NotImplemented {
+        detail: "子进程号超出 Unix pid 范围".to_owned(),
+    })?;
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pid), signal).map_err(|error| {
+        LaunchDispatchError::NotImplemented {
+            detail: format!("无法转发中断给子进程：{error}"),
+        }
+    })
+}
+
+>>>>>>> Stashed changes
 /// Run `aw run`.
 ///
 /// On success the outcome code is the target's exit code. A refused flag is

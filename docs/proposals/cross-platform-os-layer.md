@@ -136,6 +136,23 @@ macOS 崩溃兜底用看门狗管道，不用「另起一个小看门狗发 `SIG
 
 共用测试「挂住期间杀掉创建者 → 程序没了」打开这个 feature 来跑。
 
+### `aw` 自己启动的程序：退出清理边界
+
+这个边界只适用于 CLI 自己创建的两条路径：`aw run` 默认路径和
+`aw run --no-daemon`。后台自己启动、且已经 `release` 的程序**不**套这层：
+后台停止或重启后它们按“两阶段挂住与放行”的规则继续运行。
+
+| 系统 | `aw` 自己启动时 | 已放行的后台启动程序 |
+|---|---|---|
+| Linux | `aw → watchdog → program`。watchdog 在启动 program 前调用 `PR_SET_CHILD_SUBREAPER`，并用独立 session / process group 避开终端组信号；它通过私有 pipe EOF 与 `PR_SET_PDEATHSIG`（设定后复查 `getppid`）观察 `aw`。`aw` 死亡或 program 结束时，先对 `/proc` 中全部后代 `SIGSTOP`，再 `SIGKILL`、重扫并 `waitpid`；目标以 `(pid, ppid, starttime)` 核对，避免 PID 复用。故意 `setsid` 的后代也会被 subreaper 收养并清理。 | 不包 watchdog；release 后继续运行。 |
+| macOS | 保留 CLI 的 pipe-EOF + `kqueue` 看护和进程组清理；没有 Linux 的 subreaper，因此自行 `setsid` / 改进程组的后代可能脱离这次清理。【待验证】 | 不包 watchdog；release 后继续运行。 |
+| Windows | 保留 `KILL_ON_JOB_CLOSE` Job，CLI 异常退出时关闭 Job 结束其中的普通后代。 | release 前去掉该限制；release 后继续运行。 |
+
+Linux 看护进程与目标之间的启动采用 re-exec 后的私有 socket，不把目标的
+argv、环境变量或工作目录放进看护进程的 argv / 环境；fork 到 exec 的过渡只做
+async-signal-safe 原始系统调用。终端前台移交和 `SIGINT` / `SIGTERM` / `SIGHUP`
+转发仍由 `aw run` 的信号层负责，watchdog 不成为终端前台进程。
+
 ## C. 搬走清单
 
 共用代码里剩下的系统分支，按下面归属搬走。一条轨道改自己名下的文件。

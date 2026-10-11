@@ -1776,6 +1776,7 @@ pub fn verify_pipe_server_with_service_status(
 
 /// Explicit owner allowlist used only by existing test helpers. It is not a
 /// product decision path: production calls use SCM-derived service status.
+#[cfg(any(test, feature = "test-support"))]
 pub fn verify_pipe_server_for_owners(
     handle: std::os::windows::io::RawHandle,
     trusted_owners: &[&str],

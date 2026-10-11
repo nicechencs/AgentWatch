@@ -733,17 +733,24 @@ mod platform {
         // client: the public pipe name can be claimed while agentwatchd is
         // stopped or restarting.
         let checked = match (trusted_owners, service_status) {
+            #[cfg(any(test, feature = "test-support"))]
             (Some(owners), None) => {
                 // Kept for the existing reverse-test seam. Product paths do
                 // not use an allowlist override.
                 aw_platform::verify_pipe_server_for_owners(pipe.as_raw_handle(), owners)
             }
+            #[cfg(any(test, feature = "test-support"))]
             (None, Some(service_status)) => aw_platform::verify_pipe_server_with_service_status(
                 pipe.as_raw_handle(),
                 service_status,
             ),
             (None, None) => aw_platform::verify_pipe_server(pipe.as_raw_handle()),
+            #[cfg(any(test, feature = "test-support"))]
             (Some(_), Some(_)) => unreachable!("test hooks cannot be combined"),
+            // Without the test seams no caller can pass a hook; keep the one
+            // product decision path for any combination.
+            #[cfg(not(any(test, feature = "test-support")))]
+            _ => aw_platform::verify_pipe_server(pipe.as_raw_handle()),
         };
         match checked {
             Ok(()) => Ok(pipe),
@@ -764,6 +771,7 @@ mod platform {
         exchange_raw_with_service_status_inner(path, request, timeout, None)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn exchange_raw_with_service_status(
         path: &Path,
         request: &[u8],

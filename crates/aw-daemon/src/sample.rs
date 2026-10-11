@@ -1597,6 +1597,7 @@ mod depth_tests {
     #[test]
     fn exit_without_a_seen_start_is_stored_at_wall_time() {
         let (dir, db) = temp_db("exit-wall");
+        drop(aw_store::Store::open_startup(&db).expect("startup store"));
         let mut sampler = super::HostSampler::new(&db);
         let exit = proc_event(
             5,
@@ -1628,6 +1629,7 @@ mod depth_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         let db = dir.join("agentwatch.db");
+        drop(aw_store::Store::open_startup(&db).expect("startup store"));
         let mut sampler = super::HostSampler::new(&db);
         let start = aw_core::ProcessStart::new(
             1,
@@ -1744,6 +1746,7 @@ mod depth_tests {
     #[test]
     fn sampler_stores_the_executable_name_once_per_process() {
         let (dir, db) = temp_db("images");
+        drop(aw_store::Store::open_startup(&db).expect("startup store"));
         let mut sampler = super::HostSampler::new(&db);
         let first = proc_event(1, 42, start_with_exe(Some("/usr/bin/bash")));
         let nameless = proc_event(2, 43, start_with_exe(None));
@@ -1816,6 +1819,7 @@ mod depth_tests {
     #[test]
     fn a_stopped_sample_session_is_not_sampled_again() {
         let (dir, db) = temp_db("stop");
+        drop(aw_store::Store::open_startup(&db).expect("startup store"));
         let mut sampler = super::HostSampler::new(&db);
         let first = proc_event(1, 42, start_with_exe(Some("/usr/bin/bash")));
         sampler.persist(&[first], 1).expect("baseline");

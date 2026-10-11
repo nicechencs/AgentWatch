@@ -252,8 +252,19 @@ fn require_writable_database(path: &std::path::Path) -> Result<(), ApiResponse> 
 
 /// Allocate `sessions.id` and insert the row. Id 1 stays the daemon sample's.
 fn insert_session(path: &std::path::Path, target: &mut SampleTarget) -> Result<(), ApiResponse> {
-    let store_error =
-        |err: &aw_store::StoreError, what: &str| super::routes::database_store_response(err, what);
+    // Opening a runtime store reads its compatibility marker before the actual
+    // session insert. Keep every SQLite lock wait in one request-wide budget
+    // rather than granting each step a new eight seconds.
+    let busy_deadline = aw_store::BusyDeadline::start(aw_store::BUSY_TIMEOUT);
+    let store_error = |err: &aw_store::StoreError, what: &str| {
+        if let Some(detail) = err.busy_detail() {
+            return super::routes::database_busy_json(
+                Some(busy_deadline.elapsed().as_secs().max(1)),
+                Some(&detail),
+            );
+        }
+        super::routes::database_store_response(err, what)
+    };
     let mut store = aw_store::Store::open_runtime(path)
         .map_err(|err| store_error(&err, "cannot open the database"))?;
     if store.is_read_only() {
@@ -1227,11 +1238,18 @@ mod spawn_error_tests {
 mod database_busy_tests {
     use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use rusqlite::{Transaction, TransactionBehavior};
 
     use super::{insert_session, reply_delivery_failed, ApiResponse, ApiState, SampleTarget};
+
+    #[derive(Debug)]
+    struct WriterTimings {
+        open: Duration,
+        begin_immediate: Duration,
+        insert: Duration,
+    }
 
     #[test]
     fn lock_past_busy_timeout_returns_db_busy_with_measured_wait() {
@@ -1242,27 +1260,42 @@ mod database_busy_tests {
         let dir = std::env::temp_dir().join(format!("aw-db-busy-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("test directory");
         let path = dir.join("agentwatch.db");
-        drop(aw_store::Store::open_runtime(&path).expect("runtime store"));
+        drop(aw_store::Store::open_startup(&path).expect("startup store"));
 
         let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
         let writer_path = path.clone();
         let writer = thread::spawn(move || {
+            let opened = Instant::now();
             let conn = aw_store::open_connection(&writer_path).expect("writer connection");
+            let open = opened.elapsed();
+            let begun = Instant::now();
             let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
                 .expect("begin immediate");
+            let begin_immediate = begun.elapsed();
+            let inserted = Instant::now();
             tx.execute(
                 "INSERT INTO schema_meta (key, value) VALUES ('busy-test', '1')",
                 [],
             )
             .expect("writer row");
-            ready_tx.send(()).expect("signal writer");
-            // Keep the lock well beyond the connection's busy timeout.  A
-            // one-second margin raced on macOS, where setup before the write
-            // can take long enough for the writer to release first.
-            thread::sleep(aw_store::BUSY_TIMEOUT + Duration::from_secs(3));
+            let insert = inserted.elapsed();
+            ready_tx
+                .send(WriterTimings {
+                    open,
+                    begin_immediate,
+                    insert,
+                })
+                .expect("signal writer");
+            // Keep the write transaction open until `insert_session` has
+            // returned. A fixed sleep starts before the attempted write; a
+            // loaded CI runner can delay that write until after the lock has
+            // expired, which tests success rather than the timeout path.
+            let release = release_rx.recv_timeout(aw_store::BUSY_TIMEOUT + Duration::from_secs(5));
             tx.commit().expect("writer commit");
+            release
         });
-        ready_rx.recv().expect("writer ready");
+        let writer_timings = ready_rx.recv().expect("writer ready");
 
         let mut target = SampleTarget {
             db_id: 0,
@@ -1277,23 +1310,61 @@ mod database_busy_tests {
             root_hint: None,
             root_identity: None,
         };
-        let response = insert_session(&path, &mut target).expect_err("busy response");
-        assert_eq!(response.status, 503);
+        let trace = aw_store::test_support::TraceCapture::start();
+        let started = Instant::now();
+        let result = insert_session(&path, &mut target);
+        let elapsed = started.elapsed();
+        let sql_trace = trace
+            .finish()
+            .into_iter()
+            .map(|entry| format!("{}={:?}", entry.operation, entry.elapsed))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let release_sent = release_tx.send(()).is_ok();
+        let writer_release = writer.join().expect("writer thread");
+        let outcome = match &result {
+            Ok(()) => "Ok(())".to_owned(),
+            Err(response) => format!(
+                "Err(status={}, body={})",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            ),
+        };
+        let diagnostic = format!(
+            "insert_session elapsed={elapsed:?}; outcome={outcome}; \
+             writer_open={:?}; writer_begin_immediate={:?}; writer_insert={:?}; \
+             sqlite_steps=[{sql_trace}]; release_sent={release_sent}; \
+             writer_release={writer_release:?}",
+            writer_timings.open, writer_timings.begin_immediate, writer_timings.insert,
+        );
+        let response = result.expect_err(&format!("busy response; {diagnostic}"));
+        assert!(release_sent, "writer release channel closed; {diagnostic}");
+        assert!(
+            writer_release.is_ok(),
+            "writer hold limit elapsed; {diagnostic}"
+        );
+        assert!(
+            elapsed < aw_store::BUSY_TIMEOUT + Duration::from_millis(1500),
+            "insert_session exceeded the one busy-timeout budget; {diagnostic}"
+        );
+        assert_eq!(response.status, 503, "{diagnostic}");
         let body: serde_json::Value = serde_json::from_slice(&response.body).expect("busy JSON");
-        assert_eq!(body["error"]["code"], "db_busy");
+        assert_eq!(body["error"]["code"], "db_busy", "{diagnostic}");
         let waited = body["error"]["waited_seconds"]
             .as_u64()
             .expect("measured seconds");
-        assert!(waited >= aw_store::BUSY_TIMEOUT.as_secs());
+        assert!(waited >= aw_store::BUSY_TIMEOUT.as_secs(), "{diagnostic}");
         assert_eq!(
-            body["error"]["message"],
-            format!("会话数据库正忙（后台在写入），等了 {waited} 秒还是没轮到，请稍后再试。")
+            body["error"]["message"], "会话数据库正忙（后台在写入），请稍后再试。",
+            "{diagnostic}"
         );
-        assert!(body["error"]["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("database is locked")
-                || detail.contains("database is busy")));
-        writer.join().expect("writer thread");
+        assert!(
+            body["error"]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("database is locked")
+                    || detail.contains("database is busy")),
+            "{diagnostic}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1306,6 +1377,7 @@ mod database_busy_tests {
         let dir = std::env::temp_dir().join(format!("aw-undelivered-{nanos}"));
         std::fs::create_dir_all(&dir).expect("test directory");
         let path = dir.join("agentwatch.db");
+        drop(aw_store::Store::open_startup(&path).expect("startup store"));
         let mut state = ApiState::default();
         state.query = super::super::StoreQuery::open_path(path.clone());
         let mut target = SampleTarget {

@@ -25,6 +25,9 @@ mod replay;
 mod retention;
 mod sink;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 pub use retention::{
     ApplyReport, DiskCheck, OldestSession, PurgeReason, PurgeReport, PurgeScope, Retention,
     RetentionConfig, Stats, TableCount, WriteMode,
@@ -36,7 +39,7 @@ pub use agent_events::{
 };
 pub use connection::{
     configure_connection, open_connection, open_connection_with_flags, open_in_memory_connection,
-    BUSY_TIMEOUT,
+    BusyDeadline, BUSY_TIMEOUT,
 };
 pub use error::StoreError;
 pub use export::{

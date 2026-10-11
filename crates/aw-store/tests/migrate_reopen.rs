@@ -411,9 +411,9 @@ fn future_v12_is_read_only_and_unchanged_even_with_extra_scripts() {
 }
 
 #[test]
-fn fresh_runtime_database_has_file_search_schema_on_every_os() {
+fn startup_database_has_runtime_schema_on_every_os() {
     let db = TestDb::new();
-    let store = Store::open_runtime(&db.path).expect("fresh runtime store");
+    let store = Store::open_startup(&db.path).expect("startup store");
     let names: Vec<String> = store
         .connection()
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -433,6 +433,10 @@ fn fresh_runtime_database_has_file_search_schema_on_every_os() {
         "gaps",
         "file_access",
         "fts_text",
+        "http",
+        "findings",
+        "agent_events",
+        "watch_groups",
         "replay_writes",
     ] {
         assert!(
@@ -443,7 +447,7 @@ fn fresh_runtime_database_has_file_search_schema_on_every_os() {
 }
 
 #[test]
-fn concurrent_runtime_creation_and_file_backfill_are_safe() {
+fn concurrent_startup_migration_is_safe() {
     let db = TestDb::new();
     let barrier = Arc::new(Barrier::new(2));
     let mut workers = Vec::new();
@@ -452,14 +456,14 @@ fn concurrent_runtime_creation_and_file_backfill_are_safe() {
         let barrier = Arc::clone(&barrier);
         workers.push(thread::spawn(move || {
             barrier.wait();
-            Store::open_runtime(path)
+            Store::open_startup(path)
         }));
     }
     for worker in workers {
-        let store = worker.join().expect("worker joins").expect("runtime open");
+        let store = worker.join().expect("worker joins").expect("startup open");
         assert!(!store.is_read_only());
     }
-    let store = Store::open_runtime(&db.path).expect("reopen");
+    let store = Store::open_runtime(&db.path).expect("request reopen");
     for table in ["schema_meta", "file_access", "fts_text", "replay_writes"] {
         assert!(present(store.connection(), table), "missing {table}");
     }
@@ -486,7 +490,7 @@ fn legacy_rollback_journal_database_is_converted_to_wal() {
 #[test]
 fn reopen_current_database_never_writes_persistent_pragmas_while_reserved() {
     let db = TestDb::new();
-    drop(Store::open_runtime(&db.path).expect("fresh runtime store"));
+    drop(Store::open_startup(&db.path).expect("fresh startup store"));
 
     let (ready_tx, ready_rx) = mpsc::channel();
     let path = db.path.clone();
@@ -514,10 +518,47 @@ fn reopen_current_database_never_writes_persistent_pragmas_while_reserved() {
 }
 
 #[test]
+fn request_open_checks_schema_read_only_while_writer_holds_begin_immediate() {
+    let db = TestDb::new();
+    drop(Store::open_startup(&db.path).expect("startup store"));
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let path = db.path.clone();
+    let writer = thread::spawn(move || {
+        let conn = aw_store::open_connection(&path).expect("writer connection");
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+            .expect("begin immediate");
+        tx.execute(
+            "UPDATE schema_meta SET value = value WHERE key = 'schema_version'",
+            [],
+        )
+        .expect("hold reserved lock");
+        ready_tx.send(()).expect("signal writer");
+        release_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("release writer");
+        tx.commit().expect("writer commit");
+    });
+    ready_rx.recv().expect("writer ready");
+
+    let started = Instant::now();
+    let reopened = Store::open_runtime(&db.path).expect("request-time open");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "request-time schema check waited for BEGIN IMMEDIATE"
+    );
+    assert_eq!(reopened.status(), &OpenStatus::Current);
+    drop(reopened);
+    release_tx.send(()).expect("release writer");
+    writer.join().expect("writer thread");
+}
+
+#[test]
 fn large_database_reopens_during_batched_writer_activity() {
     let db = TestDb::new();
     {
-        let store = Store::open_runtime(&db.path).expect("runtime store");
+        let store = Store::open_startup(&db.path).expect("startup store");
         store
             .connection()
             .execute_batch(
@@ -577,7 +618,7 @@ fn large_database_reopens_during_batched_writer_activity() {
 fn attach_session_write_waits_for_a_batched_writer_then_succeeds() {
     let db = TestDb::new();
     {
-        let store = Store::open_runtime(&db.path).expect("fresh runtime store");
+        let store = Store::open_startup(&db.path).expect("fresh startup store");
         store
             .connection()
             .execute(

@@ -583,7 +583,7 @@ pub fn run_foreground(
     // In particular, an old rollback-journal database must become WAL here or
     // the daemon refuses to start with an actionable, localized instruction.
     let session_db = data_dir.join("agentwatch.db");
-    aw_store::Store::open_runtime(&session_db).map_err(database_startup_error)?;
+    aw_store::Store::open_startup(&session_db).map_err(database_startup_error)?;
 
     let stop = StopFlag::new();
     // Stop the batcher only after collectors have stopped. Sharing the runtime

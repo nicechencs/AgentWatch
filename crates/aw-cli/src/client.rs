@@ -151,6 +151,10 @@ pub enum ClientError {
         code: Option<String>,
         /// Short message taken from the JSON body, or a fallback. No token.
         message: String,
+        /// Measured SQLite wait from `error.waited_seconds`, when at least one
+        /// whole second elapsed. Human wording is built from this field, never
+        /// parsed from the daemon message.
+        waited_seconds: Option<u64>,
     },
 }
 
@@ -183,7 +187,14 @@ impl fmt::Display for ClientError {
                 status,
                 code,
                 message,
-            } => crate::daemon_errors::write_status(f, *status, code.as_deref(), message),
+                waited_seconds,
+            } => crate::daemon_errors::write_status(
+                f,
+                *status,
+                code.as_deref(),
+                message,
+                *waited_seconds,
+            ),
         }
     }
 }
@@ -273,6 +284,7 @@ impl<T: Transport> Client<T> {
                 status: reply.status,
                 code: status_code(&reply),
                 message: status_message(&reply),
+                waited_seconds: status_waited_seconds(&reply),
             })
         }
     }
@@ -303,6 +315,13 @@ fn status_code(reply: &ApiReply) -> Option<String> {
     reply
         .json()
         .and_then(|value| value.get("error")?.get("code")?.as_str().map(str::to_owned))
+}
+
+fn status_waited_seconds(reply: &ApiReply) -> Option<u64> {
+    reply
+        .json()
+        .and_then(|value| value.get("error")?.get("waited_seconds")?.as_u64())
+        .filter(|seconds| *seconds >= 1)
 }
 
 /// Production HTTP transport. Dials `127.0.0.1` only, writes one HTTP/1.1
@@ -663,6 +682,7 @@ mod tests {
             status: 403,
             code: Some("unidentified_peer".to_owned()),
             message: "pipe client could not be identified".to_owned(),
+            waited_seconds: None,
         };
         assert_eq!(err.exit_code(), exit::PERMISSION);
         assert_eq!(err.identity_failure_code(), Some("unidentified_peer"));

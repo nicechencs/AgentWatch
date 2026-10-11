@@ -174,6 +174,7 @@ mod tests {
                     status: 404,
                     code: None,
                     message: "not_found".to_owned(),
+                    waited_seconds: None,
                 })
             }
 
@@ -271,6 +272,7 @@ mod tests {
                     status: 404,
                     code: Some("not_found".to_owned()),
                     message: "session not found".to_owned(),
+                    waited_seconds: None,
                 })
             }
 

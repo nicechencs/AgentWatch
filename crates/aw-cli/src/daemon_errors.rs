@@ -316,16 +316,19 @@ pub(crate) fn write_status(
     status: u16,
     code: Option<&str>,
     message: &str,
+    waited_seconds: Option<u64>,
 ) -> fmt::Result {
     let Some(code) = code.filter(|code| !code.is_empty()) else {
         return write!(f, "后台返回 HTTP {status}：{message}");
     };
     if code == "db_busy" {
-        let waited = busy_waited_seconds(message).unwrap_or(0);
-        return write!(
-            f,
-            "会话数据库正忙（后台在写入），等了 {waited} 秒还是没轮到，请稍后再试。"
-        );
+        return match waited_seconds.filter(|seconds| *seconds >= 1) {
+            Some(waited) => write!(
+                f,
+                "会话数据库正忙（后台在写入），等了 {waited} 秒还是没轮到，请稍后再试。"
+            ),
+            None => f.write_str("会话数据库正忙（后台在写入），请稍后再试。"),
+        };
     }
     // These daemon messages already name the failed program, directory,
     // variable or daemon owner. Showing a stock line and then the same
@@ -349,13 +352,6 @@ pub(crate) fn write_status(
         write!(f, "（详情：{message}）")?;
     }
     Ok(())
-}
-
-fn busy_waited_seconds(message: &str) -> Option<u64> {
-    let marker = "Waited ";
-    let rest = message.split_once(marker)?.1;
-    let digits = rest.split_whitespace().next()?;
-    digits.parse().ok()
 }
 
 /// Whether `message` says something the mapped sentence does not.
@@ -456,14 +452,25 @@ mod tests {
         ),
     ];
 
-    fn render(status: u16, code: Option<&str>, message: &str) -> String {
-        struct Shown(u16, Option<String>, String);
+    fn render(
+        status: u16,
+        code: Option<&str>,
+        message: &str,
+        waited_seconds: Option<u64>,
+    ) -> String {
+        struct Shown(u16, Option<String>, String, Option<u64>);
         impl fmt::Display for Shown {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write_status(f, self.0, self.1.as_deref(), &self.2)
+                write_status(f, self.0, self.1.as_deref(), &self.2, self.3)
             }
         }
-        Shown(status, code.map(str::to_owned), message.to_owned()).to_string()
+        Shown(
+            status,
+            code.map(str::to_owned),
+            message.to_owned(),
+            waited_seconds,
+        )
+        .to_string()
     }
 
     #[test]
@@ -478,17 +485,18 @@ mod tests {
     #[test]
     fn known_403_is_the_other_user_sentence() {
         let daemon = "this process belongs to another account; recording another account's process needs an administrator";
-        let text = render(403, Some("not_your_process"), daemon);
+        let text = render(403, Some("not_your_process"), daemon, None);
         assert_eq!(text, "不能接管其他用户的进程，需要管理员权限");
         let adopt = render(
             403,
             Some("not_your_process"),
             "this process belongs to another account and cannot be adopted",
+            None,
         );
         assert_eq!(adopt, "不能接管其他用户的进程，需要管理员权限", "{adopt}");
         // The same situation under the daemon's other code reads the same way,
         // and a message that adds something is kept as the detail.
-        let other = render(403, Some("forbidden"), "administrator required");
+        let other = render(403, Some("forbidden"), "administrator required", None);
         assert!(
             other.starts_with("不能接管其他用户的进程，需要管理员权限"),
             "{other}"
@@ -501,20 +509,25 @@ mod tests {
 
     #[test]
     fn known_404_names_the_session_and_keeps_the_english_reason() {
-        let text = render(404, Some("not_found"), "session not found");
+        let text = render(404, Some("not_found"), "session not found", None);
         assert_eq!(
             text,
             "找不到这个会话（或它不属于你）（详情：session not found）"
         );
         assert_eq!(
-            render(404, Some("no_sessions"), "this account has no sessions"),
+            render(
+                404,
+                Some("no_sessions"),
+                "this account has no sessions",
+                None
+            ),
             "还没有你的会话，@last 无处可指"
         );
     }
 
     #[test]
     fn unknown_code_keeps_the_code_status_and_message() {
-        let text = render(418, Some("teapot"), "short and stout");
+        let text = render(418, Some("teapot"), "short and stout", None);
         assert_eq!(text, "后台返回错误 teapot（HTTP 418）：short and stout");
     }
 
@@ -525,6 +538,7 @@ mod tests {
                 403,
                 Some("launch_other_user"),
                 "这个后台是「1000」自己运行的，只能替「1000」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。",
+                None,
             ),
             "这个后台是「1000」自己运行的，只能替「1000」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。"
         );
@@ -533,21 +547,28 @@ mod tests {
     #[test]
     fn status_without_a_code_keeps_the_plain_form() {
         assert_eq!(
-            render(404, None, "session not found"),
+            render(404, None, "session not found", None),
             "后台返回 HTTP 404：session not found"
         );
     }
 
     #[test]
-    fn database_busy_uses_the_measured_wait_in_the_fixed_chinese_sentence() {
+    fn database_busy_uses_structured_waited_seconds_without_parsing_the_message() {
         assert_eq!(
             render(
                 503,
                 Some("db_busy"),
-                "The session database is busy (the service is writing). Waited 8 s and still couldn't get in; try again later."
+                "developer detail without a wait count",
+                Some(8),
             ),
             "会话数据库正忙（后台在写入），等了 8 秒还是没轮到，请稍后再试。"
         );
+        let without_seconds = render(503, Some("db_busy"), "Waited 9 s", None);
+        assert_eq!(
+            without_seconds,
+            "会话数据库正忙（后台在写入），请稍后再试。"
+        );
+        assert!(!without_seconds.contains("等了 0 秒"));
     }
 
     #[test]

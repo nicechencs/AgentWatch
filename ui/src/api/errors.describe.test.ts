@@ -32,18 +32,30 @@ describe("error text", () => {
     }
   });
 
-  it("uses the measured database-lock wait in the localized busy sentence", () => {
+  it("uses the structured database-lock wait in the localized busy sentence", () => {
     const err = new ApiError(
       503,
       {
         error: {
           code: "db_busy",
-          message: "The session database is busy (the service is writing). Waited 8 s and still couldn't get in; try again later.",
+          message: "developer detail without a wait count",
+          waited_seconds: 8,
         },
       },
       "x",
     );
     expect(describeError(err, t)).toBe("会话数据库正忙（后台在写入），等了 8 秒还是没轮到，请稍后再试。");
+  });
+
+  it("omits a missing or zero database-lock wait without saying zero seconds", () => {
+    for (const waited_seconds of [undefined, 0]) {
+      const text = describeError(
+        new ApiError(503, { error: { code: "db_busy", message: "Waited 9 s", waited_seconds } }, "x"),
+        t,
+      );
+      expect(text).toBe("会话数据库正忙（后台在写入），请稍后再试。");
+      expect(text).not.toContain("等了 0 秒");
+    }
   });
 
   it("uses the agreed Chinese wording for Windows peer-identity failures", () => {

@@ -527,12 +527,52 @@ impl Store {
 
     /// Open a database for the running daemon or its clients.
     ///
-    /// The bootstrap-only [`Self::open`] remains available to migration tests
-    /// and offline import code. A user-facing database, however, must always
-    /// have the file-search tables regardless of which collector the current
-    /// OS can run. This prevents a fresh Windows database from being shaped
-    /// differently from a fresh Linux or macOS one.
+    /// This is the request-time open path. It first checks the compatibility
+    /// marker through a read-only connection, then opens a normal connection
+    /// without running any schema transaction. The daemon performs schema
+    /// migration once through [`Self::open_startup`] before accepting requests.
     pub fn open_runtime(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let started = Instant::now();
+        Self::open_runtime_inner(path.as_ref()).map_err(|err| err.with_busy_elapsed(started))
+    }
+
+    fn open_runtime_inner(path: &Path) -> Result<Self, StoreError> {
+        // `user_version` lives in SQLite's file header, so reading it needs no
+        // schema table and must never turn a request into `BEGIN IMMEDIATE`.
+        // The schema_meta fallback preserves the read-only-newer behavior for
+        // databases written before this marker was introduced.
+        let user_version = read_user_version_quietly(path)?;
+        let meta_version = read_version_quietly(path)?;
+        let found = user_version.max(meta_version.unwrap_or_default());
+        if found > SUPPORTED_SCHEMA_VERSION {
+            let conn = open_connection_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|err| StoreError::sqlite("open_read_only", err))?;
+            return Ok(Self {
+                conn,
+                status: OpenStatus::ReadOnlyNewer {
+                    found,
+                    supported: SUPPORTED_SCHEMA_VERSION,
+                },
+                read_only: true,
+            });
+        }
+
+        let conn = open_writable(path)?;
+        apply_connection_pragmas(&conn)?;
+        Ok(Self {
+            conn,
+            status: OpenStatus::Current,
+            read_only: false,
+        })
+    }
+
+    /// Open and fully migrate the session database before the daemon accepts
+    /// work, or from an explicit upgrade path.
+    ///
+    /// A user-facing database always has every table its daemon may use. That
+    /// includes optional collector and agent tables, so a later request only
+    /// needs the read-only compatibility check in [`Self::open_runtime`].
+    pub fn open_startup(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let started = Instant::now();
         let mut store = Self::open(path)?;
         // A future database is deliberately readable.  Do not attempt an
@@ -541,7 +581,23 @@ impl Store {
             return Ok(store);
         }
         crate::sink::apply_file_schema(&mut store).map_err(|err| err.with_busy_elapsed(started))?;
+        apply_http_schema(&mut store).map_err(|err| err.with_busy_elapsed(started))?;
+        apply_proxy_schema(&mut store).map_err(|err| err.with_busy_elapsed(started))?;
+        apply_agent_schema(&mut store).map_err(|err| err.with_busy_elapsed(started))?;
+        apply_inter_agent_schema(&mut store).map_err(|err| err.with_busy_elapsed(started))?;
         apply_replay_schema(&mut store).map_err(|err| err.with_busy_elapsed(started))?;
+        crate::query::ensure_timeline(store.connection())
+            .map_err(|err| match err {
+                crate::QueryError::Sqlite { source, .. } => {
+                    StoreError::sqlite("migrate_timeline", source)
+                }
+                _ => StoreError::BadSchemaVersion { found: None },
+            })
+            .map_err(|err| err.with_busy_elapsed(started))?;
+        store
+            .connection()
+            .pragma_update(None, "user_version", SUPPORTED_SCHEMA_VERSION)
+            .map_err(|err| StoreError::sqlite("set_user_version", err))?;
         Ok(store)
     }
 
@@ -900,6 +956,18 @@ fn read_version_quietly(path: &Path) -> Result<Option<u32>, StoreError> {
     let found = Some(read_version(&conn)?);
     drop(conn);
     Ok(found)
+}
+
+/// Read SQLite's header-level compatibility marker without taking a write
+/// transaction. Request-time opens use this before opening their connection.
+fn read_user_version_quietly(path: &Path) -> Result<u32, StoreError> {
+    let conn = open_connection_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| StoreError::sqlite("peek_user_version", err))?;
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|err| StoreError::sqlite("peek_user_version", err))
 }
 
 /// Start a write transaction with a RESERVED lock request up front.

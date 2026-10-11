@@ -801,6 +801,7 @@ pub(crate) fn take_slow(
         return None;
     }
     Some(Box::new(move || {
+        let _busy_deadline = aw_store::BusyDeadline::start(aw_store::BUSY_TIMEOUT);
         // A read-only view: the database path and nothing else. Tickets, the
         // live hub, and the watch queue stay behind the lock.
         let snapshot = ApiState {
@@ -856,6 +857,7 @@ pub(crate) fn dispatch_peer(
 /// when the database is configured, written to `agent_events`. No database is
 /// `StorageNotReady`, not a forged success.
 fn ingest_agent_hook(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
+    let _busy_deadline = aw_store::BusyDeadline::start(aw_store::BUSY_TIMEOUT);
     let host = req.headers.get("host").cloned();
     if req_host_bad(&host, req.listen_port) {
         return misdirected();
@@ -1134,6 +1136,10 @@ fn req_host_bad(host: &Option<String>, port: u16) -> bool {
 }
 
 fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> ApiResponse {
+    // Every authenticated route shares one SQLite busy deadline across its
+    // compatibility read, query, and any write it performs. Nested helpers
+    // preserve this start rather than granting a second eight seconds.
+    let _busy_deadline = aw_store::BusyDeadline::start(aw_store::BUSY_TIMEOUT);
     let method = req.method.to_ascii_uppercase();
     let path = req.path.as_str();
 
@@ -1905,31 +1911,25 @@ pub(crate) fn database_read_only_newer_response() -> ApiResponse {
     )
 }
 
-fn database_busy_json(waited_seconds: Option<u64>, detail: Option<&str>) -> ApiResponse {
-    if let (Some(waited_seconds), Some(detail)) = (waited_seconds, detail) {
-        tracing::warn!(waited_seconds, sqlite_detail = %detail, "session database remained busy");
-        let message = format!(
-            "会话数据库正忙（后台在写入），等了 {waited_seconds} 秒还是没轮到，请稍后再试。"
-        );
-        return ApiResponse::json(
-            503,
-            &json!({
-                "error": {
-                    "code": "db_busy",
-                    "message": message,
-                    "waited_seconds": waited_seconds,
-                    "detail": detail,
-                }
-            }),
-        );
+pub(crate) fn database_busy_json(waited_seconds: Option<u64>, detail: Option<&str>) -> ApiResponse {
+    let waited_seconds = waited_seconds.filter(|seconds| *seconds >= 1);
+    if let Some(detail) = detail {
+        tracing::warn!(?waited_seconds, sqlite_detail = %detail, "session database remained busy");
+    }
+    let mut error = json!({
+        "code": "db_busy",
+        "message": "会话数据库正忙（后台在写入），请稍后再试。",
+    });
+    if let Some(waited_seconds) = waited_seconds {
+        error["waited_seconds"] = json!(waited_seconds);
+    }
+    if let Some(detail) = detail {
+        error["detail"] = json!(detail);
     }
     ApiResponse::json(
         503,
         &json!({
-            "error": {
-                "code": "db_busy",
-                "message": "会话数据库正忙（后台在写入），请稍后再试。",
-            }
+            "error": error
         }),
     )
 }
@@ -2784,7 +2784,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::expect_used)]
-    fn database_errors_use_localized_messages_and_keep_elapsed_structured() {
+    fn database_busy_keeps_elapsed_structured_without_rendering_it() {
         let unknown = database_busy_json(None, None);
         let unknown_body: Value = serde_json::from_slice(&unknown.body).expect("busy JSON");
         assert_eq!(unknown_body["error"]["code"], "db_busy");
@@ -2799,8 +2799,16 @@ mod tests {
         assert_eq!(measured_body["error"]["waited_seconds"], 3);
         assert_eq!(
             measured_body["error"]["message"],
-            "会话数据库正忙（后台在写入），等了 3 秒还是没轮到，请稍后再试。"
+            "会话数据库正忙（后台在写入），请稍后再试。"
         );
+
+        let zero = database_busy_json(Some(0), Some("test: database is locked"));
+        let zero_body: Value = serde_json::from_slice(&zero.body).expect("busy JSON");
+        assert!(zero_body["error"].get("waited_seconds").is_none());
+        assert!(!zero_body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("等了 0 秒"));
 
         let read_only = database_read_only_newer_response();
         let read_only_body: Value =

@@ -136,7 +136,8 @@ impl StoreError {
         match self {
             Self::Sqlite { op, source } if sqlite_busy(&source) => Self::Busy {
                 op,
-                waited: started.elapsed(),
+                waited: crate::connection::busy_deadline_elapsed()
+                    .unwrap_or_else(|| started.elapsed()),
                 source,
             },
             other => other,

@@ -130,6 +130,7 @@ pub(crate) enum ControlError {
         status: u16,
         code: Option<String>,
         message: String,
+        waited_seconds: Option<u64>,
     },
     /// A successful daemon response omitted a required field.
     BadReply { detail: String },
@@ -159,7 +160,14 @@ impl std::fmt::Display for ControlError {
                 status,
                 code,
                 message,
-            } => crate::daemon_errors::write_status(f, *status, code.as_deref(), message),
+                waited_seconds,
+            } => crate::daemon_errors::write_status(
+                f,
+                *status,
+                code.as_deref(),
+                message,
+                *waited_seconds,
+            ),
             Self::BadReply { detail } => write!(f, "后台返回的会话数据不完整：{detail}"),
         }
     }
@@ -181,10 +189,12 @@ impl From<ClientError> for ControlError {
                 status,
                 code,
                 message,
+                waited_seconds,
             } => Self::Status {
                 status,
                 code,
                 message,
+                waited_seconds,
             },
         }
     }
@@ -242,7 +252,7 @@ impl ControlError {
     /// Whether the daemon specifically reported that no collector is present.
     #[must_use]
     pub(crate) fn collector_unavailable(&self) -> bool {
-        matches!(self, Self::Status { status: 503, code, message }
+        matches!(self, Self::Status { status: 503, code, message, .. }
             if code.as_deref() == Some("collector_unavailable") || message.contains("collector"))
     }
 
@@ -404,6 +414,7 @@ impl<T: Transport> HttpDaemonSessions<T> {
                     "有 {} 个会话名为 `{key}`；请传入 `aw sessions list` 中的公开 ID",
                     many.len()
                 ),
+                waited_seconds: None,
             }),
         }
     }
@@ -912,6 +923,7 @@ mod tests {
                 status: 403,
                 code: None,
                 message: "forbidden".to_owned(),
+                waited_seconds: None,
             }),
             ..FakeControl::default()
         };

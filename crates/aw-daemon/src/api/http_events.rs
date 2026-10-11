@@ -388,7 +388,8 @@ pub(crate) fn open_visible(
     let Some(path) = state.query.db_path.as_deref() else {
         return Ok(None);
     };
-    let store = Store::open(path).map_err(|err| error_response(500, "store", &err.to_string()))?;
+    let store = Store::open_runtime(path)
+        .map_err(|err| super::routes::database_store_response(&err, &err.to_string()))?;
     let owner = match state.query.owner_for_viewer(caller, sid) {
         Ok(Some(owner)) => owner,
         Ok(None) => return Ok(None),

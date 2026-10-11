@@ -45,7 +45,14 @@ export interface Page<T> {
 }
 
 export interface ApiErrorBody {
-  error: { code: string; message: string; column?: number; suggestion?: string };
+  error: {
+    code: string;
+    message: string;
+    column?: number;
+    suggestion?: string;
+    /** Measured SQLite wait for `db_busy`; absent when no whole second elapsed. */
+    waited_seconds?: number;
+  };
 }
 
 export type SessionMode = "launch" | "attach";

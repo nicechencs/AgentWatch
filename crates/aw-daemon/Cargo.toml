@@ -61,6 +61,10 @@ getrandom = { version = "0.3.4", default-features = false }
 # anonymous-pipe helpers. The production dependency remains feature-free.
 aw-channel = { workspace = true, features = ["test-support"] }
 
+# Test-only SQLite profile diagnostics for the cross-platform busy-timeout
+# regression. This feature is not enabled in daemon production builds.
+aw-store = { workspace = true, features = ["test-support"] }
+
 # Internal channel peer credential (api/ipc.rs). rustix 1.1.4: Apache-2.0 WITH
 # LLVM-exception OR Apache-2.0 OR MIT, already in Cargo.lock. `SO_PEERCRED`
 # without `unsafe` in this crate.

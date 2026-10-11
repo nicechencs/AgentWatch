@@ -41,7 +41,7 @@ fn main() -> ExitCode {
     }
 
     let started = Instant::now();
-    let mut store = match Store::open_runtime(PathBuf::from(&path)) {
+    let mut store = match Store::open_startup(PathBuf::from(&path)) {
         Ok(store) => store,
         Err(err) => {
             eprintln!("open: {err}");

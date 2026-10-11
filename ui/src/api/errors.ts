@@ -12,6 +12,7 @@ export class ApiError extends Error {
   readonly code: string;
   readonly column: number | null;
   readonly suggestion: string | null;
+  readonly waitedSeconds: number | null;
 
   constructor(status: number, body: ApiErrorBody | null, fallback: string) {
     const part = errorPart(body);
@@ -21,6 +22,10 @@ export class ApiError extends Error {
     this.code = typeof part?.code === "string" ? part.code : "unknown";
     this.column = typeof part?.column === "number" ? part.column : null;
     this.suggestion = typeof part?.suggestion === "string" ? part.suggestion : null;
+    this.waitedSeconds =
+      typeof part?.waited_seconds === "number" && Number.isInteger(part.waited_seconds) && part.waited_seconds >= 1
+        ? part.waited_seconds
+        : null;
   }
 }
 
@@ -71,8 +76,9 @@ export function describeError(error: unknown, t: T): string {
         return error.message;
       }
       if (error.code === "db_busy") {
-        const waited = /\bWaited\s+(\d+)\s+s\b/u.exec(error.message)?.[1] ?? "0";
-        return t(coded, { seconds: waited });
+        return error.waitedSeconds === null
+          ? t(coded)
+          : t("error.dbBusyWaited", { seconds: error.waitedSeconds });
       }
       return t(coded);
     }

@@ -52,6 +52,7 @@ export interface ApiErrorBody {
     suggestion?: string;
     /** Measured SQLite wait for `db_busy`; absent when no whole second elapsed. */
     waited_seconds?: number;
+    detail?: { daemon_owner?: string };
   };
 }
 

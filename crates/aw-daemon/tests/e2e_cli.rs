@@ -547,6 +547,101 @@ fn aw_run_attach_stop_against_a_real_daemon() {
     let _ = sleeper.wait();
 }
 
+/// A real second account reaches the runner-owned socket with SO_PEERCRED.
+/// The non-root daemon must reject the `aw run` session before the CLI creates
+/// its held child; a unit-only uid override cannot cover that boundary.
+#[test]
+#[ignore = "needs the CI-created awother account and passwordless sudo"]
+fn non_root_daemon_refuses_a_second_os_user_before_creating_a_session() {
+    assert_ne!(
+        my_uid(),
+        0,
+        "the daemon must run as the CI runner, not root"
+    );
+    let daemon = Daemon::start(As::Me);
+    let owner = caller_name();
+    let marker = PathBuf::from(format!(
+        "/tmp/aw-e2e-owner-refusal-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let marker_command = format!("touch {}", marker.display());
+    let request = serde_json::json!({
+        "argv": ["sh", "-c", marker_command],
+    })
+    .to_string();
+
+    // Check the peer-authenticated HTTP response directly, then use the real
+    // CLI path below. Both commands run as awother, so neither can supply a
+    // body field that impersonates the daemon owner.
+    let raw = Command::new("sudo")
+        .args(["-n", "-u", "awother", "--", "curl"])
+        .args([
+            "--silent",
+            "--show-error",
+            "--unix-socket",
+            daemon.socket().to_str().expect("utf-8 socket path"),
+            "--request",
+            "POST",
+            "--header",
+            "Content-Type: application/json",
+            "--data",
+            &request,
+            "--write-out",
+            "\n%{http_code}",
+        ])
+        .arg("http://localhost/api/v1/sessions/run")
+        .output()
+        .expect("run curl as awother");
+    assert!(
+        raw.status.success(),
+        "curl as awother: {}",
+        String::from_utf8_lossy(&raw.stderr)
+    );
+    let raw_text = String::from_utf8(raw.stdout).expect("curl response utf-8");
+    let (body, status) = raw_text.rsplit_once('\n').expect("HTTP status line");
+    assert_eq!(status, "403", "{body}");
+    let response: Value = serde_json::from_str(body).expect("JSON refusal");
+    let sentence = format!(
+        "这个后台是「{owner}」自己运行的，只能替「{owner}」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。"
+    );
+    assert_eq!(response["error"]["code"], "daemon_owner_only");
+    assert_eq!(response["error"]["message"], sentence);
+    assert_eq!(response["error"]["detail"]["daemon_owner"], owner);
+
+    let socket_env = format!("AW_SOCKET={}", daemon.socket().display());
+    let cli = Command::new("sudo")
+        .args(["-n", "-u", "awother", "--", "env"])
+        .arg(socket_env)
+        .arg(aw_bin())
+        .args(["run", "-q", "--", "sh", "-c", &marker_command])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run aw as awother");
+    assert_eq!(
+        cli.status.code(),
+        Some(4),
+        "aw stderr: {}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(cli.stderr).expect("aw stderr utf-8"),
+        format!("aw: {sentence}\n")
+    );
+
+    let rows: i64 = rusqlite::Connection::open(daemon.root.join("data/agentwatch.db"))
+        .expect("open session database")
+        .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .expect("count session rows");
+    assert_eq!(rows, 0, "a refused launch creates no session row");
+    assert!(
+        !marker.exists(),
+        "the refused aw run started its target program: {}",
+        marker.display()
+    );
+}
+
 fn assert_root_exit_code(daemon: &Daemon, sid: &str) {
     let procs = daemon.procs(sid);
     let roots: Vec<&Value> = procs["processes"]

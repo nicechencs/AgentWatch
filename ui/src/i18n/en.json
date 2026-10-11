@@ -497,7 +497,7 @@
   "error.unidentifiedPeer": "The background service could not identify your system account, so it rejected this request. Confirm that aw and the service are the same version; if that does not help, restart the service.",
   "error.daemonUntrustedServer": "The connected endpoint is not the AgentWatch background service. Another program may have claimed this communication endpoint, so no content was sent.",
   "error.daemonServerUnverified": "AgentWatch could not confirm that the connected endpoint is its background service, so no content was sent. Restart the service and try again.",
-  "error.launchOtherUser": "The service runs under an ordinary account and can only start programs for that account. Run AgentWatch as a system service, then try again.",
+  "error.daemonOwnerOnly": "This background service is run by “{owner}” and can only start programs for “{owner}”. The request was refused. Use a background service that you run, or one run by an administrator.",
   "error.collectorUnavailable": "This version records new sessions on Linux only.",
   "error.launchNotInThisBuild": "Creating a session from the app is not available on Windows in this build. Start it from a terminal with aw run.",
   "error.noSuchProcess": "That process is not running (or its details cannot be read).",

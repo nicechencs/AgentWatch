@@ -25,7 +25,7 @@ describe("error text", () => {
     expect(text).toBe("找不到程序「tool」，请检查名字或路径");
     // Launch refusals are 403s with their own plain Chinese sentence, never
     // the daemon's English and never "open a terminal".
-    for (const code of ["launch_other_user", "caller_unidentified", "caller_unknown", "drop_failed"]) {
+    for (const code of ["caller_unidentified", "caller_unknown", "drop_failed"]) {
       const said = describeError(new ApiError(403, { error: { code, message: "the daemon starts programs only as its own user; use `aw run -- <cmd>`" } }, "x"), t);
       expect(said).not.toMatch(/\b[a-z]{4,}\b|终端|aw run/u);
       expect(said).not.toBe(ZH["error.forbidden"]);
@@ -69,8 +69,17 @@ describe("error text", () => {
     }
   });
 
-  it("keeps the named daemon owner in a same-user launch refusal", () => {
-    const message = "这个后台是「1000」自己运行的，只能替「1000」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。";
-    expect(describeError(new ApiError(403, { error: { code: "launch_other_user", message } }, "x"), t)).toBe(message);
+  it("uses the daemon-owner-only code and account name", () => {
+    const message = "这个后台是「runner」自己运行的，只能替「runner」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。";
+    expect(
+      describeError(
+        new ApiError(
+          403,
+          { error: { code: "daemon_owner_only", message, detail: { daemon_owner: "runner" } } },
+          "x",
+        ),
+        t,
+      ),
+    ).toBe(message);
   });
 });

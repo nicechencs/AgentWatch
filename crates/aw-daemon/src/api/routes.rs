@@ -4096,48 +4096,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The route's peer identity normally comes from SO_PEERCRED. This test
-    /// injects a different uid through a cfg(test)-only hook because the CI
-    /// worker need not have a second usable local account. The release binary
-    /// has no injection path.
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[allow(clippy::expect_used)]
-    fn non_root_daemon_refuses_an_injected_other_peer_uid() {
-        if nix::unistd::geteuid().as_raw() == 0 {
-            return;
-        }
-        let (dir, db) = seeded_db("other-peer", "");
-        let mut state = ApiState::new(1_000);
-        state.query = super::StoreQuery::open_path(db.clone());
-        let me: u32 = crate::sample::current_user_id()
-            .parse()
-            .expect("current Unix uid");
-        let other = if me == 1 { 2 } else { 1 };
-        let token = token_for(&mut state, &me.to_string(), false);
-        crate::api::watch_routes::set_test_linux_launch_peer_uid(Some(other));
-        let (status, body) = post(
-            &mut state,
-            &token,
-            "/api/v1/sessions",
-            r#"{"mode":"launch","argv":["true"]}"#,
-        );
-        crate::api::watch_routes::set_test_linux_launch_peer_uid(None);
-        assert_eq!(status, 403, "{body}");
-        assert_eq!(body["error"]["code"], "launch_other_user");
-        assert_eq!(
-            body["error"]["message"],
-            format!(
-                "这个后台是「{me}」自己运行的，只能替「{me}」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。"
-            )
-        );
-        let rows: i64 = aw_store::open_connection(&db)
-            .and_then(|c| c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)))
-            .expect("count");
-        assert_eq!(rows, 0, "a refused peer creates no session");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[cfg(windows)]
     #[test]
     #[allow(clippy::expect_used)]

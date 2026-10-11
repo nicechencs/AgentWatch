@@ -78,26 +78,76 @@ pub(crate) fn identity_for(
         // "same account" match start the program as the service account.
         return Err(no_account_switch());
     }
-    let Ok(uid) = caller_user_id.parse::<u32>() else {
-        return Err(error_response(
-            403,
-            "caller_unidentified",
-            "the caller's account could not be identified",
-        ));
-    };
+    let uid = caller_uid(caller_user_id)?;
     if uid == daemon_uid {
         return Ok(None);
     }
-    if daemon_uid != 0 {
-        return Err(error_response(
-            403,
-            "launch_other_user",
-            &format!(
-                "这个后台是「{daemon_uid}」自己运行的，只能替「{daemon_uid}」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。"
-            ),
-        ));
-    }
+    require_daemon_owner_uid(uid, daemon_uid)?;
     lookup(uid).map(Some)
+}
+
+/// Refuse a non-root daemon's request to create a launch session for a
+/// different Unix account. This applies to both daemon-spawned launches and
+/// `aw run`: the latter creates the program locally, but must not create a
+/// session that a non-root daemon cannot own on behalf of another user.
+pub(crate) fn require_daemon_owner(
+    caller_user_id: &str,
+    daemon_uid: u32,
+) -> Result<(), ApiResponse> {
+    require_daemon_owner_uid(caller_uid(caller_user_id)?, daemon_uid)
+}
+
+fn caller_uid(caller_user_id: &str) -> Result<u32, ApiResponse> {
+    caller_user_id.parse::<u32>().map_err(|_| {
+        error_response(
+            403,
+            "caller_unidentified",
+            "the caller's account could not be identified",
+        )
+    })
+}
+
+fn require_daemon_owner_uid(caller_uid: u32, daemon_uid: u32) -> Result<(), ApiResponse> {
+    if caller_uid == daemon_uid || daemon_uid == 0 {
+        return Ok(());
+    }
+    Err(daemon_owner_only(daemon_uid))
+}
+
+fn daemon_owner_only(daemon_uid: u32) -> ApiResponse {
+    let owner = daemon_owner_name(daemon_uid);
+    daemon_owner_only_named(owner)
+}
+
+fn daemon_owner_only_named(owner: String) -> ApiResponse {
+    let message = format!(
+        "这个后台是「{owner}」自己运行的，只能替「{owner}」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。"
+    );
+    let response = error_response(403, "daemon_owner_only", &message);
+    let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&response.body) else {
+        return response;
+    };
+    body["error"]["detail"] = serde_json::json!({ "daemon_owner": owner });
+    ApiResponse::json(403, &body)
+}
+
+#[cfg(unix)]
+fn daemon_owner_name(daemon_uid: u32) -> String {
+    daemon_owner_name_from(daemon_uid, || {
+        nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(daemon_uid))
+            .ok()
+            .flatten()
+            .map(|user| user.name)
+    })
+}
+
+fn daemon_owner_name_from(daemon_uid: u32, lookup: impl FnOnce() -> Option<String>) -> String {
+    lookup().unwrap_or_else(|| daemon_uid.to_string())
+}
+
+#[cfg(not(unix))]
+fn daemon_owner_name(daemon_uid: u32) -> String {
+    daemon_uid.to_string()
 }
 
 #[cfg(unix)]
@@ -743,7 +793,7 @@ fn verify_identity(pid: u32, uid: u32, gid: u32, expected_groups: &[u32]) -> boo
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::identity_for;
+    use super::{daemon_owner_name_from, daemon_owner_only_named, identity_for};
 
     fn code(result: Result<Option<super::Identity>, super::ApiResponse>) -> String {
         match result {
@@ -780,8 +830,26 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ordinary_daemon_does_not_start_programs_for_others() {
-        assert_eq!(code(identity_for("1001", 1000)), "launch_other_user");
-        assert_eq!(code(identity_for("0", 1000)), "launch_other_user");
+        assert_eq!(code(identity_for("1001", 1000)), "daemon_owner_only");
+        assert_eq!(code(identity_for("0", 1000)), "daemon_owner_only");
+    }
+
+    #[test]
+    fn daemon_owner_only_uses_the_passwd_username_in_the_refusal() {
+        let owner = daemon_owner_name_from(1000, || Some("daemon-owner".to_owned()));
+        let response = daemon_owner_only_named(owner);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"]["code"], "daemon_owner_only");
+        assert_eq!(body["error"]["detail"]["daemon_owner"], "daemon-owner");
+        assert_eq!(
+            body["error"]["message"],
+            "这个后台是「daemon-owner」自己运行的，只能替「daemon-owner」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。"
+        );
+    }
+
+    #[test]
+    fn daemon_owner_only_falls_back_to_the_numeric_uid_without_passwd_entry() {
+        assert_eq!(daemon_owner_name_from(424_242, || None), "424242");
     }
 
     /// `verify_dropped` reads a real process: a child of this account passes

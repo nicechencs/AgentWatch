@@ -13,6 +13,7 @@ export class ApiError extends Error {
   readonly column: number | null;
   readonly suggestion: string | null;
   readonly waitedSeconds: number | null;
+  readonly daemonOwner: string | null;
 
   constructor(status: number, body: ApiErrorBody | null, fallback: string) {
     const part = errorPart(body);
@@ -26,6 +27,7 @@ export class ApiError extends Error {
       typeof part?.waited_seconds === "number" && Number.isInteger(part.waited_seconds) && part.waited_seconds >= 1
         ? part.waited_seconds
         : null;
+    this.daemonOwner = typeof part?.detail?.daemon_owner === "string" ? part.detail.daemon_owner : null;
   }
 }
 
@@ -43,14 +45,14 @@ type T = (key: string, vars?: Record<string, string | number>) => string;
  */
 /**
  * Daemon error codes that have their own sentence. Checked before the status:
- * `launch_other_user` and friends are 403s but say more than 「没有权限」.
+ * `daemon_owner_only` and friends are 403s but say more than 「没有权限」.
  */
 const CODE_TEXT: Record<string, string> = {
   // Launch failures carry the reviewed Chinese sentence with the program or
   // directory name in the daemon response. Do not replace it with a generic
   // local translation that would hide which input failed.
   spawn_failed: "error.spawnFailed",
-  launch_other_user: "error.launchOtherUser",
+  daemon_owner_only: "error.daemonOwnerOnly",
   caller_unidentified: "error.callerUnidentified",
   caller_unknown: "error.callerUnidentified",
   unidentified_peer: "error.unidentifiedPeer",
@@ -72,8 +74,8 @@ export function describeError(error: unknown, t: T): string {
   if (error instanceof ApiError) {
     const coded = CODE_TEXT[error.code];
     if (coded) {
-      if (error.code === "launch_other_user" && error.message.startsWith("这个后台是「")) {
-        return error.message;
+      if (error.code === "daemon_owner_only") {
+        return error.daemonOwner === null ? error.message : t(coded, { owner: error.daemonOwner });
       }
       if (error.code === "db_busy") {
         return error.waitedSeconds === null

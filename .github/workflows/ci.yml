@@ -43,6 +43,22 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: scripts/check-daemon-current-user.sh
+      - name: non-root daemon rejects a second Unix user
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if ! id -u awother >/dev/null 2>&1; then
+            sudo useradd --create-home --shell /bin/bash awother
+          fi
+          # If an image already has the optional socket group and the runner
+          # can use it, the daemon's socket is group-readable. Give awother
+          # that same access; otherwise the daemon deliberately uses 0666 and
+          # SO_PEERCRED remains the authorization boundary.
+          if getent group agentwatch >/dev/null; then
+            sudo usermod -a -G agentwatch awother
+          fi
+          trap 'sudo userdel --remove awother || true' EXIT
+          cargo test -p aw-daemon --test e2e_cli -- --ignored non_root_daemon_refuses_a_second_os_user_before_creating_a_session
       - name: cargo test
         run: cargo test --workspace --no-fail-fast
       # Review 14:40: `aw daemon uninstall --purge --data-dir` exists only in

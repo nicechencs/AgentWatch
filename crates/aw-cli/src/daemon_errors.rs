@@ -136,10 +136,10 @@ const ROWS: &[Row] = &[
         en: Some("the caller's account has no entry in the user database"),
     },
     Row {
-        code: "launch_other_user",
-        // The daemon names the actual daemon owner in its fixed Chinese
-        // sentence, so this row is only the code-table fallback.
-        zh: "这个后台只能替它自己的账户启动程序，已拒绝",
+        code: "daemon_owner_only",
+        // The daemon fills both occurrences of {后台主人}; the CLI preserves
+        // that exact reviewed sentence instead of showing this template twice.
+        zh: "这个后台是「{后台主人}」自己运行的，只能替「{后台主人}」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。",
         en: None,
     },
     Row {
@@ -340,7 +340,7 @@ pub(crate) fn write_status(
             | "cwd_not_found"
             | "program_not_permitted"
             | "cwd_not_permitted"
-            | "launch_other_user"
+            | "daemon_owner_only"
     ) {
         return f.write_str(message);
     }
@@ -532,15 +532,15 @@ mod tests {
     }
 
     #[test]
-    fn other_user_launch_keeps_the_daemon_owner_sentence() {
+    fn daemon_owner_only_keeps_the_daemon_owner_sentence() {
         assert_eq!(
             render(
                 403,
-                Some("launch_other_user"),
-                "这个后台是「1000」自己运行的，只能替「1000」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。",
+                Some("daemon_owner_only"),
+                "这个后台是「runner」自己运行的，只能替「runner」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。",
                 None,
             ),
-            "这个后台是「1000」自己运行的，只能替「1000」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。"
+            "这个后台是「runner」自己运行的，只能替「runner」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。"
         );
     }
 

@@ -36,9 +36,10 @@ CLI 和 UI 请求到达后走同一套 axum 路由。传输层不同，但请求
 
 **授权模型**
 - 普通用户只能看到自己发起的会话（`sessions.user_id`）。
-- 管理员（root / Administrators）可以看到全部会话。
+- 管理员（root / Administrators，由内部通道的对端凭据识别）可以查看和导出全部用户的会话；`@last` 仍只指向管理员自己最新的会话。
+- 停止、删除、重命名和固定会话仍是主人操作。管理员操作别人的会话必须显式传 `--owner <user>`，daemon 会核对该值与存储的主人一致；请求的 header、query 或 body 不能赋予管理员身份。
 - 附着到属于其他用户的进程需要管理员权限。
-- 针对配置修改、删除他人会话、开启 uprobe 这三类操作的端点，只对管理员开放。
+- 配置修改和开启 uprobe 只对管理员开放；删除他人会话还必须带上匹配的 `owner`。
 
 ## 2. CLI 命令树
 
@@ -63,7 +64,9 @@ CLI 和 UI 请求到达后走同一套 axum 路由。传输层不同，但请求
 | 5 | 本版本未接入此命令或选项。 |
 | 6 | 后台运行了，但找不到这个会话或资源。 |
 
-一旦 `aw run` 已启动程序，它返回该程序的退出码；Linux/macOS 被信号终止时为 `128 + signo`，Windows 透传该代码。上表只适用于 `aw` 在程序启动前失败的情况；脚本可通过 stderr 中 `aw` 自己的错误区分两者。
+一旦 `aw run` 已启动程序，它返回该程序的退出码；Linux/macOS 被信号终止时为 `128 + signo`，Windows 透传该代码。表中的代码只适用于 `aw` 在程序启动前失败；这种情况一定由 `aw:` 自己的 stderr 错误消息标明，脚本可据此与目标程序的失败区分。
+
+调用方身份在启动前无法取得时，机器错误码是 `identity_unavailable`，人读文字是「认不出当前用户，已停止启动：<reason>」；普通启动失败的机器错误码是 `spawn_failed`，不嵌入人读文字。
 
 本构建中，`aw run` 默认先调用 `POST /sessions/run`，再由 CLI 以调用者身份启动目标程序并调用 `/sessions/{sid}/adopt`；目标的父进程始终是 `aw`。Unix 上 CLI 用 pipe gate 把子进程停在真正 `exec` 之前：daemon 确认 adopt 后才写入并关闭 pipe 的写端，子进程才执行目标；adopt 失败或 `aw` 异常退出时，目标都不会运行。Windows 上 CLI 以 `CREATE_SUSPENDED` 创建目标并在 Job 的 `KILL_ON_JOB_CLOSE` 保护下保持挂起；放行前清除该限制、恢复主线程，并把唯一的进程句柄交给 `ReleasedChild` 回收。【未在真机验证】`--env` 仅传给该子进程，不会传给 daemon。adopt 时 daemon 同步读取根进程的 pid、ppid、启动时间和 `ProcUid`，并从会话 argv[0] 保留可展示的基名；若目标在第一轮轮询前已退出，采样器以这份 root hint 写一条 `S` 级 `snapshot` 进程记录，其他不可读字段仍为 `NA`，不会把它说成已采到完整进程信息。子进程退出后 CLI 调用 `POST /sessions/{sid}/exit {"exit_code":N}` 回报数值退出码；仅会话属主可调用，且 daemon 只在 `sessions.exit_code` 仍为 `NULL` 时写入，避免覆盖 daemon 已知的结果。`aw attach --pid` 调用 `POST /sessions`（`mode:"attach"`），`aw stop` 调用 `POST /sessions/{sid}/stop`。三者都走与 `aw ui`、`aw daemon stop` 相同的内部通道（socket / 命名管道），daemon 不可达退出码 3，通道无权限或 403 退出码 4。默认 `aw run` 结束后的摘要来自 `GET /sessions/{sid}` 的 `stats`，是目标退出那一刻 daemon 已记录的数字。默认 `aw run` 不接受 `--no-follow-children`（daemon 轮询采样器总是跟随子进程），需要时用 `--no-daemon`。`aw run --no-daemon` 不连接 daemon，保留 CLI 内的本地轮询路径；Windows 的此路径同样使用上述挂起 Job 和唯一回收句柄，`cmd /c exit 7` 有条件测试。【未在真机验证】Linux 上先尝试把子进程放进委派的 cgroup v2 会话目录，本机没有可委派的 cgroup（cgroup v1，或 `cgroup.subtree_control` 没有委派控制器、目录不可写）时退化为按进程树跟踪（scope_pids），照常启动并透传退出码，摘要里写明「没采：cgroup 会话范围」（`--json` 的 `launch_note`）；会话目录建好了但 `cgroup.procs` 拒绝写入时，程序已经在跑，不杀也不重跑，同样按进程树跟踪并写明；只有连这样也启动不了程序时才报错。默认 `aw run` 不用 cgroup：子进程由 CLI 直接启动，daemon 按 adopt 的 pid 轮询跟踪进程树，会话的 `collectors` 照实列出没采的类别。记录仅在 Linux 可用；其他平台的会话创建返回 `503 collector_unavailable`，应改用 `--no-daemon`。
 
@@ -84,7 +87,7 @@ aw
 │     --pin                                会话不参与自动清理
 │     --group <name>                       （本版本未接入）
 │     --mcp-tap                            （本版本未接入）
-│     --no-daemon                          不连 daemon，在 CLI 进程内跑轮询采集器（全部 S 级，ADR-0005）
+│     --no-daemon                          不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序都会跟着结束。
 │     --raw <file>                         （本版本未接入）
 │     --unsafe-no-redact                   （本版本未接入）
 ├── attach [OPTIONS] (--pid <PID> | --name <pattern>)
@@ -93,14 +96,14 @@ aw
 │     --move-to-cgroup                     （Linux）把子树移入会话 cgroup
 │     --agent / --name / --pin / --group   同 run（附着模式不支持 --mcp-tap）
 │     --until-exit | --duration <dur>      结束条件（默认：根进程退出或 Ctrl-C）
-├── stop <SESSION>                         停止记录（程序继续运行）
+├── stop <SESSION> [--owner <user>]         停止记录（程序继续运行；管理员操作他人会话时必须指定主人）
 ├── ps [--agents-only] [--filter <text>]   列出可附着的进程（树状，经内部通道读 daemon 的 GET /processes；非管理员只看自己的进程）
 ├── sessions
 │   ├── list [--since <time>] [--agent <id>] [--active] [--limit N]
 │   ├── show <SESSION>                     概览：统计、发现、缺口、采集器能力
-│   ├── rename <SESSION> <name>
-│   ├── pin|unpin <SESSION>
-│   └── delete <SESSION>... [--yes]
+│   ├── rename <SESSION> <name> [--owner <user>]
+│   ├── pin|unpin <SESSION> [--owner <user>]
+│   └── delete <SESSION>... [--yes] [--owner <user>]
 ├── timeline <SESSION> [--filter <expr>] [--from <t>] [--to <t>] [--follow] [--limit N]
 ├── procs <SESSION> [--tree] [--filter <expr>]
 ├── files <SESSION> [--filter <expr>] [--group-by path|dir|proc] [--sort <field>]
@@ -117,7 +120,7 @@ aw
 ├── doctor [--json] [--perf]               自检；`--perf` 本版本未接入
 ├── daemon
 │   ├── status | start | stop | restart
-│   ├── install [--yes] | uninstall [--purge]      仅显示当前系统的计划；实际安装由安装包提供
+│   ├── install [--yes] | uninstall [--purge] [--data-dir <DIR>]  仅显示当前系统的计划；`--purge --data-dir` 只删除指定测试目录
 │   │     uninstall --check                只检查卸载后残留（服务/扩展/CA/数据），不执行（NFR-09）
 │   └── logs [-n N|--lines N] [--follow]   默认 200 行，最多 5000 行
 ├── config
@@ -185,12 +188,12 @@ $ aw run --proxy -- claude
 | POST | `/sessions/{sid}/adopt` | `{ticket, pid}`。ticket 不符 403，超时 410 `adopt_timeout`，没有等待中的启动 404（他人的也是 404）。 |
 | POST | `/sessions/{sid}/exit` | `{exit_code:N}`：`aw run` 回收调用方创建的目标后上报数值退出码。仅会话属主可写；仅当 `sessions.exit_code` 为 `NULL` 时更新，返回 200 `{id, exit_code}`，不存在或不属于调用方时为 404。 |
 | POST | `/sessions/{sid}/attach` | `{pid}`：在自己的、未结束的会话里再多记录一个根进程；他人进程需管理员。会话已结束 409。没有打开会话数据库的 daemon（前台运行总会打开 `agentwatch.db`，只在测试桩里出现）回 503 `store_unavailable`，不是 501。 |
-| GET | `/sessions` | 列表。参数：`?since&until&agent&active&q&cursor&limit`。每行带 `collectors`（同会话详情）和 `stats`（同 `/summary` 的计数），列表和概览的数字一致；类别没采时界面两处都写「没采」。 每行另带 `argv`（存储时已脱敏的命令，数组；没有为 null），没有名字的会话界面显示命令（如 `sleep 90`）。 |
+| GET | `/sessions` | 列表。参数：`?since&until&agent&active&q&cursor&limit`。每行带 `collectors`（同会话详情）和 `stats`（同 `/summary` 的计数），列表和概览的数字一致；类别没采时界面两处都写「没采」。 每行另带 `argv`（存储时已脱敏的命令，数组；没有为 null），没有名字的会话界面显示命令（如 `sleep 90`）。仅对内部通道识别出的管理员，行中才有 `user_id`，CLI/App 因而显示「用户」/"User" 列。 |
 | GET | `/sessions/{sid}` | 会话详情 + `stats`（与会话列表、`/summary` 同一个计数函数 `aw_store::session_counts`：`process_count, flow_count, dns_count, gap_count, bytes_up, bytes_down, finding_count`；库里还没有 `findings` 表时 `finding_count` 为 null，不是 0），另带 `mode` 和 `collectors`。`collectors` 是数组，每项 `{name, mode, capabilities:[{kind, evidence, na_reason?}]}`：轮询采集器 `poll` 列 `proc`=S，`file`、`dns`=NA（`collector_unavailable`），`net` 在 Windows 为 S、其他平台为 NA。库里存的采集器名没有能力描述时（未知名字），该项 `capabilities` 为空并带 `note: "collector_not_described"`，界面据此说“不能确认是否采集”，不说“没有发生”。`/summary` 同样带这两个字段。 |
-| PATCH | `/sessions/{sid}` | `{name?, pinned?}` |
+| PATCH | `/sessions/{sid}` | `{name?, pinned?, owner?}`。会话主人可直接操作；管理员改动他人会话时必须给出与存储主人一致的 `owner`。 |
 | PATCH | `/sessions/{sid}/findings/{id}` | body：`{user_state: "confirmed"\|"ignored"\|null}`。只接受这三个值。`null` 清除标记。写入 `user_state_by`（当前用户）和 `user_state_ns`（Unix 纳秒）。不属于该用户的会话或发现返回 404。 |
-| POST | `/sessions/{sid}/stop` | `aw stop <SESSION>` 调用此接口。接口只认 public id（`s-…`）；`@last` 和会话名由 CLI 先查 `GET /sessions` 换成 public id（`@last` 取自己最新开始的一条；同名多条时报错，请改用 public id）。停止监控但不结束目标进程，写入 `ended_ns`；之后不再往这个会话写新记录。daemon 自带的 `daemon-sample` 会话也一样：采样器每次采样前读一次 `ended_ns`，已停止就停掉，daemon 重启后也不再恢复采样。 |
-| DELETE | `/sessions/{sid}` | 删除 |
+| POST | `/sessions/{sid}/stop` | `aw stop <SESSION> [--owner <user>]` 调用此接口。接口只认 public id（`s-…`）；`@last` 和会话名由 CLI 先查 `GET /sessions` 换成 public id（`@last` 取自己最新开始的一条；同名多条时报错，请改用 public id）。管理员停止他人会话时 query 的 `owner` 必须匹配会话主人。停止监控但不结束目标进程，写入 `ended_ns`；之后不再往这个会话写新记录。daemon 自带的 `daemon-sample` 会话也一样：采样器每次采样前读一次 `ended_ns`，已停止就停掉，daemon 重启后也不再恢复采样。 |
+| DELETE | `/sessions/{sid}` | 删除。管理员删除他人会话时 query 的 `owner` 必须匹配会话主人。 |
 | GET | `/sessions/{sid}/summary` | 概览页数据：Top 目录、Top 域名、按类别计数、按证据等级计数、缺口摘要 |
 | GET | `/sessions/{sid}/timeline` | 参数：`?filter&from&to&cats&cursor&limit`。每行在视图列（`session_id, ts_ns, cat, id, proc_uid, evidence`）之外带 `summary`（按 `cat` 从来源表的已存列拼一行，NULL 的列不出现，不推测）、`fields`（拼 summary 用到的列，原样）和 `proc: {pid, exe_name}`。来源行不存在时 `summary` 为空串。`/around` 同样。 `proc` 行带 `pre_existing`：仅当会话是 `attach`、该进程属于采样器开始时的基线（`processes.how = snapshot`）且开始时间早于 `sessions.started_ns` 时为 true。`launch` 会话里的进程都由会话启动，即使根进程的开始时间（/proc 只到整秒）读出来比会话早一点，也不算。界面的「会话开始前已存在」只看这个字段。 |
 | GET | `/sessions/{sid}/timeline/histogram` | 参数：`?filter&from&to&buckets`。返回时间轴密度图数据 |

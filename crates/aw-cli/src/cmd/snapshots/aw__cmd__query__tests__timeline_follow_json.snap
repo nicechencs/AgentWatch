@@ -38,6 +38,6 @@ expression: body
       "ts_ns": 1700000002000000000
     }
   ],
-  "live_connected": false,
-  "note": "没有订阅实时 /sessions/{sid}/live（真实订阅未接通）；这些行来自注入的数据源"
+  "live_connected": true,
+  "note": null
 }

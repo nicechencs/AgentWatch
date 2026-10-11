@@ -66,6 +66,10 @@ impl std::fmt::Display for QueryError {
 pub(crate) struct SessionItem {
     /// Public id. Not a hostname.
     pub public_id: String,
+    /// Owner supplied only when the daemon identified this viewer as an
+    /// administrator.  `None` is deliberately different from an empty owner:
+    /// normal callers are not told that field at all.
+    pub user_id: Option<String>,
     /// User label, or unknown.
     pub name: Option<String>,
     /// `launch` or `attach`.
@@ -285,14 +289,24 @@ pub(crate) trait QuerySource {
     /// # Errors
     ///
     /// [`QueryError::NotFound`].
-    fn rename_session(&mut self, key: &str, name: &str) -> Result<SessionItem, QueryError>;
+    fn rename_session(
+        &mut self,
+        key: &str,
+        name: &str,
+        owner: Option<&str>,
+    ) -> Result<SessionItem, QueryError>;
 
     /// Set or clear the pin.
     ///
     /// # Errors
     ///
     /// [`QueryError::NotFound`].
-    fn set_pinned(&mut self, key: &str, pinned: bool) -> Result<SessionItem, QueryError>;
+    fn set_pinned(
+        &mut self,
+        key: &str,
+        pinned: bool,
+        owner: Option<&str>,
+    ) -> Result<SessionItem, QueryError>;
 
     /// Delete. Returns how many were removed.
     ///
@@ -300,7 +314,7 @@ pub(crate) trait QuerySource {
     ///
     /// [`QueryError::NotFound`] naming the first missing key. Earlier keys in the
     /// same call are not removed (all-or-nothing).
-    fn delete_sessions(&mut self, keys: &[String]) -> Result<u64, QueryError>;
+    fn delete_sessions(&mut self, keys: &[String], owner: Option<&str>) -> Result<u64, QueryError>;
 
     /// One timeline page.
     ///
@@ -309,7 +323,8 @@ pub(crate) trait QuerySource {
     /// [`QueryError::NotFound`].
     fn timeline(&self, key: &str, bounds: &TimelineBounds) -> Result<TimelinePage, QueryError>;
 
-    /// Events that arrived after `after_ns` (exclusive). Used by `--follow`.
+    /// Events whose SSE record id is after `cursor` (exclusive). Used by
+    /// `--follow`.
     ///
     /// The daemon's `/sessions/{sid}/live` endpoint is an SSE stream. A source
     /// that cannot consume it returns [`QueryError::Unavailable`]. The memory
@@ -318,7 +333,12 @@ pub(crate) trait QuerySource {
     /// # Errors
     ///
     /// [`QueryError::NotFound`] or [`QueryError::Unavailable`].
-    fn follow(&self, key: &str, after_ns: Option<i64>) -> Result<Vec<TimelineItem>, QueryError>;
+    fn follow(
+        &self,
+        key: &str,
+        filter: Option<&str>,
+        cursor: Option<i64>,
+    ) -> Result<Vec<TimelineItem>, QueryError>;
 
     /// Processes. `tree` asks the source to fill [`ProcItem::children`].
     ///
@@ -792,19 +812,24 @@ impl QuerySource for UnavailableSource {
         })
     }
 
-    fn rename_session(&mut self, _: &str, _: &str) -> Result<SessionItem, QueryError> {
+    fn rename_session(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<SessionItem, QueryError> {
         Err(QueryError::Unavailable {
             detail: UNAVAILABLE.to_owned(),
         })
     }
 
-    fn set_pinned(&mut self, _: &str, _: bool) -> Result<SessionItem, QueryError> {
+    fn set_pinned(&mut self, _: &str, _: bool, _: Option<&str>) -> Result<SessionItem, QueryError> {
         Err(QueryError::Unavailable {
             detail: UNAVAILABLE.to_owned(),
         })
     }
 
-    fn delete_sessions(&mut self, _: &[String]) -> Result<u64, QueryError> {
+    fn delete_sessions(&mut self, _: &[String], _: Option<&str>) -> Result<u64, QueryError> {
         Err(QueryError::Unavailable {
             detail: UNAVAILABLE.to_owned(),
         })
@@ -816,9 +841,14 @@ impl QuerySource for UnavailableSource {
         })
     }
 
-    fn follow(&self, _: &str, _: Option<i64>) -> Result<Vec<TimelineItem>, QueryError> {
+    fn follow(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        _: Option<i64>,
+    ) -> Result<Vec<TimelineItem>, QueryError> {
         Err(QueryError::Unavailable {
-            detail: format!("{UNAVAILABLE}；没有订阅实时 /sessions/{{sid}}/live（真实订阅未接通）"),
+            detail: UNAVAILABLE.to_owned(),
         })
     }
 
@@ -1024,19 +1054,29 @@ impl QuerySource for MemorySource {
         })
     }
 
-    fn rename_session(&mut self, key: &str, name: &str) -> Result<SessionItem, QueryError> {
+    fn rename_session(
+        &mut self,
+        key: &str,
+        name: &str,
+        _: Option<&str>,
+    ) -> Result<SessionItem, QueryError> {
         let index = self.find(key)?;
         self.sessions[index].item.name = Some(name.to_owned());
         Ok(self.sessions[index].item.clone())
     }
 
-    fn set_pinned(&mut self, key: &str, pinned: bool) -> Result<SessionItem, QueryError> {
+    fn set_pinned(
+        &mut self,
+        key: &str,
+        pinned: bool,
+        _: Option<&str>,
+    ) -> Result<SessionItem, QueryError> {
         let index = self.find(key)?;
         self.sessions[index].item.pinned = Some(pinned);
         Ok(self.sessions[index].item.clone())
     }
 
-    fn delete_sessions(&mut self, keys: &[String]) -> Result<u64, QueryError> {
+    fn delete_sessions(&mut self, keys: &[String], _: Option<&str>) -> Result<u64, QueryError> {
         let mut indexes = Vec::with_capacity(keys.len());
         for key in keys {
             indexes.push(self.find(key)?);
@@ -1076,16 +1116,25 @@ impl QuerySource for MemorySource {
         Ok(TimelinePage { rows, next })
     }
 
-    fn follow(&self, key: &str, after_ns: Option<i64>) -> Result<Vec<TimelineItem>, QueryError> {
+    fn follow(
+        &self,
+        key: &str,
+        filter: Option<&str>,
+        cursor: Option<i64>,
+    ) -> Result<Vec<TimelineItem>, QueryError> {
         // The memory source is the test stand-in for `/live`. It does not open
         // a socket. Callers that need the real stream still see UnavailableSource.
         let index = self.find(key)?;
         Ok(self.sessions[index]
             .timeline
             .iter()
-            .filter(|row| match after_ns {
-                Some(after) => row.ts_ns > after,
+            .filter(|row| match cursor {
+                Some(after) => row.id > after,
                 None => true,
+            })
+            .filter(|row| match filter {
+                Some(text) if !text.trim().is_empty() => row_matches_filter(row, text),
+                _ => true,
             })
             .cloned()
             .collect())
@@ -1801,8 +1850,9 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Result<i64, String> {
 /// Candidate polling interval for a stream-capable `--follow` source. Tests can
 /// inspect the fixed value without sleeping.
 #[must_use]
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn follow_poll_interval() -> Duration {
-    Duration::from_millis(200)
+    Duration::from_secs(1)
 }
 
 /// Marker printed on a gap line. ANSI red is added only when `color` is set.
@@ -1823,6 +1873,7 @@ pub(crate) fn sample_source() -> MemorySource {
     source.push(MemorySession {
         item: SessionItem {
             public_id: "s-7k2m".to_owned(),
+            user_id: None,
             name: Some("demo".to_owned()),
             mode: "launch".to_owned(),
             agent: Some("example-agent".to_owned()),
@@ -2099,6 +2150,7 @@ mod tests {
             &SessionsCmd::Rename {
                 session: "s-7k2m".to_owned(),
                 name: "kept".to_owned(),
+                owner: None,
             },
             true,
             &mut source,
@@ -2110,6 +2162,7 @@ mod tests {
         let pinned = sessions::run(
             &SessionsCmd::Pin {
                 session: "kept".to_owned(),
+                owner: None,
             },
             false,
             &mut source,
@@ -2126,6 +2179,7 @@ mod tests {
             &SessionsCmd::Delete {
                 sessions: vec!["kept".to_owned()],
                 yes: false,
+                owner: None,
             },
             false,
             &mut source,
@@ -2137,6 +2191,7 @@ mod tests {
             &SessionsCmd::Delete {
                 sessions: vec!["kept".to_owned()],
                 yes: true,
+                owner: None,
             },
             true,
             &mut source,
@@ -2194,9 +2249,9 @@ mod tests {
 
     #[test]
     fn timeline_follow_renders_the_stub_format() {
-        // The HTTP client does not consume the SSE stream. The memory source
-        // stands in so the line format (gap marker, evidence column) can be
-        // checked. Delay under 2 s is not measured.
+        // The memory source stands in for one `/live` snapshot so the line
+        // format (gap marker, evidence column) can be checked without a
+        // daemon or a terminal interrupt.
         let source = sample_source();
         let outcome = timeline::run(
             TimelineArgs {
@@ -2214,8 +2269,7 @@ mod tests {
         .expect("follow");
         assert_eq!(outcome.code, exit::OK);
         let body = text(&outcome.stdout);
-        assert!(body.contains("真实订阅未接通"), "{body}");
-        assert!(body.contains("\"live_connected\": false"), "{body}");
+        assert!(body.contains("\"cat\": \"gap\""), "{body}");
         assert!(body.contains("\"level\": \"E1\""), "{body}");
         insta::assert_snapshot!("timeline_follow_json", body);
     }

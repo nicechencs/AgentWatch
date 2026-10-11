@@ -40,10 +40,20 @@ pub(crate) fn run(
             source,
         ),
         SessionsCmd::Show { session } => show(session, mode, source),
-        SessionsCmd::Rename { session, name } => rename(session, name, mode, source),
-        SessionsCmd::Pin { session } => pin(session, true, mode, source),
-        SessionsCmd::Unpin { session } => pin(session, false, mode, source),
-        SessionsCmd::Delete { sessions, yes } => delete(sessions, *yes, mode, source),
+        SessionsCmd::Rename {
+            session,
+            name,
+            owner,
+        } => rename(session, name, owner.as_deref(), mode, source),
+        SessionsCmd::Pin { session, owner } => pin(session, true, owner.as_deref(), mode, source),
+        SessionsCmd::Unpin { session, owner } => {
+            pin(session, false, owner.as_deref(), mode, source)
+        }
+        SessionsCmd::Delete {
+            sessions,
+            yes,
+            owner,
+        } => delete(sessions, *yes, owner.as_deref(), mode, source),
     }
 }
 
@@ -112,6 +122,7 @@ fn show(session: &str, mode: OutputMode, source: &dyn QuerySource) -> io::Result
 fn rename(
     session: &str,
     name: &str,
+    owner: Option<&str>,
     mode: OutputMode,
     source: &mut dyn QuerySource,
 ) -> io::Result<Outcome> {
@@ -123,7 +134,7 @@ fn rename(
             mode == OutputMode::Json,
         ));
     }
-    match source.rename_session(session, name) {
+    match source.rename_session(session, name, owner) {
         Ok(item) => {
             let doc = mutation_json("rename", &render::session_json(std::slice::from_ref(&item)));
             let table = render::session_table(std::slice::from_ref(&item));
@@ -136,10 +147,11 @@ fn rename(
 fn pin(
     session: &str,
     pinned: bool,
+    owner: Option<&str>,
     mode: OutputMode,
     source: &mut dyn QuerySource,
 ) -> io::Result<Outcome> {
-    match source.set_pinned(session, pinned) {
+    match source.set_pinned(session, pinned, owner) {
         Ok(item) => {
             let action = if pinned { "pin" } else { "unpin" };
             let doc = mutation_json(action, &json!({ "id": item.public_id, "pinned": pinned }));
@@ -153,6 +165,7 @@ fn pin(
 fn delete(
     sessions: &[String],
     yes: bool,
+    owner: Option<&str>,
     mode: OutputMode,
     source: &mut dyn QuerySource,
 ) -> io::Result<Outcome> {
@@ -164,7 +177,7 @@ fn delete(
             mode == OutputMode::Json,
         ));
     }
-    match source.delete_sessions(sessions) {
+    match source.delete_sessions(sessions, owner) {
         Ok(removed) => {
             let doc = mutation_json("delete", &json!({ "removed": removed }));
             let table = crate::output::Table {

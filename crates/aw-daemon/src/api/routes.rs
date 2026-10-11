@@ -1163,13 +1163,16 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
             let rows: Vec<Value> = visible
                 .into_iter()
                 .map(|session| {
-                    json!({
+                    let mut row = json!({
                         "id": session.id,
-                        "user_id": session.user_id,
                         "name": session.name,
                         "platform": null,
                         "os_version": null,
-                    })
+                    });
+                    if caller.admin {
+                        row["user_id"] = Value::String(session.user_id.clone());
+                    }
+                    row
                 })
                 .collect();
             return ApiResponse::json(200, &json!({ "sessions": rows }));
@@ -1178,13 +1181,13 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
             Ok(q) => q,
             Err(response) => return response,
         };
-        return match state.query.list_sessions(&caller.user_id, &query) {
+        return match state.query.list_sessions_for_viewer(caller, &query) {
             Ok(page) => {
                 let rows: Vec<Value> = page
                     .rows
                     .iter()
                     .map(|row| {
-                        json!({
+                        let mut value = json!({
                             "id": row.public_id,
                             "session_id": row.id,
                             "name": row.name,
@@ -1199,7 +1202,11 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                             "collectors": stored_collectors_json(&row.collectors),
                             "argv": super::query::argv_value(row.argv.as_deref()),
                             "stats": counts_json(&row.counts),
-                        })
+                        });
+                        if caller.admin {
+                            value["user_id"] = Value::String(row.user_id.clone());
+                        }
+                        value
                     })
                     .collect();
                 ApiResponse::json(
@@ -1452,15 +1459,34 @@ fn session_sub(
                 &json!({ "id": sid, "user_id": owner, "name": session.name }),
             );
         }
-        return map_summary(state.query.session_detail(&caller.user_id, &sid));
+        let owner = match state.query.owner_for_viewer(caller, &sid) {
+            Ok(Some(owner)) => owner,
+            Ok(None) => return not_found_session(),
+            Err(err) => return from_backend(err),
+        };
+        return map_summary(state.query.session_detail(&owner, &sid));
     }
     if tail.is_empty() && method == "DELETE" {
+        let requested_owner = query_value(query, "owner");
         if memory.is_none() {
-            return match state.query.delete_session(&caller.user_id, &sid) {
+            let owner = match mutation_owner(state, caller, &sid, requested_owner) {
+                Ok(owner) => owner,
+                Err(response) => return response,
+            };
+            return match state.query.delete_session(&owner, &sid) {
                 Ok(None) => not_found_session(),
                 Ok(Some(())) => ApiResponse::json(200, &json!({ "deleted": sid })),
                 Err(err) => from_backend(err),
             };
+        }
+        let allowed =
+            owner == caller.user_id || (caller.admin && requested_owner == Some(owner.as_str()));
+        if !allowed {
+            return error_response(
+                403,
+                "owner_action_forbidden",
+                "only the session owner may operate it",
+            );
         }
         let input = AuthInput {
             http: false,
@@ -1573,22 +1599,60 @@ fn patch_memory_or_store(
     let value: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
     let name = value.get("name").and_then(serde_json::Value::as_str);
     let pinned = value.get("pinned").and_then(serde_json::Value::as_bool);
+    let requested_owner = value.get("owner").and_then(serde_json::Value::as_str);
     if let Some(session) = state.sessions.iter_mut().find(|row| row.id == sid) {
-        if !caller.admin && session.user_id != caller.user_id {
-            return not_found_session();
+        if session.user_id != caller.user_id
+            && (!caller.admin || requested_owner != Some(session.user_id.as_str()))
+        {
+            return error_response(
+                403,
+                "owner_action_forbidden",
+                "only the session owner may operate it",
+            );
         }
         if let Some(name) = name {
             session.name = name.to_owned();
         }
         return ApiResponse::json(200, &json!({ "id": sid, "name": session.name }));
     }
-    match state
-        .query
-        .patch_session(&caller.user_id, sid, name, pinned)
-    {
+    let owner = match mutation_owner(state, caller, sid, requested_owner) {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    match state.query.patch_session(&owner, sid, name, pinned) {
         Ok(None) => not_found_session(),
         Ok(Some(())) => ApiResponse::json(200, &json!({ "id": sid })),
         Err(err) => from_backend(err),
+    }
+}
+
+/// Owner-only actions cannot be widened by merely being root: the caller must
+/// name the target owner explicitly.  The owner comes from the stored row,
+/// never from the request, and `@last` was resolved as the caller's own row.
+fn mutation_owner(
+    state: &ApiState,
+    caller: &Caller,
+    sid: &str,
+    requested_owner: Option<&str>,
+) -> Result<String, ApiResponse> {
+    let owner = match state.query.owner_for_viewer(caller, sid) {
+        Ok(Some(owner)) => owner,
+        Ok(None) => return Err(not_found_session()),
+        Err(error) => return Err(from_backend(error)),
+    };
+    let allowed = if owner == caller.user_id {
+        requested_owner.is_none() || (caller.admin && requested_owner == Some(owner.as_str()))
+    } else {
+        caller.admin && requested_owner == Some(owner.as_str())
+    };
+    if allowed {
+        Ok(owner)
+    } else {
+        Err(error_response(
+            403,
+            "owner_action_forbidden",
+            "only the session owner may operate it",
+        ))
     }
 }
 
@@ -2025,7 +2089,19 @@ fn session_query_route(
         Ok(q) => q,
         Err(response) => return Some(response),
     };
-    let user = caller.user_id.as_str();
+    // Store helpers take a user id because their SQL predicates enforce
+    // ownership.  Resolve the actual row owner first for an administrator;
+    // the `Caller` itself came solely from peer credentials / a bound token.
+    let owner = if state.query.db_path.is_some() {
+        match state.query.owner_for_viewer(caller, sid) {
+            Ok(Some(owner)) => Some(owner),
+            Ok(None) => return Some(not_found_session()),
+            Err(err) => return Some(from_backend(err)),
+        }
+    } else {
+        None
+    };
+    let user = owner.as_deref().unwrap_or(caller.user_id.as_str());
     // Memory stub sessions are not in SQLite. Query endpoints 404 them the same
     // way a hidden id does, except `/live`, which is in-process.
     let response = match (method, tail) {
@@ -2054,30 +2130,42 @@ fn session_query_route(
         },
         ("GET", "files") => map_opt(state.query.files(user, sid, &parsed)),
         ("GET", "live") => live_snapshot(state, sid, caller, &parsed),
-        ("POST", "stop") => match state.query.stop_session(user, sid) {
-            Ok(None) => stop_memory(state, sid, caller),
-            Ok(Some(public_id)) => {
-                // A `/sessions/run` the CLI never adopted (it could not start the
-                // program) has no process to record. Stopping it discards the
-                // empty row instead of leaving a session that never ran.
-                let unadopted = state.pending_launches.contains_key(&public_id);
-                super::watch_routes::stopped(state, &public_id);
-                if unadopted {
-                    match state.query.delete_session(user, &public_id) {
-                        Ok(Some(())) => {
-                            return Some(ApiResponse::json(
-                                200,
-                                &json!({ "stopped": sid, "id": public_id, "discarded": true }),
-                            ));
-                        }
-                        Ok(None) => {}
-                        Err(err) => return Some(from_backend(err)),
-                    }
-                }
-                ApiResponse::json(200, &json!({ "stopped": sid, "id": public_id }))
+        ("POST", "stop") => {
+            // Viewing a foreign session is useful to an administrator, but a
+            // mutating action must name that session's owner explicitly.  The
+            // owner came from the store after peer-credential authorization;
+            // it is never accepted as an authority-bearing request field.
+            let requested_owner = query_value(query, "owner");
+            if owner.as_deref() != Some(caller.user_id.as_str())
+                && !(caller.admin && requested_owner == owner.as_deref())
+            {
+                return Some(owner_action_forbidden());
             }
-            Err(err) => from_backend(err),
-        },
+            match state.query.stop_session(user, sid) {
+                Ok(None) => stop_memory(state, sid, caller),
+                Ok(Some(public_id)) => {
+                    // A `/sessions/run` the CLI never adopted (it could not start the
+                    // program) has no process to record. Stopping it discards the
+                    // empty row instead of leaving a session that never ran.
+                    let unadopted = state.pending_launches.contains_key(&public_id);
+                    super::watch_routes::stopped(state, &public_id);
+                    if unadopted {
+                        match state.query.delete_session(user, &public_id) {
+                            Ok(Some(())) => {
+                                return Some(ApiResponse::json(
+                                    200,
+                                    &json!({ "stopped": sid, "id": public_id, "discarded": true }),
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(err) => return Some(from_backend(err)),
+                        }
+                    }
+                    ApiResponse::json(200, &json!({ "stopped": sid, "id": public_id }))
+                }
+                Err(err) => from_backend(err),
+            }
+        }
         _ => {
             return session_p3_route(
                 state,
@@ -2094,6 +2182,14 @@ fn session_query_route(
         }
     };
     Some(response)
+}
+
+fn owner_action_forbidden() -> ApiResponse {
+    error_response(
+        403,
+        "owner_action_forbidden",
+        "only the session owner may operate it",
+    )
 }
 
 struct P3Route<'a> {
@@ -2291,7 +2387,7 @@ fn live_snapshot(state: &ApiState, sid: &str, caller: &Caller, query: &ListQuery
     // the id, still serve the hub: the store check below hides foreign ids
     // when a database is configured.
     if !visible && state.query.db_path.is_some() {
-        match state.query.session_detail(&caller.user_id, sid) {
+        match state.query.owner_for_viewer(caller, sid) {
             Ok(None) | Err(_) => return not_found_session(),
             Ok(Some(_)) => {}
         }
@@ -4085,6 +4181,182 @@ mod tests {
             .unwrap_or(Some(-1));
         assert_eq!(ended, None, "root's session was not stopped");
         assert_eq!(call(&user, "GET", "/api/v1/sessions/s-usersess").0, 200);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admin_can_view_and_export_all_but_must_name_owner_for_mutations() {
+        let (dir, db) = seeded_db(
+            "admin-session-scope",
+            "INSERT INTO sessions (id, public_id, name, mode, user_id, started_ns, platform, collectors, pinned) VALUES \
+               (1, 's-alice', 'alice-session', 'attach', 'alice', 10, 'linux', '[]', 0), \
+               (2, 's-root', 'root-session', 'attach', 'root', 20, 'linux', '[]', 0);",
+        );
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let alice = token_for(&mut state, "alice", false);
+        let root = token_for(&mut state, "root", true);
+        let mut call = |token: &str, method: &str, path: &str, query: &str, body: &[u8]| {
+            let mut request = req(method, path, Some("127.0.0.1:7456"), Some(token), body);
+            request.query = query.to_owned();
+            dispatch(&mut state, &request)
+        };
+
+        let admin_list = call(&root, "GET", "/api/v1/sessions", "", b"");
+        assert_eq!(admin_list.status, 200);
+        let rows = json_body(&admin_list)["sessions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|row| row["user_id"].is_string()),
+            "{rows:?}"
+        );
+
+        // A token identifies Alice. A caller-supplied identity header cannot
+        // widen the query to root's session.
+        drop(call);
+        let mut claimed_admin = req(
+            "GET",
+            "/api/v1/sessions",
+            Some("127.0.0.1:7456"),
+            Some(&alice),
+            b"",
+        );
+        claimed_admin
+            .headers
+            .insert("x-user-id".to_owned(), "root".to_owned());
+        let alice_list = dispatch(&mut state, &claimed_admin);
+        assert_eq!(alice_list.status, 200);
+        let rows = json_body(&alice_list)["sessions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "s-alice");
+        assert!(rows[0].get("user_id").is_none());
+
+        let mut call = |token: &str, method: &str, path: &str, query: &str, body: &[u8]| {
+            let mut request = req(method, path, Some("127.0.0.1:7456"), Some(token), body);
+            request.query = query.to_owned();
+            dispatch(&mut state, &request)
+        };
+
+        // Views and export span owners for a peer-identified administrator.
+        assert_eq!(
+            call(&root, "GET", "/api/v1/sessions/s-alice", "", b"").status,
+            200
+        );
+        assert_eq!(
+            call(
+                &root,
+                "GET",
+                "/api/v1/sessions/s-alice/export",
+                "format=jsonl",
+                b""
+            )
+            .status,
+            200
+        );
+        // `@last` remains root's own newest session rather than Alice's.
+        let last = call(&root, "GET", "/api/v1/sessions/@last", "", b"");
+        assert_eq!(last.status, 200);
+        assert_eq!(json_body(&last)["id"], "s-root");
+
+        // Mutations need the actual stored owner. A missing or invented owner
+        // cannot turn read-all administrator scope into write-all scope.
+        for query in ["", "owner=bob"] {
+            let response = call(&root, "POST", "/api/v1/sessions/s-alice/stop", query, b"{}");
+            assert_eq!(response.status, 403, "{query}");
+            assert_eq!(
+                json_body(&response)["error"]["code"],
+                "owner_action_forbidden"
+            );
+        }
+        assert_eq!(
+            call(
+                &root,
+                "PATCH",
+                "/api/v1/sessions/s-alice",
+                "",
+                br#"{"name":"renamed"}"#,
+            )
+            .status,
+            403
+        );
+        assert_eq!(
+            call(
+                &root,
+                "PATCH",
+                "/api/v1/sessions/s-alice",
+                "",
+                br#"{"name":"renamed","owner":"alice"}"#,
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            call(
+                &root,
+                "PATCH",
+                "/api/v1/sessions/s-alice",
+                "",
+                br#"{"pinned":true}"#,
+            )
+            .status,
+            403
+        );
+        assert_eq!(
+            call(
+                &root,
+                "PATCH",
+                "/api/v1/sessions/s-alice",
+                "",
+                br#"{"pinned":true,"owner":"alice"}"#,
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            call(
+                &root,
+                "POST",
+                "/api/v1/sessions/s-alice/stop",
+                "owner=alice",
+                b"{}"
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            call(
+                &root,
+                "PATCH",
+                "/api/v1/sessions/s-alice",
+                "",
+                br#"{"pinned":false,"owner":"alice"}"#,
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            call(&root, "DELETE", "/api/v1/sessions/s-alice", "", b"").status,
+            403
+        );
+        let deleted = call(
+            &root,
+            "DELETE",
+            "/api/v1/sessions/s-alice",
+            "owner=alice",
+            b"",
+        );
+        assert_eq!(
+            deleted.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&deleted.body)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

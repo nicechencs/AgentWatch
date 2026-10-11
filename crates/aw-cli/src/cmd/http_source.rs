@@ -8,9 +8,9 @@
 //! absent is [`QueryError::Unavailable`] naming that field — never a guessed `0`
 //! or `""`. A 200 with an empty list is a real empty list.
 //!
-//! `follow` does not poll. The daemon timeline page has `next_cursor` of the form
-//! `ts_ns,id`, not an `after` bound, and this client reads one HTTP response then
-//! closes the socket, so it cannot consume `GET /sessions/{sid}/live` (SSE).
+//! `follow` polls the daemon's bounded SSE snapshot endpoint, exactly as the
+//! App does.  Each response closes after its current records; the SSE `id` is
+//! retained as the next `cursor`.
 
 use std::cell::RefCell;
 
@@ -77,25 +77,33 @@ impl<T: Transport> HttpQuerySource<T> {
         request: &ApiRequest,
         session: Option<&str>,
     ) -> Result<Value, QueryError> {
-        let reply = match self.transport.as_ref() {
+        let reply = self.call_reply(request, session)?;
+        reply.json().ok_or_else(|| QueryError::Unavailable {
+            detail: "后台返回的响应体不是 JSON".to_owned(),
+        })
+    }
+
+    fn call_reply(
+        &self,
+        request: &ApiRequest,
+        session: Option<&str>,
+    ) -> Result<crate::client::ApiReply, QueryError> {
+        match self.transport.as_ref() {
             Some(transport) => {
                 let mut transport = transport.borrow_mut();
                 let mut client = Client::new(self.endpoint.clone(), Passthrough(&mut *transport));
                 client
                     .call(request)
-                    .map_err(|err| client_to_query_for(&err, session))?
+                    .map_err(|err| client_to_query_for(&err, session))
             }
             None => {
                 let transport = LoopbackHttp::new(&self.endpoint).map_err(client_to_query)?;
                 let mut client = Client::new(self.endpoint.clone(), transport);
                 client
                     .call(request)
-                    .map_err(|err| client_to_query_for(&err, session))?
+                    .map_err(|err| client_to_query_for(&err, session))
             }
-        };
-        reply.json().ok_or_else(|| QueryError::Unavailable {
-            detail: "后台返回的响应体不是 JSON".to_owned(),
-        })
+        }
     }
 }
 
@@ -150,15 +158,33 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
         })
     }
 
-    fn rename_session(&mut self, key: &str, name: &str) -> Result<SessionItem, QueryError> {
-        let _ = self.patch(key, &serde_json::json!({ "name": name }))?;
+    fn rename_session(
+        &mut self,
+        key: &str,
+        name: &str,
+        owner: Option<&str>,
+    ) -> Result<SessionItem, QueryError> {
+        let mut body = serde_json::json!({ "name": name });
+        if let Some(owner) = owner {
+            body["owner"] = Value::String(owner.to_owned());
+        }
+        let _ = self.patch(key, &body)?;
         // PATCH answers `{ "id" }` only. Re-read so the printed row is the
         // daemon's row, not a name this process guessed onto a missing session.
         Ok(self.show_session(key)?.item)
     }
 
-    fn set_pinned(&mut self, key: &str, pinned: bool) -> Result<SessionItem, QueryError> {
-        let _ = self.patch(key, &serde_json::json!({ "pinned": pinned }))?;
+    fn set_pinned(
+        &mut self,
+        key: &str,
+        pinned: bool,
+        owner: Option<&str>,
+    ) -> Result<SessionItem, QueryError> {
+        let mut body = serde_json::json!({ "pinned": pinned });
+        if let Some(owner) = owner {
+            body["owner"] = Value::String(owner.to_owned());
+        }
+        let _ = self.patch(key, &body)?;
         // The summary route predates the `pinned` field. The successful PATCH
         // is authoritative for this mutation, so do not turn it into "没采".
         let mut item = self.show_session(key)?.item;
@@ -166,14 +192,16 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
         Ok(item)
     }
 
-    fn delete_sessions(&mut self, keys: &[String]) -> Result<u64, QueryError> {
+    fn delete_sessions(&mut self, keys: &[String], owner: Option<&str>) -> Result<u64, QueryError> {
         let mut removed = 0u64;
         for key in keys {
             let path = format!("/api/v1/sessions/{}", encode_path_segment(key));
             let request = ApiRequest {
                 method: "DELETE".to_owned(),
                 path,
-                query: String::new(),
+                query: owner
+                    .map(|owner| encode_query(&[("owner", owner)]))
+                    .unwrap_or_default(),
                 body: Vec::new(),
             };
             let body = self.call_session(&request, Some(key))?;
@@ -225,13 +253,25 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
         Ok(TimelinePage { rows: items, next })
     }
 
-    fn follow(&self, _key: &str, _after_ns: Option<i64>) -> Result<Vec<TimelineItem>, QueryError> {
-        // `GET /sessions/{sid}/live` is SSE. LoopbackHttp reads one response and
-        // closes. The timeline page's cursor is `ts_ns,id`, not an `after` bound,
-        // so polling it would replay the same page. Do not invent a stream.
-        Err(QueryError::Unavailable {
-            detail: format!("{FOLLOW_NOTE}；没有订阅实时 /sessions/{{sid}}/live（真实订阅未接通）"),
-        })
+    fn follow(
+        &self,
+        key: &str,
+        filter: Option<&str>,
+        cursor: Option<i64>,
+    ) -> Result<Vec<TimelineItem>, QueryError> {
+        let mut pairs = Vec::new();
+        if let Some(filter) = filter.filter(|text| !text.is_empty()) {
+            pairs.push(("filter".to_owned(), filter.to_owned()));
+        }
+        if let Some(cursor) = cursor {
+            pairs.push(("cursor".to_owned(), cursor.to_string()));
+        }
+        let path = format!("/api/v1/sessions/{}/live", encode_path_segment(key));
+        let reply = self.call_reply(&get_pairs(&path, &pairs), Some(key))?;
+        let text = std::str::from_utf8(&reply.body).map_err(|_| QueryError::Unavailable {
+            detail: "后台返回的实时事件不是 UTF-8".to_owned(),
+        })?;
+        parse_sse_timeline(text)
     }
 
     fn procs(
@@ -397,9 +437,6 @@ impl<T: Transport> HttpQuerySource<T> {
     }
 }
 
-const FOLLOW_NOTE: &str =
-    "后台时间线没有可供此客户端轮询的 after 游标，且 GET /sessions/{sid}/live 是此 HTTP 客户端不会保持打开的事件流";
-
 fn get_pairs(path: &str, pairs: &[(String, String)]) -> ApiRequest {
     let borrowed: Vec<(&str, &str)> = pairs
         .iter()
@@ -507,6 +544,7 @@ fn session_from_fields(
     };
     Ok(SessionItem {
         public_id,
+        user_id: opt_string(value, "user_id")?,
         name: opt_string(value, "name")?,
         mode,
         agent: opt_string(value, "agent")?,
@@ -520,6 +558,41 @@ fn session_from_fields(
         // A session the daemon returned was observed by the tool.
         evidence: Evidence::E1,
     })
+}
+
+/// Decode the short-lived `text/event-stream` snapshot returned by `/live`.
+/// This deliberately has the same frame rules as the App: comments and an
+/// incomplete/non-record frame do not become a made-up timeline row.
+fn parse_sse_timeline(text: &str) -> Result<Vec<TimelineItem>, QueryError> {
+    let mut rows = Vec::new();
+    for frame in text.split("\n\n") {
+        let mut event = "message";
+        let mut data = Vec::new();
+        for line in frame.lines() {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+            let Some((field, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match field {
+                "event" => event = value,
+                "data" => data.push(value),
+                _ => {}
+            }
+        }
+        if event != "record" || data.is_empty() {
+            continue;
+        }
+        let data = data.join("\n");
+        let value: Value = serde_json::from_str(&data).map_err(|_| QueryError::Unavailable {
+            detail: "后台返回的实时记录不是 JSON".to_owned(),
+        })?;
+        rows.push(timeline_item(&value)?);
+    }
+    Ok(rows)
 }
 
 fn timeline_item(value: &Value) -> Result<TimelineItem, QueryError> {
@@ -1073,11 +1146,15 @@ fn parse_na_reason(text: &str) -> NaReason {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{gap_item, search_hit, session_item};
-    use crate::cmd::query::SessionShow;
+    use super::{gap_item, search_hit, session_item, HttpQuerySource};
+    use crate::client::{ApiReply, ApiRequest, ClientError, Transport};
+    use crate::cmd::query::{QuerySource, SessionShow};
     use crate::cmd::render;
+    use crate::endpoint::{Endpoint, HttpBase};
     use crate::output::OutputMode;
     use aw_core::Evidence;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     /// `GET /sessions/{id}` as the daemon builds it: the store summary, which
     /// has `mode` and `stats` and no `pinned`.
@@ -1212,5 +1289,40 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("后台返回的数据缺少字段 `id`"), "{text}");
         assert!(!text.contains("response is missing"), "{text}");
+    }
+
+    #[test]
+    fn follow_uses_the_apps_live_sse_snapshot_route_and_cursor() {
+        struct LiveTransport(Rc<RefCell<Vec<ApiRequest>>>);
+
+        impl Transport for LiveTransport {
+            fn exchange(&mut self, request: &ApiRequest) -> Result<ApiReply, ClientError> {
+                self.0.borrow_mut().push(request.clone());
+                Ok(ApiReply {
+                    status: 200,
+                    body: b"retry: 1000\n\nid: 22\nevent: record\ndata: {\"ts_ns\":9,\"cat\":\"gap\",\"id\":22,\"proc_uid\":null,\"evidence\":\"S\"}\n\n"
+                        .to_vec(),
+                })
+            }
+        }
+
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let endpoint = Endpoint::Http {
+            base: HttpBase {
+                host: "127.0.0.1".to_owned(),
+                port: 7456,
+            },
+            token: "test".to_owned(),
+        };
+        let source = HttpQuerySource::with_transport(endpoint, LiveTransport(Rc::clone(&seen)));
+        let rows = source
+            .follow("s-live", Some("kind:gap"), Some(7))
+            .expect("live snapshot");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 22);
+        assert!(rows[0].is_gap);
+        let request = seen.borrow().first().cloned().expect("request");
+        assert_eq!(request.path, "/api/v1/sessions/s-live/live");
+        assert_eq!(request.query, "filter=kind%3Agap&cursor=7");
     }
 }

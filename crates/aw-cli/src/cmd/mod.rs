@@ -445,7 +445,12 @@ fn session_command(
             let args = attach_parts(&cli.command, json)?;
             Some(attach::run(&args, &mut *control.open(endpoint)))
         }
-        Command::Stop { session } => Some(stop::run(session, json, &mut *control.open(endpoint))),
+        Command::Stop { session, owner } => Some(stop::run(
+            session,
+            owner.as_deref(),
+            json,
+            &mut *control.open(endpoint),
+        )),
         _ => None,
     }
 }
@@ -457,7 +462,7 @@ fn injected_session_command(
     json: bool,
     control: &mut dyn ControlFactory,
 ) -> Option<Outcome> {
-    let Command::Stop { session } = &cli.command else {
+    let Command::Stop { session, owner } = &cli.command else {
         return None;
     };
     use crate::endpoint::HttpBase;
@@ -468,7 +473,12 @@ fn injected_session_command(
         },
         token: cli.token.clone().unwrap_or_default(),
     };
-    Some(stop::run(session, json, &mut *control.open(&endpoint)))
+    Some(stop::run(
+        session,
+        owner.as_deref(),
+        json,
+        &mut *control.open(&endpoint),
+    ))
 }
 
 /// Same as [`execute_args`], with the token, HTTP factory, and query source injected.
@@ -785,7 +795,12 @@ fn launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
             };
             Some(attach::run(&args, &mut attach::UnwiredControl))
         }
-        Command::Stop { session } => Some(stop::run(session, json, &mut attach::UnwiredControl)),
+        Command::Stop { session, owner } => Some(stop::run(
+            session,
+            owner.as_deref(),
+            json,
+            &mut attach::UnwiredControl,
+        )),
         _ => None,
     }
 }
@@ -1001,9 +1016,14 @@ fn ops_command(
                 | tree::DaemonCmd::Restart
                 | tree::DaemonCmd::Logs { .. } => return None,
                 tree::DaemonCmd::Install { yes } => daemon::DaemonOp::Install { confirm: *yes },
-                tree::DaemonCmd::Uninstall { purge, check } => daemon::DaemonOp::Uninstall {
+                tree::DaemonCmd::Uninstall {
+                    purge,
+                    check,
+                    data_dir,
+                } => daemon::DaemonOp::Uninstall {
                     purge: *purge,
                     check: *check,
+                    data_dir: data_dir.clone(),
                 },
             };
             Some(daemon::run(
@@ -1160,6 +1180,26 @@ fn client_outcome(err: ClientError, endpoint: &Endpoint, json: bool) -> Outcome 
     // `from_http_status` is what `ClientError::exit_code` uses. Keep the call so
     // a status this match does not name still maps.
     let _ = from_http_status;
+    // The channel keeps its stable English diagnostic for logs and structured
+    // troubleshooting, but no human-facing stderr should expose it.
+    if json {
+        if let ClientError::Unreachable { detail } = &err {
+            if let Some(human) = aw_channel::human_socket_path_error(detail) {
+                let body = serde_json::json!({
+                    "error": {
+                        "code": machine,
+                        "message": human,
+                        "detail": detail,
+                    }
+                });
+                return Outcome {
+                    code,
+                    stdout: Vec::new(),
+                    stderr: format!("{body}\n").into_bytes(),
+                };
+            }
+        }
+    }
     error_outcome(code, machine, &message, json)
 }
 
@@ -1206,7 +1246,7 @@ pub(crate) fn output_mode(json: bool) -> OutputMode {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{execute_args_with, output_mode, HttpFactory, Outcome};
+    use super::{client_outcome, execute_args_with, output_mode, HttpFactory, Outcome};
     use crate::client::{ApiReply, ClientError, MemoryTransport, Transport};
     use crate::endpoint::Endpoint;
     use crate::exit;
@@ -1491,6 +1531,34 @@ mod tests {
         let placeholder = run(&["agents"], None, &mut http);
         assert_eq!(placeholder.code, exit::NOT_IN_BUILD);
         assert_eq!(text(&placeholder.stderr), "aw: `agents` 本版本未接入\n");
+    }
+
+    #[test]
+    fn json_socket_path_error_keeps_internal_detail_out_of_the_human_message() {
+        let endpoint = Endpoint::Unix {
+            path: "/tmp/aw.sock".into(),
+        };
+        let outcome = client_outcome(
+            ClientError::Unreachable {
+                detail: "unusable socket path（套接字路径太长：120 字节，这个系统的上限是 108 字节（不含结尾的空字节））"
+                    .to_owned(),
+            },
+            &endpoint,
+            true,
+        );
+        let body: serde_json::Value = serde_json::from_slice(&outcome.stderr).expect("json");
+        assert_eq!(
+            body["error"]["message"],
+            "通信口路径太长（120 字节），这个系统最多支持 108 字节。请把 `AW_SOCKET` 换到短一点的目录。"
+        );
+        assert!(!body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unusable socket path"));
+        assert!(body["error"]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unusable socket path"));
     }
 
     #[test]

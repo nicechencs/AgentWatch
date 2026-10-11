@@ -102,19 +102,21 @@ impl Confirm for StdinConfirm {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct UnwiredProxy;
 
-const UNWIRED: &str = "后台代理 API 未接通；aw proxy 不会读取 ca.key。请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）";
+const CA_INFO_UNWIRED: &str = "`aw proxy ca-info` 本版本未接入";
+const ROTATE_CA_UNWIRED: &str = "`aw proxy rotate-ca` 本版本未接入";
+const TRUST_UNWIRED: &str = "后台代理 API 未接通；aw proxy 不会读取 ca.key。请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）";
 
 impl ProxyApi for UnwiredProxy {
     fn ca_info(&mut self) -> Result<CaInfoView, String> {
-        Err(UNWIRED.to_owned())
+        Err(CA_INFO_UNWIRED.to_owned())
     }
 
     fn rotate(&mut self, _revoke_now: bool) -> Result<CaInfoView, String> {
-        Err(UNWIRED.to_owned())
+        Err(ROTATE_CA_UNWIRED.to_owned())
     }
 
     fn note_trust(&mut self, _plan: &TrustPlan) -> Result<(), String> {
-        Err(UNWIRED.to_owned())
+        Err(TRUST_UNWIRED.to_owned())
     }
 }
 

@@ -154,21 +154,29 @@ pub(crate) fn evidence_or_na(evidence: Option<&Evidence>) -> Evidence {
 }
 
 pub(crate) fn session_table(items: &[SessionItem]) -> Table {
+    // The daemon sends `user_id` only to an OS-identified administrator.  Do
+    // not add an empty column for normal users (or for an old daemon which
+    // does not expose an owner field).
+    let show_user = items.iter().any(|item| item.user_id.is_some());
+    let mut headers = vec![
+        "id".to_owned(),
+        "name".to_owned(),
+        "mode".to_owned(),
+        "agent".to_owned(),
+        "started_ns".to_owned(),
+        "ended_ns".to_owned(),
+        "end_reason".to_owned(),
+        "pinned".to_owned(),
+    ];
+    if show_user {
+        headers.push("User".to_owned());
+    }
     Table {
-        headers: vec![
-            "id".to_owned(),
-            "name".to_owned(),
-            "mode".to_owned(),
-            "agent".to_owned(),
-            "started_ns".to_owned(),
-            "ended_ns".to_owned(),
-            "end_reason".to_owned(),
-            "pinned".to_owned(),
-        ],
+        headers,
         rows: items
             .iter()
-            .map(|item| Row {
-                cells: vec![
+            .map(|item| {
+                let mut cells = vec![
                     item.public_id.clone(),
                     opt_text(item.name.as_deref()),
                     item.mode.clone(),
@@ -177,8 +185,14 @@ pub(crate) fn session_table(items: &[SessionItem]) -> Table {
                     opt_i64(item.ended_ns),
                     end_reason_label(item.end_reason.as_deref()).to_owned(),
                     pinned_text(item.pinned),
-                ],
-                evidence: item.evidence.clone(),
+                ];
+                if show_user {
+                    cells.push(opt_text(item.user_id.as_deref()));
+                }
+                Row {
+                    cells,
+                    evidence: item.evidence.clone(),
+                }
             })
             .collect(),
     }
@@ -191,7 +205,7 @@ pub(crate) fn session_json(items: &[SessionItem]) -> Value {
 }
 
 fn session_item_json(item: &SessionItem) -> Value {
-    json!({
+    let mut value = json!({
         "id": item.public_id,
         "name": item.name,
         "mode": item.mode,
@@ -202,7 +216,11 @@ fn session_item_json(item: &SessionItem) -> Value {
         "end_reason_label": end_reason_label(item.end_reason.as_deref()),
         "pinned": item.pinned,
         "evidence": evidence_json(&item.evidence),
-    })
+    });
+    if let Some(owner) = &item.user_id {
+        value["user_id"] = Value::String(owner.clone());
+    }
+    value
 }
 
 pub(crate) fn show_table(show: &SessionShow) -> Table {

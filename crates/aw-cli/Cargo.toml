@@ -50,6 +50,9 @@ serde_json = { version = "1.0.151", default-features = false, features = ["std"]
 # binary's `#![forbid(unsafe_code)]` policy.
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", default-features = false, features = ["fs", "process", "signal"] }
+# MIT. Installs safe process-local signal flags; `aw run --no-daemon` relays
+# SIGINT/SIGTERM to the target's process group without local unsafe handlers.
+signal-hook = { version = "=0.3.18", default-features = false }
 
 [dev-dependencies]
 # insta is MIT OR Apache-2.0. Same pin as aw-core. Snapshots record `aw --help`.

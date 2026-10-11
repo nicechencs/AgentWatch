@@ -76,7 +76,10 @@ pub(crate) enum Command {
         group: Option<String>,
         #[arg(long, help = "MCP 调用记录（本版本未接入）")]
         mcp_tap: bool,
-        #[arg(long, help = "不使用后台，在当前进程记录")]
+        #[arg(
+            long,
+            help = "不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序都会跟着结束。"
+        )]
         no_daemon: bool,
         #[arg(long, help = "原始事件文件（本版本未接入）")]
         raw: Option<String>,
@@ -114,6 +117,9 @@ pub(crate) enum Command {
     Stop {
         /// 会话号或 @last
         session: String,
+        /// 管理员操作其他用户会话时，明确指定会话主人
+        #[arg(long)]
+        owner: Option<String>,
     },
     /// 列出可附着的进程
     Ps {
@@ -340,17 +346,36 @@ pub(crate) enum SessionsCmd {
     /// 会话概览
     Show { session: String },
     /// 重命名会话
-    Rename { session: String, name: String },
+    Rename {
+        session: String,
+        name: String,
+        /// 管理员操作其他用户会话时，明确指定会话主人
+        #[arg(long)]
+        owner: Option<String>,
+    },
     /// 固定会话，不参与自动清理
-    Pin { session: String },
+    Pin {
+        session: String,
+        /// 管理员操作其他用户会话时，明确指定会话主人
+        #[arg(long)]
+        owner: Option<String>,
+    },
     /// 取消固定
-    Unpin { session: String },
+    Unpin {
+        session: String,
+        /// 管理员操作其他用户会话时，明确指定会话主人
+        #[arg(long)]
+        owner: Option<String>,
+    },
     /// 删除会话
     Delete {
         #[arg(required = true)]
         sessions: Vec<String>,
         #[arg(long, help = "不再确认，直接删除（无法恢复）")]
         yes: bool,
+        /// 管理员操作其他用户会话时，明确指定会话主人
+        #[arg(long)]
+        owner: Option<String>,
     },
 }
 
@@ -376,6 +401,9 @@ pub(crate) enum DaemonCmd {
         purge: bool,
         #[arg(long)]
         check: bool,
+        /// 仅用于测试：`--purge` 时删除这个指定的数据目录，不触碰系统后台的数据
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<std::path::PathBuf>,
     },
     /// 日志：daemon 日志文件的最后若干行；`-f` 持续输出新增内容
     Logs {

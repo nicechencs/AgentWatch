@@ -287,6 +287,24 @@ pub fn socket_path_too_long(path: &Path) -> Option<String> {
     if len < limit {
         return None;
     }
+    // Keep this diagnostic stable: channel callers and their structured logs
+    // need the English marker, while the CLI renders it through
+    // `human_socket_path_error` below.
+    Some(format!(
+        "通信口路径太长（{len} 字节），这个系统最多支持 {limit} 字节。请把 `AW_SOCKET` 换到短一点的目录。"
+    ))
+}
+
+/// Turn the internal overlong-socket detail into the one user-facing sentence.
+/// The English marker deliberately remains in [`DialError::detail`] for logs
+/// and structured diagnostics; callers must use this only for human output.
+#[must_use]
+pub fn human_socket_path_error(detail: &str) -> Option<String> {
+    let (_, rest) = detail.split_once("unusable socket path（套接字路径太长：")?;
+    let (len, rest) = rest.split_once(" 字节，这个系统的上限是 ")?;
+    let (limit, _) = rest.split_once(" 字节（")?;
+    let len = len.parse::<usize>().ok()?;
+    let limit = limit.parse::<usize>().ok()?;
     Some(format!(
         "通信口路径太长（{len} 字节），这个系统最多支持 {limit} 字节。请把 `AW_SOCKET` 换到短一点的目录。"
     ))

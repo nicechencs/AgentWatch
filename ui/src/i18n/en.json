@@ -131,6 +131,8 @@
   "sessions.col.findings": "Findings",
   "sessions.col.gaps": "Gaps",
   "sessions.col.size": "Size",
+  "sessions.col.user": "User",
+  "sessions.ownerOnly": "Only the session owner can operate it",
   "sessions.mode.launch": "launch",
   "sessions.mode.attach": "attach",
   "sessions.purged": "purged",

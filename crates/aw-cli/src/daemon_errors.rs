@@ -55,6 +55,11 @@ const ROWS: &[Row] = &[
         en: None,
     },
     Row {
+        code: "owner_action_forbidden",
+        zh: "只有会话主人能操作",
+        en: Some("only the session owner may operate it"),
+    },
+    Row {
         code: "not_your_process",
         zh: "不能接管其他用户的进程，需要管理员权限",
         // The daemon sends one of two messages with this code (attach names the

@@ -131,6 +131,8 @@
   "sessions.col.findings": "发现",
   "sessions.col.gaps": "缺口",
   "sessions.col.size": "体积",
+  "sessions.col.user": "用户",
+  "sessions.ownerOnly": "只有会话主人能操作",
   "sessions.mode.launch": "启动",
   "sessions.mode.attach": "附着",
   "sessions.purged": "已清理",

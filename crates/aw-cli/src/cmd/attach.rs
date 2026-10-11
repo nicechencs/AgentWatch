@@ -15,7 +15,7 @@ use crate::client::{ApiRequest, Client, ClientError, LoopbackHttp, Transport};
 use crate::endpoint::Endpoint;
 use crate::exit;
 
-use super::query::encode_path_segment;
+use super::query::{encode_path_segment, encode_query};
 use super::Outcome;
 
 /// Parsed `aw attach` flags.
@@ -239,7 +239,11 @@ pub(crate) trait DaemonSessions {
     /// Stop observation for a session. This never ends the target process.
     /// Returns the public id that was stopped. `@last` is resolved by the
     /// daemon; a name is resolved among the caller's own sessions.
-    fn stop_monitoring(&mut self, session: &str) -> Result<String, ControlError>;
+    fn stop_monitoring(
+        &mut self,
+        session: &str,
+        owner: Option<&str>,
+    ) -> Result<String, ControlError>;
 
     /// Set the session's pinned flag.
     fn pin(&mut self, session: &str) -> Result<(), ControlError>;
@@ -405,10 +409,22 @@ impl<T: Transport> DaemonSessions for HttpDaemonSessions<T> {
         })
     }
 
-    fn stop_monitoring(&mut self, session: &str) -> Result<String, ControlError> {
+    fn stop_monitoring(
+        &mut self,
+        session: &str,
+        owner: Option<&str>,
+    ) -> Result<String, ControlError> {
         let public_id = self.resolve_session(session)?;
         let path = format!("/api/v1/sessions/{}/stop", encode_path_segment(&public_id));
-        let reply = self.call(&ApiRequest::post_json(&path, &json!({})))?;
+        let request = ApiRequest {
+            method: "POST".to_owned(),
+            path,
+            query: owner
+                .map(|value| encode_query(&[("owner", value)]))
+                .unwrap_or_default(),
+            body: b"{}".to_vec(),
+        };
+        let reply = self.call(&request)?;
         // `@last` is resolved by the daemon. The id it stopped is the one it
         // names back; a reply that names nothing keeps what was sent.
         Ok(reply
@@ -453,7 +469,7 @@ impl DaemonSessions for UnwiredControl {
         Err(unwired())
     }
 
-    fn stop_monitoring(&mut self, _: &str) -> Result<String, ControlError> {
+    fn stop_monitoring(&mut self, _: &str, _: Option<&str>) -> Result<String, ControlError> {
         Err(unwired())
     }
 
@@ -530,7 +546,7 @@ pub(crate) fn run_with_sleeper(
     };
     if let Some(duration) = duration {
         sleeper.sleep(duration);
-        if let Err(error) = control.stop_monitoring(&handle.public_id) {
+        if let Err(error) = control.stop_monitoring(&handle.public_id, None) {
             return control_outcome(error, args.json);
         }
         return attached_outcome(&handle, true, false, args.json, pin_warning.as_deref());
@@ -743,7 +759,11 @@ mod tests {
             }
         }
 
-        fn stop_monitoring(&mut self, session: &str) -> Result<String, ControlError> {
+        fn stop_monitoring(
+            &mut self,
+            session: &str,
+            _: Option<&str>,
+        ) -> Result<String, ControlError> {
             self.stopped.push(session.to_owned());
             match self.stop_error.take() {
                 Some(error) => Err(error),
@@ -934,10 +954,16 @@ mod tests {
             ],
         );
         let mut control = HttpDaemonSessions::new(endpoint);
-        assert_eq!(control.stop_monitoring("@last").expect("@last"), "s-new");
-        assert_eq!(control.stop_monitoring("x").expect("by name"), "s-old");
         assert_eq!(
-            control.stop_monitoring("s-direct").expect("by id"),
+            control.stop_monitoring("@last", None).expect("@last"),
+            "s-new"
+        );
+        assert_eq!(
+            control.stop_monitoring("x", None).expect("by name"),
+            "s-old"
+        );
+        assert_eq!(
+            control.stop_monitoring("s-direct", None).expect("by id"),
             "s-direct"
         );
         let seen = server.join().expect("join");
@@ -997,7 +1023,9 @@ mod tests {
                 agent: Some("agent-b".to_owned()),
             })
             .expect("attach");
-        control.stop_monitoring(&attached.public_id).expect("stop");
+        control
+            .stop_monitoring(&attached.public_id, None)
+            .expect("stop");
         control.pin(&attached.public_id).expect("pin");
         let seen = server.join().expect("join");
         assert!(seen[0].starts_with("POST /api/v1/sessions/run HTTP/1.1"));

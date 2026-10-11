@@ -6,6 +6,7 @@
 //! and exit 4 when it says the caller is not an administrator.
 
 use serde_json::json;
+use std::path::{Path, PathBuf};
 
 use crate::exit;
 
@@ -82,6 +83,9 @@ pub(crate) enum DaemonOp {
         purge: bool,
         /// `--check`: report leftovers, do not remove anything.
         check: bool,
+        /// Explicit test-data target. It is never inferred from the system
+        /// service configuration.
+        data_dir: Option<PathBuf>,
     },
 }
 
@@ -122,11 +126,20 @@ impl DaemonControl for PlannedControl {
                     ("planned", "已生成 install 计划；尚未注册任何内容")
                 }
             }
-            DaemonOp::Uninstall { purge, check } => {
+            DaemonOp::Uninstall {
+                purge,
+                check,
+                data_dir,
+            } => {
                 if *check {
                     ("checked", "此构建的 uninstall --check 没有发现可移除内容")
                 } else if *purge {
-                    ("planned", "已记录 uninstall --purge；没有删除数据库")
+                    if let Some(path) = data_dir.as_deref() {
+                        remove_test_data_dir(path)?;
+                        ("removed", "已删除指定的测试数据目录；没有移除系统服务")
+                    } else {
+                        ("planned", "已记录 uninstall --purge；没有删除数据库")
+                    }
                 } else {
                     ("planned", "已记录 uninstall；没有移除服务")
                 }
@@ -137,6 +150,20 @@ impl DaemonControl for PlannedControl {
             detail: detail.to_owned(),
         })
     }
+}
+
+/// Remove only an explicit test target.  The normal daemon data directory is
+/// deliberately not inferred here, so this command cannot accidentally affect
+/// an installed service.  A filesystem root and a path without a final name
+/// are never valid removal targets.
+fn remove_test_data_dir(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() || path.file_name().is_none() {
+        return Err("测试数据目录无效，拒绝删除".to_owned());
+    }
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(path).map_err(|_| "无法删除指定的测试数据目录".to_owned())
 }
 
 /// Run one daemon subcommand.
@@ -407,7 +434,14 @@ sc.exe description AgentWatch \"AgentWatch process-behavior audit daemon\"
 }
 
 fn needs_admin(op: &DaemonOp) -> bool {
-    matches!(op, DaemonOp::Uninstall { .. })
+    matches!(
+        op,
+        DaemonOp::Uninstall {
+            check: false,
+            data_dir: None,
+            ..
+        }
+    )
 }
 
 fn ok_outcome(effect: &DaemonEffect, json: bool) -> Outcome {
@@ -531,6 +565,7 @@ mod tests {
             DaemonOp::Uninstall {
                 purge: true,
                 check: false,
+                data_dir: None,
             },
             true,
             &Admin(true),
@@ -544,8 +579,45 @@ mod tests {
             control.seen,
             vec![DaemonOp::Uninstall {
                 purge: true,
-                check: false
+                check: false,
+                data_dir: None,
             }]
         );
+    }
+
+    #[test]
+    fn uninstall_can_remove_only_an_explicit_test_data_directory() {
+        let path =
+            std::env::temp_dir().join(format!("aw-cli-uninstall-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(path.join("nested")).expect("temp test data");
+        std::fs::write(path.join("nested/state"), b"test").expect("temp state");
+        let outcome = run(
+            DaemonOp::Uninstall {
+                purge: true,
+                check: false,
+                data_dir: Some(path.clone()),
+            },
+            false,
+            &Admin(false),
+            &mut PlannedControl,
+        );
+        assert_eq!(outcome.code, exit::OK);
+        assert!(!path.exists(), "only the supplied test target is removed");
+    }
+
+    #[test]
+    fn uninstall_check_is_not_a_privileged_operation() {
+        let outcome = run(
+            DaemonOp::Uninstall {
+                purge: false,
+                check: true,
+                data_dir: None,
+            },
+            false,
+            &Admin(false),
+            &mut PlannedControl,
+        );
+        assert_eq!(outcome.code, exit::OK);
     }
 }

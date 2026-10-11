@@ -95,6 +95,8 @@ pub struct SessionFilter {
 pub struct SessionListItem {
     /// `sessions.id`.
     pub id: i64,
+    /// Owning user. Returned only to administrator viewers by the daemon.
+    pub user_id: String,
     /// Public id. Not a hostname.
     pub public_id: String,
     /// User label, or unknown.
@@ -385,12 +387,32 @@ pub fn list_sessions(
     user_id: &str,
     filter: &SessionFilter,
 ) -> Result<Vec<SessionListItem>, QueryError> {
+    list_sessions_visible(conn, Some(user_id), filter)
+}
+
+/// Sessions visible to an administrator, newest first.
+pub fn list_all_sessions(
+    conn: &Connection,
+    filter: &SessionFilter,
+) -> Result<Vec<SessionListItem>, QueryError> {
+    list_sessions_visible(conn, None, filter)
+}
+
+fn list_sessions_visible(
+    conn: &Connection,
+    user_id: Option<&str>,
+    filter: &SessionFilter,
+) -> Result<Vec<SessionListItem>, QueryError> {
     let pred = compile_optional(filter.expr.as_deref(), Target::Sessions, None, None)?;
     let mut sql = String::from(
-        "SELECT id, public_id, name, mode, platform, os_version, agent, started_ns, ended_ns, end_reason, pinned, collectors, argv \
-         FROM sessions WHERE user_id = ?",
+        "SELECT id, public_id, user_id, name, mode, platform, os_version, agent, started_ns, ended_ns, end_reason, pinned, collectors, argv \
+         FROM sessions WHERE 1 = 1",
     );
-    let mut bind: Vec<Param> = vec![Param::Text(user_id.to_string())];
+    let mut bind: Vec<Param> = Vec::new();
+    if let Some(user_id) = user_id {
+        sql.push_str(" AND user_id = ?");
+        bind.push(Param::Text(user_id.to_string()));
+    }
     if let Some(q) = filter.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         // `instr` treats every byte in user text literally, unlike `LIKE`.
         // `argv` is a redacted JSON array when present. Check validity before
@@ -445,17 +467,18 @@ pub fn list_sessions(
             Ok(SessionListItem {
                 id: row.get(0)?,
                 public_id: row.get(1)?,
-                name: row.get(2)?,
-                mode: row.get(3)?,
-                platform: row.get(4)?,
-                os_version: row.get(5)?,
-                agent: row.get(6)?,
-                started_ns: row.get(7)?,
-                ended_ns: row.get(8)?,
-                end_reason: row.get(9)?,
-                pinned: row.get(10)?,
-                collectors: row.get(11)?,
-                argv: row.get(12)?,
+                user_id: row.get(2)?,
+                name: row.get(3)?,
+                mode: row.get(4)?,
+                platform: row.get(5)?,
+                os_version: row.get(6)?,
+                agent: row.get(7)?,
+                started_ns: row.get(8)?,
+                ended_ns: row.get(9)?,
+                end_reason: row.get(10)?,
+                pinned: row.get(11)?,
+                collectors: row.get(12)?,
+                argv: row.get(13)?,
                 counts: SessionCounts::default(),
             })
         })

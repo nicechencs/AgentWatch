@@ -24,12 +24,13 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use aw_store::{
-    around, delete_session, dns_events, files, flow_buckets, flows, gaps, list_sessions,
-    newest_session_for_user, patch_session, process_detail, process_tree, process_tree_filtered,
-    public_id_by_session_id, search, session_by_public_id, session_summary, stop_session, timeline,
-    timeline_histogram, traffic, CompileCtx, Cursor, FileGroupBy, FileQuery, FlowQuery, FtsMode,
-    ProcessNode, PurgeScope, QueryError, Retention, RetentionConfig, SessionFilter,
-    SessionListItem, SessionSummary, Store, StoreError, StoreExpr, TimelinePage, TimelineQuery,
+    around, delete_session, dns_events, files, flow_buckets, flows, gaps, list_all_sessions,
+    list_sessions, newest_session_for_user, patch_session, process_detail, process_tree,
+    process_tree_filtered, public_id_by_session_id, search, session_by_public_id, session_summary,
+    stop_session, timeline, timeline_histogram, traffic, CompileCtx, Cursor, FileGroupBy,
+    FileQuery, FlowQuery, FtsMode, ProcessNode, PurgeScope, QueryError, Retention, RetentionConfig,
+    SessionFilter, SessionListItem, SessionSummary, Store, StoreError, StoreExpr, TimelinePage,
+    TimelineQuery,
 };
 
 // Every method calls a function `aw-store` exports. A filter string is parsed
@@ -488,6 +489,86 @@ impl StoreQuery {
             self.remember(sid, id);
         }
         Ok(found)
+    }
+
+    /// Owner of a session visible to this OS-identified caller.  `@last`
+    /// deliberately resolves through the caller's own user id even for root.
+    pub(crate) fn owner_for_viewer(
+        &self,
+        caller: &crate::api::auth::Caller,
+        sid: &str,
+    ) -> Result<Option<String>, QueryBackendError> {
+        let Some(store) = self.open()? else {
+            return Ok(None);
+        };
+        if !caller.admin || sid == "@last" {
+            let Some(id) = self.resolve_id(&store, &caller.user_id, sid)? else {
+                return Ok(None);
+            };
+            return store
+                .connection()
+                .query_row("SELECT user_id FROM sessions WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .map_err(|err| QueryBackendError::Store(format!("session owner: {err}")));
+        }
+        let sql = if sid.parse::<i64>().is_ok() {
+            "SELECT user_id FROM sessions WHERE id = ?1"
+        } else {
+            "SELECT user_id FROM sessions WHERE public_id = ?1"
+        };
+        store
+            .connection()
+            .query_row(sql, [sid], |row| row.get(0))
+            .optional()
+            .map_err(|err| QueryBackendError::Store(format!("session owner: {err}")))
+    }
+
+    /// List sessions using only the transport-established administrator bit.
+    pub(crate) fn list_sessions_for_viewer(
+        &self,
+        caller: &crate::api::auth::Caller,
+        query: &ListQuery,
+    ) -> Result<Page<SessionListItem>, QueryBackendError> {
+        let Some(store) = self.open()? else {
+            return Ok(Page {
+                rows: Vec::new(),
+                next_cursor: None,
+            });
+        };
+        let cursor = parse_cursor(query.cursor.as_deref())?;
+        let filter = SessionFilter {
+            q: query.q.clone(),
+            agent: query.agent.clone(),
+            active_only: query.active_only,
+            since_ns: query.since_ns,
+            until_ns: query.until_ns,
+            expr: query.filter.clone(),
+            limit: Some(query.limit.saturating_add(1)),
+            cursor,
+        };
+        let mut rows = if caller.admin {
+            list_all_sessions(store.connection(), &filter)
+        } else {
+            list_sessions(store.connection(), &caller.user_id, &filter)
+        }
+        .map_err(map_query)?;
+        let next_cursor = if rows.len() as i64 > query.limit {
+            rows.truncate(query.limit as usize);
+            rows.last()
+                .map(|row| format!("{},{}", row.started_ns, row.id))
+        } else {
+            None
+        };
+        let mut guard = self
+            .ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for row in &rows {
+            guard.insert(&row.public_id, row.id);
+        }
+        Ok(Page { rows, next_cursor })
     }
 }
 

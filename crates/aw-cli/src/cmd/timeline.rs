@@ -1,11 +1,16 @@
 //! `aw timeline <S> [--filter --from --to --follow --limit]` (P1-CLI-03).
 //!
-//! `--follow` renders a [`QuerySource`] subscription. The daemon provides an
-//! SSE endpoint at `/sessions/{sid}/live`, but the current HTTP client does not
-//! consume streams, so its source returns `Unavailable`. Tests inject a source
-//! and check the rendered gap marker and evidence column.
+//! `--follow` polls the daemon's bounded SSE snapshot endpoint.  That is the
+//! same cursor protocol used by the App: every response contains records after
+//! the last SSE `id`, then closes.  On Unix SIGINT/SIGTERM stop the poll loop
+//! cleanly rather than leaving a terminal in a half-written state.
 
 use std::io;
+#[cfg(not(test))]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use crate::exit;
 use crate::output::OutputMode;
@@ -65,7 +70,7 @@ pub(crate) fn run(args: TimelineArgs<'_>, source: &dyn QuerySource) -> io::Resul
     };
 
     if args.follow {
-        return follow(key, mode, args.color, source);
+        return follow(key, args.filter, mode, args.color, source);
     }
 
     let started = source
@@ -98,22 +103,89 @@ pub(crate) fn run(args: TimelineArgs<'_>, source: &dyn QuerySource) -> io::Resul
 
 fn follow(
     key: &str,
+    filter: Option<&str>,
     mode: OutputMode,
     color: bool,
     source: &dyn QuerySource,
 ) -> io::Result<Outcome> {
-    // One poll of the injected source. The HTTP source cannot consume the SSE
-    // stream, so it returns `Unavailable`; the interval is retained for a
-    // stream-capable client.
-    let _interval = super::query::follow_poll_interval();
-    match source.follow(key, None) {
+    #[cfg(test)]
+    {
+        // Unit tests provide an in-memory source, not a daemon that can be
+        // interrupted. The transport parser has its own multi-poll tests.
+        follow_once(key, filter, mode, color, source)
+    }
+    #[cfg(not(test))]
+    {
+        let cancelled = interrupt_flag();
+        let mut cursor = None;
+        let mut collected = Vec::new();
+        while !cancelled.load(Ordering::Relaxed) {
+            match source.follow(key, filter, cursor) {
+                Ok(rows) => {
+                    if let Some(last) = rows.last() {
+                        cursor = Some(last.id);
+                    }
+                    collected.extend(rows);
+                }
+                Err(err) => return Ok(query_outcome(err, mode == OutputMode::Json)),
+            }
+            // `/live` deliberately closes its snapshot promptly. Avoid a busy
+            // reconnect loop while preserving the App's one-second cadence.
+            std::thread::sleep(super::query::follow_poll_interval());
+        }
+        let table = render::timeline_table(&collected, color);
+        let doc = render::timeline_json(&collected, true);
+        write_ok(mode, &table, &doc)
+    }
+}
+
+#[cfg(test)]
+fn follow_once(
+    key: &str,
+    filter: Option<&str>,
+    mode: OutputMode,
+    color: bool,
+    source: &dyn QuerySource,
+) -> io::Result<Outcome> {
+    match source.follow(key, filter, None) {
         Ok(rows) => {
             let table = render::timeline_table(&rows, color);
-            let doc = render::timeline_json(&rows, false);
+            let doc = render::timeline_json(&rows, true);
             write_ok(mode, &table, &doc)
         }
         Err(err) => Ok(query_outcome(err, mode == OutputMode::Json)),
     }
+}
+
+/// Receive terminal stop signals with `sigwait`, which needs no unsafe signal
+/// handler. The calling thread blocks the two signals before the worker is
+/// made; the worker turns either into a cooperative cancellation flag.
+#[cfg(all(not(test), any(target_os = "linux", target_os = "macos")))]
+fn interrupt_flag() -> Arc<AtomicBool> {
+    use nix::sys::signal::{SigSet, Signal};
+
+    let mut signals = SigSet::empty();
+    signals.add(Signal::SIGINT);
+    signals.add(Signal::SIGTERM);
+    let stopped = Arc::new(AtomicBool::new(false));
+    if signals.thread_block().is_ok() {
+        let stop = Arc::clone(&stopped);
+        let _ = std::thread::Builder::new()
+            .name("aw-timeline-interrupt".to_owned())
+            .spawn(move || {
+                let _ = signals.wait();
+                stop.store(true, Ordering::Relaxed);
+            });
+    }
+    stopped
+}
+
+#[cfg(all(not(test), not(any(target_os = "linux", target_os = "macos"))))]
+fn interrupt_flag() -> Arc<AtomicBool> {
+    // Windows has the console handler owned by the platform launcher. A normal
+    // Ctrl-C still ends this foreground command; this flag is for the Unix
+    // cooperative path above.
+    Arc::new(AtomicBool::new(false))
 }
 
 fn resolve(text: Option<&str>, started: Option<i64>, json: bool) -> Result<Option<i64>, Outcome> {

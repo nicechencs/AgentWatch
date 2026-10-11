@@ -350,12 +350,14 @@ mod tests {
             std::process::id(),
             Instant::now().elapsed().as_nanos()
         ));
+        let signal_log = marker.with_extension("signals");
         let mut command = std::process::Command::new("sh");
         command.args([
             "-c",
-            "sleep 300 & echo $! > \"$1\"; wait",
+            "trap 'printf \"INT target_pid=%s\\n\" \"$$\" >> \"$2\"; trap - INT; kill -INT $$' INT; trap 'printf \"HUP target_pid=%s\\n\" \"$$\" >> \"$2\"; trap - HUP; kill -HUP $$' HUP; sleep 300 & echo $! > \"$1\"; wait",
             "aw-terminal-test",
             &marker.to_string_lossy(),
+            &signal_log.to_string_lossy(),
         ]);
         command.process_group(0);
         let child = command.spawn().expect("spawn target");
@@ -380,7 +382,11 @@ mod tests {
             grandchild
         );
         drop(child);
-        assert_eq!(terminal.wait().expect("wait target"), 130);
+        let exit = terminal.wait().expect("wait target");
+        let target_signals = std::fs::read_to_string(&signal_log)
+            .unwrap_or_else(|_| "no target signal record".to_owned());
+        macred_diag!("target_signal_log={target_signals:?}");
+        assert_eq!(exit, 130, "target signal record: {target_signals:?}");
         let gone_by = Instant::now() + Duration::from_secs(2);
         while kill(nix::unistd::Pid::from_raw(grandchild), None).is_ok() && Instant::now() < gone_by
         {
@@ -391,5 +397,6 @@ mod tests {
             "grandchild {grandchild} survived the forwarded interrupt"
         );
         let _ = std::fs::remove_file(marker);
+        let _ = std::fs::remove_file(signal_log);
     }
 }

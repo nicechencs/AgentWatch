@@ -504,9 +504,10 @@ fn client_to_query_for(err: &ClientError, key: Option<&str>) -> QueryError {
         } => QueryError::Permission {
             detail: clip(&format!("认证失败：{err}")),
         },
-        ClientError::Unreachable { .. }
-        | ClientError::Transport { .. }
-        | ClientError::Status { .. } => QueryError::Unavailable {
+        ClientError::Unreachable { .. } => QueryError::Unreachable {
+            detail: clip(&err.to_string()),
+        },
+        ClientError::Transport { .. } | ClientError::Status { .. } => QueryError::Unavailable {
             detail: clip(&err.to_string()),
         },
     }
@@ -1323,7 +1324,7 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 port: 7456,
             },
-            token: "test".to_owned(),
+            token: crate::secret::Secret::new("test"),
         };
         let source = HttpQuerySource::with_transport(endpoint, LiveTransport(Rc::clone(&seen)));
         let rows = source

@@ -11,6 +11,7 @@ mod endpoint;
 mod exit;
 mod launch;
 mod output;
+mod secret;
 
 use std::io::{self, Write};
 use std::process::ExitCode;

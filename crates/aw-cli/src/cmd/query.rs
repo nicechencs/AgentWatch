@@ -46,6 +46,11 @@ pub(crate) enum QueryError {
     BadArgument { detail: String },
     /// No query source is available. The message says why; it is not a fake empty list.
     Unavailable { detail: String },
+    /// The daemon did not answer (missing socket, refused port, or a connect
+    /// timeout). Same exit as [`crate::client::ClientError::Unreachable`]: 3.
+    /// Kept apart from [`Self::Unavailable`] so a decode or transport failure
+    /// stays a general error.
+    Unreachable { detail: String },
 }
 
 impl std::fmt::Display for QueryError {
@@ -56,7 +61,7 @@ impl std::fmt::Display for QueryError {
             Self::Permission { detail } => write!(f, "{detail}"),
             Self::IdentityFailure { detail, .. } => write!(f, "{detail}"),
             Self::BadArgument { detail } => write!(f, "{detail}"),
-            Self::Unavailable { detail } => write!(f, "{detail}"),
+            Self::Unavailable { detail } | Self::Unreachable { detail } => write!(f, "{detail}"),
         }
     }
 }

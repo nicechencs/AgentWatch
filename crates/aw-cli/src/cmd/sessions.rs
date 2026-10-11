@@ -233,6 +233,7 @@ pub(crate) fn query_outcome(err: QueryError, json: bool) -> Outcome {
         QueryError::IdentityFailure { code, .. } => (exit::PERMISSION, *code),
         QueryError::BadArgument { .. } => (exit::USAGE, "usage"),
         QueryError::Unavailable { .. } => (exit::GENERAL, "not_connected"),
+        QueryError::Unreachable { .. } => (exit::UNREACHABLE, "unreachable"),
     };
     super::error_outcome(code, machine, &err.to_string(), json)
 }
@@ -277,7 +278,7 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 port: 9,
             },
-            token: "test-token".to_owned(),
+            token: crate::secret::Secret::new("test-token"),
         }
     }
 

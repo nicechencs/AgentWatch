@@ -385,36 +385,47 @@ mod unix {
     }
 
     /// The peer as an API caller. uid 0 is an administrator.
-    pub(super) fn peer_caller(stream: &UnixStream) -> Caller {
-        match peer_uid(stream) {
-            Some(uid) => Caller {
-                user_id: uid.to_string(),
-                admin: uid == 0,
-            },
-            None => Caller {
-                user_id: UNVERIFIED_PEER.to_owned(),
-                admin: false,
-            },
+    ///
+    /// Linux keeps the previous behaviour: a credential that cannot be read
+    /// becomes [`UNVERIFIED_PEER`] and is not an administrator. macOS refuses
+    /// that connection before dispatch — an unidentified peer is not turned
+    /// into an ordinary user.
+    pub(super) fn peer_caller(stream: &UnixStream) -> Result<Caller, super::routes::ApiResponse> {
+        match aw_platform::peer_identity(stream) {
+            aw_platform::PeerIdentity::Identified { owner, .. } => {
+                let uid = match owner {
+                    aw_platform::Owner::Unix { euid, .. } => euid,
+                    aw_platform::Owner::Windows { .. } => {
+                        return Err(super::routes::error_response(
+                            403,
+                            "caller_unidentified",
+                            "the caller's account could not be identified",
+                        ));
+                    }
+                };
+                Ok(Caller {
+                    user_id: uid.to_string(),
+                    admin: uid == 0,
+                })
+            }
+            aw_platform::PeerIdentity::NotIdentified { .. } => {
+                #[cfg(target_os = "macos")]
+                {
+                    Err(super::routes::error_response(
+                        403,
+                        "caller_unidentified",
+                        "the caller's account could not be identified",
+                    ))
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Ok(Caller {
+                        user_id: UNVERIFIED_PEER.to_owned(),
+                        admin: false,
+                    })
+                }
+            }
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn peer_uid(stream: &UnixStream) -> Option<u32> {
-        rustix::net::sockopt::socket_peercred(stream)
-            .ok()
-            .map(|cred| cred.uid.as_raw())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn peer_uid(stream: &UnixStream) -> Option<u32> {
-        nix::unistd::getpeereid(stream)
-            .ok()
-            .map(|(uid, _gid)| uid.as_raw())
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn peer_uid(_stream: &UnixStream) -> Option<u32> {
-        None
     }
 
     fn serve(mut stream: UnixStream, state: &SharedState, control: &Control) -> io::Result<()> {

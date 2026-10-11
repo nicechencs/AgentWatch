@@ -1,11 +1,18 @@
 //! Explicit operating-system boundary for AgentWatch shared code.
-#![forbid(unsafe_code)]
+//!
+//! `unsafe_code` is `deny`, not the workspace `forbid`: a `forbid` cannot be
+//! relaxed, and the macOS module needs one FFI module. That module is the
+//! only place that opts back in (`#[allow(unsafe_code)]`), and every call
+//! there has a `SAFETY` comment. Shared code in this file stays safe.
+#![deny(unsafe_code)]
 use std::fmt;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::spawn::gate_main;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "linux")]
@@ -95,6 +102,10 @@ pub enum Owner {
         euid: u32,
         suid: u32,
         groups: Vec<u32>,
+        /// `None` when the group list was read. `Some` names why it was not
+        /// (macOS has no per-pid `getgroups`). An empty `groups` then means
+        /// "unavailable", not "this process has no supplementary groups".
+        groups_unavailable: Option<&'static str>,
     },
     Windows {
         sid: String,

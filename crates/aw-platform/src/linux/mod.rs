@@ -58,6 +58,7 @@ fn entry(pid: u32) -> Result<Option<ProcessEntry>, PlatformError> {
             euid: *u.get(1)?,
             suid: *u.get(2)?,
             groups: nums("Groups:").unwrap_or_default(),
+            groups_unavailable: None,
         })
     });
     let argv = fs::read(root.join("cmdline")).ok().map(|b| {
@@ -124,5 +125,29 @@ impl Platform for CurrentPlatform {
     }
     fn is_privileged(&self) -> Option<bool> {
         aw_collector_linux::privilege::is_privileged()
+    }
+}
+
+/// `SO_PEERCRED`, the call `aw-daemon` used to make inline. `None` is the old
+/// "could not read" result: the daemon still maps that to `unverified-peer`
+/// and does not treat it as an administrator. This wrapper does not change
+/// that. Groups are not in the credential.
+pub fn peer_identity(stream: &std::os::unix::net::UnixStream) -> crate::PeerIdentity {
+    match rustix::net::sockopt::socket_peercred(stream) {
+        Ok(cred) => crate::PeerIdentity::Identified {
+            owner: Owner::Unix {
+                ruid: cred.uid.as_raw(),
+                euid: cred.uid.as_raw(),
+                suid: cred.uid.as_raw(),
+                groups: vec![cred.gid.as_raw()],
+                groups_unavailable: Some(
+                    "SO_PEERCRED carries one gid, not the supplementary group list",
+                ),
+            },
+            pid: Some(cred.pid.as_raw_nonzero().get() as u32),
+        },
+        Err(_) => crate::PeerIdentity::NotIdentified {
+            reason: "SO_PEERCRED failed",
+        },
     }
 }

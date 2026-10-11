@@ -6,6 +6,11 @@
 //! there has a `SAFETY` comment. Shared code in this file stays safe.
 #![deny(unsafe_code)]
 
+// The batch-file escaper is pure and deliberately tested on every OS. Only the
+// Windows process implementation calls it.
+#[cfg(any(windows, test))]
+mod cmd_escape;
+
 /// OS-independent Windows Job launch state machine.
 ///
 /// The Windows platform module supplies the FFI primitives; this module keeps
@@ -131,6 +136,11 @@ pub enum PlatformError {
         capability: &'static str,
         detail: &'static str,
     },
+    /// `cmd.exe` cannot safely represent this exact argv item. The CLI prints
+    /// the prescribed refusal instead of ever splicing it into a command line.
+    UnsafeBatchArgument {
+        argument: String,
+    },
 }
 impl fmt::Display for PlatformError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -155,6 +165,11 @@ impl fmt::Display for PlatformError {
             ),
             Self::Io(error) => write!(f, "platform I/O error: {error}"),
             Self::Invalid { capability, detail } => write!(f, "{capability}: {detail}"),
+            // The argument itself is not printed: it can carry a secret, and the
+            // CLI has its own sentence for the user.
+            Self::UnsafeBatchArgument { .. } => {
+                f.write_str("a batch-file argument cannot be represented safely")
+            }
         }
     }
 }

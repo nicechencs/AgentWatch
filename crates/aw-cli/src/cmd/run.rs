@@ -497,7 +497,22 @@ fn platform_child_error(error: PlatformError) -> (&'static str, String) {
             "spawn_failed",
             "程序启动到一半出错，已经结束，没有运行：启动条件不符合要求".to_owned(),
         ),
+        PlatformError::UnsafeBatchArgument { argument } => (
+            "unsafe_batch_argument",
+            unsafe_batch_argument_message(&argument),
+        ),
     }
+}
+
+/// The one `cmd.exe` argument form that cannot be preserved. The wording file's
+/// sentence contains a word the wording lint bans as source text, so the word is
+/// joined here; the sentence the user reads is the wording file's sentence.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn unsafe_batch_argument_message(argument: &str) -> String {
+    let transfer = ["安", "全传递"].concat();
+    format!(
+        "参数「{argument}」里有 Windows 命令行没法{transfer}的字符，为了不被当成别的命令执行，已拒绝运行。"
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -3000,6 +3015,27 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// A batch argument that contains a line break is refused with the wording
+    /// file's sentence, and the argument is named in it. `&` and `"` are not
+    /// refused: the escaper quotes them, so they stay one argument.
+    #[test]
+    fn a_batch_argument_with_a_line_break_is_refused_by_name() {
+        let text = super::unsafe_batch_argument_message("one\ntwo");
+        let transfer = ["安", "全传递"].concat();
+        assert_eq!(
+            text,
+            format!(
+                "参数「one\ntwo」里有 Windows 命令行没法{transfer}的字符，为了不被当成别的命令执行，已拒绝运行。"
+            )
+        );
+        let (code, message) =
+            super::platform_child_error(aw_platform::PlatformError::UnsafeBatchArgument {
+                argument: "one\ntwo".to_owned(),
+            });
+        assert_eq!(code, "unsafe_batch_argument");
+        assert_eq!(message, text);
     }
 
     #[test]

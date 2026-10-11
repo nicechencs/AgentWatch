@@ -1,7 +1,8 @@
 //! Windows process identity.  FFI stays in the smallest functions that need it.
 
+use crate::cmd_escape::{batch_command_line, is_batch_file_name};
 use crate::{
-    Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner, PeerIdentity,
+    Capability, CapabilityStatus, EnvSource, IdentifiedCaller, IntegrityLevel, Owner, PeerIdentity,
     PipeServerVerificationError, Platform, PlatformError, ProcessEntry, ProcessKey,
     SamplingProcess, SpawnRequest, UnsupportedKind,
 };
@@ -50,7 +51,9 @@ use windows::Win32::System::JobObjects::{
 };
 use windows::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
 #[allow(unused_imports)] // Kept with the named-pipe-fix import set for its boot-time helpers.
-use windows::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
+use windows::Win32::System::SystemInformation::{
+    GetSystemDirectoryW, GetSystemTimeAsFileTime, GetTickCount64,
+};
 use windows::Win32::System::SystemServices::{
     SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_RID,
     SECURITY_MANDATORY_SYSTEM_RID,
@@ -951,7 +954,20 @@ fn sampling_entry(
     }))
 }
 
-fn command_line(command: &[String]) -> Result<Vec<u16>, PlatformError> {
+/// The command `CreateProcessW` runs. `application` is `cmd.exe`'s path when the
+/// target is a batch file; otherwise `None`, and the command line's first token
+/// is the program.
+struct CreateProcessCommandLine {
+    application: Option<Vec<u16>>,
+    command: Vec<u16>,
+}
+
+/// Fixed `PATHEXT` for a daemon-launched program. The request's environment, and
+/// this process's, are not read: a caller must not be able to make a bare name
+/// resolve to a script type this build does not escape.
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+fn command_line(command: &[String]) -> Result<CreateProcessCommandLine, PlatformError> {
     let Some(program) = command.first() else {
         return Err(PlatformError::Invalid {
             capability: "spawn_suspended",
@@ -989,14 +1005,162 @@ fn command_line(command: &[String]) -> Result<Vec<u16>, PlatformError> {
         out.push('"');
         out
     };
-    Ok(command
-        .iter()
-        .map(|arg| quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .encode_utf16()
-        .chain(Some(0))
-        .collect())
+    let normal = || CreateProcessCommandLine {
+        application: None,
+        command: command
+            .iter()
+            .map(|arg| quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect(),
+    };
+    Ok(normal())
+}
+
+/// One program `CreateProcessW` may be asked to run, in search order.
+enum LaunchCandidate {
+    /// An ordinary executable. `CreateProcessW` quotes it itself.
+    Direct(CreateProcessCommandLine),
+    /// A `.cmd` / `.bat`. Runs through the system `cmd.exe` with each argument
+    /// escaped, so it cannot fall through to cmd's own parsing.
+    Batch(CreateProcessCommandLine),
+}
+
+/// The programs to try, as strings. This function does not touch the filesystem:
+/// no `stat`, no `SearchPath`. `CreateProcessW` is what decides which one exists,
+/// and it does that under the caller's token.
+///
+/// A name containing `\` or `/`, or a drive path, is one candidate. A bare name
+/// is that name plus, when it has no extension, the name with each `PATHEXT`
+/// extension appended. Empty `PATHEXT` entries are skipped. `.cmd` and `.bat`
+/// are marked so they go through `cmd.exe /c`; every other candidate is direct.
+fn launch_candidates(request: &SpawnRequest) -> Result<Vec<LaunchCandidate>, PlatformError> {
+    let command = &request.command;
+    let Some(program) = command.first() else {
+        return Err(PlatformError::Invalid {
+            capability: "spawn_suspended",
+            detail: "empty command",
+        });
+    };
+    if program.is_empty() {
+        return Err(PlatformError::Invalid {
+            capability: "spawn_suspended",
+            detail: "empty program",
+        });
+    }
+    // A batch file refuses a CR/LF argument before anything is created, whether
+    // the caller wrote `.cmd` or PATHEXT added it. Check the arguments once.
+    let batch_possible = is_batch_file_name(program)
+        || (!program_has_separator(program)
+            && !has_extension(program)
+            && pathext_for(request).split(';').any(|extension| {
+                extension.eq_ignore_ascii_case(".cmd") || extension.eq_ignore_ascii_case(".bat")
+            }));
+    if batch_possible {
+        for argument in &command[1..] {
+            if argument.contains(['\r', '\n']) {
+                return Err(PlatformError::UnsafeBatchArgument {
+                    argument: argument.clone(),
+                });
+            }
+        }
+    }
+    let mut names = vec![program.clone()];
+    if !program_has_separator(program) && !has_extension(program) {
+        for extension in pathext_for(request).split(';') {
+            if extension.is_empty() {
+                continue;
+            }
+            names.push(format!("{program}{extension}"));
+        }
+    }
+    let mut candidates = Vec::with_capacity(names.len());
+    for name in &names {
+        if is_batch_file_name(name) {
+            let line = batch_command_line(name, &command[1..]).map_err(|error| {
+                PlatformError::UnsafeBatchArgument {
+                    argument: error.argument,
+                }
+            })?;
+            candidates.push(LaunchCandidate::Batch(CreateProcessCommandLine {
+                application: Some(system_cmd_exe()?),
+                command: line,
+            }));
+        } else {
+            let mut argv = command.clone();
+            argv[0] = name.clone();
+            candidates.push(LaunchCandidate::Direct(command_line(&argv)?));
+        }
+    }
+    Ok(candidates)
+}
+
+/// Which `PATHEXT` the lookup uses. A daemon launch uses the fixed default and
+/// ignores both the request and this process. `aw run` / `--no-daemon` use the
+/// user's own, which is this process's, with a request value overriding it.
+fn pathext_for(request: &SpawnRequest) -> String {
+    match request.env_source {
+        EnvSource::Exact => DEFAULT_PATHEXT.to_owned(),
+        EnvSource::Inherit => request
+            .env
+            .iter()
+            .rev()
+            .find(|(key, _)| key.eq_ignore_ascii_case("PATHEXT"))
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var("PATHEXT").ok())
+            .unwrap_or_else(|| DEFAULT_PATHEXT.to_owned()),
+    }
+}
+
+/// A name that already says where it is: a drive path, a UNC path, or anything
+/// containing `\` or `/`. Those are one candidate and are not searched.
+fn program_has_separator(program: &str) -> bool {
+    program.contains(['\\', '/']) || Path::new(program).is_absolute()
+}
+
+/// Windows treats a final component ending in `.` as having no extension only
+/// after it strips trailing spaces and periods. `tool.cmd.` is still a batch
+/// file; `tool.exe` has an extension and is not given another one.
+fn has_extension(program: &str) -> bool {
+    let final_name = program
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(program)
+        .trim_end_matches([' ', '.']);
+    final_name.contains('.')
+}
+
+/// `CreateProcessW` says the name is not a program it can run. The lookup tries
+/// the next candidate. `ERROR_FILE_NOT_FOUND` is a missing file; `ERROR_PATH_NOT_FOUND`
+/// is a missing directory on the way to it. `ERROR_BAD_EXE_FORMAT` is not one of
+/// these: that is a file that exists and is not executable, and it stops the search.
+fn not_found(error: &Error) -> bool {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+    error.code() == ERROR_FILE_NOT_FOUND.into() || error.code() == ERROR_PATH_NOT_FOUND.into()
+}
+
+/// The system `cmd.exe`, never one found through the caller's PATH or the
+/// working directory. A batch file runs through this one so the caller cannot
+/// point the lookup at a different `cmd.exe`.
+fn system_cmd_exe() -> Result<Vec<u16>, PlatformError> {
+    let mut buffer = vec![0_u16; 32_768];
+    // SAFETY: `buffer` is writable UTF-16 storage for the documented system
+    // directory API. The static capacity exceeds the supported Windows path.
+    #[allow(unsafe_code)]
+    let length = unsafe { GetSystemDirectoryW(Some(buffer.as_mut_slice())) };
+    if length == 0
+        || usize::try_from(length)
+            .ok()
+            .is_none_or(|length| length >= buffer.len())
+    {
+        return Err(io_error(Error::from_win32()));
+    }
+    buffer.truncate(length as usize);
+    buffer.extend(r"\cmd.exe".encode_utf16());
+    buffer.push(0);
+    Ok(buffer)
 }
 
 /// Build an environment block for the target only.  This buffer is never
@@ -1603,8 +1767,12 @@ impl Platform for CurrentPlatform {
         if caller.owner() != &self.current_owner()? {
             return Err(no("spawn_suspended_for_other_user"));
         }
-        let mut command = command_line(&request.command)?;
-        let mut env = environment(&request.env);
+        let mut candidates = launch_candidates(request)?;
+        let mut env = match request.env_source {
+            // A daemon launch never hands this process's environment across.
+            EnvSource::Exact => environment_from(std::iter::empty(), &request.env),
+            EnvSource::Inherit => environment(&request.env),
+        };
         let inherited = InheritedStdHandles::for_current_process()?;
         let attributes = AttributeList::with_handles(&inherited.handles)?;
         // SAFETY: STARTUPINFOEXW is documented as zero-initialized before cb is set.
@@ -1616,9 +1784,6 @@ impl Platform for CurrentPlatform {
         startup.StartupInfo.hStdOutput = inherited.handles[1];
         startup.StartupInfo.hStdError = inherited.handles[2];
         startup.lpAttributeList = attributes.list;
-        // SAFETY: CreateProcessW fills this output structure.
-        #[allow(unsafe_code)]
-        let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
         let cwd = request.cwd.as_ref().map(|path| {
             use std::os::windows::ffi::OsStrExt;
             path.as_os_str()
@@ -1629,26 +1794,53 @@ impl Platform for CurrentPlatform {
         let flags = PROCESS_CREATION_FLAGS(
             CREATE_SUSPENDED.0 | CREATE_UNICODE_ENVIRONMENT.0 | EXTENDED_STARTUPINFO_PRESENT.0,
         );
-        // SAFETY: command/environment/cwd buffers are live for the synchronous
-        // call; handle inheritance is constrained by the explicit attribute list
-        // to the three inheritable standard-handle duplicates, and it starts suspended.
+        // Try each candidate. `CreateProcessW` reports "not found" for a name
+        // that is not on PATH; that one is skipped and the next PATHEXT entry is
+        // tried. Any other error stops. A `.cmd` / `.bat` candidate names the
+        // system `cmd.exe` as the application, so the search never hands a batch
+        // file to cmd's own unescaped parsing.
+        let mut created = Err(Error::from_win32());
+        // SAFETY: CreateProcessW fills this output structure.
         #[allow(unsafe_code)]
-        let created = unsafe {
-            CreateProcessW(
-                windows::core::PCWSTR::null(),
-                PWSTR(command.as_mut_ptr()),
-                None,
-                None,
-                true,
-                flags,
-                Some(env.as_mut_ptr().cast()),
-                cwd.as_ref().map_or(windows::core::PCWSTR::null(), |value| {
-                    windows::core::PCWSTR(value.as_ptr())
-                }),
-                &startup.StartupInfo,
-                &mut info,
-            )
-        };
+        let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
+        for candidate in &mut candidates {
+            let (application, command) = match candidate {
+                LaunchCandidate::Direct(line) => (None, &mut line.command),
+                LaunchCandidate::Batch(line) => (line.application.as_ref(), &mut line.command),
+            };
+            // SAFETY: command/environment/cwd buffers are live for the synchronous
+            // call; handle inheritance is constrained by the explicit attribute list
+            // to the three inheritable standard-handle duplicates, and it starts suspended.
+            #[allow(unsafe_code)]
+            let attempt = unsafe {
+                CreateProcessW(
+                    application.map_or(windows::core::PCWSTR::null(), |value| {
+                        windows::core::PCWSTR(value.as_ptr())
+                    }),
+                    PWSTR(command.as_mut_ptr()),
+                    None,
+                    None,
+                    true,
+                    flags,
+                    Some(env.as_mut_ptr().cast()),
+                    cwd.as_ref().map_or(windows::core::PCWSTR::null(), |value| {
+                        windows::core::PCWSTR(value.as_ptr())
+                    }),
+                    &startup.StartupInfo,
+                    &mut info,
+                )
+            };
+            match attempt {
+                Ok(()) => {
+                    created = Ok(());
+                    break;
+                }
+                Err(error) if not_found(&error) => {
+                    created = Err(error);
+                }
+                Err(error) => return Err(io_error(error)),
+            }
+        }
         created.map_err(io_error)?;
         let key = match creation_time(info.hProcess) {
             Ok(start_time) => ProcessKey {
@@ -1893,6 +2085,68 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_nanos())
         ))
+    }
+
+    /// A bare name grows one candidate per PATHEXT entry, and the `.cmd` / `.bat`
+    /// ones are batch candidates. A daemon launch uses the fixed PATHEXT, so a
+    /// `PATHEXT` in the request does not change the list. `aw run` uses the
+    /// request's own. An argument with a line break is refused before any
+    /// candidate exists, for a `.cmd` the caller wrote and for a bare name alike.
+    #[test]
+    fn pathext_candidates_mark_batch_files_and_a_line_break_is_refused() {
+        use super::{launch_candidates, LaunchCandidate, DEFAULT_PATHEXT};
+        use crate::EnvSource;
+        let daemon = SpawnRequest {
+            command: vec!["npm".to_owned(), "a&echo pwned".to_owned()],
+            cwd: None,
+            env: vec![("PATHEXT".to_owned(), ".JS".to_owned())],
+            env_source: EnvSource::Exact,
+        };
+        let candidates = launch_candidates(&daemon).expect("candidates");
+        let extensions: Vec<&str> = DEFAULT_PATHEXT.split(';').collect();
+        assert_eq!(candidates.len(), 1 + extensions.len());
+        for (candidate, extension) in candidates.iter().skip(1).zip(&extensions) {
+            let batch =
+                extension.eq_ignore_ascii_case(".cmd") || extension.eq_ignore_ascii_case(".bat");
+            assert_eq!(matches!(candidate, LaunchCandidate::Batch(_)), batch);
+            if let LaunchCandidate::Batch(line) = candidate {
+                let text =
+                    String::from_utf16(&line.command[..line.command.len() - 1]).expect("utf-16");
+                // `&` and the argument stay inside one quoted argument. cmd.exe
+                // is the application, so it cannot be the one PATH finds.
+                assert!(text.contains("\"a&echo pwned\""), "{text}");
+                assert!(text.starts_with("cmd.exe /e:ON /v:OFF /d /c \""), "{text}");
+            }
+        }
+        // The request's PATHEXT was `.JS`. It did not replace the fixed list.
+        assert!(candidates.len() > 2, "the fixed PATHEXT has more than .JS");
+
+        let user = SpawnRequest {
+            command: vec!["npm".to_owned()],
+            cwd: None,
+            env: vec![("PATHEXT".to_owned(), ".JS".to_owned())],
+            env_source: EnvSource::Inherit,
+        };
+        let candidates = launch_candidates(&user).expect("user candidates");
+        assert_eq!(candidates.len(), 2, "the name, then the one .JS entry");
+
+        for program in ["npm", "npm.cmd"] {
+            let refused = SpawnRequest {
+                command: vec![program.to_owned(), "one\ntwo".to_owned()],
+                cwd: None,
+                env: Vec::new(),
+                env_source: EnvSource::Exact,
+            };
+            let Err(error) = launch_candidates(&refused) else {
+                panic!("a line break was not refused");
+            };
+            match error {
+                PlatformError::UnsafeBatchArgument { argument } => {
+                    assert_eq!(argument, "one\ntwo")
+                }
+                other => panic!("expected the batch refusal, got {other}"),
+            }
+        }
     }
 
     /// The official directory comes from the known folder, not from the

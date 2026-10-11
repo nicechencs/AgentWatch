@@ -155,9 +155,9 @@ function toCollector(raw: unknown): Session["collectors"][number] | null {
 const SEARCH_KIND: Record<string, string> = { file_access: "file", process_images: "proc", http: "url" };
 
 /**
- * Search: the daemon answers `{hits: [{src, src_id, session_id, public_id}]}`.
- * The page reads groups per session. A hit names its row only: time, text and
- * evidence are not in the answer and stay null (never invented).
+ * Search: the daemon answers `{hits: [{src, src_id, session_id, public_id,
+ * text, ts_ns, evidence}]}`. The page reads groups per session. A field the
+ * daemon left null stays null (never invented).
  */
 export function toSearchResult(raw: unknown): SearchResult {
   const r = isObj(raw) ? raw : {};
@@ -174,7 +174,8 @@ export function toSearchResult(raw: unknown): SearchResult {
       kind: SEARCH_KIND[src] ?? (typeof hit.kind === "string" ? hit.kind : src),
       id: typeof hit.src_id === "number" ? hit.src_id : typeof hit.id === "number" ? hit.id : 0,
       ts_ns: numOrNull(hit.ts_ns),
-      summary: strOrNull(hit.summary),
+      // The daemon sends the row's stored text (file path / executable path).
+      summary: strOrNull(hit.summary) ?? strOrNull(hit.text),
       evidence: (strOrNull(hit.evidence) as SearchResult["groups"][number]["hits"][number]["evidence"]) ?? null,
     });
     groups.set(sid, group);

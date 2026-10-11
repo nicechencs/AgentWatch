@@ -63,6 +63,12 @@ describe("#2 search Enter white screen", () => {
     expect(result.groups).toHaveLength(1);
     expect(result.groups[0].hits[0]).toMatchObject({ kind: "proc", id: 7, ts_ns: null, summary: null });
   });
+  it("shows the daemon's text and time instead of 记录 #id", () => {
+    const result = toSearchResult({
+      hits: [{ src: "file_access", src_id: 3, session_id: 1, public_id: "s1", text: "/home/u/.aws/credentials", ts_ns: 1_760_000_000_000_000_000, evidence: "E1" }],
+    });
+    expect(result.groups[0].hits[0]).toMatchObject({ kind: "file", summary: "/home/u/.aws/credentials", ts_ns: 1_760_000_000_000_000_000, evidence: "E1" });
+  });
   it("tolerates an empty or odd body", () => {
     expect(toSearchResult({}).groups).toEqual([]);
     expect(toSearchResult(null).groups).toEqual([]);

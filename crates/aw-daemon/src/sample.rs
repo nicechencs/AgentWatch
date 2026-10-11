@@ -395,9 +395,13 @@ impl HostSampler {
         // remembers the process and emits no `ProcessRec` (scope.rs
         // `remember_open`). The events were still redacted and counted.
         // Rows are built from the events, not from a second reading of argv.
-        let mut batch = map_events(events, self.mono_ns);
+        let clock = Clock {
+            mono_ns: self.mono_ns,
+            wall_ns,
+        };
+        let mut batch = map_events(events, wall_ns);
         batch.process_images = image_rows(events, &self.imaged, wall_ns);
-        let from_output = map_output(&output, self.mono_ns);
+        let from_output = map_output(&output, clock);
         batch.processes.extend(from_output.processes);
         batch.net_flows.extend(from_output.net_flows);
         batch.net_flow_buckets.extend(from_output.net_flow_buckets);
@@ -755,7 +759,7 @@ fn unix_uid_string() -> String {
 /// Depth is the parent walk. A start whose parent uid is set but not in this
 /// batch is skipped and counted, not stored at depth 0. Evidence stays the
 /// event's evidence.
-fn map_events(events: &[aw_core::RawEvent], now_ns: u64) -> WriteBatch {
+fn map_events(events: &[aw_core::RawEvent], now_ns: i64) -> WriteBatch {
     let mut drafts: Vec<ProcessRec> = Vec::new();
     let mut gaps = Vec::new();
     let mut skipped_pid = 0_u64;
@@ -891,7 +895,8 @@ fn walk_pid(parent: &BTreeMap<u32, Option<u32>>, pid: u32) -> Option<i64> {
     }
 }
 
-fn map_output(output: &Output, now_ns: u64) -> WriteBatch {
+fn map_output(output: &Output, clock: Clock) -> WriteBatch {
+    let now_ns = clock.wall_ns;
     let mut batch = WriteBatch::default();
     let depths = depths_of(&output.processes);
     let mut skipped = 0_u64;
@@ -924,7 +929,7 @@ fn map_output(output: &Output, now_ns: u64) -> WriteBatch {
         }
     }
     for gap in &output.gaps {
-        batch.gaps.push(gap_row(gap));
+        batch.gaps.push(gap_row(gap, clock));
     }
     batch
 }
@@ -1121,7 +1126,35 @@ fn dns_row(dns: &aw_pipeline::DnsRec) -> Option<DnsRow> {
     })
 }
 
-fn gap_row(gap: &GapRec) -> GapRow {
+/// The sampler's two clocks read at the same instant. Collectors stamp gaps
+/// with the monotonic tick; the `gaps` table is read as unix time.
+#[derive(Debug, Clone, Copy)]
+struct Clock {
+    mono_ns: u64,
+    wall_ns: i64,
+}
+
+impl Clock {
+    /// Wall time of an earlier (or equal) monotonic tick. Stored as-is, the
+    /// tick read as a few seconds after 1970-01-01 on the gaps page.
+    fn wall_of(self, mono_ns: u64) -> i64 {
+        let back = i64::try_from(self.mono_ns.saturating_sub(mono_ns)).unwrap_or(i64::MAX);
+        let ahead = i64::try_from(mono_ns.saturating_sub(self.mono_ns)).unwrap_or(i64::MAX);
+        self.wall_ns.saturating_sub(back).saturating_add(ahead)
+    }
+}
+
+fn gap_row(gap: &GapRec, clock: Clock) -> GapRow {
+    // Anchor on the gap event's own pair of clocks when it carries a wall
+    // time; otherwise on the sampler's reading for this batch.
+    let clock = if gap.ts_wall_ns > 0 {
+        Clock {
+            mono_ns: gap.ts_mono_ns,
+            wall_ns: gap.ts_wall_ns,
+        }
+    } else {
+        clock
+    };
     GapRow {
         id: None,
         session_id: gap
@@ -1131,8 +1164,8 @@ fn gap_row(gap: &GapRec) -> GapRow {
         collector: gap.collector.as_str().to_owned(),
         kind: gaps::gap_kind_name(gap.gap_kind).to_owned(),
         affects: json_string_array(&gap.affects),
-        from_ns: i64::try_from(gap.from_mono_ns).unwrap_or(i64::MAX),
-        to_ns: i64::try_from(gap.to_mono_ns).unwrap_or(i64::MAX),
+        from_ns: clock.wall_of(gap.from_mono_ns),
+        to_ns: clock.wall_of(gap.to_mono_ns),
         count: gap.count.and_then(|n| i64::try_from(n).ok()),
         detail: gap.detail.clone(),
     }
@@ -1152,8 +1185,8 @@ fn store_failure_gap(now_ns: i64) -> GapRow {
     }
 }
 
-fn depth_gap(now_ns: u64, count: u64) -> GapRow {
-    let ns = i64::try_from(now_ns).unwrap_or(i64::MAX);
+fn depth_gap(now_ns: i64, count: u64) -> GapRow {
+    let ns = now_ns;
     GapRow {
         id: None,
         session_id: Some(SESSION_DB_ID),
@@ -1269,6 +1302,46 @@ mod depth_tests {
             kind,
         })
         .expect("event")
+    }
+
+    /// Gap rows were stored with the collector's monotonic tick, which the
+    /// gaps page read as unix time (a few seconds after 1970-01-01).
+    #[test]
+    fn gap_rows_are_stored_at_wall_time() {
+        let wall = 1_700_000_000_000_000_000_i64;
+        let gap = aw_pipeline::GapRec {
+            seq: 1,
+            ts_mono_ns: 10_000_000_000,
+            ts_wall_ns: wall,
+            session_id: Some(aw_core::SessionId(1)),
+            proc: None,
+            evidence: Evidence::S,
+            field_evidence: std::collections::BTreeMap::new(),
+            source: Source::new("poll/sysinfo"),
+            collector: Source::new("poll/sysinfo"),
+            gap_kind: aw_core::GapKind::Unknown,
+            affects: vec!["process".to_owned()],
+            from_mono_ns: 8_000_000_000,
+            to_mono_ns: 10_000_000_000,
+            count: None,
+            detail: None,
+        };
+        let clock = super::Clock {
+            mono_ns: 12_000_000_000,
+            wall_ns: wall + 2_000_000_000,
+        };
+        let row = super::gap_row(&gap, clock);
+        assert_eq!(row.from_ns, wall - 2_000_000_000);
+        assert_eq!(row.to_ns, wall);
+        // A gap event without a wall time falls back to the batch's clocks.
+        let unstamped = aw_pipeline::GapRec {
+            ts_wall_ns: 0,
+            ..gap
+        };
+        let row = super::gap_row(&unstamped, clock);
+        assert_eq!(row.from_ns, wall - 2_000_000_000);
+        assert_eq!(row.to_ns, wall);
+        assert_eq!(clock.wall_of(13_000_000_000), wall + 3_000_000_000);
     }
 
     /// UI review of #143: an exit whose start was never seen was stored with
@@ -1473,6 +1546,10 @@ mod depth_tests {
             .expect("search");
             assert_eq!(hits.len(), 1, "fts={fts}: {hits:?}");
             assert_eq!(hits[0].src, "process_images");
+            // The hit says what it is and when, not just a row id.
+            assert_eq!(hits[0].text.as_deref(), Some("/usr/bin/bash"));
+            assert!(hits[0].ts_ns.is_some_and(|ns| ns > 0), "{hits:?}");
+            assert_eq!(hits[0].evidence.as_deref(), Some("S"));
         }
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);

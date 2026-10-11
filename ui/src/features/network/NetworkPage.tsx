@@ -127,6 +127,9 @@ export function NetworkPage() {
           netCoverage === "unknown" ? <CoverageNote kind="net" coverage={netCoverage} /> : <EmptyNote>{t("net.empty")}</EmptyNote>
         ) : null}
 
+        {/* No header row over an empty list: the empty note used to sit above
+            a lone header. */}
+        {groups.length > 0 ? (
         <table className="w-full border-collapse text-xs">
           <thead className="text-left text-ink-faint">
             <tr>
@@ -155,6 +158,7 @@ export function NetworkPage() {
             ))}
           </tbody>
         </table>
+        ) : null}
       </div>
       {selected ? <DetailPanel record={toRecord(selected)} patch={patch} onClose={() => setSelected(null)} /> : null}
     </div>

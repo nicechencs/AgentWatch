@@ -9,6 +9,7 @@ import { ErrorNote, Loading } from "@/components/QueryState";
 import { useAuth } from "@/lib/auth";
 import { diskUnavailableText, diskUsed } from "@/lib/disk";
 import { useI18n } from "@/lib/i18n";
+import { redactPreview } from "@/lib/redact-preview";
 import { usePrefs, type Theme, type TimeFormat } from "@/lib/prefs";
 import type { Lang } from "@/lib/i18n";
 import { ProxySection } from "@/features/settings/proxy/ProxySection";
@@ -136,7 +137,7 @@ function Privacy({ config, admin }: { config: ConfigView; admin: boolean }) {
     onError: (caught) => setNotice(isApiError(caught) && caught.status === 403 ? t("settings.forbidden") : caught.message),
   });
 
-  const preview = pattern ? sample.replaceAll(pattern, "«redacted:custom»") : sample;
+  const preview = redactPreview(pattern, sample);
 
   return (
     <Section title={t("settings.privacy")}>
@@ -160,10 +161,13 @@ function Privacy({ config, admin }: { config: ConfigView; admin: boolean }) {
         {t("settings.ruleSample")}
         <input value={sample} onChange={(event) => setSample(event.target.value)} className="mt-1 w-full rounded border border-line bg-paper px-2 py-1" />
       </label>
-      <p>{t("settings.previewResult")}：<span className="font-mono">{preview}</span></p>
+      <p>
+        {t("settings.previewResult")}：<span className="font-mono">{preview.text}</span>
+        {preview.invalid ? <span className="ml-2 text-amber-700 dark:text-amber-400">{t("settings.patternInvalid")}</span> : null}
+      </p>
       <button
         type="button"
-        disabled={!admin || pattern.trim() === ""}
+        disabled={!admin || pattern.trim() === "" || preview.invalid}
         onClick={() => add.mutate({ id: `custom-${Date.now()}`, builtin: false, pattern, description: null })}
         className="rounded border border-line px-2 py-1 disabled:text-ink-faint"
       >

@@ -406,7 +406,7 @@
   "coverage.notCollectedTip": "This version does not collect {kind} (process sampling only)",
   "coverage.notCollected": "Not collected: this version does not collect {kind} (process sampling only). No data here does not mean nothing happened.",
   "coverage.unknown": "No {kind} records. The service did not say whether {kind} is collected, so this cannot tell \"nothing happened\" from \"not collected\".",
-  "overview.capabilitiesUnknown": "unavailable (the service returned no capabilities)",
+  "overview.capabilitiesUnknown": "the service returned no capabilities",
   "overview.noRecordedGaps": "No capture gaps recorded",
   "overview.notCollected": "Not collected: {kinds} (process sampling only)",
   "overview.coverageUnknown": "Coverage unavailable; completeness cannot be confirmed",
@@ -424,5 +424,6 @@
   "gaps.noCollectors": "The service returned no collector information for this session.",
   "gaps.capsNotDescribed": "This collector did not describe what it captures.",
   "timeline.timeNa": "time unavailable",
-  "timeline.timeNaTip": "This record has no usable time (it was not read at capture)"
+  "timeline.timeNaTip": "This record has no usable time (it was not read at capture)",
+  "settings.patternInvalid": "Not a valid regular expression"
 }

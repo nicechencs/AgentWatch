@@ -851,6 +851,13 @@ pub struct SearchHit {
     pub session_id: i64,
     /// Public session id.
     pub public_id: String,
+    /// What the hit is, as stored: the file path, or the executable path
+    /// (argv when the path is unknown). `None` when the row has neither.
+    pub text: Option<String>,
+    /// When: `file_access.first_ns` or `process_images.ts_ns`.
+    pub ts_ns: Option<i64>,
+    /// Record evidence of the source row.
+    pub evidence: Option<String>,
 }
 
 /// Substring search across the caller's sessions.
@@ -898,13 +905,25 @@ pub fn search(
                     src_id: row.get(1)?,
                     session_id: row.get(2)?,
                     public_id: row.get(3)?,
+                    text: None,
+                    ts_ns: None,
+                    evidence: None,
                 })
             },
         )
         .map_err(|err| QueryError::sqlite("search", err))?;
-    let mut hits = collect_rows(rows)?;
+    let mut hits: Vec<SearchHit> = collect_rows(rows)?;
+    // The id alone left the page printing 「记录 #id」; each hit now carries
+    // the text and time of its row.
+    for hit in &mut hits {
+        if let Some((text, ts_ns, evidence)) = hit_detail(conn, hit)? {
+            hit.text = text;
+            hit.ts_ns = ts_ns;
+            hit.evidence = evidence;
+        }
+    }
     if let Some(since) = since_ns {
-        hits.retain(|hit| hit_time(conn, hit).unwrap_or(None).unwrap_or(i64::MIN) >= since);
+        hits.retain(|hit| hit.ts_ns.unwrap_or(i64::MIN) >= since);
     }
     Ok(hits)
 }
@@ -1699,15 +1718,22 @@ fn process_children(
     collect_rows(rows)
 }
 
-fn hit_time(conn: &Connection, hit: &SearchHit) -> Result<Option<i64>, QueryError> {
+/// Text, time and evidence of a hit's source row.
+type HitDetail = (Option<String>, Option<i64>, Option<String>);
+
+fn hit_detail(conn: &Connection, hit: &SearchHit) -> Result<Option<HitDetail>, QueryError> {
     let sql = match hit.src.as_str() {
-        "file_access" => "SELECT first_ns FROM file_access WHERE id = ?",
-        "process_images" => "SELECT ts_ns FROM process_images WHERE id = ?",
+        "file_access" => "SELECT path, first_ns, evidence FROM file_access WHERE id = ?",
+        "process_images" => {
+            "SELECT coalesce(exe, argv), ts_ns, evidence FROM process_images WHERE id = ?"
+        }
         _ => return Ok(None),
     };
-    conn.query_row(sql, rusqlite::params![hit.src_id], |row| row.get(0))
-        .optional()
-        .map_err(|err| QueryError::sqlite("search_time", err))
+    conn.query_row(sql, rusqlite::params![hit.src_id], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    })
+    .optional()
+    .map_err(|err| QueryError::sqlite("search_detail", err))
 }
 
 fn clamp_page(limit: Option<i64>) -> Result<i64, QueryError> {
@@ -2482,5 +2508,28 @@ mod tests {
             elapsed.as_millis() < 3_000,
             "20k filtered timeline took {elapsed:?}"
         );
+    }
+
+    /// UI review of #143: a hit carried only its row id, so the search page
+    /// printed 「记录 #id」. It now carries the row's text, time and evidence,
+    /// and the executable path is matched when argv is unknown.
+    #[test]
+    fn search_hit_carries_text_and_time() {
+        let conn = conn();
+        conn.execute_batch(include_str!("../../migrations/0003_file_access.sql"))
+            .unwrap();
+        session(&conn, 1, "u", 10);
+        image(&conn, 1, 7, 1_000, Some("/usr/bin/node"));
+        let hits = search(&conn, "u", "NODE", false, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text.as_deref(), Some("/usr/bin/node"));
+        assert_eq!(hits[0].ts_ns, Some(1_000));
+        assert_eq!(hits[0].evidence.as_deref(), Some("E1"));
+        assert!(search(&conn, "u", "node", false, Some(2_000), None)
+            .unwrap()
+            .is_empty());
+        assert!(search(&conn, "other", "node", false, None, None)
+            .unwrap()
+            .is_empty());
     }
 }

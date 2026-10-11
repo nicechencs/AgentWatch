@@ -160,7 +160,7 @@ fn command_log_probe(config_path: Option<&std::path::Path>) -> Result<ExitCode, 
     // Probe still takes the single-instance lock so it cannot race a live daemon
     // in the same data directory, then emits one event and shuts down.
     let data_dir = config::resolve_data_dir(&config).map_err(CliError::Config)?;
-    paths::ensure_data_dir(&data_dir).map_err(|source| {
+    let data_dir = paths::ensure_data_dir(&data_dir).map_err(|source| {
         CliError::Runtime(RuntimeError::DataDir {
             path: data_dir.clone(),
             source,

@@ -15,23 +15,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use windows::core::{Error, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, FILETIME, HANDLE, HLOCAL, PSID,
-    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, ERROR_ALREADY_EXISTS,
+    ERROR_NO_MORE_FILES, FILETIME, HANDLE, HLOCAL, PSID, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, GetSecurityInfo, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
-    SE_KERNEL_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
 };
 use windows::Win32::Security::{
-    GetSecurityDescriptorDacl, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
-    RevertToSelf, TokenElevation, TokenIntegrityLevel, TokenUser, ACL, DACL_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetSidSubAuthority,
+    GetSidSubAuthorityCount, GetTokenInformation, RevertToSelf, TokenElevation,
+    TokenIntegrityLevel, TokenUser, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateDirectoryW, CreateFileW, FindClose, FindFirstFileW, FindNextFileW,
+    GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
+    WIN32_FIND_DATAW, WRITE_DAC, WRITE_OWNER,
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -93,11 +97,16 @@ enum DataDirAcl<'a> {
 impl DataDirAcl<'_> {
     fn sddl(&self) -> String {
         match self {
-            // `P` turns off inheritance. OI|CI applies the same two ACEs to
-            // database, WAL, lock, and log files created underneath it.
-            Self::Machine => "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)".to_owned(),
-            Self::Owner(sid) => format!("D:P(A;OICI;GA;;;{sid})"),
+            // `FA`, rather than generic access, is stored as one ACE per SID.
+            // `O:BA` makes a directory born for a privileged daemon belong to
+            // Administrators instead of briefly belonging to its creator.
+            Self::Machine => "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)".to_owned(),
+            Self::Owner(sid) => format!("D:P(A;OICI;FA;;;{sid})"),
         }
+    }
+
+    const fn sets_machine_owner(&self) -> bool {
+        matches!(self, Self::Machine)
     }
 }
 
@@ -111,40 +120,105 @@ fn is_machine_data_dir(path: &Path, default: &Path) -> bool {
         .eq_ignore_ascii_case(&default.as_os_str().to_string_lossy())
 }
 
-/// Reject symlinks and junctions/reparse points in every existing component.
-/// The boolean tells the caller whether the final component existed before it
-/// chose to create it; a pre-created directory gets an ownership check before
-/// any ACL is altered.
-fn validate_directory_path(path: &Path) -> Result<bool, PlatformError> {
+#[derive(Clone)]
+enum DataDirPolicy {
+    Machine,
+    Owner(String),
+}
+
+impl DataDirPolicy {
+    fn acl(&self) -> DataDirAcl<'_> {
+        match self {
+            Self::Machine => DataDirAcl::Machine,
+            Self::Owner(sid) => DataDirAcl::Owner(sid),
+        }
+    }
+
+    fn accepts_owner(&self, owner: &str) -> bool {
+        match self {
+            // A privileged process needs a machine-owned directory even when
+            // --data-dir names a non-default location.
+            Self::Machine => owner == SYSTEM_SID || owner == ADMINISTRATORS_SID,
+            Self::Owner(sid) => owner == sid,
+        }
+    }
+
+    fn permits_official_data_dir(&self) -> bool {
+        matches!(self, Self::Machine)
+    }
+}
+
+fn data_dir_policy_for_token(sid: String, elevated: bool) -> DataDirPolicy {
+    if elevated || sid == SYSTEM_SID {
+        DataDirPolicy::Machine
+    } else {
+        DataDirPolicy::Owner(sid)
+    }
+}
+
+struct ResolvedDataDir {
+    canonical: PathBuf,
+    create_base: PathBuf,
+    missing: Vec<OsString>,
+}
+
+fn invalid<T>(detail: &'static str) -> Result<T, PlatformError> {
+    Err(PlatformError::Invalid {
+        capability: "secure_data_dir",
+        detail,
+    })
+}
+
+/// Canonicalize the real existing parent before comparing paths or creating a
+/// descendant. Windows has no benign system reparse-point ancestor equivalent:
+/// every existing reparse point is refused before it can be followed.
+fn resolve_data_dir_path(path: &Path) -> Result<ResolvedDataDir, PlatformError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
     };
+    let components: Vec<_> = absolute.components().collect();
     let mut current = PathBuf::new();
-    for component in absolute.components() {
+    for (index, component) in components.iter().enumerate() {
         current.push(component.as_os_str());
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 let reparse = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0;
                 if metadata.file_type().is_symlink() || reparse {
-                    return Err(PlatformError::Invalid {
-                        capability: "secure_data_dir",
-                        detail: "data directory path contains a reparse point",
-                    });
+                    return invalid("data directory path contains a reparse point");
                 }
                 if !metadata.is_dir() {
-                    return Err(PlatformError::Invalid {
-                        capability: "secure_data_dir",
-                        detail: "data directory path contains a non-directory",
-                    });
+                    return invalid("data directory path contains a non-directory");
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = current.parent() else {
+                    return invalid("data directory has no existing ancestor");
+                };
+                let create_base = std::fs::canonicalize(parent)?;
+                let missing = components[index..]
+                    .iter()
+                    .map(|item| item.as_os_str().to_os_string())
+                    .collect::<Vec<_>>();
+                let canonical = missing
+                    .iter()
+                    .fold(create_base.clone(), |path, item| path.join(item));
+                return Ok(ResolvedDataDir {
+                    canonical,
+                    create_base,
+                    missing,
+                });
+            }
             Err(error) => return Err(error.into()),
         }
     }
-    Ok(true)
+    let canonical = std::fs::canonicalize(&absolute)?;
+    Ok(ResolvedDataDir {
+        create_base: canonical.clone(),
+        canonical,
+        missing: Vec::new(),
+    })
 }
 
 fn sid_text(sid: PSID) -> Result<String, PlatformError> {
@@ -165,39 +239,54 @@ fn sid_text(sid: PSID) -> Result<String, PlatformError> {
     result
 }
 
-fn owner_sid_for_path(path: &Path) -> Result<String, PlatformError> {
-    let wide = wide_nul(path.as_os_str());
+fn owner_sid_for_handle(handle: HANDLE) -> Result<String, PlatformError> {
     let mut owner = PSID::default();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: `wide` is NUL terminated; output pointers are valid and the
-    // descriptor remains live until its LocalFree below.
+    // SAFETY: `handle` is an open object handle; output pointers are valid and
+    // the returned descriptor remains live until LocalFree below.
     #[allow(unsafe_code)]
     let result = unsafe {
-        GetNamedSecurityInfoW(
-            windows::core::PCWSTR(wide.as_ptr()),
+        GetSecurityInfo(
+            handle,
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION,
             Some(&mut owner),
             None,
             None,
             None,
-            &mut descriptor,
+            Some(&mut descriptor),
         )
     }
     .ok()
     .map_err(io_error)
     .and_then(|()| sid_text(owner));
-    // SAFETY: GetNamedSecurityInfoW allocates the descriptor with LocalAlloc
+    // SAFETY: GetSecurityInfo allocates the descriptor with LocalAlloc
     // on success; the default/null value is safe to pass to LocalFree too.
     #[allow(unsafe_code)]
     let _ = unsafe { LocalFree(HLOCAL(descriptor.0.cast())) };
     result
 }
 
-fn set_data_dir_dacl(path: &Path, policy: DataDirAcl<'_>) -> Result<(), PlatformError> {
+struct DataDirSecurityDescriptor {
+    descriptor: PSECURITY_DESCRIPTOR,
+    dacl: *mut ACL,
+    owner: Option<PSID>,
+}
+
+impl Drop for DataDirSecurityDescriptor {
+    fn drop(&mut self) {
+        // SAFETY: ConvertStringSecurityDescriptorToSecurityDescriptorW owns
+        // this LocalAlloc descriptor until this one-time release.
+        #[allow(unsafe_code)]
+        let _ = unsafe { LocalFree(HLOCAL(self.descriptor.0.cast())) };
+    }
+}
+
+fn data_dir_security_descriptor(
+    policy: DataDirAcl<'_>,
+) -> Result<DataDirSecurityDescriptor, PlatformError> {
     let sddl = policy.sddl();
     let sddl_wide = wide_nul(OsStr::new(&sddl));
-    let path_wide = wide_nul(path.as_os_str());
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     // SAFETY: `sddl_wide` is a NUL-terminated Rust-owned SDDL string; Windows
     // writes the returned LocalAlloc descriptor pointer into valid storage.
@@ -217,7 +306,7 @@ fn set_data_dir_dacl(path: &Path, policy: DataDirAcl<'_>) -> Result<(), Platform
     // SAFETY: descriptor is the valid self-relative descriptor returned above;
     // all output locations are writable for the duration of this function.
     #[allow(unsafe_code)]
-    let result = unsafe {
+    unsafe {
         GetSecurityDescriptorDacl(
             descriptor,
             &mut dacl_present,
@@ -225,70 +314,258 @@ fn set_data_dir_dacl(path: &Path, policy: DataDirAcl<'_>) -> Result<(), Platform
             &mut dacl_defaulted,
         )
     }
-    .map_err(io_error)
-    .and_then(|()| {
-        if dacl_present.0 == 0 || dacl.is_null() {
-            return Err(PlatformError::Invalid {
-                capability: "secure_data_dir",
-                detail: "generated data-directory DACL is absent",
-            });
-        }
-        // SAFETY: `path_wide` is NUL terminated and `dacl` points into the
-        // live descriptor. Passing DACL|PROTECTED makes inherited ProgramData
-        // ACEs disappear instead of leaving a read path for ordinary users.
+    .map_err(io_error)?;
+    if dacl_present.0 == 0 || dacl.is_null() {
+        // SAFETY: the descriptor belongs to this error path and is not wrapped.
         #[allow(unsafe_code)]
-        unsafe {
-            SetNamedSecurityInfoW(
-                windows::core::PCWSTR(path_wide.as_ptr()),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                PSID::default(),
-                PSID::default(),
-                Some(dacl.cast_const()),
-                None,
-            )
+        let _ = unsafe { LocalFree(HLOCAL(descriptor.0.cast())) };
+        return invalid("generated data-directory DACL is absent");
+    }
+    let owner = if policy.sets_machine_owner() {
+        let mut owner = PSID::default();
+        let mut defaulted = windows::Win32::Foundation::BOOL(0);
+        // SAFETY: descriptor is live, and both output locations are writable.
+        #[allow(unsafe_code)]
+        if let Err(error) =
+            unsafe { GetSecurityDescriptorOwner(descriptor, &mut owner, &mut defaulted) }
+        {
+            // SAFETY: construction has not transferred this LocalAlloc block
+            // into DataDirSecurityDescriptor on this error path.
+            #[allow(unsafe_code)]
+            let _ = unsafe { LocalFree(HLOCAL(descriptor.0.cast())) };
+            return Err(io_error(error));
         }
-        .ok()
-        .map_err(io_error)
-    });
-    // SAFETY: ConvertStringSecurityDescriptorToSecurityDescriptorW allocated
-    // the descriptor with LocalAlloc; no pointer into it is used after this.
+        Some(owner)
+    } else {
+        None
+    };
+    Ok(DataDirSecurityDescriptor {
+        descriptor,
+        dacl,
+        owner,
+    })
+}
+
+fn set_data_dir_dacl(handle: HANDLE, policy: DataDirAcl<'_>) -> Result<(), PlatformError> {
+    let descriptor = data_dir_security_descriptor(policy)?;
+    let owner_information = if descriptor.owner.is_some() {
+        OWNER_SECURITY_INFORMATION
+    } else {
+        windows::Win32::Security::OBJECT_SECURITY_INFORMATION(0)
+    };
+    // SAFETY: every pointer comes from the live descriptor; security changes
+    // target this open handle and therefore cannot follow a substituted path.
     #[allow(unsafe_code)]
-    let _ = unsafe { LocalFree(HLOCAL(descriptor.0.cast())) };
-    result
+    unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION | owner_information,
+            descriptor.owner.unwrap_or_default(),
+            PSID::default(),
+            Some(descriptor.dacl.cast_const()),
+            None,
+        )
+    }
+    .ok()
+    .map_err(io_error)
+}
+
+/// Create every missing component with its protected descriptor already in
+/// place. There is no inherited-ACL interval in which another user can seed a
+/// junction or a file beneath the new directory.
+fn create_missing_directories(
+    resolved: &ResolvedDataDir,
+    policy: &DataDirPolicy,
+) -> Result<(), PlatformError> {
+    let descriptor = data_dir_security_descriptor(policy.acl())?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.descriptor.0.cast(),
+        bInheritHandle: windows::Win32::Foundation::BOOL(0),
+    };
+    let mut current = resolved.create_base.clone();
+    for name in &resolved.missing {
+        current.push(name);
+        let wide = wide_nul(current.as_os_str());
+        // SAFETY: the path is NUL terminated and `attributes` owns a live
+        // security descriptor for the duration of CreateDirectoryW.
+        #[allow(unsafe_code)]
+        match unsafe {
+            CreateDirectoryW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                Some(&attributes as *const SECURITY_ATTRIBUTES),
+            )
+        } {
+            Ok(()) => {}
+            Err(error) if (error.code().0 & 0xffff) == ERROR_ALREADY_EXISTS.0 as i32 => {
+                // An object appeared during creation. Pin it before checking
+                // its owner or changing a DACL; never trust a path query here.
+                let (handle, directory) = open_data_object(&current)?;
+                let result = if directory {
+                    secure_entry_handle(handle, policy)
+                } else {
+                    invalid("data directory path contains a non-directory")
+                };
+                close(handle);
+                result?;
+            }
+            Err(error) => return Err(io_error(error)),
+        }
+    }
+    Ok(())
+}
+
+/// Open a final component without following a symlink/junction. A reparse
+/// point is opened as the point itself and immediately refused.
+fn open_data_object(path: &Path) -> Result<(HANDLE, bool), PlatformError> {
+    let wide = wide_nul(path.as_os_str());
+    // SAFETY: `wide` is NUL terminated. The returned handle is closed by the
+    // caller on every path after this function succeeds.
+    #[allow(unsafe_code)]
+    let handle = unsafe {
+        CreateFileW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            READ_CONTROL.0 | WRITE_DAC.0 | WRITE_OWNER.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            HANDLE::default(),
+        )
+    }
+    .map_err(io_error)?;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is open and `information` is writable output storage.
+    #[allow(unsafe_code)]
+    let information_result =
+        unsafe { GetFileInformationByHandle(handle, &mut information) }.map_err(io_error);
+    if let Err(error) = information_result {
+        close(handle);
+        return Err(error);
+    }
+    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        close(handle);
+        return invalid("data directory path contains a reparse point");
+    }
+    Ok((
+        handle,
+        information.dwFileAttributes
+            & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY.0
+            != 0,
+    ))
+}
+
+fn final_path_for_handle(handle: HANDLE) -> Result<PathBuf, PlatformError> {
+    let mut buffer = vec![0_u16; 32_768];
+    // SAFETY: `handle` is open and `buffer` is writable for the documented
+    // number of UTF-16 code units.
+    #[allow(unsafe_code)]
+    let length = unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, FILE_NAME_NORMALIZED) };
+    if length == 0 || length as usize >= buffer.len() {
+        return Err(io_error(Error::from_win32()));
+    }
+    buffer.truncate(length as usize);
+    Ok(PathBuf::from(OsString::from_wide(&buffer)))
+}
+
+fn directory_children(path: &Path) -> Result<Vec<OsString>, PlatformError> {
+    let wildcard = path.join("*");
+    let wide = wide_nul(wildcard.as_os_str());
+    let mut entry = WIN32_FIND_DATAW::default();
+    // SAFETY: the wildcard is NUL terminated and `entry` is writable storage.
+    #[allow(unsafe_code)]
+    let find = unsafe { FindFirstFileW(windows::core::PCWSTR(wide.as_ptr()), &mut entry) }
+        .map_err(io_error)?;
+    let mut names = Vec::new();
+    loop {
+        let length = entry
+            .cFileName
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(entry.cFileName.len());
+        let name = &entry.cFileName[..length];
+        if name != [u16::from(b'.')] && name != [u16::from(b'.'), u16::from(b'.')] {
+            if entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+                // SAFETY: `find` is an owned FindFirstFileW handle.
+                #[allow(unsafe_code)]
+                let _ = unsafe { FindClose(find) };
+                return invalid("data directory contains a reparse point");
+            }
+            names.push(OsString::from_wide(&entry.cFileName[..length]));
+        }
+        // SAFETY: `find` remains valid until FindClose below; `entry` is writable.
+        #[allow(unsafe_code)]
+        match unsafe { FindNextFileW(find, &mut entry) } {
+            Ok(()) => {}
+            Err(error) if (error.code().0 & 0xffff) == ERROR_NO_MORE_FILES.0 as i32 => break,
+            Err(error) => {
+                // SAFETY: `find` is an owned FindFirstFileW handle.
+                #[allow(unsafe_code)]
+                let _ = unsafe { FindClose(find) };
+                return Err(io_error(error));
+            }
+        }
+    }
+    // SAFETY: `find` is an owned FindFirstFileW handle and is closed exactly once.
+    #[allow(unsafe_code)]
+    let _ = unsafe { FindClose(find) };
+    Ok(names)
+}
+
+fn secure_entry_handle(handle: HANDLE, policy: &DataDirPolicy) -> Result<(), PlatformError> {
+    if !policy.accepts_owner(&owner_sid_for_handle(handle)?) {
+        return invalid("data directory owner is not trusted");
+    }
+    set_data_dir_dacl(handle, policy.acl())
+}
+
+fn secure_directory_tree(
+    handle: HANDLE,
+    canonical_path: &Path,
+    policy: &DataDirPolicy,
+) -> Result<(), PlatformError> {
+    secure_entry_handle(handle, policy)?;
+    // The root descriptor is now protected, so an ordinary user cannot
+    // substitute children while their individual handles are opened below.
+    for name in directory_children(canonical_path)? {
+        let child_path = canonical_path.join(name);
+        let (child, is_directory) = open_data_object(&child_path)?;
+        let result = if is_directory {
+            let child_canonical = final_path_for_handle(child)?;
+            secure_directory_tree(child, &child_canonical, policy)
+        } else {
+            secure_entry_handle(child, policy)
+        };
+        close(child);
+        result?;
+    }
+    Ok(())
 }
 
 fn secure_data_dir_with_policy(
     path: &Path,
-    expected_owner: impl Fn(&str) -> bool,
-    policy: DataDirAcl<'_>,
-) -> Result<(), PlatformError> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let existed = validate_directory_path(&absolute)?;
-    if existed && !expected_owner(&owner_sid_for_path(&absolute)?) {
-        return Err(PlatformError::Invalid {
-            capability: "secure_data_dir",
-            detail: "data directory owner is not trusted",
-        });
+    default: &Path,
+    policy: DataDirPolicy,
+) -> Result<PathBuf, PlatformError> {
+    let resolved = resolve_data_dir_path(path)?;
+    let default = resolve_data_dir_path(default)?;
+    // Compare canonical paths before creation. A normal token cannot use the
+    // machine's official location, even if an ACL happens to name that user.
+    let official_data_dir = is_machine_data_dir(&resolved.canonical, &default.canonical);
+    if official_data_dir && !policy.permits_official_data_dir() {
+        return invalid("official data directory requires a privileged daemon");
     }
-    std::fs::create_dir_all(&absolute)?;
-    if !validate_directory_path(&absolute)? {
-        return Err(PlatformError::Invalid {
-            capability: "secure_data_dir",
-            detail: "data directory disappeared while it was being created",
-        });
+    create_missing_directories(&resolved, &policy)?;
+    let (directory, is_directory) = open_data_object(&resolved.canonical)?;
+    if !is_directory {
+        close(directory);
+        return invalid("data directory path contains a non-directory");
     }
-    if !expected_owner(&owner_sid_for_path(&absolute)?) {
-        return Err(PlatformError::Invalid {
-            capability: "secure_data_dir",
-            detail: "data directory owner changed while it was being secured",
-        });
-    }
-    set_data_dir_dacl(&absolute, policy)
+    let canonical = final_path_for_handle(directory)?;
+    let result = secure_directory_tree(directory, &canonical, &policy).map(|()| canonical);
+    close(directory);
+    result
 }
 
 fn io_error(error: Error) -> PlatformError {
@@ -473,6 +750,19 @@ fn owner_for_token(token: HANDLE) -> Result<Owner, PlatformError> {
         elevated: elevated_for_token(token)?,
         integrity: integrity_for_token(token),
     })
+}
+
+/// Read the daemon process token directly. Data-directory policy must not use
+/// a caller-provided identity, an environment switch, or a process-table view.
+fn current_token_owner() -> Result<Owner, PlatformError> {
+    let mut token = HANDLE::default();
+    // SAFETY: GetCurrentProcess is a valid pseudo-handle and `token` is
+    // writable output storage for an owned token handle.
+    #[allow(unsafe_code)]
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.map_err(io_error)?;
+    let owner = owner_for_token(token);
+    close(token);
+    owner
 }
 
 fn image_for_process(process: HANDLE) -> Option<PathBuf> {
@@ -1369,23 +1659,19 @@ impl Platform for CurrentPlatform {
         }
         Ok(rows)
     }
-    fn secure_data_dir(&self, path: &Path) -> Result<(), PlatformError> {
-        let Owner::Windows { sid, .. } = self.current_owner()? else {
+    fn secure_data_dir(&self, path: &Path) -> Result<PathBuf, PlatformError> {
+        let Owner::Windows { sid, elevated, .. } = current_token_owner()? else {
             return Err(PlatformError::Invalid {
                 capability: "secure_data_dir",
                 detail: "current process is not a Windows account",
             });
         };
         let default = self.default_data_dir()?;
-        if is_machine_data_dir(path, &default) {
-            secure_data_dir_with_policy(
-                path,
-                |owner| owner == SYSTEM_SID || owner == ADMINISTRATORS_SID,
-                DataDirAcl::Machine,
-            )
-        } else {
-            secure_data_dir_with_policy(path, |owner| owner == sid, DataDirAcl::Owner(&sid))
-        }
+        // Elevation and the token user are the daemon's own kernel-authenticated
+        // identity. A privileged daemon cannot bypass machine ownership by
+        // selecting a custom location.
+        let policy = data_dir_policy_for_token(sid, elevated);
+        secure_data_dir_with_policy(path, &default, policy)
     }
     fn default_data_dir(&self) -> Result<PathBuf, PlatformError> {
         std::env::var_os("ProgramData")
@@ -1408,11 +1694,7 @@ impl Platform for CurrentPlatform {
         })
     }
     fn current_owner(&self) -> Result<Owner, PlatformError> {
-        entry(std::process::id(), None)?
-            .and_then(|process| process.owner)
-            .ok_or(PlatformError::PeerNotIdentified {
-                reason: "current process ownership is unavailable",
-            })
+        current_token_owner()
     }
 }
 
@@ -1426,21 +1708,24 @@ pub fn os_version() -> Option<String> {
 mod tests {
     #[allow(unused_imports)] // Kept with the named-pipe-fix test import set.
     use super::{
-        close, environment_from, owner_sid_for_path, secure_data_dir_with_policy,
-        set_data_dir_dacl, sid_text, trusted_pipe_owner, CurrentPlatform, DataDirAcl,
-        ADMINISTRATORS_SID, SYSTEM_SID,
+        close, current_token_owner, data_dir_policy_for_token, environment_from, open_data_object,
+        secure_data_dir_with_policy, set_data_dir_dacl, sid_text, trusted_pipe_owner,
+        CurrentPlatform, DataDirAcl, DataDirPolicy, ADMINISTRATORS_SID, SYSTEM_SID,
     };
     use crate::{
         platform, Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner,
         PeerIdentity, Platform, PlatformError, ReapOutcome, SpawnRequest, UnsupportedKind,
     };
-    use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::{HLOCAL, PSID};
-    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows::Win32::Security::{
         GetAce, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateSymbolicLinkW, FILE_ALL_ACCESS, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+        SYMBOLIC_LINK_FLAG_DIRECTORY,
     };
     use windows::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 
@@ -1453,23 +1738,24 @@ mod tests {
     /// `icacls`-equivalent readback used by the ACL test. It deliberately
     /// reads the DACL Windows stored, rather than asserting the SDDL input
     /// string, so inheritance and unexpected Users/Everyone ACEs are visible.
-    fn read_dacl(path: &std::path::Path) -> Result<DaclReadback, PlatformError> {
-        let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
+    fn read_dacl(
+        handle: windows::Win32::Foundation::HANDLE,
+    ) -> Result<DaclReadback, PlatformError> {
         let mut dacl = std::ptr::null_mut();
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: the path is NUL terminated and output storage remains live
+        // SAFETY: the pinned object handle and all output storage remain live
         // until the descriptor is released after all ACEs are read.
         #[allow(unsafe_code)]
         let result = unsafe {
-            GetNamedSecurityInfoW(
-                windows::core::PCWSTR(wide.as_ptr()),
+            GetSecurityInfo(
+                handle,
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 None,
                 None,
                 Some(&mut dacl),
                 None,
-                &mut descriptor,
+                Some(&mut descriptor),
             )
         }
         .ok()
@@ -1483,7 +1769,7 @@ mod tests {
             }
             let mut control = 0_u16;
             let mut revision = 0_u32;
-            // SAFETY: descriptor is live and came from GetNamedSecurityInfoW;
+            // SAFETY: descriptor is live and came from GetSecurityInfo;
             // both output locations are writable.
             #[allow(unsafe_code)]
             unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }
@@ -1519,7 +1805,7 @@ mod tests {
                 aces,
             })
         });
-        // SAFETY: GetNamedSecurityInfoW allocated the descriptor with LocalAlloc.
+        // SAFETY: GetSecurityInfo allocated the descriptor with LocalAlloc.
         #[allow(unsafe_code)]
         let _ = unsafe { windows::Win32::Foundation::LocalFree(HLOCAL(descriptor.0.cast())) };
         result
@@ -1564,19 +1850,28 @@ mod tests {
         let root = temp_dir("machine-dacl");
         let data = root.join("data");
         std::fs::create_dir_all(&data)?;
-        set_data_dir_dacl(&data, DataDirAcl::Machine)?;
-        let readback = read_dacl(&data)?;
+        let (handle, is_directory) = open_data_object(&data)?;
+        assert!(is_directory);
+        set_data_dir_dacl(handle, DataDirAcl::Machine)?;
+        let readback = read_dacl(handle)?;
         // Restore the creator's access before cleanup. This is outside the
         // assertion: the readback above is the state the daemon leaves behind.
-        let owner = owner_sid_for_path(&data)?;
-        set_data_dir_dacl(&data, DataDirAcl::Owner(&owner))?;
+        let Owner::Windows { sid: owner, .. } = current_token_owner()? else {
+            return Err(PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "current process is not a Windows account",
+            });
+        };
+        set_data_dir_dacl(handle, DataDirAcl::Owner(&owner))?;
+        close(handle);
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(readback.protected, "DACL inheritance must be disabled");
         assert_eq!(readback.aces.len(), 2, "no Users/Everyone/other ACEs");
-        assert!(readback.aces.iter().all(|(_, mask, flags)| {
-            *mask == windows::Win32::Foundation::GENERIC_ALL.0 && *flags == 3
-        }));
+        assert!(readback
+            .aces
+            .iter()
+            .all(|(_, mask, flags)| { *mask == FILE_ALL_ACCESS.0 && *flags == 3 }));
         let mut sids: Vec<&str> = readback
             .aces
             .iter()
@@ -1592,7 +1887,9 @@ mod tests {
         let root = temp_dir("foreign-owner");
         let data = root.join("data");
         std::fs::create_dir_all(&data)?;
-        let Err(error) = secure_data_dir_with_policy(&data, |_| false, DataDirAcl::Machine) else {
+        let Err(error) =
+            secure_data_dir_with_policy(&data, &root.join("official"), DataDirPolicy::Machine)
+        else {
             return Err(PlatformError::Invalid {
                 capability: "secure_data_dir",
                 detail: "normal user's pre-created directory was accepted",
@@ -1606,6 +1903,224 @@ mod tests {
                 detail: "data directory owner is not trusted",
             }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn data_dir_policy_matrix_uses_only_the_daemon_token() {
+        let user = "S-1-5-21-10-20-30-1001".to_owned();
+        let other = "S-1-5-21-10-20-30-1002";
+        for (policy, official, owner, allowed) in [
+            // A normal token can only use a self-owned non-official dir.
+            (
+                data_dir_policy_for_token(user.clone(), false),
+                true,
+                user.as_str(),
+                false,
+            ),
+            (
+                data_dir_policy_for_token(user.clone(), false),
+                true,
+                SYSTEM_SID,
+                false,
+            ),
+            (
+                data_dir_policy_for_token(user.clone(), false),
+                true,
+                other,
+                false,
+            ),
+            (
+                data_dir_policy_for_token(user.clone(), false),
+                false,
+                user.as_str(),
+                true,
+            ),
+            (
+                data_dir_policy_for_token(user.clone(), false),
+                false,
+                SYSTEM_SID,
+                false,
+            ),
+            (
+                data_dir_policy_for_token(user.clone(), false),
+                false,
+                other,
+                false,
+            ),
+            // An elevated token cannot use either official or custom dirs
+            // owned by the normal token.
+            (
+                data_dir_policy_for_token(user.clone(), true),
+                true,
+                SYSTEM_SID,
+                true,
+            ),
+            (
+                data_dir_policy_for_token(user.clone(), true),
+                true,
+                ADMINISTRATORS_SID,
+                true,
+            ),
+            (
+                data_dir_policy_for_token(user.clone(), true),
+                true,
+                user.as_str(),
+                false,
+            ),
+            (
+                data_dir_policy_for_token(user.clone(), true),
+                false,
+                SYSTEM_SID,
+                true,
+            ),
+            (
+                data_dir_policy_for_token(user.clone(), true),
+                false,
+                ADMINISTRATORS_SID,
+                true,
+            ),
+            (
+                data_dir_policy_for_token(user.clone(), true),
+                false,
+                user.as_str(),
+                false,
+            ),
+        ] {
+            let path_allowed = !official || policy.permits_official_data_dir();
+            assert_eq!(path_allowed && policy.accepts_owner(owner), allowed);
+        }
+    }
+
+    #[test]
+    fn user_policy_refuses_the_official_machine_path() -> Result<(), PlatformError> {
+        let root = temp_dir("official-user");
+        std::fs::create_dir_all(&root)?;
+        let Owner::Windows { sid, .. } = current_token_owner()? else {
+            return Err(PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "current process is not a Windows account",
+            });
+        };
+        let Err(error) = secure_data_dir_with_policy(&root, &root, DataDirPolicy::Owner(sid))
+        else {
+            return Err(PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "normal token used the machine location",
+            });
+        };
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(matches!(
+            error,
+            PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "official data directory requires a privileged daemon",
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn user_data_dir_accepts_its_creator_and_has_one_owner_ace() -> Result<(), PlatformError> {
+        let root = temp_dir("self-owner");
+        let data = root.join("data");
+        std::fs::create_dir_all(&data)?;
+        let secret = data.join("secret.txt");
+        std::fs::write(&secret, b"metadata only")?;
+        let Owner::Windows { sid, .. } = current_token_owner()? else {
+            return Err(PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "current process is not a Windows account",
+            });
+        };
+        secure_data_dir_with_policy(
+            &data,
+            &root.join("official"),
+            DataDirPolicy::Owner(sid.clone()),
+        )?;
+        let (handle, is_directory) = open_data_object(&data)?;
+        assert!(is_directory);
+        let readback = read_dacl(handle)?;
+        close(handle);
+        let (secret_handle, is_directory) = open_data_object(&secret)?;
+        assert!(!is_directory);
+        let secret_readback = read_dacl(secret_handle)?;
+        close(secret_handle);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(readback.protected);
+        assert_eq!(readback.aces, vec![(sid, FILE_ALL_ACCESS.0, 3)]);
+        assert_eq!(secret_readback.aces.len(), 1, "existing file is hardened");
+        assert_eq!(secret_readback.aces[0].0, readback.aces[0].0);
+        assert_eq!(secret_readback.aces[0].1, FILE_ALL_ACCESS.0);
+        Ok(())
+    }
+
+    #[test]
+    fn secure_data_dir_refuses_final_ancestor_and_nested_reparse_points(
+    ) -> Result<(), PlatformError> {
+        let root = temp_dir("reparse");
+        let target = root.join("target");
+        let link = root.join("link");
+        let data = root.join("data");
+        std::fs::create_dir_all(&target)?;
+        let Owner::Windows { sid, .. } = current_token_owner()? else {
+            return Err(PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "current process is not a Windows account",
+            });
+        };
+        let link_wide: Vec<u16> = link.as_os_str().encode_wide().chain(Some(0)).collect();
+        let target_wide: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: both paths are NUL terminated; this only creates a test link.
+        #[allow(unsafe_code)]
+        let created = unsafe {
+            CreateSymbolicLinkW(
+                windows::core::PCWSTR(link_wide.as_ptr()),
+                windows::core::PCWSTR(target_wide.as_ptr()),
+                SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+            )
+        };
+        if !created.as_bool() {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err(super::io_error(windows::core::Error::from_win32()));
+        }
+        let policy = DataDirPolicy::Owner(sid.clone());
+        let final_error =
+            secure_data_dir_with_policy(&link, &root.join("official"), policy.clone());
+        let ancestor_error = secure_data_dir_with_policy(
+            &link.join("child"),
+            &root.join("official"),
+            policy.clone(),
+        );
+        secure_data_dir_with_policy(&data, &root.join("official"), policy)?;
+        let nested = data.join("evil");
+        let nested_wide: Vec<u16> = nested.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: both paths are NUL terminated; this only creates a test link.
+        #[allow(unsafe_code)]
+        let nested_created = unsafe {
+            CreateSymbolicLinkW(
+                windows::core::PCWSTR(nested_wide.as_ptr()),
+                windows::core::PCWSTR(target_wide.as_ptr()),
+                SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+            )
+        };
+        if !nested_created.as_bool() {
+            let _ = std::fs::remove_dir_all(&root);
+            return Err(super::io_error(windows::core::Error::from_win32()));
+        }
+        let nested_error =
+            secure_data_dir_with_policy(&data, &root.join("official"), DataDirPolicy::Owner(sid));
+        let _ = std::fs::remove_dir_all(&root);
+        for error in [final_error, ancestor_error, nested_error] {
+            assert!(matches!(
+                error,
+                Err(PlatformError::Invalid {
+                    capability: "secure_data_dir",
+                    detail: "data directory path contains a reparse point"
+                        | "data directory contains a reparse point",
+                })
+            ));
+        }
         Ok(())
     }
 

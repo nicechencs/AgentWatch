@@ -446,6 +446,20 @@ impl Platform for CurrentPlatform {
     }
 }
 
+/// `PRETTY_NAME` from `/etc/os-release`. `None` when the file or the field is
+/// missing: the caller prints 「不可得」, never an empty string.
+pub fn os_version() -> Option<String> {
+    let text = std::fs::read_to_string("/etc/os-release").ok()?;
+    for line in text.lines() {
+        let value = line.strip_prefix("PRETTY_NAME=")?;
+        let value = value.trim().trim_matches('"').trim();
+        if !value.is_empty() {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "test-hold-delay")]

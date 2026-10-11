@@ -188,6 +188,7 @@ dependencies = [
  "aw-collector-linux",
  "aw-collector-macos",
  "aw-collector-windows",
+ "libc",
  "nix",
 ]
 

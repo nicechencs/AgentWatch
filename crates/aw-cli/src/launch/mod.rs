@@ -2,8 +2,8 @@
 //!
 //! Windows calls [`windows::run_launch`]. Production on Windows is
 //! [`windows::production`]: Job assignment is unavailable in this crate, so no
-//! process is created. macOS uses [`unix_macos`] (cfg-gated); that launcher
-//! spawns with `Command` and does not claim suspension. Linux production uses
+//! process is created. macOS `aw run` starts through `aw-platform`
+//! (`POSIX_SPAWN_START_SUSPENDED`), not through this module. Linux production uses
 //! [`unix_linux::LocalCgroupHost`] (cfg-gated): a delegated cgroup v2 directory,
 //! or a structured error and no child. [`UnsupportedUnixLauncher`] remains the
 //! production value on every other non-Windows target.
@@ -15,14 +15,6 @@
 // variant is constructed by this binary yet; that is not a dead-code defect.
 #[allow(dead_code)]
 mod windows;
-
-// P1-MAC-03. macOS `aw run` needs [`unix_macos::production`], which does not
-// exist on other targets, so the module is cfg-gated to macOS. Linux is the
-// `unix_linux` module below, also cfg-gated.
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-#[path = "unix_macos.rs"]
-mod unix_macos;
 
 // Linux production `aw run` uses [`unix_linux::LocalCgroupHost`]. The module is
 // cfg-gated so non-Linux builds do not compile the host. [`UnverifiedCgroupLaunch`]
@@ -43,12 +35,6 @@ pub use windows::{
 #[cfg(target_os = "windows")]
 #[allow(unused_imports)]
 pub use windows::production;
-
-/// Present only on macOS. [`unix_macos::production`] spawns with `Command` and
-/// records that suspension was not applied. It does not claim E1 scope.
-#[cfg(target_os = "macos")]
-#[allow(unused_imports)]
-pub use unix_macos::{launch_command, production};
 
 /// Present only on Linux. [`unix_linux::LocalCgroupHost`] creates a cgroup v2
 /// session directory when the caller is delegated, and refuses otherwise.

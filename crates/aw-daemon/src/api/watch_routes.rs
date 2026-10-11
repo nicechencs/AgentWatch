@@ -1079,6 +1079,13 @@ mod database_busy_tests {
 
     use super::{insert_session, reply_delivery_failed, ApiResponse, ApiState, SampleTarget};
 
+    #[derive(Debug)]
+    struct WriterTimings {
+        open: Duration,
+        begin_immediate: Duration,
+        insert: Duration,
+    }
+
     #[test]
     fn lock_past_busy_timeout_returns_db_busy_with_measured_wait() {
         let nanos = SystemTime::now()
@@ -1094,15 +1101,27 @@ mod database_busy_tests {
         let (release_tx, release_rx) = mpsc::channel();
         let writer_path = path.clone();
         let writer = thread::spawn(move || {
+            let opened = Instant::now();
             let conn = aw_store::open_connection(&writer_path).expect("writer connection");
+            let open = opened.elapsed();
+            let begun = Instant::now();
             let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
                 .expect("begin immediate");
+            let begin_immediate = begun.elapsed();
+            let inserted = Instant::now();
             tx.execute(
                 "INSERT INTO schema_meta (key, value) VALUES ('busy-test', '1')",
                 [],
             )
             .expect("writer row");
-            ready_tx.send(()).expect("signal writer");
+            let insert = inserted.elapsed();
+            ready_tx
+                .send(WriterTimings {
+                    open,
+                    begin_immediate,
+                    insert,
+                })
+                .expect("signal writer");
             // Keep the write transaction open until `insert_session` has
             // returned. A fixed sleep starts before the attempted write; a
             // loaded CI runner can delay that write until after the lock has
@@ -1111,7 +1130,7 @@ mod database_busy_tests {
             tx.commit().expect("writer commit");
             release
         });
-        ready_rx.recv().expect("writer ready");
+        let writer_timings = ready_rx.recv().expect("writer ready");
 
         let mut target = SampleTarget {
             db_id: 0,
@@ -1126,9 +1145,16 @@ mod database_busy_tests {
             root_hint: None,
             root_identity: None,
         };
+        let trace = aw_store::test_support::TraceCapture::start();
         let started = Instant::now();
         let result = insert_session(&path, &mut target);
         let elapsed = started.elapsed();
+        let sql_trace = trace
+            .finish()
+            .into_iter()
+            .map(|entry| format!("{}={:?}", entry.operation, entry.elapsed))
+            .collect::<Vec<_>>()
+            .join(", ");
         let release_sent = release_tx.send(()).is_ok();
         let writer_release = writer.join().expect("writer thread");
         let outcome = match &result {
@@ -1141,7 +1167,10 @@ mod database_busy_tests {
         };
         let diagnostic = format!(
             "insert_session elapsed={elapsed:?}; outcome={outcome}; \
-             release_sent={release_sent}; writer_release={writer_release:?}"
+             writer_open={:?}; writer_begin_immediate={:?}; writer_insert={:?}; \
+             sqlite_steps=[{sql_trace}]; release_sent={release_sent}; \
+             writer_release={writer_release:?}",
+            writer_timings.open, writer_timings.begin_immediate, writer_timings.insert,
         );
         let response = result.expect_err(&format!("busy response; {diagnostic}"));
         assert!(release_sent, "writer release channel closed; {diagnostic}");

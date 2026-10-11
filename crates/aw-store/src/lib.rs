@@ -25,6 +25,9 @@ mod replay;
 mod retention;
 mod sink;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 pub use retention::{
     ApplyReport, DiskCheck, OldestSession, PurgeReason, PurgeReport, PurgeScope, Retention,
     RetentionConfig, Stats, TableCount, WriteMode,

@@ -11,6 +11,9 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 
+#[cfg(feature = "test-support")]
+use crate::test_support;
+
 /// How long SQLite waits for an existing writer before returning `SQLITE_BUSY`.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -19,14 +22,27 @@ pub const BUSY_TIMEOUT: Duration = Duration::from_secs(8);
 /// This must remain the first database operation on every connection.  The
 /// remaining connection-local settings belong to [`crate::Store`], whose
 /// writable connections need them, rather than to read-only inspection opens.
-pub fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
-    conn.busy_timeout(BUSY_TIMEOUT)
+pub fn configure_connection(conn: &mut Connection) -> rusqlite::Result<()> {
+    let started = std::time::Instant::now();
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    #[cfg(feature = "test-support")]
+    test_support::record("sqlite3_busy_timeout", started.elapsed());
+    #[cfg(not(feature = "test-support"))]
+    let _ = started;
+    Ok(())
 }
 
 /// Open a connection with the shared busy timeout installed first.
 pub fn open_connection(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
-    configure_connection(&conn)?;
+    let started = std::time::Instant::now();
+    let mut conn = Connection::open(path)?;
+    #[cfg(feature = "test-support")]
+    test_support::record("sqlite3_open", started.elapsed());
+    #[cfg(not(feature = "test-support"))]
+    let _ = started;
+    configure_connection(&mut conn)?;
+    #[cfg(feature = "test-support")]
+    test_support::install_profile(&mut conn);
     Ok(conn)
 }
 
@@ -34,8 +50,15 @@ pub fn open_connection(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
 ///
 /// Unit tests use this rather than bypassing the production connection setup.
 pub fn open_in_memory_connection() -> rusqlite::Result<Connection> {
-    let conn = Connection::open_in_memory()?;
-    configure_connection(&conn)?;
+    let started = std::time::Instant::now();
+    let mut conn = Connection::open_in_memory()?;
+    #[cfg(feature = "test-support")]
+    test_support::record("sqlite3_open_in_memory", started.elapsed());
+    #[cfg(not(feature = "test-support"))]
+    let _ = started;
+    configure_connection(&mut conn)?;
+    #[cfg(feature = "test-support")]
+    test_support::install_profile(&mut conn);
     Ok(conn)
 }
 
@@ -44,7 +67,14 @@ pub fn open_connection_with_flags(
     path: impl AsRef<Path>,
     flags: OpenFlags,
 ) -> rusqlite::Result<Connection> {
-    let conn = Connection::open_with_flags(path, flags)?;
-    configure_connection(&conn)?;
+    let started = std::time::Instant::now();
+    let mut conn = Connection::open_with_flags(path, flags)?;
+    #[cfg(feature = "test-support")]
+    test_support::record("sqlite3_open_with_flags", started.elapsed());
+    #[cfg(not(feature = "test-support"))]
+    let _ = started;
+    configure_connection(&mut conn)?;
+    #[cfg(feature = "test-support")]
+    test_support::install_profile(&mut conn);
     Ok(conn)
 }

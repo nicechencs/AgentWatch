@@ -15,6 +15,8 @@
 //!   and a process table to the sampler; otherwise it answers 503
 //!   `collector_unavailable` and creates nothing.
 
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Value};
 
 use super::auth::{random_secret, Caller};
@@ -225,13 +227,33 @@ fn require_writable_database(path: &std::path::Path) -> Result<(), ApiResponse> 
 
 /// Allocate `sessions.id` and insert the row. Id 1 stays the daemon sample's.
 fn insert_session(path: &std::path::Path, target: &mut SampleTarget) -> Result<(), ApiResponse> {
+    insert_session_timed(path, target).map(|_| ())
+}
+
+/// Diagnostic portions of a synchronous attach session-row insertion.
+///
+/// This is only returned to the IPC timing probe.  It is never serialized in
+/// an API response or stored with a session.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct AttachDbTiming {
+    pub(super) open_connection: Duration,
+    pub(super) db_lock: Duration,
+    pub(super) write_session: Duration,
+}
+
+fn insert_session_timed(
+    path: &std::path::Path,
+    target: &mut SampleTarget,
+) -> Result<AttachDbTiming, ApiResponse> {
     let store_error =
         |err: &aw_store::StoreError, what: &str| super::routes::database_store_response(err, what);
+    let open_started = Instant::now();
     let mut store = aw_store::Store::open_runtime(path)
         .map_err(|err| store_error(&err, "cannot open the database"))?;
     if store.is_read_only() {
         return Err(super::routes::database_read_only_newer_response());
     }
+    let allocate_started = Instant::now();
     let max: i64 = store
         .connection()
         .query_row("SELECT COALESCE(MAX(id), 1) FROM sessions", [], |row| {
@@ -241,13 +263,19 @@ fn insert_session(path: &std::path::Path, target: &mut SampleTarget) -> Result<(
     target.db_id = max.max(1).saturating_add(1);
     let mut batch = aw_store::WriteBatch::default();
     batch.sessions.push(target.session_row(now_ns()));
+    let allocation = allocate_started.elapsed();
     let mut sink = aw_store::SqliteSink::new(&mut store)
         .map_err(|err| store_error(&err, "cannot open the writer"))?;
-    use aw_store::RecordSink;
-    sink.write_batch(&batch)
+    let open_connection = open_started.elapsed().saturating_sub(allocation);
+    let timing = sink
+        .write_batch_timed(&batch)
         .map_err(|err| store_error(&err, "cannot write the session row"))?;
     target.write_session_row = false;
-    Ok(())
+    Ok(AttachDbTiming {
+        open_connection,
+        db_lock: timing.db_lock,
+        write_session: allocation.saturating_add(timing.write),
+    })
 }
 
 fn new_public_id() -> Result<String, ApiResponse> {
@@ -348,8 +376,92 @@ fn created(target: &SampleTarget, extra: Value) -> ApiResponse {
     ApiResponse::json(201, &body)
 }
 
+/// An attach request that passed the caller/process ownership check while the
+/// API state lock was held.  The database write is deliberately separate: it
+/// can wait on SQLite without blocking every unrelated local API request.
+pub(super) struct PreparedAttach {
+    path: std::path::PathBuf,
+    target: SampleTarget,
+    deadline_ns: Option<i64>,
+}
+
+impl PreparedAttach {
+    pub(super) fn pid(&self) -> u32 {
+        self.target.root_pid
+    }
+
+    pub(super) fn persist(&mut self) -> Result<AttachDbTiming, ApiResponse> {
+        insert_session_timed(&self.path, &mut self.target)
+    }
+
+    pub(super) fn enqueue(self, state: &mut ApiState) -> ApiResponse {
+        let response = created(&self.target, json!({ "scan_pending": true }));
+        state.pending_scans.insert(self.target.public_id.clone());
+        state.watch_requests.push(WatchRequest::Start {
+            target: Box::new(self.target),
+            child: None,
+            deadline_ns: self.deadline_ns,
+        });
+        response
+    }
+}
+
+/// The attach-only half of `POST /sessions` that must precede any response.
+///
+/// `None` leaves a launch or malformed/non-attach request on the existing
+/// dispatcher path.  A successful value has already run [`check_pid_owner`];
+/// only its database insertion and the subsequent full scan are deferred.
+pub(super) fn prepare_attach(
+    state: &ApiState,
+    caller: &Caller,
+    body: &[u8],
+) -> Result<Option<PreparedAttach>, ApiResponse> {
+    // A database-free state is a test stub.  Keep its existing in-memory
+    // branch rather than turning a production-only optimization into a second
+    // authorization path.
+    if state.query.db_path.is_none() {
+        return Ok(None);
+    }
+    let value = parse(body)?;
+    if value.get("mode").and_then(Value::as_str) != Some("attach") {
+        return Ok(None);
+    }
+    let path = db_path(state)?;
+    let pid = pid_field(&value)?;
+    // This check is intentionally before the deferred SQLite work and before
+    // the 201 response.  A name or subtree scan may happen later; ownership
+    // may not.
+    let root_identity = check_pid_owner(caller, pid, true)?;
+    let deadline_ns = duration_deadline(&value)?;
+    let mut target = target_for(caller, &value, "attach", pid, None)?;
+    target.root_identity = Some(root_identity);
+    target.root_hint = crate::sample::root_hint(pid, None).filter(|hint| hint.uid == root_identity);
+    Ok(Some(PreparedAttach {
+        path,
+        target,
+        deadline_ns,
+    }))
+}
+
+/// Whether env-gated attach timing diagnostics are enabled.
+///
+/// The value is intentionally not a configuration setting or API field: it is
+/// for benchmark runs and emits only elapsed times and numeric ids to debug
+/// logs.
+pub(crate) fn attach_timing_enabled() -> bool {
+    std::env::var_os("AW_ATTACH_TIMING").is_some_and(|value| !value.is_empty())
+}
+
 /// `POST /sessions` with a database. `mode` is `attach` or `launch`.
 pub(super) fn create(state: &mut ApiState, caller: &Caller, body: &[u8]) -> ApiResponse {
+    match prepare_attach(state, caller, body) {
+        Ok(Some(mut attach)) => match attach.persist() {
+            Ok(_) => return attach.enqueue(state),
+            Err(response) => return response,
+        },
+        Ok(None) => {}
+        Err(response) => return response,
+    }
     match create_inner(state, caller, body) {
         Ok(response) | Err(response) => response,
     }
@@ -362,29 +474,9 @@ fn create_inner(
 ) -> Result<ApiResponse, ApiResponse> {
     let value = parse(body)?;
     let path = db_path(state)?;
+    #[cfg(windows)]
+    let _ = (caller, &path);
     match value.get("mode").and_then(Value::as_str) {
-        Some("attach") => {
-            let pid = pid_field(&value)?;
-            let root_identity = check_pid_owner(caller, pid, true)?;
-            let deadline_ns = duration_deadline(&value)?;
-            let mut target = target_for(caller, &value, "attach", pid, None)?;
-            // This is a single identity read, not the full process-table scan.
-            // It is retained so the session always identifies the root the
-            // daemon actually authorized, even if that root exits before the
-            // asynchronous sampler gets its first turn.
-            target.root_identity = Some(root_identity);
-            target.root_hint =
-                crate::sample::root_hint(pid, None).filter(|hint| hint.uid == root_identity);
-            insert_session(&path, &mut target)?;
-            let response = created(&target, json!({ "scan_pending": true }));
-            state.pending_scans.insert(target.public_id.clone());
-            state.watch_requests.push(WatchRequest::Start {
-                target: Box::new(target),
-                child: None,
-                deadline_ns,
-            });
-            Ok(response)
-        }
         Some("launch") => {
             // App/API launch creation has no Windows token-to-user launch path
             // yet. `aw run` is different: its CLI creates a held child as the

@@ -2772,7 +2772,7 @@ mod tests {
         database_busy_json, database_read_only_newer_response, dispatch, not_implemented, ApiState,
         HttpBind, HttpRequest,
     };
-    use crate::api::auth::{TicketStore, UI_TICKET_TTL};
+    use crate::api::auth::{Caller, SessionView, TicketStore, UI_TICKET_TTL};
     use crate::api::pipe_dacl_configured;
     use serde_json::Value;
     use std::collections::BTreeMap;
@@ -4868,6 +4868,29 @@ mod tests {
             ),
         );
         assert_eq!(adopt.status, 503);
+    }
+
+    #[test]
+    fn in_memory_session_helpers_check_the_owner_before_mutating_or_stopping() {
+        let mut state = ApiState::new(10);
+        state.sessions.push(SessionView {
+            id: "s-alice".to_owned(),
+            user_id: "alice".to_owned(),
+            name: "kept".to_owned(),
+        });
+        let bob = Caller {
+            user_id: "bob".to_owned(),
+            admin: false,
+            peer: None,
+        };
+        // These helpers are normally reached only after `session_sub` hides a
+        // foreign memory session.  Test their own guards too, so a future
+        // route shortcut cannot turn the test-only stub into an owner bypass.
+        let patch = super::patch_memory_or_store(&mut state, "s-alice", &bob, br#"{}"#);
+        assert_eq!(patch.status, 403);
+        assert_eq!(state.sessions[0].name, "kept");
+        let stop = super::stop_memory(&mut state, "s-alice", &bob);
+        assert_eq!(stop.status, 404);
     }
 
     #[test]

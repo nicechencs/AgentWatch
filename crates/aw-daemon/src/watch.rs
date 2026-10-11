@@ -280,6 +280,17 @@ impl Watches {
         // Do not begin recording after that daemon-owned deadline merely
         // because the foreground loop reached this queued request late.
         if deadline_ns.is_some_and(|deadline| now_ns() >= deadline) {
+            if crate::api::watch_routes::attach_timing_enabled() {
+                tracing::debug!(
+                    session = db_id,
+                    public_id = %target.public_id,
+                    pid,
+                    scan_us = 0_u64,
+                    scan_started_recording = false,
+                    scan_skipped = "duration_expired_before_scan",
+                    "attach timing"
+                );
+            }
             self.end(db_id, "duration", None);
             if let Some(child) = child {
                 reap_launched_child(child);
@@ -287,12 +298,25 @@ impl Watches {
             return;
         }
         let mut sampler = HostSampler::for_target(self.db_path.clone(), target);
+        let public_id = sampler.target().public_id.clone();
         let started_at = std::time::Instant::now();
         // Adopted root: its row first (from the `/adopt` identity), then poll.
         let hinted = sampler.persist_root_hint();
         let root_hint_elapsed = started_at.elapsed();
         let scan_started = std::time::Instant::now();
-        if sampler.start() {
+        let scan_started_recording = sampler.start();
+        let scan_elapsed = scan_started.elapsed();
+        if crate::api::watch_routes::attach_timing_enabled() {
+            tracing::debug!(
+                session = db_id,
+                public_id,
+                pid,
+                scan_us = scan_elapsed.as_micros(),
+                scan_started_recording,
+                "attach timing"
+            );
+        }
+        if scan_started_recording {
             if deadline_ns.is_some_and(|deadline| now_ns() >= deadline) {
                 // The snapshot began before the deadline but finished after
                 // it.  Close in this same foreground turn rather than leave a
@@ -308,7 +332,7 @@ impl Watches {
                 session = db_id,
                 pid,
                 root_hint_ms = root_hint_elapsed.as_millis(),
-                scan_ms = scan_started.elapsed().as_millis(),
+                scan_ms = scan_elapsed.as_millis(),
                 "watching process"
             );
             self.running.push(Running {

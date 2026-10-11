@@ -55,6 +55,20 @@ pub trait RecordSink {
 /// batches are small.
 pub const MAX_ROWS_PER_TRANSACTION: usize = 500;
 
+/// Measured portions of one [`SqliteSink`] batch write.
+///
+/// `db_lock` is the time spent entering each `BEGIN IMMEDIATE` transaction;
+/// `write` starts once that transaction owns the writer lock and includes its
+/// SQL work and commit.  Callers use this only for diagnostics, never for
+/// persisted session data or user-facing API responses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteBatchTiming {
+    /// Time SQLite spent waiting for a writer lock.
+    pub db_lock: std::time::Duration,
+    /// Time spent writing after the writer lock was acquired.
+    pub write: std::time::Duration,
+}
+
 /// Rows for one commit. Empty vectors are skipped. Nothing is dropped silently:
 /// a constraint failure fails the batch.
 #[derive(Clone, Default)]
@@ -380,13 +394,33 @@ impl<'a> SqliteSink<'a> {
 impl RecordSink for SqliteSink<'_> {
     fn write_batch(&mut self, batch: &WriteBatch) -> Result<(), StoreError> {
         let started = Instant::now();
-        self.write_batch_inner(batch)
+        self.write_batch_inner(batch, None)
             .map_err(|err| err.with_busy_elapsed(started))
     }
 }
 
 impl SqliteSink<'_> {
-    fn write_batch_inner(&mut self, batch: &WriteBatch) -> Result<(), StoreError> {
+    /// Write one batch and report its writer-lock and in-transaction portions.
+    ///
+    /// This is intentionally an opt-in diagnostic API.  The ordinary
+    /// [`RecordSink`] implementation keeps the same semantics and does not
+    /// allocate or log timing data.
+    pub fn write_batch_timed(
+        &mut self,
+        batch: &WriteBatch,
+    ) -> Result<WriteBatchTiming, StoreError> {
+        let started = Instant::now();
+        let mut timing = WriteBatchTiming::default();
+        self.write_batch_inner(batch, Some(&mut timing))
+            .map_err(|err| err.with_busy_elapsed(started))?;
+        Ok(timing)
+    }
+
+    fn write_batch_inner(
+        &mut self,
+        batch: &WriteBatch,
+        mut timing: Option<&mut WriteBatchTiming>,
+    ) -> Result<(), StoreError> {
         if !batch.file_access.is_empty() || image_has_argv(&batch.process_images) {
             // 0003–0005. A P1 database stays at SCHEMA_VERSION until the first
             // file row or indexed argv, which is what the P1 reopen test asserts.
@@ -423,16 +457,25 @@ impl SqliteSink<'_> {
             ));
         }
         for chunk in bounded_batches(batch) {
+            let lock_started = Instant::now();
             let tx = self
                 .store
                 .connection_mut()
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|err| StoreError::sqlite("begin_batch", err))?;
+            if let Some(timing) = timing.as_deref_mut() {
+                timing.db_lock += lock_started.elapsed();
+            }
+            let write_started = Instant::now();
             let result = write_all(&tx, &chunk, fts);
             match result {
-                Ok(()) => tx
-                    .commit()
-                    .map_err(|err| StoreError::sqlite("commit_batch", err))?,
+                Ok(()) => {
+                    tx.commit()
+                        .map_err(|err| StoreError::sqlite("commit_batch", err))?;
+                    if let Some(timing) = timing.as_deref_mut() {
+                        timing.write += write_started.elapsed();
+                    }
+                }
                 Err(err) => {
                     drop(tx);
                     return Err(err);

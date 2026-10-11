@@ -37,6 +37,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use super::control::Control;
 use super::routes::ApiState;
@@ -136,6 +137,9 @@ fn answer(
     if let Some(reply) = super::control::handle(control, request, caller) {
         return reply;
     }
+    if let Some(reply) = answer_attach_without_global_lock(state, request, caller) {
+        return super::control::decorate(control, request, reply);
+    }
     let (reply, slow) = {
         let mut guard = match state.lock() {
             Ok(guard) => guard,
@@ -156,6 +160,61 @@ fn answer(
         (None, None) => super::routes::error_response(500, "internal", "no response"),
     };
     super::control::decorate(control, request, reply)
+}
+
+/// Prepare an attach under the request lock, then let its SQLite work happen
+/// without that lock.  The ownership check remains in `prepare_attach`, before
+/// the reply.  This keeps a large database or a busy writer from turning one
+/// attach into a pause for every local API request.
+fn answer_attach_without_global_lock(
+    state: &SharedState,
+    request: &super::routes::HttpRequest,
+    caller: &super::auth::Caller,
+) -> Option<super::routes::ApiResponse> {
+    if !request.method.eq_ignore_ascii_case("POST") || request.path != "/api/v1/sessions" {
+        return None;
+    }
+    let timing_enabled = super::watch_routes::attach_timing_enabled();
+    let first_lock_started = Instant::now();
+    let prepared = {
+        let guard = match state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let waited = first_lock_started.elapsed();
+        let prepared = match super::watch_routes::prepare_attach(&guard, caller, &request.body) {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => return None,
+            Err(reply) => return Some(reply),
+        };
+        (prepared, waited)
+    };
+    let (mut prepared, first_lock) = prepared;
+    let pid = prepared.pid();
+    let db_timing = match prepared.persist() {
+        Ok(timing) => timing,
+        Err(reply) => return Some(reply),
+    };
+    let queue_lock_started = Instant::now();
+    let reply = {
+        let mut guard = match state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        prepared.enqueue(&mut guard)
+    };
+    if timing_enabled {
+        tracing::debug!(
+            pid,
+            global_lock_us = first_lock.as_micros(),
+            queue_lock_us = queue_lock_started.elapsed().as_micros(),
+            open_connection_us = db_timing.open_connection.as_micros(),
+            db_lock_us = db_timing.db_lock.as_micros(),
+            write_session_us = db_timing.write_session.as_micros(),
+            "attach timing"
+        );
+    }
+    Some(reply)
 }
 
 #[cfg(unix)]

@@ -167,6 +167,10 @@ pub struct HostSampler {
         aw_collector_poll::HostConnectionSource,
     >,
     db_path: std::path::PathBuf,
+    /// Long-lived write connection for this sampler.  Opening a runtime store
+    /// runs connection setup and schema probes; doing that every 250 ms made
+    /// every active sampler contend with session creation for no benefit.
+    store: Option<Store>,
     session_written: bool,
     started: bool,
     /// Pids returned by the last `snapshot`. A pid that disappears between
@@ -201,6 +205,7 @@ impl HostSampler {
             target,
             collector: PollCollector::with_host(PollConfig::standard()),
             db_path: db_path.into(),
+            store: None,
             started: false,
             seen_pids: BTreeSet::new(),
             seq: 0,
@@ -653,8 +658,13 @@ impl HostSampler {
         if batch_is_empty(&batch) {
             return Ok(());
         }
-        let mut store = Store::open_runtime(&self.db_path).map_err(|err| store_io(&err))?;
-        let mut writer = SqliteSink::new(&mut store).map_err(|err| store_io(&err))?;
+        if self.store.is_none() {
+            self.store = Some(Store::open_runtime(&self.db_path).map_err(|err| store_io(&err))?);
+        }
+        let store = self.store.as_mut().ok_or_else(|| {
+            io::Error::other("sampler store was not available after a successful open")
+        })?;
+        let mut writer = SqliteSink::new(store).map_err(|err| store_io(&err))?;
         match writer.write_batch(&batch) {
             Ok(()) => {
                 if !batch.sessions.is_empty() {

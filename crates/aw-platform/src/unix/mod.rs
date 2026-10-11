@@ -11,3 +11,6 @@
     allow(dead_code)
 )]
 pub(crate) mod hold;
+
+#[allow(unsafe_code)]
+pub(crate) mod signals;

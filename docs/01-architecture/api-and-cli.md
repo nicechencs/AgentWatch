@@ -87,7 +87,7 @@ aw
 │     --pin                                会话不参与自动清理
 │     --group <name>                       （本版本未接入）
 │     --mcp-tap                            （本版本未接入）
-│     --no-daemon                          不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序都会跟着结束。
+│     --no-daemon                          Linux/macOS：不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它直接启动的子程序会跟着结束，但自己脱离出去的子程序可能还留着。Windows：不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序都会跟着结束。
 │     --raw <file>                         （本版本未接入）
 │     --unsafe-no-redact                   （本版本未接入）
 ├── attach [OPTIONS] (--pid <PID> | --name <pattern>)

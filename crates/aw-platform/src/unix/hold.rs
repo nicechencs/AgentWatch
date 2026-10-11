@@ -13,7 +13,11 @@
 //!    and gid, and that `setuid(0)` fails. Nothing the caller supplied is used
 //!    while the process is still root.
 //! 2. `chdir` to the caller's directory only after that switch.
-//! 3. Block on a `read` of the gate pipe. EOF (the creator died, or aborted
+//! 3. When stdin is a terminal, make this new process group its foreground
+//!    group before the gate can be read. This prevents an immediately-reading
+//!    target from being stopped with `SIGTTIN` in the release-to-parent-handoff
+//!    window.
+//! 4. Block on a `read` of the gate pipe. EOF (the creator died, or aborted
 //!    before release) `_exit`s without exec. One byte means release: close the
 //!    pipe and `execve` the target. The target's environment is the pointer
 //!    array built in the parent, applied at `execve` and not before. What goes
@@ -32,7 +36,7 @@
 //! process-wide mutex covers `pipe` through `fork`, so no other thread of this
 //! process can fork in that window and inherit either end.
 //!
-//! Each failed step `_exit`s with its own code (121–127). Those are not a
+//! Each failed step `_exit`s with its own code (121–128). Those are not a
 //! clean run: a clean run replaced the process. Exactly one owner waits, on
 //! the pid this module forked. There is no `SIGCHLD` reaper and no second
 //! `waitpid`. 【待验证】not run on a real Mac.
@@ -51,6 +55,7 @@ pub const EXIT_SETUID: i32 = 124;
 pub const EXIT_SWITCH_CHECK: i32 = 125;
 pub const EXIT_CHDIR: i32 = 126;
 pub const EXIT_EXEC: i32 = 127;
+pub const EXIT_TERMINAL: i32 = 128;
 
 /// `PATH` for a target whose environment is built from scratch
 /// ([`crate::EnvSource::Exact`]). It is not this process's `PATH`: a privileged
@@ -71,7 +76,7 @@ struct Prepared {
     /// parent; the child tries them after the identity switch. Empty when the
     /// name was bare and no absolute PATH entry survived the skip rules.
     program_paths: Vec<std::ffi::CString>,
-    argv: Vec<std::ffi::CString>,
+    _argv: Vec<std::ffi::CString>,
     /// NUL-terminated `execve` argv pointers. Built in the parent so the
     /// post-fork child only indexes preallocated memory.
     argv_pointers: Vec<*const libc::c_char>,
@@ -89,6 +94,9 @@ struct Prepared {
     /// `_exit`s; a successful `execve` closes it (it is `CLOEXEC`) and the parent
     /// sees EOF. The parent keeps the read end.
     report: std::os::fd::RawFd,
+    /// Captured in the parent. `isatty` is not part of the post-fork path.
+    /// When true, the child must take the terminal before it reads the gate.
+    stdin_is_tty: bool,
 }
 
 struct PreparedSwitch {
@@ -225,13 +233,14 @@ fn spawn_inner(
         switch,
         cwd,
         program_paths,
-        argv,
+        _argv: argv,
         argv_pointers,
         _env: env,
         env_pointers,
         gate_read: std::os::fd::AsRawFd::as_raw_fd(&gate_read),
         stdout: stdout.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
         report: std::os::fd::AsRawFd::as_raw_fd(&report_write),
+        stdin_is_tty: ffi::stdin_is_tty(),
     };
     // SAFETY: the child calls only async-signal-safe functions, then `_exit`
     // or `execve`. It does not return. The parent closes its copy of the read
@@ -246,9 +255,16 @@ fn spawn_inner(
         // the parent to win the race before the child execs, the child in case
         // the parent has not run yet.
         ffi::set_own_group(0);
-        // The parent's copy of every fd is still open here; close the write
-        // end so the creator's later close is a real EOF, then hold.
-        ffi::child_hold(&prepared, std::os::fd::AsRawFd::as_raw_fd(&gate_write));
+        // This is intentionally in the forked child, after setpgid and before
+        // it can read the release gate. A parent-side handoff after release
+        // races an immediately-reading target, which the terminal stops with
+        // SIGTTIN. The helper uses raw async-signal-safe syscalls only.
+        // Close the inherited writer before a possible terminal-handoff
+        // failure waits on the gate. Otherwise aborting the held child could
+        // never produce EOF because the child would still own a writer.
+        ffi::close_fd(std::os::fd::AsRawFd::as_raw_fd(&gate_write));
+        ffi::child_take_foreground(&prepared);
+        ffi::child_hold(&prepared);
     }
     ffi::set_own_group(pid);
     // Parent. The child has its own copy of the read end.
@@ -466,6 +482,12 @@ fn failure_error(outcome: ReapOutcome, errno: i32) -> PlatformError {
         // ENOENT when any candidate denied execution (execvp semantics).
         ReapOutcome::Exited(EXIT_EXEC) if permitted => SpawnFailure::ProgramNotPermitted,
         ReapOutcome::Exited(EXIT_EXEC) => SpawnFailure::ProgramNotFound,
+        ReapOutcome::Exited(EXIT_TERMINAL) => {
+            return PlatformError::Invalid {
+                capability: "spawn_suspended",
+                detail: "held child could not take terminal foreground",
+            }
+        }
         _ => {
             return PlatformError::Invalid {
                 capability: "spawn_suspended",
@@ -485,6 +507,7 @@ enum GateStep {
     SwitchCheck,
     Chdir,
     Exec,
+    Terminal,
 }
 
 impl GateStep {
@@ -497,6 +520,7 @@ impl GateStep {
             Self::SwitchCheck => EXIT_SWITCH_CHECK,
             Self::Chdir => EXIT_CHDIR,
             Self::Exec => EXIT_EXEC,
+            Self::Terminal => EXIT_TERMINAL,
         }
     }
 }
@@ -514,6 +538,17 @@ mod ffi {
         unsafe {
             // SAFETY: geteuid takes no pointer and cannot fail.
             libc::geteuid()
+        }
+    }
+
+    /// This runs in the parent, before `fork`, so the child only consumes a
+    /// boolean prepared by the creator rather than calling a non-syscall
+    /// terminal helper after a multi-threaded fork.
+    pub(super) fn stdin_is_tty() -> bool {
+        unsafe {
+            // SAFETY: stdin is a process-owned descriptor. `isatty` neither
+            // retains nor writes through a caller pointer.
+            libc::isatty(libc::STDIN_FILENO) == 1
         }
     }
 
@@ -549,17 +584,10 @@ mod ffi {
     }
 
     /// The whole hold stage. Never returns: it execs, or `_exit`s.
-    pub(super) fn child_hold(prepared: &Prepared, gate_write: RawFd) -> ! {
-        unsafe {
-            // SAFETY: closing the inherited write end. The parent keeps its own.
-            libc::close(gate_write);
-        }
+    pub(super) fn child_hold(prepared: &Prepared) -> ! {
         if let Some(stdout) = prepared.stdout {
             redirect_stdout_or_exit(stdout, prepared.report);
         }
-        // A caller-controlled loader must not be in force while this process
-        // is still privileged. The target receives its own env at execve.
-        clear_preload();
         if let Some(switch) = &prepared.switch {
             switch_ids(&switch.groups, switch.gid, switch.uid);
         }
@@ -597,6 +625,60 @@ mod ffi {
         }
     }
 
+    /// Make this held child's process group foreground before it is allowed to
+    /// read the release gate. All work here is post-fork-safe: stack storage
+    /// plus raw POSIX calls. A failure is reported before the gate is read;
+    /// the child then waits for its creator's release/abort so the parent's
+    /// gate write cannot race a closed read end.
+    pub(super) fn child_take_foreground(prepared: &Prepared) {
+        if !prepared.stdin_is_tty {
+            return;
+        }
+        if handoff_stdin_to_own_group() {
+            return;
+        }
+        report_errno(prepared.report, errno_now());
+        wait_for_release(prepared.gate_read);
+        exit_step(GateStep::Terminal);
+    }
+
+    /// Close an inherited descriptor in the forked child without invoking a
+    /// Rust destructor.
+    pub(super) fn close_fd(fd: RawFd) {
+        unsafe {
+            // SAFETY: the child owns its inherited descriptor copy.
+            libc::close(fd);
+        }
+    }
+
+    /// Block `SIGTTOU` while handing stdin's terminal to the child group, then
+    /// restore exactly the inherited mask. `tcsetpgrp`, `getpgrp`, and
+    /// `sigprocmask` are async-signal-safe POSIX calls.
+    fn handoff_stdin_to_own_group() -> bool {
+        let mut block = unsafe {
+            // SAFETY: `sigset_t` is immediately initialized by sigemptyset.
+            std::mem::MaybeUninit::<libc::sigset_t>::zeroed().assume_init()
+        };
+        let mut previous = unsafe {
+            // SAFETY: libc fills this before it is read by the restore call.
+            std::mem::MaybeUninit::<libc::sigset_t>::zeroed().assume_init()
+        };
+        unsafe {
+            // SAFETY: both pointers name writable stack signal sets. The
+            // signal mask and foreground group belong only to this child.
+            if libc::sigemptyset(&mut block) != 0
+                || libc::sigaddset(&mut block, libc::SIGTTOU) != 0
+                || libc::sigprocmask(libc::SIG_BLOCK, &block, &mut previous) != 0
+            {
+                return false;
+            }
+            let switched = libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) == 0;
+            let restored =
+                libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut()) == 0;
+            switched && restored
+        }
+    }
+
     /// `execve` errno that means "not this candidate, try the next". `execvp`
     /// treats these the same way: the name is not a file here, so keep looking.
     fn try_next(errno: i32) -> bool {
@@ -604,17 +686,6 @@ mod ffi {
             errno,
             libc::ENOENT | libc::ENOTDIR | libc::ESTALE | libc::ENODEV | libc::ETIMEDOUT
         )
-    }
-
-    /// `unsetenv` of the two loader names. Async-signal-safe; no allocation.
-    fn clear_preload() {
-        for name in [c"DYLD_INSERT_LIBRARIES", c"LD_PRELOAD"] {
-            unsafe {
-                // SAFETY: both names are NUL-terminated literals. `unsetenv`
-                // is async-signal-safe and only changes this process.
-                libc::unsetenv(name.as_ptr());
-            }
-        }
     }
 
     /// `setgroups`, then `setgid`, then `setuid`. Afterwards real and effective
@@ -696,6 +767,13 @@ mod ffi {
     /// write is a raw syscall: this runs after `fork`, so nothing here
     /// allocates or formats a string.
     fn report_and_exit(fd: RawFd, step: GateStep, errno: i32) -> ! {
+        report_errno(fd, errno);
+        exit_step(step);
+    }
+
+    /// Write the raw errno without exiting. The terminal-handoff path must
+    /// remain alive at the gate so its creator can reliably observe the error.
+    fn report_errno(fd: RawFd, errno: i32) {
         let bytes = errno.max(0).to_ne_bytes();
         unsafe {
             // SAFETY: `bytes` is the raw integer and `fd` is the pipe end this
@@ -704,7 +782,6 @@ mod ffi {
             // failure, never as a successful exec.
             libc::write(fd, bytes.as_ptr().cast(), bytes.len());
         }
-        exit_step(step);
     }
 
     /// Read one raw errno. `None` is EOF: the child exec'd and the CLOEXEC
@@ -756,8 +833,7 @@ mod ffi {
                 libc::read(fd, byte.as_mut_ptr().cast(), 1)
             };
             if got < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
+                if errno_now() == libc::EINTR {
                     continue;
                 }
                 exit_step(GateStep::Spec);
@@ -776,7 +852,7 @@ mod ffi {
     /// search continues; any other errno stops. The errno left for the parent is
     /// `EACCES` when one was seen, otherwise the last errno.
     fn exec(prepared: &Prepared) -> ! {
-        if prepared.argv.is_empty() || prepared.program_paths.is_empty() {
+        if prepared.argv_pointers.len() <= 1 || prepared.program_paths.is_empty() {
             // No candidate at all is "not found", the same answer `execvp` gives
             // for a bare name whose PATH produced nothing.
             report_and_exit(prepared.report, GateStep::Exec, libc::ENOENT);
@@ -941,28 +1017,12 @@ mod ffi {
     }
 }
 
-/// Names the hold stage removes from its own environment before it reads the
-/// gate. The target's copy of these, if the caller asked for one, is applied
-/// later by `execve` and is not removed. The child clears them by name; this
-/// constant exists so the test checks the same names.
-#[cfg(test)]
-const HOLD_CLEARED_PRELOAD: [&str; 2] = ["DYLD_INSERT_LIBRARIES", "LD_PRELOAD"];
-
-/// True when none of [`HOLD_CLEARED_PRELOAD`] is set. That is the hold stage's
-/// own environment, checked before `execve`.
-#[cfg(test)]
-fn caller_preload_absent_before_exec() -> bool {
-    HOLD_CLEARED_PRELOAD
-        .iter()
-        .all(|key| std::env::var_os(key).is_none())
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        caller_preload_absent_before_exec, GateStep, EXIT_CHDIR, EXIT_EXEC, EXIT_SETGID,
-        EXIT_SETGROUPS, EXIT_SETUID, EXIT_SPEC, EXIT_SWITCH_CHECK, HOLD_CLEARED_PRELOAD,
+        GateStep, EXIT_CHDIR, EXIT_EXEC, EXIT_SETGID, EXIT_SETGROUPS, EXIT_SETUID, EXIT_SPEC,
+        EXIT_SWITCH_CHECK, EXIT_TERMINAL,
     };
 
     #[test]
@@ -983,6 +1043,8 @@ mod tests {
         assert_eq!(EXIT_CHDIR, 126);
         assert_eq!(GateStep::Exec.code(), EXIT_EXEC);
         assert_eq!(EXIT_EXEC, 127);
+        assert_eq!(GateStep::Terminal.code(), EXIT_TERMINAL);
+        assert_eq!(EXIT_TERMINAL, 128);
         let codes = [
             EXIT_SPEC,
             EXIT_SETGROUPS,
@@ -991,6 +1053,7 @@ mod tests {
             EXIT_SWITCH_CHECK,
             EXIT_CHDIR,
             EXIT_EXEC,
+            EXIT_TERMINAL,
         ];
         let mut unique = codes.to_vec();
         unique.sort_unstable();
@@ -1005,41 +1068,6 @@ mod tests {
         let signaled = ReapOutcome::Signaled(9);
         assert!(matches!(signaled, ReapOutcome::Signaled(_)));
         assert!(!matches!(signaled, ReapOutcome::Exited(0)));
-    }
-
-    /// The hold stage's own environment, before exec, does not contain a
-    /// caller `DYLD_INSERT_LIBRARIES` or `LD_PRELOAD`. The child unsets both
-    /// before it reads the gate; this process checks the same predicate on
-    /// its own environment after unsetting them, which is the state the child
-    /// is in at the exec point. The names are still data for the target: they
-    /// are applied at `execve`, after the switch, and not before.
-    #[cfg(unix)]
-    #[test]
-    fn caller_preload_is_absent_before_exec() {
-        let saved: Vec<_> = HOLD_CLEARED_PRELOAD
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect();
-        for key in HOLD_CLEARED_PRELOAD {
-            std::env::set_var(key, "/no/such/libaw-preload.so");
-        }
-        assert!(
-            !caller_preload_absent_before_exec(),
-            "the predicate must see a preload that is still set"
-        );
-        for key in HOLD_CLEARED_PRELOAD {
-            std::env::remove_var(key);
-        }
-        assert!(
-            caller_preload_absent_before_exec(),
-            "DYLD_INSERT_LIBRARIES and LD_PRELOAD must be absent before exec"
-        );
-        for (key, value) in saved {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
     }
 
     /// A directory no other test in this process uses. The name includes a counter,

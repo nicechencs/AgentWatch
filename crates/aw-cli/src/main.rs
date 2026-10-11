@@ -21,6 +21,16 @@ fn main() -> ExitCode {
         Ok(outcome) => {
             let code = outcome.code;
             if let Err(err) = write_outcome(&outcome) {
+                // Closing a terminal can make its slave return EIO while we
+                // print the completed run summary. The target has already
+                // been reaped and the terminal guard has cleaned its group;
+                // preserve that target status instead of changing it to 1.
+                if output_went_away(&err) {
+                    #[cfg(windows)]
+                    std::process::exit(code);
+                    #[cfg(not(windows))]
+                    return exit_code(code);
+                }
                 let _ = writeln!(io::stderr(), "aw: 写出结果失败：{err}");
                 return ExitCode::from(1);
             }
@@ -41,6 +51,18 @@ fn main() -> ExitCode {
     }
 }
 
+fn output_went_away(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(nix::libc::EIO)
+    }
+    #[cfg(not(unix))]
+    false
+}
+
 fn write_outcome(outcome: &cmd::Outcome) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
@@ -53,4 +75,18 @@ fn write_outcome(outcome: &cmd::Outcome) -> io::Result<()> {
 #[cfg(not(windows))]
 fn exit_code(code: i32) -> ExitCode {
     u8::try_from(code).map_or(ExitCode::from(1), ExitCode::from)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn closed_terminal_output_keeps_the_completed_run_status() {
+        assert!(super::output_went_away(&std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe
+        )));
+        #[cfg(unix)]
+        assert!(super::output_went_away(&std::io::Error::from_raw_os_error(
+            nix::libc::EIO
+        )));
+    }
 }

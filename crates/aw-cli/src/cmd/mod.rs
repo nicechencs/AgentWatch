@@ -1586,6 +1586,24 @@ mod tests {
         let run_text = text(&run_help.stdout);
         assert!(run_text.contains("只交给被启动的程序，不发给后台"));
         assert!(run_text.contains("关闭脱敏（本版本未接入）"));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(
+            run_text.contains(
+                "不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它直接启动的子程序会跟着结束，但自己脱离出去的子程序可能还留着。"
+            ),
+            "{run_text}"
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert!(
+            run_text.contains("不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序都会跟着结束。"),
+            "{run_text}"
+        );
+        #[cfg(target_os = "linux")]
+        insta::assert_snapshot!("run_help_linux", run_text);
+        #[cfg(target_os = "macos")]
+        insta::assert_snapshot!("run_help_macos", run_text);
+        #[cfg(windows)]
+        insta::assert_snapshot!("run_help_windows", run_text);
         let attach = run(&["attach", "--help"], None, &mut http);
         let attach_help = text(&attach.stdout);
         assert_eq!(attach.code, exit::OK, "{attach_help}");

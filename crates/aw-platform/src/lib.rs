@@ -32,6 +32,11 @@ pub const fn unix_default_path() -> &'static str {
     unix::hold::DEFAULT_TARGET_PATH
 }
 
+/// Hold `SIGINT` and `SIGQUIT` ignored for an interactive foreground-child
+/// wait, restoring their prior dispositions when the guard drops.
+#[cfg(unix)]
+pub use unix::signals::{ignore_terminal_interrupts, TerminalInterruptIgnore};
+
 /// Candidate paths for a program name, built as strings. No filesystem access.
 /// See [`unix::hold::program_candidates`]. Unix only: Windows does not search a
 /// `:`-separated PATH.

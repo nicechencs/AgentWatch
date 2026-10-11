@@ -925,17 +925,17 @@ pub(crate) fn current_user_id() -> String {
 
 // Kept for the existing formula-level sampler tests. Production process
 // identity reads live exclusively behind `aw_platform::Platform` above.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 const LINUX_CLK_TCK: u64 = 100;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn start_ns_from_ticks(btime_secs: u64, ticks: u64) -> Option<u64> {
     let btime_ns = btime_secs.checked_mul(1_000_000_000)?;
     let elapsed_ns = ticks.checked_mul(1_000_000_000)? / LINUX_CLK_TCK;
     btime_ns.checked_add(elapsed_ns)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn read_boot_id() -> Option<Vec<u8>> {
     Some(
         aw_platform::platform()

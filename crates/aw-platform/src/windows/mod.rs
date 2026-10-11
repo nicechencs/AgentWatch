@@ -1,6 +1,6 @@
 use crate::{
-    IdentifiedCaller, Platform, PlatformError, ProcessEntry, ProcessKey, ReapOutcome, SpawnRequest,
-    UnsupportedKind,
+    IdentifiedCaller, Platform, PlatformError, ProcessEntry, ProcessKey, ReapOutcome,
+    SamplingProcess, SpawnRequest, UnsupportedKind,
 };
 use std::path::{Path, PathBuf};
 pub(crate) struct CurrentPlatform;
@@ -28,6 +28,12 @@ impl Platform for CurrentPlatform {
     fn process_table(&self) -> Result<Vec<ProcessEntry>, PlatformError> {
         Err(no("process_table"))
     }
+    fn sampling_process(&self, _: u32) -> Result<Option<SamplingProcess>, PlatformError> {
+        Err(no("sampling_process"))
+    }
+    fn sampling_process_table(&self) -> Result<Vec<SamplingProcess>, PlatformError> {
+        Err(no("sampling_process_table"))
+    }
     fn reap_child(&self, _: ProcessKey) -> Result<ReapOutcome, PlatformError> {
         Err(no("reap_child"))
     }
@@ -47,5 +53,8 @@ impl Platform for CurrentPlatform {
     }
     fn is_privileged(&self) -> Option<bool> {
         aw_collector_windows::privilege::is_privileged()
+    }
+    fn current_user_id(&self) -> Option<String> {
+        None
     }
 }

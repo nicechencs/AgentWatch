@@ -109,6 +109,18 @@ pub struct ProcessEntry {
     pub argv: Option<Vec<String>>,
     pub owner: Option<Owner>,
 }
+/// Process facts needed to form the poll collector's stable identity.
+///
+/// `start_ns` is a wall-clock timestamp when the OS can provide one.  It is
+/// deliberately separate from [`ProcessKey::start_time`], whose unit is
+/// native to the OS (Linux clock ticks, Windows FILETIME, and so on).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SamplingProcess {
+    pub key: ProcessKey,
+    pub ppid: u32,
+    pub start_ns: u64,
+    pub boot_id: Vec<u8>,
+}
 impl fmt::Debug for ProcessEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProcessEntry")
@@ -182,12 +194,20 @@ pub trait Platform: Send + Sync {
     ) -> Result<Box<dyn HeldChild>, PlatformError>;
     fn process_identity(&self, pid: u32) -> Result<Option<ProcessEntry>, PlatformError>;
     fn process_table(&self) -> Result<Vec<ProcessEntry>, PlatformError>;
+    /// Facts used by the platform-independent poll sampler to make a stable
+    /// process identity.  Unsupported systems return an explicit error rather
+    /// than an empty table.
+    fn sampling_process(&self, pid: u32) -> Result<Option<SamplingProcess>, PlatformError>;
+    fn sampling_process_table(&self) -> Result<Vec<SamplingProcess>, PlatformError>;
     /// Used by stop-recording and sampler disappearance handling; Windows waits, uses `GetExitCodeProcess`, and closes its handle.
     fn reap_child(&self, key: ProcessKey) -> Result<ReapOutcome, PlatformError>;
     fn secure_data_dir(&self, path: &Path) -> Result<(), PlatformError>;
     fn default_data_dir(&self) -> Result<PathBuf, PlatformError>;
     fn default_config_path(&self) -> Result<PathBuf, PlatformError>;
     fn is_privileged(&self) -> Option<bool>;
+    /// Stable textual identifier for the daemon's own account, if the OS has
+    /// one that can be represented without guessing.
+    fn current_user_id(&self) -> Option<String>;
 }
 #[must_use]
 pub fn platform() -> &'static dyn Platform {

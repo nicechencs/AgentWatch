@@ -167,7 +167,7 @@ pub fn install_plan() -> ServicePlan {
         start_mode: StartMode::DelayedAuto,
         recovery: RecoveryPlan::task_card(),
         account: "LocalSystem",
-        bin_path: r"C:\Program Files\AgentWatch\agentwatchd.exe --foreground".to_owned(),
+        bin_path: r#""C:\Program Files\AgentWatch\agentwatchd.exe" --foreground"#.to_owned(),
         sid_type: "restricted",
     }
 }
@@ -222,7 +222,10 @@ pub fn install(plan: &ServicePlan, confirmed: bool) -> Result<InstallOutcome, Se
 
 /// `sc` text for a human to run. Not passed to a shell.
 fn render_sc_commands(plan: &ServicePlan) -> String {
-    // Quotes are part of the text. Nothing here is executed.
+    // The SCM must receive quotes around the executable, not merely quotes
+    // that group the `sc.exe` argument. Escape those inner quotes in the text
+    // an administrator copies to a shell. Nothing here is executed.
+    let bin = plan.bin_path.replace('"', r#"\""#);
     format!(
         "\
 sc.exe create {name} binPath= \"{bin}\" start= {start} obj= {account} DisplayName= \"{display}\"
@@ -231,7 +234,7 @@ sc.exe sidtype {name} {sid}
 sc.exe description {name} \"AgentWatch process-behavior audit daemon\"
 ",
         name = plan.name,
-        bin = plan.bin_path,
+        bin = bin,
         start = plan.start_mode.as_str(),
         account = plan.account,
         display = plan.display_name,
@@ -329,4 +332,26 @@ pub fn describe_acl(plan: &AclPlan) -> String {
     }
     out.push('\n');
     out
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::{install, install_plan};
+
+    #[test]
+    fn install_plan_quotes_service_image_inside_bin_path_value() {
+        let plan = install_plan();
+        assert_eq!(
+            plan.bin_path,
+            r#""C:\Program Files\AgentWatch\agentwatchd.exe" --foreground"#
+        );
+        let commands = install(&plan, true).expect("confirmed plan").sc_commands;
+        assert!(
+            commands.contains(
+                "binPath= \"\\\"C:\\Program Files\\AgentWatch\\agentwatchd.exe\\\" --foreground\""
+            ),
+            "sc.exe plan must keep the executable itself quoted: {commands}"
+        );
+    }
 }

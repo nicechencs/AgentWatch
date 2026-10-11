@@ -133,13 +133,13 @@ pub enum ClientError {
     Unreachable { detail: String },
     /// The socket or pipe exists but this account may not open it. Exit 4.
     Forbidden { detail: String },
-    /// The Windows pipe was opened, but its owner failed the service rule:
-    /// LocalSystem is required when the service is installed or SCM is
-    /// unavailable; a same-user owner is accepted only when SCM confirms no
-    /// service exists. The client sent no request bytes. Exit 4.
+    /// The Windows pipe was opened, but its server image does not match the
+    /// configured AgentWatch service image. The client sent no request bytes.
+    /// Exit 4.
     UntrustedServer { detail: String },
-    /// The Windows pipe owner could not be queried before any bytes were sent.
-    /// This must stay distinct from a queried but untrusted owner. Exit 4.
+    /// The Windows pipe server or configured service image could not be queried
+    /// before any bytes were sent. This must stay distinct from a queried but
+    /// mismatched image. Exit 4.
     ServerVerificationUnavailable { detail: String },
     /// The exchange failed after connect. Exit 1.
     Transport { detail: String },
@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn pipe_server_verification_failures_keep_the_two_fixed_sentences() {
         let untrusted = ClientError::UntrustedServer {
-            detail: "owner mismatch".to_owned(),
+            detail: "server image mismatch".to_owned(),
         };
         assert_eq!(untrusted.exit_code(), exit::PERMISSION);
         assert_eq!(
@@ -707,7 +707,7 @@ mod tests {
             "连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为防内容被它拿到，这次没有发送任何内容。"
         );
         let unavailable = ClientError::ServerVerificationUnavailable {
-            detail: "GetSecurityInfo failed".to_owned(),
+            detail: "QueryFullProcessImageNameW failed".to_owned(),
         };
         assert_eq!(unavailable.exit_code(), exit::PERMISSION);
         assert_eq!(
@@ -718,7 +718,10 @@ mod tests {
             unavailable.to_string(),
             "没法确认连上的是不是 AgentWatch 后台，为防连到冒充的程序，这次没有发送任何内容。请重启后台后再试。"
         );
-        assert_eq!(unavailable.json_detail(), Some("GetSecurityInfo failed"));
+        assert_eq!(
+            unavailable.json_detail(),
+            Some("QueryFullProcessImageNameW failed")
+        );
     }
 
     #[test]

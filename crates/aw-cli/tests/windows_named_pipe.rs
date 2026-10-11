@@ -19,7 +19,7 @@ use std::thread;
 use std::time::Duration;
 
 use aw_collector_windows::pipe::{create_server, flush_server, pipe_sddl};
-use aw_platform::{identify_pipe_peer, platform, Owner};
+use aw_platform::{identify_pipe_peer, platform, Owner, PipeServiceStatus};
 use tokio::net::windows::named_pipe::NamedPipeServer;
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -33,6 +33,7 @@ fn pipe_name() -> PathBuf {
 }
 
 #[test]
+#[ignore = "requires an installed AgentWatch service whose binary matches the test daemon"]
 fn separate_aw_processes_are_identified_and_each_get_a_fresh_pipe_instance() {
     let path = pipe_name();
     let name = path.as_os_str().to_owned();
@@ -80,7 +81,7 @@ fn separate_aw_processes_are_identified_and_each_get_a_fresh_pipe_instance() {
 }
 
 #[test]
-fn untrusted_pipe_owner_receives_zero_request_bytes() {
+fn mismatched_pipe_server_image_receives_zero_request_bytes() {
     let path = pipe_name();
     let name = path.as_os_str().to_owned();
     let sddl = pipe_sddl().expect("pipe SDDL");
@@ -103,11 +104,21 @@ fn untrusted_pipe_owner_receives_zero_request_bytes() {
         .recv_timeout(Duration::from_secs(10))
         .expect("temporary pipe listener ready");
 
-    // This is a real pipe owned by this test process, but the protected client
-    // is told that no owner is trusted. It must fail after the owner query and
-    // before a single HTTP request byte is written.
-    let err = aw_channel::open_pipe_client_with_trusted_owners(&path, &["S-1-5-0"])
-        .expect_err("untrusted owner must be refused");
+    // This is a real pipe served by this test process, but the configured
+    // service image is another existing file. The client must refuse before a
+    // single HTTP request byte is written.
+    let image = std::env::temp_dir().join(format!(
+        "aw-cli-mismatched-pipe-image-{}.exe",
+        std::process::id()
+    ));
+    std::fs::write(&image, b"not-the-test-server").expect("mismatched service image");
+    let err = aw_channel::open_pipe_client_with_service_status_for_test(
+        &path,
+        &PipeServiceStatus::Installed {
+            binary_path: image.clone(),
+        },
+    )
+    .expect_err("mismatched server image must be refused");
     assert_eq!(err.code(), "daemon_untrusted_server", "{err}");
     assert_eq!(
         result_rx
@@ -117,6 +128,7 @@ fn untrusted_pipe_owner_receives_zero_request_bytes() {
         0,
         "the untrusted server must receive no request bytes"
     );
+    let _ = std::fs::remove_file(image);
     server.join().expect("server thread");
 }
 

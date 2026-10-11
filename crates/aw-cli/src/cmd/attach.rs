@@ -117,11 +117,12 @@ pub(crate) enum ControlError {
     Unreachable { detail: String },
     /// The local channel denied the caller before an HTTP response.
     Forbidden { detail: String },
-    /// A process other than LocalSystem or the current user owned the opened
-    /// Windows pipe. No request bytes were sent.
+    /// The opened Windows pipe server image does not match the configured
+    /// AgentWatch service image. No request bytes were sent.
     UntrustedServer { detail: String },
-    /// The Windows pipe owner could not be queried. No request bytes were
-    /// sent, and this is distinct from an owner known not to be the daemon.
+    /// The Windows pipe server or configured service image could not be
+    /// queried. No request bytes were sent, and this is distinct from an image
+    /// known not to be the daemon.
     ServerVerificationUnavailable { detail: String },
     /// The request or response transport failed.
     Transport { detail: String },

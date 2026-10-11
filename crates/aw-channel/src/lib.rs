@@ -198,12 +198,12 @@ pub enum DialError {
     Unreachable(String),
     /// The socket or pipe exists but this user may not open it.
     Forbidden(String),
-    /// A Windows named pipe opened, but its owner did not meet the installed
-    /// service rule. No request bytes were sent.
+    /// A Windows named pipe opened, but the server image did not match the
+    /// installed service image. No request bytes were sent.
     UntrustedServer(String),
-    /// A Windows named pipe opened, but its owner could not be queried before
-    /// a request was sent. This is deliberately distinct from a queried,
-    /// untrusted owner.
+    /// A Windows named pipe opened, but its server image or the installed
+    /// service image could not be queried before a request was sent. This is
+    /// deliberately distinct from a queried, mismatched image.
     ServerVerificationUnavailable(String),
     /// Every pipe instance stayed busy for [`BUSY_RETRY`].
     Busy(String),
@@ -508,23 +508,13 @@ pub fn exchange_raw(path: &Path, request: &[u8], timeout: Duration) -> Result<Ve
 }
 
 /// Open a Windows named-pipe client with identification-only SQOS and verify
-/// the owner of the connected pipe before any bytes are written.
+/// the connected server image before any bytes are written.
 ///
 /// This is the only production entry point for opening an AgentWatch named
 /// pipe. It is Windows-only because Unix-domain sockets do not use `File`.
 #[cfg(windows)]
 pub fn open_pipe_client(path: &Path) -> Result<std::fs::File, DialError> {
-    platform::open_pipe_client(path, None, None)
-}
-
-/// Test hook for a connected pipe whose trusted owners are intentionally
-/// overridden. Production callers must use [`open_pipe_client`].
-#[cfg(all(windows, any(test, feature = "test-support")))]
-pub fn open_pipe_client_with_trusted_owners(
-    path: &Path,
-    trusted_owners: &[&str],
-) -> Result<std::fs::File, DialError> {
-    platform::open_pipe_client(path, Some(trusted_owners), None)
+    platform::open_pipe_client(path)
 }
 
 /// Test hook for a connected pipe with an injected AgentWatch service state.
@@ -534,15 +524,15 @@ pub fn open_pipe_client_with_service_status_for_test(
     path: &Path,
     service_status: &aw_platform::PipeServiceStatus,
 ) -> Result<std::fs::File, DialError> {
-    platform::open_pipe_client(path, None, Some(service_status))
+    platform::open_pipe_client_with_service_status(path, service_status)
 }
 
 /// Opens a Windows pipe at `SECURITY_ANONYMOUS` for daemon integration tests.
-/// It still checks the server owner before returning the handle. Product code
+/// It still checks the server image before returning the handle. Product code
 /// must use [`open_pipe_client`], which always uses identification SQOS.
 #[cfg(all(windows, any(test, feature = "test-support")))]
 pub fn open_anonymous_pipe_client_for_test(path: &Path) -> Result<std::fs::File, DialError> {
-    platform::open_pipe_client_with_qos(path, 0, None, None)
+    platform::open_pipe_client_with_qos(path, 0)
 }
 
 /// Test-only exchange that follows the production pipe-open path while using
@@ -703,24 +693,13 @@ mod platform {
     const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 
     /// Open and authenticate one concrete pipe instance without writing to it.
-    pub(super) fn open_pipe_client(
-        path: &Path,
-        trusted_owners: Option<&[&str]>,
-        service_status: Option<&aw_platform::PipeServiceStatus>,
-    ) -> Result<File, DialError> {
-        open_pipe_client_with_qos(
-            path,
-            SECURITY_IDENTIFICATION,
-            trusted_owners,
-            service_status,
-        )
+    pub(super) fn open_pipe_client(path: &Path) -> Result<File, DialError> {
+        open_pipe_client_with_qos(path, SECURITY_IDENTIFICATION)
     }
 
     pub(super) fn open_pipe_client_with_qos(
         path: &Path,
         security_qos_flags: u32,
-        trusted_owners: Option<&[&str]>,
-        service_status: Option<&aw_platform::PipeServiceStatus>,
     ) -> Result<File, DialError> {
         let pipe = std::fs::OpenOptions::new()
             .read(true)
@@ -729,29 +708,36 @@ mod platform {
             .open(path)
             .map_err(|err| classify(&err, path))?;
         // `CreateFileW` has connected us to one concrete server instance.
-        // Validate the pipe object's owner before any request byte leaves this
-        // client: the public pipe name can be claimed while agentwatchd is
-        // stopped or restarting.
-        let checked = match (trusted_owners, service_status) {
-            #[cfg(any(test, feature = "test-support"))]
-            (Some(owners), None) => {
-                // Kept for the existing reverse-test seam. Product paths do
-                // not use an allowlist override.
-                aw_platform::verify_pipe_server_for_owners(pipe.as_raw_handle(), owners)
-            }
-            #[cfg(any(test, feature = "test-support"))]
-            (None, Some(service_status)) => aw_platform::verify_pipe_server_with_service_status(
-                pipe.as_raw_handle(),
-                service_status,
-            ),
-            (None, None) => aw_platform::verify_pipe_server(pipe.as_raw_handle()),
-            #[cfg(any(test, feature = "test-support"))]
-            (Some(_), Some(_)) => unreachable!("test hooks cannot be combined"),
-            // Without the test seams no caller can pass a hook; keep the one
-            // product decision path for any combination.
-            #[cfg(not(any(test, feature = "test-support")))]
-            _ => aw_platform::verify_pipe_server(pipe.as_raw_handle()),
-        };
+        // Validate the server process image before any request byte leaves
+        // this client: the public pipe name can be claimed while agentwatchd
+        // is stopped or restarting.
+        let checked = aw_platform::verify_pipe_server(pipe.as_raw_handle());
+        checked_pipe(pipe, checked)
+    }
+
+    /// Test-only SCM injection. This symbol does not exist in normal builds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn open_pipe_client_with_service_status(
+        path: &Path,
+        service_status: &aw_platform::PipeServiceStatus,
+    ) -> Result<File, DialError> {
+        let pipe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(path)
+            .map_err(|err| classify(&err, path))?;
+        let checked = aw_platform::verify_pipe_server_with_service_status(
+            pipe.as_raw_handle(),
+            service_status,
+        );
+        checked_pipe(pipe, checked)
+    }
+
+    fn checked_pipe(
+        pipe: File,
+        checked: Result<(), aw_platform::PipeServerVerificationError>,
+    ) -> Result<File, DialError> {
         match checked {
             Ok(()) => Ok(pipe),
             Err(error @ aw_platform::PipeServerVerificationError::CannotQuery { .. }) => {
@@ -768,7 +754,7 @@ mod platform {
         request: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, DialError> {
-        exchange_raw_with_service_status_inner(path, request, timeout, None)
+        exchange_raw_with_pipe_opener(path, request, timeout, || open_pipe_client(path))
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -778,20 +764,25 @@ mod platform {
         timeout: Duration,
         service_status: &aw_platform::PipeServiceStatus,
     ) -> Result<Vec<u8>, DialError> {
-        exchange_raw_with_service_status_inner(path, request, timeout, Some(service_status))
+        exchange_raw_with_pipe_opener(path, request, timeout, || {
+            open_pipe_client_with_service_status(path, service_status)
+        })
     }
 
-    fn exchange_raw_with_service_status_inner(
+    fn exchange_raw_with_pipe_opener<F>(
         path: &Path,
         request: &[u8],
         timeout: Duration,
-        service_status: Option<&aw_platform::PipeServiceStatus>,
-    ) -> Result<Vec<u8>, DialError> {
+        mut open: F,
+    ) -> Result<Vec<u8>, DialError>
+    where
+        F: FnMut() -> Result<File, DialError>,
+    {
         let started = Instant::now();
         // A named pipe opens like a file. All instances busy is a short wait,
         // not "not running".
         let mut pipe = loop {
-            match open_pipe_client(path, None, service_status) {
+            match open() {
                 Ok(pipe) => break pipe,
                 Err(error) => {
                     if matches!(error, DialError::Busy(_)) && started.elapsed() < BUSY_RETRY {
@@ -962,7 +953,7 @@ mod tests {
 
     #[test]
     fn untrusted_pipe_server_has_a_distinct_error_and_no_send_message() {
-        let err = DialError::UntrustedServer("unexpected server SID".to_owned());
+        let err = DialError::UntrustedServer("unexpected server image".to_owned());
         assert_eq!(err.code(), "daemon_untrusted_server");
         assert_eq!(
             err.plain(),
@@ -971,8 +962,10 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_owner_query_has_its_own_code_and_fixed_message() {
-        let err = DialError::ServerVerificationUnavailable("GetSecurityInfo failed".to_owned());
+    fn unavailable_server_image_query_has_its_own_code_and_fixed_message() {
+        let err = DialError::ServerVerificationUnavailable(
+            "QueryFullProcessImageNameW failed".to_owned(),
+        );
         assert_eq!(err.code(), "daemon_server_unverified");
         assert_eq!(
             err.plain(),
@@ -1257,12 +1250,12 @@ fn tests_is_root() -> bool {
     root
 }
 
-/// Real Windows pipe-owner tests. The first test deliberately takes the
-/// production pipe name: a same-user process that creates it before the
-/// service must be refused when SCM says the service is installed.
+/// Real Windows pipe-server-image tests. They deliberately take the production
+/// pipe name and use an injected SCM result, so they prove the connected pipe
+/// receives no request bytes without installing a service on the runner.
 #[cfg(all(test, windows))]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
-mod windows_pipe_owner_tests {
+mod windows_pipe_server_tests {
     use std::ffi::OsStr;
     use std::io::ErrorKind;
     use std::path::PathBuf;
@@ -1305,151 +1298,121 @@ mod windows_pipe_owner_tests {
         }
     }
 
+    async fn refuse_without_sending_or_falling_back(status: PipeServiceStatus) -> DialError {
+        let path = PathBuf::from(WINDOWS_PIPE);
+        let sddl = pipe_sddl().expect("current-user pipe SDDL");
+        let first = create_server(OsStr::new(WINDOWS_PIPE), true, &sddl)
+            .expect("fake server owns the public pipe first");
+        // If the client were to retry after refusing the first instance, this
+        // second instance would accept that retry.
+        let second = create_server(OsStr::new(WINDOWS_PIPE), false, &sddl)
+            .expect("second fake pipe instance");
+        let request = b"must-not-reach-the-fake-server".to_vec();
+        let client = thread::spawn(move || {
+            exchange_raw_with_service_status_for_test(
+                &path,
+                &request,
+                Duration::from_secs(1),
+                &status,
+            )
+        });
+
+        let first_connection = first.connect();
+        let second_connection = second.connect();
+        tokio::pin!(first_connection, second_connection);
+        let connected_to_first = tokio::select! {
+            result = &mut first_connection => {
+                result.expect("first fake server connection");
+                true
+            }
+            result = &mut second_connection => {
+                result.expect("second fake server connection");
+                false
+            }
+        };
+        let error = client
+            .join()
+            .expect("client thread")
+            .expect_err("must refuse");
+
+        if connected_to_first {
+            assert_no_request_bytes(&first).await;
+            assert!(
+                timeout(Duration::from_millis(200), second.connect())
+                    .await
+                    .is_err(),
+                "client retried a second pipe instance"
+            );
+        } else {
+            assert_no_request_bytes(&second).await;
+            assert!(
+                timeout(Duration::from_millis(200), first.connect())
+                    .await
+                    .is_err(),
+                "client retried a second pipe instance"
+            );
+        }
+        error
+    }
+
     #[test]
-    fn installed_service_refuses_a_same_user_server_without_sending_or_falling_back() {
+    fn mismatched_service_image_refuses_without_sending_or_falling_back() {
         let _lock = PIPE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         runtime().block_on(async {
-            let path = PathBuf::from(WINDOWS_PIPE);
-            let sddl = pipe_sddl().expect("current-user pipe SDDL");
-            let first = create_server(OsStr::new(WINDOWS_PIPE), true, &sddl)
-                .expect("fake server owns the public pipe first");
-            // If the client were to retry/fall back after refusing the first
-            // instance, this second same-user instance would accept it.
-            let second = create_server(OsStr::new(WINDOWS_PIPE), false, &sddl)
-                .expect("second fake pipe instance");
-            let status = PipeServiceStatus::Installed { binary_path: None };
-            let request = b"must-not-reach-the-fake-server".to_vec();
-            let client = thread::spawn(move || {
-                exchange_raw_with_service_status_for_test(
-                    &path,
-                    &request,
-                    Duration::from_secs(1),
-                    &status,
-                )
-            });
-
-            let first_connection = first.connect();
-            let second_connection = second.connect();
-            tokio::pin!(first_connection, second_connection);
-            let connected_to_first = tokio::select! {
-                result = &mut first_connection => {
-                    result.expect("first fake server connection");
-                    true
-                }
-                result = &mut second_connection => {
-                    result.expect("second fake server connection");
-                    false
-                }
-            };
-            let error = client
-                .join()
-                .expect("client thread")
-                .expect_err("must refuse");
+            let image = std::env::temp_dir().join(format!(
+                "aw-channel-mismatched-image-{}.exe",
+                std::process::id()
+            ));
+            std::fs::write(&image, b"not-the-test-server").expect("mismatched service image");
+            let error = refuse_without_sending_or_falling_back(PipeServiceStatus::Installed {
+                binary_path: image.clone(),
+            })
+            .await;
             assert!(matches!(error, DialError::UntrustedServer(_)), "{error}");
-
-            if connected_to_first {
-                assert_no_request_bytes(&first).await;
-                assert!(
-                    timeout(Duration::from_millis(200), second.connect())
-                        .await
-                        .is_err(),
-                    "client retried a second same-user pipe instance"
-                );
-            } else {
-                assert_no_request_bytes(&second).await;
-                assert!(
-                    timeout(Duration::from_millis(200), first.connect())
-                        .await
-                        .is_err(),
-                    "client retried a second same-user pipe instance"
-                );
-            }
+            let _ = std::fs::remove_file(image);
         });
     }
 
     #[test]
-    fn service_query_failure_refuses_a_same_user_server_without_sending_or_falling_back() {
+    fn unavailable_service_image_refuses_without_sending_or_falling_back() {
         let _lock = PIPE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         runtime().block_on(async {
-            let path = PathBuf::from(WINDOWS_PIPE);
-            let sddl = pipe_sddl().expect("current-user pipe SDDL");
-            let first = create_server(OsStr::new(WINDOWS_PIPE), true, &sddl)
-                .expect("fake server owns the public pipe first");
-            let second = create_server(OsStr::new(WINDOWS_PIPE), false, &sddl)
-                .expect("second fake pipe instance");
-            let status = PipeServiceStatus::QueryFailed {
+            let error = refuse_without_sending_or_falling_back(PipeServiceStatus::QueryFailed {
                 operation: "OpenSCManagerW",
                 win32_error: 5,
-            };
-            let request = b"must-not-reach-the-fake-server".to_vec();
-            let client = thread::spawn(move || {
-                exchange_raw_with_service_status_for_test(
-                    &path,
-                    &request,
-                    Duration::from_secs(1),
-                    &status,
-                )
-            });
-
-            let first_connection = first.connect();
-            let second_connection = second.connect();
-            tokio::pin!(first_connection, second_connection);
-            let connected_to_first = tokio::select! {
-                result = &mut first_connection => {
-                    result.expect("first fake server connection");
-                    true
-                }
-                result = &mut second_connection => {
-                    result.expect("second fake server connection");
-                    false
-                }
-            };
-            let error = client
-                .join()
-                .expect("client thread")
-                .expect_err("must refuse when SCM status is unavailable");
-            assert!(matches!(error, DialError::UntrustedServer(_)), "{error}");
-
-            if connected_to_first {
-                assert_no_request_bytes(&first).await;
-                assert!(
-                    timeout(Duration::from_millis(200), second.connect())
-                        .await
-                        .is_err(),
-                    "client retried a second same-user pipe instance"
-                );
-            } else {
-                assert_no_request_bytes(&second).await;
-                assert!(
-                    timeout(Duration::from_millis(200), first.connect())
-                        .await
-                        .is_err(),
-                    "client retried a second same-user pipe instance"
-                );
-            }
+            })
+            .await;
+            assert!(
+                matches!(error, DialError::ServerVerificationUnavailable(_)),
+                "{error}"
+            );
         });
     }
 
     #[test]
-    fn no_service_allows_a_same_user_development_pipe() {
+    fn matching_service_image_accepts_the_connected_pipe() {
         let _lock = PIPE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         runtime().block_on(async {
             let sddl = pipe_sddl().expect("current-user pipe SDDL");
-            let _server = create_server(OsStr::new(WINDOWS_PIPE), true, &sddl)
-                .expect("same-user development server");
+            let server = create_server(OsStr::new(WINDOWS_PIPE), true, &sddl).expect("test server");
+            let connected = server.connect();
+            tokio::pin!(connected);
             let client = open_pipe_client_with_service_status_for_test(
                 std::path::Path::new(WINDOWS_PIPE),
-                &PipeServiceStatus::NotInstalled,
+                &PipeServiceStatus::Installed {
+                    binary_path: std::env::current_exe().expect("test server image"),
+                },
             );
+            connected.await.expect("test server connection");
             assert!(
                 client.is_ok(),
-                "development pipe must remain usable: {client:?}"
+                "matching service image must be accepted: {client:?}"
             );
         });
     }

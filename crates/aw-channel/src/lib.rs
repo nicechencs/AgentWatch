@@ -252,10 +252,10 @@ impl DialError {
                 "AgentWatch 服务在运行，但当前账户没有连接权限。请让管理员把你加入 agentwatch 组（Windows 为 AgentWatch Users 组）。".to_owned()
             }
             Self::UntrustedServer(_) => {
-                "连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为了安全，这次没有发送任何内容。".to_owned()
+                "连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为防内容被它拿到，这次没有发送任何内容。".to_owned()
             }
             Self::ServerVerificationUnavailable(_) => {
-                "没法确认连上的是不是 AgentWatch 后台，为了安全，这次没有发送任何内容。请重启后台后再试。".to_owned()
+                "没法确认连上的是不是 AgentWatch 后台，为防连到冒充的程序，这次没有发送任何内容。请重启后台后再试。".to_owned()
             }
             Self::Busy(_) => "AgentWatch 服务正忙，请稍后重试。".to_owned(),
             Self::Timeout(_) => "AgentWatch 服务没有及时响应，请重试。".to_owned(),
@@ -906,7 +906,7 @@ mod tests {
         assert_eq!(err.code(), "daemon_untrusted_server");
         assert_eq!(
             err.plain(),
-            "连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为了安全，这次没有发送任何内容。"
+            "连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为防内容被它拿到，这次没有发送任何内容。"
         );
     }
 
@@ -916,7 +916,7 @@ mod tests {
         assert_eq!(err.code(), "daemon_server_unverified");
         assert_eq!(
             err.plain(),
-            "没法确认连上的是不是 AgentWatch 后台，为了安全，这次没有发送任何内容。请重启后台后再试。"
+            "没法确认连上的是不是 AgentWatch 后台，为防连到冒充的程序，这次没有发送任何内容。请重启后台后再试。"
         );
     }
 

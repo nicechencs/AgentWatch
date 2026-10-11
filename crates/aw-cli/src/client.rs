@@ -169,10 +169,10 @@ impl fmt::Display for ClientError {
                 "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。详情：{detail}"
             ),
             Self::UntrustedServer { .. } => f.write_str(
-                "连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为了安全，这次没有发送任何内容。",
+                "连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为防内容被它拿到，这次没有发送任何内容。",
             ),
             Self::ServerVerificationUnavailable { .. } => f.write_str(
-                "没法确认连上的是不是 AgentWatch 后台，为了安全，这次没有发送任何内容。请重启后台后再试。",
+                "没法确认连上的是不是 AgentWatch 后台，为防连到冒充的程序，这次没有发送任何内容。请重启后台后再试。",
             ),
             // The transport detail is for logs and `--json`; it often has a
             // Win32 code and must not become a second, English user message.
@@ -679,7 +679,7 @@ mod tests {
         );
         assert_eq!(
             untrusted.to_string(),
-            "连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为了安全，这次没有发送任何内容。"
+            "连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为防内容被它拿到，这次没有发送任何内容。"
         );
         let unavailable = ClientError::ServerVerificationUnavailable {
             detail: "GetSecurityInfo failed".to_owned(),
@@ -691,7 +691,7 @@ mod tests {
         );
         assert_eq!(
             unavailable.to_string(),
-            "没法确认连上的是不是 AgentWatch 后台，为了安全，这次没有发送任何内容。请重启后台后再试。"
+            "没法确认连上的是不是 AgentWatch 后台，为防连到冒充的程序，这次没有发送任何内容。请重启后台后再试。"
         );
         assert_eq!(unavailable.json_detail(), Some("GetSecurityInfo failed"));
     }

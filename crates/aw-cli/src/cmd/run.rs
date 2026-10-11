@@ -2876,7 +2876,7 @@ mod tests {
                     let gated = listed_fds(&fds);
                     if gated.iter().any(|fd| !plain.contains(fd)) {
                         failures.lock().expect("failures").push(format!(
-                            "round {round} child {index}: leaked fd gated {gated:?} plain {plain:?}"
+                            "round {round} child {index}: extra fd gated {gated:?} plain {plain:?}"
                         ));
                     }
                 }));

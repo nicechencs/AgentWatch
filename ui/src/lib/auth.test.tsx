@@ -131,7 +131,7 @@ describe("desktop app entry", () => {
     );
     await waitFor(() => expect(screen.getByText("untrusted_server")).toBeInTheDocument());
     expect(
-      screen.getByText("连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为了安全，这次没有发送任何内容。"),
+      screen.getByText("连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为防内容被它拿到，这次没有发送任何内容。"),
     ).toBeInTheDocument();
   });
 

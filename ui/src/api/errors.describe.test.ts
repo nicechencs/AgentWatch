@@ -50,8 +50,8 @@ describe("error text", () => {
   it("uses the agreed Chinese wording for Windows peer-identity failures", () => {
     const cases = [
       ["unidentified_peer", "后台认不出你是哪个用户，已拒绝这次请求。请确认 `aw` 和后台是同一个版本，还不行就重启后台。"],
-      ["daemon_untrusted_server", "连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为了安全，这次没有发送任何内容。"],
-      ["daemon_server_unverified", "没法确认连上的是不是 AgentWatch 后台，为了安全，这次没有发送任何内容。请重启后台后再试。"],
+      ["daemon_untrusted_server", "连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为防内容被它拿到，这次没有发送任何内容。"],
+      ["daemon_server_unverified", "没法确认连上的是不是 AgentWatch 后台，为防连到冒充的程序，这次没有发送任何内容。请重启后台后再试。"],
     ] as const;
     for (const [code, expected] of cases) {
       expect(describeError(new ApiError(403, { error: { code, message: "developer detail" } }, "x"), t)).toBe(expected);

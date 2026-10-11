@@ -128,10 +128,10 @@ impl std::fmt::Display for ControlError {
                 "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。详情：{detail}"
             ),
             Self::UntrustedServer { .. } => {
-                f.write_str("连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为了安全，这次没有发送任何内容。")
+                f.write_str("连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为防内容被它拿到，这次没有发送任何内容。")
             }
             Self::ServerVerificationUnavailable { .. } => f.write_str(
-                "没法确认连上的是不是 AgentWatch 后台，为了安全，这次没有发送任何内容。请重启后台后再试。",
+                "没法确认连上的是不是 AgentWatch 后台，为防连到冒充的程序，这次没有发送任何内容。请重启后台后再试。",
             ),
             // Keep OS/pipe details for `--json`; the terminal gets the shared
             // #147 wording only.

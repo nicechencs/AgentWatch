@@ -56,17 +56,10 @@ fn secure_data_dir_error(dir: &Path, error: aw_platform::PlatformError) -> io::E
                 | "data directory owner changed while it was being secured",
         }
     ) {
-        let message = if cfg!(windows) {
-            format!(
-                "数据目录「{}」不是由系统或管理员创建的，为了安全，后台不会使用它。请删除这个目录后再启动后台。",
-                dir.display()
-            )
-        } else {
-            format!(
-                "数据目录「{}」不是由后台账户创建的，为了安全，后台不会使用它。请删除这个目录后再启动后台。",
-                dir.display()
-            )
-        };
+        let message = format!(
+            "数据目录「{}」不归管理员所有，可能被别人改过。为防万一，后台没有启动。请删掉这个目录后再启动后台。",
+            dir.display()
+        );
         return io::Error::new(io::ErrorKind::PermissionDenied, message);
     }
     platform_error(error)

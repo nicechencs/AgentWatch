@@ -137,7 +137,7 @@ impl fmt::Display for PlatformError {
                 f,
                 "named-pipe peer was not identified: {operation} failed (Win32 error {win32_error})"
             ),
-            Self::Io(error) => write!(f, "platform I/O error: {error}"),
+            Self::Io(error) => write!(f, "平台 I/O 出错：{error}"),
             Self::Invalid { capability, detail } => write!(f, "{capability}: {detail}"),
         }
     }

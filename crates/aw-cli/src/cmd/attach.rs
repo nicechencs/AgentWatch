@@ -351,10 +351,10 @@ impl<T: Transport> HttpDaemonSessions<T> {
 impl<T: Transport> HttpDaemonSessions<T> {
     /// The daemon's session routes take public ids and `@last`. `@last` is
     /// resolved on the daemon, against the caller's own sessions, so it is
-    /// forwarded unchanged. Any other key that is not an `s-` id is looked up
-    /// by exact name among the sessions the daemon returned for this caller.
-    /// Not found by name is passed through so the daemon answers 404.
-    fn resolve_session(&mut self, key: &str) -> Result<String, ControlError> {
+    /// forwarded unchanged. A name is looked up only within the selected
+    /// owner: an administrator's wider list must not make `aw stop build`
+    /// silently target another account's session.
+    fn resolve_session(&mut self, key: &str, owner: Option<&str>) -> Result<String, ControlError> {
         if key.starts_with("s-") || key == "@last" {
             return Ok(key.to_owned());
         }
@@ -365,10 +365,31 @@ impl<T: Transport> HttpDaemonSessions<T> {
             .ok_or_else(|| ControlError::BadReply {
                 detail: "缺少字段 `sessions`".to_owned(),
             })?;
+        let includes_owners = rows.iter().any(|row| row.get("user_id").is_some());
+        let caller_id = if includes_owners {
+            let me = self.call(&ApiRequest::get("/api/v1/me"))?;
+            required_text(&me, "user_id")?
+        } else {
+            String::new()
+        };
+        let owner_matches = |row: &Value| {
+            if !includes_owners {
+                return owner.is_none();
+            }
+            let row_owner = row.get("user_id").and_then(Value::as_str);
+            match owner {
+                None | Some("self") => row_owner == Some(caller_id.as_str()),
+                Some(selected) => {
+                    row_owner == Some(selected)
+                        || row.get("user").and_then(Value::as_str) == Some(selected)
+                }
+            }
+        };
         let ids = |row: &Value| row.get("id").and_then(Value::as_str).map(str::to_owned);
         let matches: Vec<String> = rows
             .iter()
             .filter(|row| row.get("name").and_then(Value::as_str) == Some(key))
+            .filter(|row| owner_matches(row))
             .filter_map(ids)
             .collect();
         match matches.as_slice() {
@@ -452,7 +473,7 @@ impl<T: Transport> DaemonSessions for HttpDaemonSessions<T> {
         session: &str,
         owner: Option<&str>,
     ) -> Result<String, ControlError> {
-        let public_id = self.resolve_session(session)?;
+        let public_id = self.resolve_session(session, owner)?;
         let path = format!("/api/v1/sessions/{}/stop", encode_path_segment(&public_id));
         let request = ApiRequest {
             method: "POST".to_owned(),
@@ -1029,6 +1050,42 @@ mod tests {
             "{}",
             seen[3]
         );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn administrator_name_lookup_stays_with_self_or_the_explicit_owner() {
+        use super::{DaemonSessions, HttpDaemonSessions};
+        let (endpoint, dir, server) = fake_daemon(
+            "owner-name",
+            vec![
+                r#"{"sessions":[{"id":"s-mine","name":"build","user_id":"1000","user":"me"},{"id":"s-alice","name":"build","user_id":"1001","user":"alice"}]}"#,
+                r#"{"user_id":"1000","admin":true}"#,
+                r#"{"stopped":"s-mine","id":"s-mine"}"#,
+                r#"{"sessions":[{"id":"s-mine","name":"build","user_id":"1000","user":"me"},{"id":"s-alice","name":"build","user_id":"1001","user":"alice"}]}"#,
+                r#"{"user_id":"1000","admin":true}"#,
+                r#"{"stopped":"s-alice","id":"s-alice"}"#,
+            ],
+        );
+        let mut control = HttpDaemonSessions::new(endpoint);
+        assert_eq!(
+            control.stop_monitoring("build", None).expect("own name"),
+            "s-mine"
+        );
+        assert_eq!(
+            control
+                .stop_monitoring("build", Some("alice"))
+                .expect("named foreign owner"),
+            "s-alice"
+        );
+        let seen = server.join().expect("join");
+        assert!(seen[0].starts_with("GET /api/v1/sessions?limit=500 "));
+        assert!(seen[1].starts_with("GET /api/v1/me "));
+        assert!(seen[2].starts_with("POST /api/v1/sessions/s-mine/stop "));
+        assert!(seen[3].starts_with("GET /api/v1/sessions?limit=500 "));
+        assert!(seen[4].starts_with("GET /api/v1/me "));
+        assert!(seen[5].starts_with("POST /api/v1/sessions/s-alice/stop?owner=alice "));
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 

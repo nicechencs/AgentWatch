@@ -6,6 +6,7 @@
 //! and exit 4 when it says the caller is not an administrator.
 
 use serde_json::json;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
 use crate::exit;
@@ -83,8 +84,8 @@ pub(crate) enum DaemonOp {
         purge: bool,
         /// `--check`: report leftovers, do not remove anything.
         check: bool,
-        /// Explicit test-data target. It is never inferred from the system
-        /// service configuration.
+        /// Explicit test-data target. This is absent from production builds.
+        #[cfg(test)]
         data_dir: Option<PathBuf>,
     },
 }
@@ -129,15 +130,21 @@ impl DaemonControl for PlannedControl {
             DaemonOp::Uninstall {
                 purge,
                 check,
+                #[cfg(test)]
                 data_dir,
             } => {
                 if *check {
                     ("checked", "此构建的 uninstall --check 没有发现可移除内容")
                 } else if *purge {
+                    #[cfg(test)]
                     if let Some(path) = data_dir.as_deref() {
                         remove_test_data_dir(path)?;
                         ("removed", "已删除指定的测试数据目录；没有移除系统服务")
                     } else {
+                        ("planned", "已记录 uninstall --purge；没有删除数据库")
+                    }
+                    #[cfg(not(test))]
+                    {
                         ("planned", "已记录 uninstall --purge；没有删除数据库")
                     }
                 } else {
@@ -156,6 +163,7 @@ impl DaemonControl for PlannedControl {
 /// deliberately not inferred here, so this command cannot accidentally affect
 /// an installed service.  A filesystem root and a path without a final name
 /// are never valid removal targets.
+#[cfg(test)]
 fn remove_test_data_dir(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() || path.file_name().is_none() {
         return Err("测试数据目录无效，拒绝删除".to_owned());
@@ -293,6 +301,7 @@ fn finish(op: &DaemonOp, effect: &DaemonEffect, json: bool) -> Outcome {
         DaemonOp::Uninstall {
             purge: true,
             check: false,
+            #[cfg(test)]
             data_dir: None,
         }
     ) && !json
@@ -422,14 +431,23 @@ sc.exe description AgentWatch \"AgentWatch process-behavior audit daemon\"
 }
 
 fn needs_admin(op: &DaemonOp) -> bool {
-    matches!(
+    let DaemonOp::Uninstall { check, .. } = op else {
+        return false;
+    };
+    if *check {
+        return false;
+    }
+    #[cfg(test)]
+    if matches!(
         op,
         DaemonOp::Uninstall {
-            check: false,
-            data_dir: None,
+            data_dir: Some(_),
             ..
         }
-    )
+    ) {
+        return false;
+    }
+    true
 }
 
 fn ok_outcome(effect: &DaemonEffect, json: bool) -> Outcome {
@@ -550,6 +568,7 @@ mod tests {
             DaemonOp::Uninstall {
                 purge: true,
                 check: false,
+                #[cfg(test)]
                 data_dir: None,
             },
             true,
@@ -565,6 +584,7 @@ mod tests {
             vec![DaemonOp::Uninstall {
                 purge: true,
                 check: false,
+                #[cfg(test)]
                 data_dir: None,
             }]
         );
@@ -576,6 +596,7 @@ mod tests {
             DaemonOp::Uninstall {
                 purge: true,
                 check: false,
+                #[cfg(test)]
                 data_dir: None,
             },
             false,
@@ -600,6 +621,7 @@ mod tests {
             DaemonOp::Uninstall {
                 purge: true,
                 check: false,
+                #[cfg(test)]
                 data_dir: Some(path.clone()),
             },
             false,
@@ -616,6 +638,7 @@ mod tests {
             DaemonOp::Uninstall {
                 purge: false,
                 check: true,
+                #[cfg(test)]
                 data_dir: None,
             },
             false,

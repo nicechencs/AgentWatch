@@ -1,11 +1,13 @@
 //! `aw timeline <S> [--filter --from --to --follow --limit]` (P1-CLI-03).
 //!
-//! `--follow` polls the daemon's bounded SSE snapshot endpoint.  That is the
-//! same cursor protocol used by the App: every response contains records after
-//! the last SSE `id`, then closes.  On Unix SIGINT/SIGTERM stop the poll loop
-//! cleanly rather than leaving a terminal in a half-written state.
+//! `--follow` polls the persisted daemon timeline. Every response contains rows
+//! after the prior `(ts_ns,id)` cursor and is printed immediately. On Unix
+//! SIGINT/SIGTERM stop the poll loop cleanly rather than leaving a terminal in
+//! a half-written state.
 
 use std::io;
+#[cfg(not(test))]
+use std::io::Write;
 #[cfg(not(test))]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -40,7 +42,8 @@ pub(crate) struct TimelineArgs<'a> {
     pub color: bool,
 }
 
-/// Render one timeline page, or the follow buffer when `follow` is set.
+/// Render one timeline page, or continuously write follow batches when
+/// `follow` is set.
 ///
 /// # Errors
 ///
@@ -118,25 +121,54 @@ fn follow(
     {
         let cancelled = interrupt_flag();
         let mut cursor = None;
-        let mut collected = Vec::new();
         while !cancelled.load(Ordering::Relaxed) {
-            match source.follow(key, filter, cursor) {
+            match source.follow(key, filter, cursor.as_deref()) {
                 Ok(rows) => {
                     if let Some(last) = rows.last() {
-                        cursor = Some(last.id);
+                        cursor = Some(format!("{},{}", last.ts_ns, last.id));
                     }
-                    collected.extend(rows);
+                    if !rows.is_empty() {
+                        write_follow_batch(&rows, mode, color)?;
+                    }
                 }
                 Err(err) => return Ok(query_outcome(err, mode == OutputMode::Json)),
             }
-            // `/live` deliberately closes its snapshot promptly. Avoid a busy
-            // reconnect loop while preserving the App's one-second cadence.
+            // Each timeline request is a bounded snapshot. The timeline table
+            // is authoritative for records; the summary tells us when an empty
+            // final snapshot is final.
+            match source.show_session(key) {
+                Ok(session) if session.item.ended_ns.is_some() => break,
+                Ok(_) => {}
+                Err(err) => return Ok(query_outcome(err, mode == OutputMode::Json)),
+            }
+            // The snapshot returns promptly. Avoid a busy poll loop while
+            // preserving the App's one-second cadence.
             std::thread::sleep(super::query::follow_poll_interval());
         }
-        let table = render::timeline_table(&collected, color);
-        let doc = render::timeline_json(&collected, true);
-        write_ok(mode, &table, &doc)
+        Ok(Outcome {
+            code: exit::OK,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
     }
+}
+
+/// Send a completed snapshot immediately.  `Outcome` normally lets the top
+/// level own stdout, but delaying every snapshot until Ctrl-C made `--follow`
+/// look idle.  A flush is required on Windows too, where the console is often
+/// the only live display path.
+#[cfg(not(test))]
+fn write_follow_batch(
+    rows: &[super::query::TimelineItem],
+    mode: OutputMode,
+    color: bool,
+) -> io::Result<()> {
+    let table = render::timeline_table(rows, color);
+    let doc = render::timeline_json(rows, true);
+    let outcome = write_ok(mode, &table, &doc)?;
+    let mut output = io::stdout().lock();
+    output.write_all(&outcome.stdout)?;
+    output.flush()
 }
 
 #[cfg(test)]
@@ -192,15 +224,7 @@ fn resolve(text: Option<&str>, started: Option<i64>, json: bool) -> Result<Optio
     let Some(text) = text else {
         return Ok(None);
     };
-    if text.trim().starts_with('-') {
-        return Err(super::error_outcome(
-            exit::USAGE,
-            "usage",
-            "`--from`/`--to` 的相对当前时间（-10m）需要此构建没有的时钟；请传入 RFC 3339 或 +30s",
-            json,
-        ));
-    }
-    match super::query::resolve_time(text, started, 0) {
+    match super::query::resolve_time(text, started, super::query::current_time_ns()) {
         Ok(ns) => Ok(Some(ns)),
         Err(detail) => Err(super::error_outcome(exit::USAGE, "usage", &detail, json)),
     }

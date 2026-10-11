@@ -204,7 +204,7 @@ fn rows_from_json(body: &Value) -> Result<Vec<ProcessRow>, PsError> {
 fn not_collected_detail(reason: Option<&str>) -> String {
     let sentence = match reason.map(str::trim).filter(|text| !text.is_empty()) {
         Some("no_process_table") => "这个平台上后台没有可读的进程表".to_owned(),
-        Some(code) => format!("原因码 {code}，这个版本还不认识"),
+        Some(code) => format!("后台给出的类别「{code}」这个版本还不认识"),
         None => "后台没说原因".to_owned(),
     };
     format!("没采：进程表（{sentence}）")
@@ -493,7 +493,7 @@ mod tests {
         let outcome = run(false, None, false, &mut daemon(200, body));
         let text = String::from_utf8(outcome.stderr).expect("utf8");
         assert!(
-            text.contains("没采：进程表（原因码 disk_asleep，这个版本还不认识）"),
+            text.contains("没采：进程表（后台给出的类别「disk_asleep」这个版本还不认识）"),
             "{text}"
         );
     }

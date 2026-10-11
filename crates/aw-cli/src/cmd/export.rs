@@ -63,6 +63,17 @@ pub(crate) struct ExportQuery {
     pub redact_hosts: bool,
 }
 
+/// A source failure that is distinct from an empty or missing export. The
+/// daemon uses `no_sessions` for `@last`; preserving it here gives the same
+/// text and exit code as the other session commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExportLoadError {
+    /// `@last` had no session for this caller.
+    NoSessions,
+    /// The daemon or output source failed after a request was made.
+    Failed(String),
+}
+
 /// Where records come from. The default answers "no session".
 pub(crate) trait ExportSource {
     /// Load one session. `Ok(None)` is "not found", not an empty export.
@@ -70,7 +81,7 @@ pub(crate) trait ExportSource {
     /// # Errors
     ///
     /// A source-level failure. The message must not contain argv, URLs, or tokens.
-    fn load(&mut self, query: &ExportQuery) -> Result<Option<ExportBatch>, String>;
+    fn load(&mut self, query: &ExportQuery) -> Result<Option<ExportBatch>, ExportLoadError>;
 
     /// Body of a daemon export, after a successful [`Self::load`].
     ///
@@ -89,7 +100,7 @@ pub(crate) trait ExportSource {
 pub(crate) struct EmptyExport;
 
 impl ExportSource for EmptyExport {
-    fn load(&mut self, _query: &ExportQuery) -> Result<Option<ExportBatch>, String> {
+    fn load(&mut self, _query: &ExportQuery) -> Result<Option<ExportBatch>, ExportLoadError> {
         Ok(None)
     }
 }
@@ -146,7 +157,7 @@ impl<F: ExportFetch> DaemonExport<F> {
 }
 
 impl<F: ExportFetch> ExportSource for DaemonExport<F> {
-    fn load(&mut self, query: &ExportQuery) -> Result<Option<ExportBatch>, String> {
+    fn load(&mut self, query: &ExportQuery) -> Result<Option<ExportBatch>, ExportLoadError> {
         let session = session_key(&query.session);
         let mut pairs = vec![("format", self.format)];
         if let Some(filter) = query.filter.as_deref() {
@@ -173,8 +184,8 @@ impl<F: ExportFetch> ExportSource for DaemonExport<F> {
                 }))
             }
             Err(ExportFetchError::NotFound { .. }) => Ok(None),
-            Err(ExportFetchError::NoSessions) => Err("还没有你的会话，@last 无处可指".to_owned()),
-            Err(ExportFetchError::Failed { detail }) => Err(detail),
+            Err(ExportFetchError::NoSessions) => Err(ExportLoadError::NoSessions),
+            Err(ExportFetchError::Failed { detail }) => Err(ExportLoadError::Failed(detail)),
         }
     }
 
@@ -478,13 +489,18 @@ pub(crate) fn run_to(
         Ok(None) => {
             let typed = session_key(&query.session);
             return error_outcome(
-                exit::GENERAL,
+                exit::NOT_FOUND,
                 "not_found",
-                &format!("找不到会话 `{typed}`"),
+                &format!("找不到会话「{typed}」"),
                 json,
             );
         }
-        Err(detail) => return error_outcome(exit::GENERAL, "export", &detail, json),
+        Err(ExportLoadError::NoSessions) => {
+            return error_outcome(exit::NOT_FOUND, "no_sessions", "你还没有会话", json)
+        }
+        Err(ExportLoadError::Failed(detail)) => {
+            return error_outcome(exit::GENERAL, "export", &detail, json)
+        }
     };
     // A daemon export is already a file. Writing `batch` would drop it: that
     // source returns no records of its own.
@@ -944,10 +960,10 @@ mod tests {
             },
             &mut source,
         );
-        assert_eq!(outcome.code, exit::GENERAL);
+        assert_eq!(outcome.code, exit::NOT_FOUND);
         assert_eq!(
             String::from_utf8(outcome.stderr).expect("utf8"),
-            "aw: 还没有你的会话，@last 无处可指\n"
+            "aw: 你还没有会话\n"
         );
     }
 
@@ -975,10 +991,10 @@ mod tests {
             },
             &mut source,
         );
-        assert_eq!(outcome.code, exit::GENERAL);
+        assert_eq!(outcome.code, exit::NOT_FOUND);
         assert_eq!(
             String::from_utf8(outcome.stderr).expect("utf8"),
-            "aw: 找不到会话 `s-someone-else`\n"
+            "aw: 找不到会话「s-someone-else」\n"
         );
     }
 

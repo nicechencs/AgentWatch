@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::endpoint::{token_hint, Endpoint, HttpBase};
+use crate::endpoint::{Endpoint, HttpBase};
 use crate::exit::{self, from_http_status};
 
 /// Fixed human wording for a daemon that cannot be reached. Diagnostics stay
@@ -130,7 +130,7 @@ impl Transport for Box<dyn Transport> {
 
 /// Why a call did not produce a successful reply.
 ///
-/// `Display` never includes a token. HTTP failures include [`token_hint`] only.
+/// `Display` never includes a token or a token-derived hint.
 #[derive(Debug)]
 pub enum ClientError {
     /// The daemon did not answer. Exit 3.
@@ -324,10 +324,7 @@ fn status_waited_seconds(reply: &ApiReply) -> Option<u64> {
 /// structured diagnostic, not terminal prose.
 #[must_use]
 pub(crate) fn human_transport_message(detail: &str) -> String {
-    if detail.contains("daemon_timeout")
-        || detail.contains("operation would block")
-        || detail.contains("timed out")
-    {
+    if detail.contains("daemon_timeout") || detail.contains("timed out") {
         "后台 5 秒没有回应，这次请求没有完成。".to_owned()
     } else {
         "跟后台的连接断了，请再试一次。".to_owned()
@@ -399,11 +396,7 @@ fn http_exchange(
     let addr = SocketAddr::from(([127, 0, 0, 1], base.port));
     let mut stream =
         TcpStream::connect_timeout(&addr, timeout).map_err(|_| ClientError::Unreachable {
-            detail: format!(
-                "连接 {} 超时或被拒绝（token {}）",
-                base.origin(),
-                token_hint(token)
-            ),
+            detail: format!("连接 {} 超时或被拒绝", base.origin()),
         })?;
     stream
         .set_read_timeout(Some(timeout))
@@ -602,10 +595,7 @@ impl Transport for MemoryTransport {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{
-        encode_request, parse_response, token_hint, ApiRequest, Client, ClientError,
-        MemoryTransport,
-    };
+    use super::{encode_request, parse_response, ApiRequest, Client, ClientError, MemoryTransport};
     use crate::endpoint::{resolve, EndpointInput};
     use crate::exit;
 
@@ -648,8 +638,7 @@ mod tests {
         assert!(text.contains("没有通过后台的身份验证"), "{text}");
         assert!(!text.contains("bearer token required"), "{text}");
         assert!(!text.contains("unit-test-token"), "{text}");
-        assert!(!text.contains("ABCD") || text.contains("len="), "{text}");
-        let _ = token_hint("unit-test-token-ABCD");
+        assert!(!text.contains("ABCD"), "{text}");
     }
 
     #[test]

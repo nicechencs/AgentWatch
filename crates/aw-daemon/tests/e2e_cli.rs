@@ -643,13 +643,12 @@ fn a_session_created_right_after_start_stays_recording() {
     let _ = sleeper.wait();
 }
 
-/// `timeline --follow` uses the daemon's bounded `/live` SSE snapshots rather
-/// than the old unavailable stub.  The foreground CLI is interrupted like a
-/// person pressing Ctrl-C: it finishes its current snapshot and exits cleanly.
-/// This uses the same isolated foreground daemon as the other end-to-end
-/// tests, never the installed daemon.
+/// `timeline --follow` polls stored timeline rows rather than an unconnected
+/// live hub. It prints the first persisted batch and exits itself once the
+/// watched program ends. This uses the same isolated foreground daemon as the
+/// other end-to-end tests, never the installed daemon.
 #[test]
-fn timeline_follow_uses_temp_daemon_and_stops_cleanly_on_sigint() {
+fn timeline_follow_uses_temp_daemon_database_rows_and_ends_with_the_session() {
     let mut sleeper = Command::new("sleep").arg("30").spawn().expect("sleep");
     let daemon = Daemon::start(As::Me);
     let (status, body) = daemon.http(
@@ -660,7 +659,31 @@ fn timeline_follow_uses_temp_daemon_and_stops_cleanly_on_sigint() {
     assert_eq!(status, 201, "{body} / {}", daemon.log());
     let sid = body["id"].as_str().expect("id").to_owned();
 
-    let follow = Command::new(aw_bin())
+    // The poll sampler writes a persisted process/timeline row. Waiting for
+    // it first makes this a real database-follow assertion, not an empty-hub
+    // smoke test.
+    let mut stored = false;
+    for _ in 0..30 {
+        let (status, timeline) =
+            daemon.http("GET", &format!("/api/v1/sessions/{sid}/timeline"), "");
+        if status == 200
+            && timeline
+                .get("rows")
+                .and_then(Value::as_array)
+                .is_some_and(|rows| !rows.is_empty())
+        {
+            stored = true;
+            break;
+        }
+        sleep(Duration::from_millis(100));
+    }
+    assert!(
+        stored,
+        "sampler did not persist a timeline row: {}",
+        daemon.log()
+    );
+
+    let mut follow = Command::new(aw_bin())
         .envs(env_for(&daemon.root))
         .env_remove("AW_TOKEN")
         .env("AW_DAEMON_CONFIG", daemon.root.join("config.toml"))
@@ -671,14 +694,20 @@ fn timeline_follow_uses_temp_daemon_and_stops_cleanly_on_sigint() {
         .spawn()
         .expect("spawn timeline follow");
 
-    // Give the CLI enough time to make one bounded `/live` request and install
-    // its Unix signal waiter before emulating Ctrl-C.
-    sleep(Duration::from_millis(1_300));
-    let signal = Command::new("kill")
-        .args(["-INT", &follow.id().to_string()])
-        .status()
-        .expect("send SIGINT to timeline follow");
-    assert!(signal.success(), "could not signal timeline follow");
+    // A finished session drains its final stored page and makes follow exit;
+    // no Ctrl-C is required. Keep the bounded wait so a regression cannot hang
+    // the end-to-end suite.
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    let started = Instant::now();
+    while follow.try_wait().expect("poll timeline follow").is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "timeline follow did not leave after the session ended: {}",
+            daemon.log()
+        );
+        sleep(Duration::from_millis(100));
+    }
     let output = follow.wait_with_output().expect("wait for timeline follow");
     assert!(
         output.status.success(),
@@ -686,17 +715,11 @@ fn timeline_follow_uses_temp_daemon_and_stops_cleanly_on_sigint() {
         String::from_utf8_lossy(&output.stderr),
         daemon.log()
     );
-    // The old implementation refused before dialing `/live`; a successful
-    // clean exit is the contract here because this foreground runtime has no
-    // live pipeline publisher yet and its snapshot may correctly be empty.
     assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("真实订阅未接通"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stdout).contains("\"cat\""),
+        "timeline did not print persisted rows: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
-
-    let _ = sleeper.kill();
-    let _ = sleeper.wait();
 }
 
 /// The local runner owns no daemon state.  It must still relay a terminal

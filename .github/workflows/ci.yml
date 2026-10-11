@@ -34,6 +34,11 @@ jobs:
         run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: release aw hides test-only uninstall data directory
+        shell: bash
+        run: |
+          cargo build -p aw-cli --release
+          ! target/release/aw daemon uninstall --help | grep -F -- '--data-dir'
       - name: daemon cannot use its own identity
         if: runner.os == 'Linux'
         shell: bash

@@ -63,6 +63,7 @@ const CODE_TEXT: Record<string, string> = {
   session_ended: "error.sessionEnded",
   write_failed: "error.writeFailed",
   db_busy: "error.dbBusy",
+  db_read_only_newer: "error.dbReadOnlyNewer",
   daemon_timeout: "error.daemonTimeout",
 };
 

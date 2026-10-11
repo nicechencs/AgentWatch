@@ -265,33 +265,11 @@ fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("127.0.0.1") || host.eq_ignore_ascii_case("localhost")
 }
 
-/// Length and last four characters. Short tokens show the length only.
-#[must_use]
-pub fn token_hint(token: &str) -> String {
-    let len = token.chars().count();
-    let tail: String = token
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    if len > 4 {
-        format!("len={len} …{tail}")
-    } else if len == 0 {
-        "len=0".to_owned()
-    } else {
-        format!("len={len}")
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        parse_loopback_http, resolve, token_hint, Endpoint, EndpointError, EndpointInput,
-        DEFAULT_HTTP_PORT,
+        parse_loopback_http, resolve, Endpoint, EndpointError, EndpointInput, DEFAULT_HTTP_PORT,
     };
 
     fn input(
@@ -386,15 +364,6 @@ mod tests {
         assert!(parse_loopback_http("https://127.0.0.1:7456").is_err());
         let ok = parse_loopback_http("http://127.0.0.1:7456").expect("ok");
         assert_eq!(ok.port, DEFAULT_HTTP_PORT);
-    }
-
-    #[test]
-    fn token_hint_never_returns_the_whole_token() {
-        let hint = token_hint("abcdefghij");
-        assert_eq!(hint, "len=10 …ghij");
-        assert!(!hint.contains("abcdefghij"));
-        assert_eq!(token_hint("ab"), "len=2");
-        assert_eq!(token_hint(""), "len=0");
     }
 
     #[test]

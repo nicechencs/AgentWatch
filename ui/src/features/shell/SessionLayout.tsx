@@ -37,6 +37,8 @@ export function SessionLayout() {
   const [stopNotice, setStopNotice] = useState(false);
   const client = useQueryClient();
   const session = useQuery(sessionQueryOptions(sid));
+  const doctor = useQuery({ queryKey: ["doctor"], queryFn: () => api.doctor() });
+  const databaseReadOnly = doctor.data?.database_read_only === true;
   const ended = session.data ? session.data.ended_ns !== null || Boolean(session.data.purged) : null;
   const wasRecording = useRef(false);
   useEffect(() => {
@@ -121,7 +123,7 @@ export function SessionLayout() {
         {data.scan_pending ? <span className="text-xs text-ink-faint">正在读取进程…</span> : null}
         <div className="ml-auto flex gap-2">
           {active ? (
-            <button type="button" onClick={stop} disabled={stopping} className="rounded border border-line px-2 py-1 text-xs">
+            <button type="button" onClick={stop} disabled={stopping || databaseReadOnly} title={databaseReadOnly ? t("database.readOnlyNewer") : undefined} className="rounded border border-line px-2 py-1 text-xs">
               {stopping ? t("session.stopping") : t("session.stop")}
             </button>
           ) : null}
@@ -156,6 +158,7 @@ export function SessionLayout() {
           ) : null}
         </div>
       </header>
+      {databaseReadOnly ? <p role="alert" className="mx-3 mt-2 rounded border border-gap/40 bg-gap/10 px-3 py-2 text-xs text-ink">{t("database.readOnlyNewer")}</p> : null}
       {stopNotice ? <p role="status" className="px-3 py-1 text-xs text-ink-soft">{t("session.stopNotice")}</p> : null}
       {stopError ? <ErrorNote error={stopError} /> : null}
       <nav className="flex gap-1 border-b border-line px-3">

@@ -1019,10 +1019,12 @@ fn ops_command(
                 tree::DaemonCmd::Uninstall {
                     purge,
                     check,
+                    #[cfg(test)]
                     data_dir,
                 } => daemon::DaemonOp::Uninstall {
                     purge: *purge,
                     check: *check,
+                    #[cfg(test)]
                     data_dir: data_dir.clone(),
                 },
             };
@@ -1324,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn health_200_then_unimplemented_is_exit_1() {
+    fn health_200_then_unimplemented_is_exit_5() {
         let mut http = script(200, r#"{"status":"ok"}"#);
         // `ps` is implemented (P1-CLI-02) and does not probe `/health`.
         // This socket-free test dispatcher does not wire `ui`.
@@ -1527,6 +1529,7 @@ mod tests {
         let run_help = run(&["run", "--help"], None, &mut http);
         let run_text = text(&run_help.stdout);
         assert!(run_text.contains("只交给被启动的程序，不发给后台"));
+        assert!(run_text.contains("参数里写成 `--secret=…`、`TOKEN=…` 这种带名字的会自动隐藏；只写一个值认不出来，会原样记下。密钥请用 `--env` 传，它不会被记录。"));
         assert!(run_text.contains("关闭脱敏（本版本未接入）"));
         let attach = run(&["attach", "--help"], None, &mut http);
         let attach_help = text(&attach.stdout);

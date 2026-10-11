@@ -123,6 +123,7 @@ export function toSession(raw: unknown): Session {
     argv: Array.isArray(r.argv) ? (r.argv as string[]) : null,
     cwd: strOrNull(r.cwd),
     user_id: typeof r.user_id === "string" ? r.user_id : "",
+    user: strOrNull(r.user),
     started_ns: typeof r.started_ns === "number" ? r.started_ns : 0,
     ended_ns: numOrNull(r.ended_ns),
     end_reason: strOrNull(r.end_reason),
@@ -219,6 +220,7 @@ export function toSystemProcessTable(raw: unknown): SystemProcessTable {
 export function toDoctor(raw: unknown): DoctorReport {
   const r = isObj(raw) ? raw : {};
   const host = isObj(r.host) ? r.host : {};
+  const database = isObj(r.database) ? r.database : {};
   const caps = arr(r.capabilities).filter(isObj) as unknown as DoctorReport["capabilities"];
   return {
     ...(r as object),
@@ -231,6 +233,7 @@ export function toDoctor(raw: unknown): DoctorReport {
     reason: strOrNull(r.reason),
     privileged: typeof host.privileged === "boolean" ? host.privileged : null,
     privileged_note: strOrNull(host.privileged_note),
+    database_read_only: typeof database.read_only === "boolean" ? database.read_only : null,
   } as DoctorReport;
 }
 

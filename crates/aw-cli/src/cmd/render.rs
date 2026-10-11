@@ -211,7 +211,9 @@ pub(crate) fn session_table(items: &[SessionItem]) -> Table {
                     pinned_text(item.pinned),
                 ];
                 if show_user {
-                    cells.push(opt_text(item.user_id.as_deref()));
+                    cells.push(opt_text(
+                        item.user_label.as_deref().or(item.user_id.as_deref()),
+                    ));
                 }
                 Row {
                     cells,

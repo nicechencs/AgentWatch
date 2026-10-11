@@ -283,7 +283,7 @@ pub(crate) fn spawn_error_text(error: &std::io::Error) -> String {
     // The code and the OS number stay out of this sentence. The caller pairs
     // it with `spawn_error_code` for the log and, with `--json`, `error.code`.
     match error.kind() {
-        std::io::ErrorKind::NotFound => "无法启动程序：找不到这个程序或工作目录".to_owned(),
+        std::io::ErrorKind::NotFound => "找不到程序，请检查名字或路径".to_owned(),
         std::io::ErrorKind::PermissionDenied => {
             "无法启动程序：没有权限运行它或进入工作目录".to_owned()
         }
@@ -512,12 +512,26 @@ fn platform_spawn_error(program: &str, error: PlatformError) -> (&'static str, S
 fn caller_identity_error() -> (&'static str, String) {
     (
         "identity_unavailable",
-        "认不出当前用户，已停止启动：无法确认当前用户".to_owned(),
+        "认不出当前用户，已停止启动：系统没有提供可确认的身份。".to_owned(),
     )
+}
+
+/// Check the directory separately from program lookup so a missing `--cwd`
+/// never masquerades as a misspelled executable.
+fn validate_working_dir(cwd: Option<&str>) -> Result<(), (&'static str, String)> {
+    let Some(path) = cwd else {
+        return Ok(());
+    };
+    if std::path::Path::new(path).is_dir() {
+        Ok(())
+    } else {
+        Err(("working_dir_not_found", format!("找不到工作目录「{path}」")))
+    }
 }
 
 impl Spawner for CommandSpawner {
     fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, (&'static str, String)> {
+        validate_working_dir(spec.cwd.as_deref())?;
         #[cfg(target_os = "linux")]
         {
             let Some((program, args)) = spec.command.split_first() else {
@@ -2196,7 +2210,6 @@ mod tests {
             let mut ran = args(&command);
             ran.env = &env;
             ran.cwd = Some("/private/cwd-marker");
-            ran.raw = Some("/private/raw-marker");
             ran.pin = true;
             ran.no_daemon = true;
             ran.json = json;
@@ -2207,7 +2220,7 @@ mod tests {
             for summary in sources {
                 let mut launcher = fake_exit_7();
                 let outcome = run(&ran, none(), &mut UnixAdapter(&mut launcher), summary);
-                assert_eq!(outcome.code, exit::NOT_IN_BUILD);
+                assert_eq!(outcome.code, 7);
                 assert!(outcome.stdout.is_empty());
                 let err = text(&outcome.stderr);
                 for marker in [
@@ -2216,14 +2229,30 @@ mod tests {
                     "super-secret-value",
                     "TOKEN",
                     "cwd-marker",
-                    "raw-marker",
                 ] {
                     assert!(!err.contains(marker), "input marker appeared: {marker}");
                 }
-                assert!(err.contains("`--raw` 本版本未接入"), "{err}");
-                assert_eq!(launcher.env_len, None);
+                assert_eq!(launcher.env_len, Some(1));
             }
         }
+    }
+
+    #[test]
+    fn raw_is_refused_before_the_program_starts() {
+        let command = vec!["tool".to_owned()];
+        let mut ran = args(&command);
+        ran.raw = Some("/not-printed.raw");
+        let mut launcher = fake_exit_7();
+        let outcome = run(
+            &ran,
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut EmptySummary,
+        );
+        assert_eq!(outcome.code, exit::NOT_IN_BUILD);
+        assert!(outcome.stdout.is_empty());
+        assert!(text(&outcome.stderr).contains("`--raw` 本版本未接入"));
+        assert_eq!(launcher.env_len, None);
     }
 
     #[test]
@@ -3020,6 +3049,13 @@ mod tests {
             "spawn_failed"
         );
         assert!(!other.contains("系统错误码"), "{other}");
+        let cwd = super::validate_working_dir(Some("/definitely/not/a/working-directory"))
+            .expect_err("missing cwd");
+        assert_eq!(cwd.0, "working_dir_not_found");
+        assert_eq!(
+            cwd.1,
+            "找不到工作目录「/definitely/not/a/working-directory」"
+        );
         let wait = super::wait_error_text(&Error::from(ErrorKind::Other));
         assert_eq!(wait, "等待程序结束失败");
         for text in [not_found, denied, other, wait] {
@@ -3075,7 +3111,7 @@ mod tests {
             code: 0,
             fail: Some((
                 "identity_unavailable",
-                "认不出当前用户，已停止启动：无法确认当前用户".to_owned(),
+                "认不出当前用户，已停止启动：系统没有提供可确认的身份。".to_owned(),
             )),
         };
         let mut parsed = args(&command);
@@ -3092,7 +3128,7 @@ mod tests {
         assert_eq!(body["error"]["code"], "identity_unavailable");
         assert_eq!(
             body["error"]["message"],
-            "认不出当前用户，已停止启动：无法确认当前用户"
+            "认不出当前用户，已停止启动：系统没有提供可确认的身份。"
         );
     }
 

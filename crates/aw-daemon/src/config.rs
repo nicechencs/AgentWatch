@@ -22,7 +22,9 @@
 //! the same fields as [`DaemonConfig`].
 
 use std::fs;
-use std::io;
+#[cfg(unix)]
+use std::io::Read;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -50,6 +52,13 @@ impl ConfigWarning {
 /// Why a config file or value was refused.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    /// Refusing to follow a link prevents a privileged daemon from replacing an
+    /// operator-selected target outside the configuration directory.
+    #[error("配置文件「{}」是一个链接，为防改到别的文件，不会顺着链接修改，请换成普通文件后再试。", path.display())]
+    Symlink {
+        /// The link that was refused.
+        path: PathBuf,
+    },
     /// The file could not be read.
     #[error("failed to read config `{}`: {source}", path.display())]
     Read {
@@ -469,10 +478,7 @@ pub fn set_dotted(config: &mut DaemonConfig, key: &str, value: &Value) -> Result
 /// common table/key form is patched in place so comments and untouched sections
 /// survive; a missing key is inserted into (or creates) its table.
 pub fn merge_set_path(path: &Path, key: &str, value: &Value) -> Result<DaemonConfig, ConfigError> {
-    let source = fs::read_to_string(path).map_err(|source| ConfigError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let source = read_regular_config(path)?;
     let (mut config, _) = parse_toml(&source)?;
     set_dotted(&mut config, key, value).map_err(|detail| ConfigError::Invalid {
         key: key.to_owned(),
@@ -486,10 +492,7 @@ pub fn merge_set_path(path: &Path, key: &str, value: &Value) -> Result<DaemonCon
     // Parse exactly what will be persisted, so a line-oriented merge cannot
     // produce an invalid configuration document.
     let (parsed, _) = parse_toml(&merged)?;
-    atomic_write(path, merged.as_bytes()).map_err(|source| ConfigError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    atomic_write(path, merged.as_bytes())?;
     Ok(parsed)
 }
 
@@ -554,12 +557,219 @@ fn merge_toml_line(source: &str, dotted: &str, value: &str) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let temp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-    let permissions = fs::metadata(path)?.permissions();
-    fs::write(&temp, bytes)?;
-    fs::set_permissions(&temp, permissions)?;
-    fs::rename(temp, path)
+/// Read only a regular configuration file.  Do the `lstat` check before every
+/// privileged update; Unix also opens with `O_NOFOLLOW` to close the race
+/// between that check and opening the file.
+fn read_regular_config(path: &Path) -> Result<String, ConfigError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(ConfigError::Symlink {
+            path: path.to_path_buf(),
+        });
+    }
+    read_regular_config_impl(path)
+}
+
+#[cfg(unix)]
+fn read_regular_config_impl(path: &Path) -> Result<String, ConfigError> {
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::Mode;
+
+    let fd = open(path, OFlag::O_RDONLY | OFlag::O_NOFOLLOW, Mode::empty()).map_err(|source| {
+        ConfigError::Read {
+            path: path.to_path_buf(),
+            source: io::Error::other(source),
+        }
+    })?;
+    let mut file = fs::File::from(fd);
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(text)
+}
+
+#[cfg(not(unix))]
+fn read_regular_config_impl(path: &Path) -> Result<String, ConfigError> {
+    fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Persist one merged configuration while keeping its existing ownership and
+/// permissions.  The replacement is created in the same directory, flushed,
+/// atomically renamed, then the directory is flushed too.
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    #[cfg(unix)]
+    {
+        atomic_write_unix(path, bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        atomic_write_portable(path, bytes)
+    }
+}
+
+#[cfg(unix)]
+fn atomic_write_unix(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    use std::os::unix::fs::MetadataExt;
+
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::{fchmod, Mode};
+    use nix::unistd::{fchown, fsync, Gid, Uid};
+
+    let metadata = fs::symlink_metadata(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(ConfigError::Symlink {
+            path: path.to_path_buf(),
+        });
+    }
+    let Some(parent) = path.parent() else {
+        return Err(ConfigError::Read {
+            path: path.to_path_buf(),
+            source: io::Error::other("configuration path has no parent directory"),
+        });
+    };
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|source| ConfigError::Read {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    if parent_metadata.file_type().is_symlink() {
+        return Err(ConfigError::Symlink {
+            path: parent.to_path_buf(),
+        });
+    }
+    let name = path.file_name().ok_or_else(|| ConfigError::Read {
+        path: path.to_path_buf(),
+        source: io::Error::other("configuration path has no file name"),
+    })?;
+
+    let mut temp = None;
+    let mut file = None;
+    for _ in 0..64 {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source: io::Error::other(source.to_string()),
+        })?;
+        let candidate = parent.join(format!(
+            ".{}.{}.tmp",
+            name.to_string_lossy(),
+            u128::from_le_bytes(random)
+        ));
+        match open(
+            &candidate,
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW,
+            Mode::from_bits_truncate(0o600),
+        ) {
+            Ok(fd) => {
+                temp = Some(candidate);
+                file = Some(fs::File::from(fd));
+                break;
+            }
+            Err(nix::errno::Errno::EEXIST) => continue,
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.to_path_buf(),
+                    source: io::Error::other(source),
+                });
+            }
+        }
+    }
+    let temp = temp.ok_or_else(|| ConfigError::Read {
+        path: path.to_path_buf(),
+        source: io::Error::other("could not allocate a unique configuration temporary file"),
+    })?;
+    let Some(mut file) = file else {
+        return Err(ConfigError::Read {
+            path: path.to_path_buf(),
+            source: io::Error::other("temporary configuration file was not opened"),
+        });
+    };
+
+    let result = (|| -> io::Result<()> {
+        fchown(
+            &file,
+            Some(Uid::from_raw(metadata.uid())),
+            Some(Gid::from_raw(metadata.gid())),
+        )
+        .map_err(io::Error::other)?;
+        fchmod(
+            &file,
+            Mode::from_bits_truncate((metadata.mode() & 0o7777) as nix::libc::mode_t),
+        )
+        .map_err(io::Error::other)?;
+        file.write_all(bytes)?;
+        fsync(&file).map_err(io::Error::other)?;
+        drop(file);
+        fs::rename(&temp, path)?;
+        let directory = open(
+            parent,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(io::Error::other)?;
+        fsync(&directory).map_err(io::Error::other)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result.map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(not(unix))]
+fn atomic_write_portable(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(ConfigError::Symlink {
+            path: path.to_path_buf(),
+        });
+    }
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source: io::Error::other(source.to_string()),
+    })?;
+    let temp = path.with_extension(format!("toml.{}.tmp", u128::from_le_bytes(random)));
+    if fs::symlink_metadata(&temp)
+        .ok()
+        .is_some_and(|entry| entry.file_type().is_symlink())
+    {
+        return Err(ConfigError::Symlink { path: temp });
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options.open(&temp).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    drop(file);
+    fs::rename(&temp, path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// JSON Schema document whose `properties` match [`DaemonConfig`] 1:1.
@@ -972,7 +1182,13 @@ fn dot(prefix: &str, key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::merge_set_path;
     use super::{config_schema_json, parse_toml, ConfigError, TlsReject};
+    #[cfg(unix)]
+    use serde_json::json;
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn minimal_keys_override_defaults() -> Result<(), ConfigError> {
@@ -1085,6 +1301,70 @@ mod tests {
         assert_eq!(off.api.http_port, 0);
         assert!(parse_toml("[api]\nhttp_port = 70000\n").is_err());
         assert!(parse_toml("[api]\nhttp_port = -1\n").is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_set_preserves_mode_owner_and_comments_without_sudo(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = std::env::temp_dir().join(format!(
+            "aw-config-set-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("agentwatch.toml");
+        std::fs::write(
+            &path,
+            "# leave this comment\n[api]\nhttp_port = 7456 # keep this too\n",
+        )?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+        let before = std::fs::metadata(&path)?;
+
+        merge_set_path(&path, "api.http_port", &json!(7457))?;
+
+        let after = std::fs::metadata(&path)?;
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
+        assert_eq!(after.mode() & 0o7777, 0o640);
+        let text = std::fs::read_to_string(&path)?;
+        assert!(text.contains("# leave this comment"), "{text}");
+        assert!(text.contains("http_port = 7457 # keep this too"), "{text}");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn config_set_refuses_a_config_symlink_without_touching_its_target(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aw-config-link-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let target = dir.join("target.toml");
+        let path = dir.join("agentwatch.toml");
+        std::fs::write(&target, "[api]\nhttp_port = 7456\n")?;
+        symlink(&target, &path)?;
+
+        let error = merge_set_path(&path, "api.http_port", &json!(7457)).expect_err("link refused");
+        assert_eq!(
+            error.to_string(),
+            format!("配置文件「{}」是一个链接，为防改到别的文件，不会顺着链接修改，请换成普通文件后再试。", path.display())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target)?,
+            "[api]\nhttp_port = 7456\n"
+        );
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 }

@@ -53,6 +53,9 @@ pub(crate) struct Cli {
 #[derive(Subcommand)]
 pub(crate) enum Command {
     /// 启动程序并记录
+    #[command(
+        after_help = "参数里写成 `--secret=…`、`TOKEN=…` 这种带名字的会自动隐藏；只写一个值认不出来，会原样记下。密钥请用 `--env` 传，它不会被记录。"
+    )]
     Run {
         #[arg(long, help = "智能体类型")]
         agent: Option<String>,
@@ -405,6 +408,11 @@ pub(crate) enum DaemonCmd {
         purge: bool,
         #[arg(long)]
         check: bool,
+        // This switch exists solely for unit tests which exercise the
+        // side-effect boundary below.  It must not be compiled into a
+        // distributable `aw`: an uninstall command must never accept an
+        // arbitrary directory to recursively remove.
+        #[cfg(test)]
         /// 仅用于测试：`--purge` 时删除这个指定的数据目录，不触碰系统后台的数据
         #[arg(long, value_name = "DIR")]
         data_dir: Option<std::path::PathBuf>,

@@ -19,6 +19,7 @@ export function NewSessionPage() {
   const doctor = useQuery({ queryKey: ["doctor"], queryFn: () => api.doctor() });
   const [error, setError] = useState<unknown>(null);
   const [pending, setPending] = useState(false);
+  const databaseReadOnly = doctor.data?.database_read_only === true;
 
   // Stable, so the launch form does not re-render on every page update.
   const start = useCallback(async (body: Parameters<typeof api.createSession>[0]) => {
@@ -46,9 +47,10 @@ export function NewSessionPage() {
   return (
     <main className="px-4 py-3">
       <h1 className="text-base font-semibold">{t("new.title")}</h1>
+      {databaseReadOnly ? <p role="alert" className="mt-2 rounded border border-gap/40 bg-gap/10 px-3 py-2 text-xs text-ink">{t("database.readOnlyNewer")}</p> : null}
       <div className="mt-3 grid gap-4 lg:grid-cols-2">
-        <LaunchForm pending={pending} onStart={start} onEdit={clearError} />
-        <AttachForm pending={pending} onStart={start} onPick={clearError} />
+        <LaunchForm pending={pending || databaseReadOnly} onStart={start} onEdit={clearError} />
+        <AttachForm pending={pending || databaseReadOnly} onStart={start} onPick={clearError} />
       </div>
       {error ? <ErrorNote error={error} /> : null}
       <section className="mt-4">
@@ -73,7 +75,7 @@ export function NewSessionPage() {
  * Collected kinds as chips with their evidence; the rest in one plain
  * sentence per reason, worded like the Settings page (「没采」). A kind whose
  * collector does not run in this mode (`collector_unavailable`) says exactly
- * that, not 「不可得：当前运行模式不支持采集此信息」. List separator and colon
+ * that, not 「不可得：这个平台或权限下没有对应采集器」. List separator and colon
  * come from the locale, never a hard-coded full-width 「：」.
  */
 export function CapabilityList({ capabilities }: { capabilities: DoctorCapability[] }) {
@@ -140,6 +142,7 @@ export const LaunchForm = memo(function LaunchForm({
       className="rounded border border-line p-3"
       onSubmit={(event) => {
         event.preventDefault();
+        if (pending) return;
         const argv = splitCommand(commandRef.current?.value ?? "");
         const cwd = (cwdRef.current?.value ?? "").trim();
         if (argv.length === 0) return;
@@ -169,6 +172,7 @@ export const LaunchForm = memo(function LaunchForm({
           onInput={onEdit}
           className="mt-1 w-full rounded border border-line bg-paper px-2 py-1 font-mono"
         />
+        <span className="mt-1 block text-[11px] text-ink-faint">{t("new.appEnv")}</span>
       </label>
       <label className="mt-2 block text-xs">
         {t("new.cwd")}
@@ -266,6 +270,7 @@ function AttachForm({
       className="rounded border border-line p-3"
       onSubmit={(event) => {
         event.preventDefault();
+        if (pending) return;
         if (selected === null) return;
         onStart({ mode: "attach", pid: selected, include_existing_children: includeChildren, follow_children: true });
       }}

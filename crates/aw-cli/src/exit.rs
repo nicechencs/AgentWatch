@@ -2,8 +2,8 @@
 //!
 //! `0` success, `1` general error, `2` bad arguments, `3` daemon unreachable,
 //! `4` permission denied, `5` a feature absent from this build, and `6` a
-//! resource the daemon could not find. `aw run` adds the target's own status
-//! on top of these.
+//! resource the daemon could not find. `7` means an interactive deletion was
+//! explicitly cancelled. `aw run` adds the target's own status on top of these.
 
 /// Success.
 pub const OK: i32 = 0;

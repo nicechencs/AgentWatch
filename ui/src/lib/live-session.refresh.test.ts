@@ -12,7 +12,7 @@ describe("refresh while recording", () => {
   it("header and overview re-read while recording and stop once ended", () => {
     const session = (ended: number | null) =>
       ({ state: { data: toSession({ id: "s-1", mode: "launch", started_ns: 1, ended_ns: ended }) } }) as unknown as Query<Session, Error>;
-    // Recording: re-read, so 「录制中」 turns into 「已停止」 when the program exits
+    // Recording: re-read, so 「记录中」 turns into 「已停止」 when the program exits
     // and 「0 进程」 read before the first sample is replaced.
     expect(refreshWhileRecording(session(null))).toBe(RECORDING_REFRESH_MS);
     expect(refreshWhileRecording(session(2))).toBe(false);

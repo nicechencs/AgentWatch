@@ -91,6 +91,8 @@ export interface Session {
   argv: string[] | null;
   cwd: string | null;
   user_id: string;
+  /** Resolved account name for administrator list views, when available. */
+  user?: string | null;
   started_ns: number;
   ended_ns: number | null;
   end_reason: string | null;
@@ -359,6 +361,8 @@ export interface DoctorReport {
   reason: string | null;
   privileged: boolean | null;
   privileged_note: string | null;
+  /** A newer AgentWatch wrote this database, so this daemon can only read it. */
+  database_read_only: boolean | null;
 }
 
 export interface SystemProcess {

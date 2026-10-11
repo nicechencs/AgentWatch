@@ -8,9 +8,8 @@
 //! absent is [`QueryError::Unavailable`] naming that field — never a guessed `0`
 //! or `""`. A 200 with an empty list is a real empty list.
 //!
-//! `follow` polls the daemon's bounded SSE snapshot endpoint, exactly as the
-//! App does.  Each response closes after its current records; the SSE `id` is
-//! retained as the next `cursor`.
+//! `follow` polls the persisted timeline endpoint. Each response is one bounded
+//! database page; the final `(ts_ns,id)` is retained as the next cursor.
 
 use std::cell::RefCell;
 
@@ -257,21 +256,21 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
         &self,
         key: &str,
         filter: Option<&str>,
-        cursor: Option<i64>,
+        cursor: Option<&str>,
     ) -> Result<Vec<TimelineItem>, QueryError> {
         let mut pairs = Vec::new();
         if let Some(filter) = filter.filter(|text| !text.is_empty()) {
             pairs.push(("filter".to_owned(), filter.to_owned()));
         }
         if let Some(cursor) = cursor {
-            pairs.push(("cursor".to_owned(), cursor.to_string()));
+            pairs.push(("cursor".to_owned(), cursor.to_owned()));
         }
-        let path = format!("/api/v1/sessions/{}/live", encode_path_segment(key));
-        let reply = self.call_reply(&get_pairs(&path, &pairs), Some(key))?;
-        let text = std::str::from_utf8(&reply.body).map_err(|_| QueryError::Unavailable {
-            detail: "后台返回的实时事件不是 UTF-8".to_owned(),
-        })?;
-        parse_sse_timeline(text)
+        let path = format!("/api/v1/sessions/{}/timeline", encode_path_segment(key));
+        let body = self.call_session(&get_pairs(&path, &pairs), Some(key))?;
+        array_field(&body, "rows")?
+            .iter()
+            .map(timeline_item)
+            .collect()
     }
 
     fn procs(
@@ -504,9 +503,10 @@ fn client_to_query_for(err: &ClientError, key: Option<&str>) -> QueryError {
         } => QueryError::Permission {
             detail: clip(&err.to_string()),
         },
-        ClientError::Unreachable { .. }
-        | ClientError::Transport { .. }
-        | ClientError::Status { .. } => QueryError::Unavailable {
+        ClientError::Unreachable { .. } => QueryError::Unreachable {
+            detail: clip(&err.to_string()),
+        },
+        ClientError::Transport { .. } | ClientError::Status { .. } => QueryError::Unavailable {
             detail: clip(&err.to_string()),
         },
     }
@@ -556,6 +556,7 @@ fn session_from_fields(
     Ok(SessionItem {
         public_id,
         user_id: opt_string(value, "user_id")?,
+        user_label: opt_string(value, "user")?,
         name: opt_string(value, "name")?,
         mode,
         agent: opt_string(value, "agent")?,
@@ -569,41 +570,6 @@ fn session_from_fields(
         // A session the daemon returned was observed by the tool.
         evidence: Evidence::E1,
     })
-}
-
-/// Decode the short-lived `text/event-stream` snapshot returned by `/live`.
-/// This deliberately has the same frame rules as the App: comments and an
-/// incomplete/non-record frame do not become a made-up timeline row.
-fn parse_sse_timeline(text: &str) -> Result<Vec<TimelineItem>, QueryError> {
-    let mut rows = Vec::new();
-    for frame in text.split("\n\n") {
-        let mut event = "message";
-        let mut data = Vec::new();
-        for line in frame.lines() {
-            let line = line.trim_end_matches('\r');
-            if line.is_empty() || line.starts_with(':') {
-                continue;
-            }
-            let Some((field, value)) = line.split_once(':') else {
-                continue;
-            };
-            let value = value.strip_prefix(' ').unwrap_or(value);
-            match field {
-                "event" => event = value,
-                "data" => data.push(value),
-                _ => {}
-            }
-        }
-        if event != "record" || data.is_empty() {
-            continue;
-        }
-        let data = data.join("\n");
-        let value: Value = serde_json::from_str(&data).map_err(|_| QueryError::Unavailable {
-            detail: "后台返回的实时记录不是 JSON".to_owned(),
-        })?;
-        rows.push(timeline_item(&value)?);
-    }
-    Ok(rows)
 }
 
 fn timeline_item(value: &Value) -> Result<TimelineItem, QueryError> {
@@ -1303,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn follow_uses_the_apps_live_sse_snapshot_route_and_cursor() {
+    fn follow_polls_the_timeline_database_route_and_cursor() {
         struct LiveTransport(Rc<RefCell<Vec<ApiRequest>>>);
 
         impl Transport for LiveTransport {
@@ -1311,7 +1277,7 @@ mod tests {
                 self.0.borrow_mut().push(request.clone());
                 Ok(ApiReply {
                     status: 200,
-                    body: b"retry: 1000\n\nid: 22\nevent: record\ndata: {\"ts_ns\":9,\"cat\":\"gap\",\"id\":22,\"proc_uid\":null,\"evidence\":\"S\"}\n\n"
+                    body: b"{\"rows\":[{\"ts_ns\":9,\"cat\":\"gap\",\"id\":22,\"proc_uid\":null,\"evidence\":\"S\"}],\"next_cursor\":null}"
                         .to_vec(),
                 })
             }
@@ -1327,13 +1293,13 @@ mod tests {
         };
         let source = HttpQuerySource::with_transport(endpoint, LiveTransport(Rc::clone(&seen)));
         let rows = source
-            .follow("s-live", Some("kind:gap"), Some(7))
-            .expect("live snapshot");
+            .follow("s-live", Some("kind:gap"), Some("7,22"))
+            .expect("timeline poll");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, 22);
         assert!(rows[0].is_gap);
         let request = seen.borrow().first().cloned().expect("request");
-        assert_eq!(request.path, "/api/v1/sessions/s-live/live");
-        assert_eq!(request.query, "filter=kind%3Agap&cursor=7");
+        assert_eq!(request.path, "/api/v1/sessions/s-live/timeline");
+        assert_eq!(request.query, "filter=kind%3Agap&cursor=7%2C22");
     }
 }

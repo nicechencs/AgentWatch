@@ -692,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn perf_is_refused_as_p2() {
+    fn perf_is_refused_as_not_in_build() {
         let outcome = run(true, false, &mut Fixed);
         assert_eq!(outcome.code, exit::NOT_IN_BUILD);
         let err = String::from_utf8(outcome.stderr).expect("utf8");

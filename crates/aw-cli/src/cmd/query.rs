@@ -44,6 +44,9 @@ pub(crate) enum QueryError {
     IdentityFailure { detail: String, code: &'static str },
     /// `--group-by` / `--sort` / a time bound the command refused.
     BadArgument { detail: String },
+    /// The daemon was not listening at the configured local endpoint. This is
+    /// distinct from a malformed response from a daemon that did answer.
+    Unreachable { detail: String },
     /// No query source is available. The message says why; it is not a fake empty list.
     Unavailable { detail: String },
 }
@@ -56,6 +59,7 @@ impl std::fmt::Display for QueryError {
             Self::Permission { detail } => write!(f, "{detail}"),
             Self::IdentityFailure { detail, .. } => write!(f, "{detail}"),
             Self::BadArgument { detail } => write!(f, "{detail}"),
+            Self::Unreachable { detail } => write!(f, "{detail}"),
             Self::Unavailable { detail } => write!(f, "{detail}"),
         }
     }
@@ -70,6 +74,9 @@ pub(crate) struct SessionItem {
     /// administrator.  `None` is deliberately different from an empty owner:
     /// normal callers are not told that field at all.
     pub user_id: Option<String>,
+    /// Account name for the administrator-facing table. The stable uid/SID is
+    /// still preserved in `user_id` for structured output.
+    pub user_label: Option<String>,
     /// User label, or unknown.
     pub name: Option<String>,
     /// `launch` or `attach`.
@@ -334,12 +341,8 @@ pub(crate) trait QuerySource {
     /// [`QueryError::NotFound`].
     fn timeline(&self, key: &str, bounds: &TimelineBounds) -> Result<TimelinePage, QueryError>;
 
-    /// Events whose SSE record id is after `cursor` (exclusive). Used by
-    /// `--follow`.
-    ///
-    /// The daemon's `/sessions/{sid}/live` endpoint is an SSE stream. A source
-    /// that cannot consume it returns [`QueryError::Unavailable`]. The memory
-    /// source returns whatever it was given, so tests can check rendered lines.
+    /// Events after the database timeline cursor.  It preserves both timestamp
+    /// and row id, so simultaneous records are not skipped by `--follow`.
     ///
     /// # Errors
     ///
@@ -348,7 +351,7 @@ pub(crate) trait QuerySource {
         &self,
         key: &str,
         filter: Option<&str>,
-        cursor: Option<i64>,
+        cursor: Option<&str>,
     ) -> Result<Vec<TimelineItem>, QueryError>;
 
     /// Processes. `tree` asks the source to fill [`ProcItem::children`].
@@ -852,7 +855,7 @@ impl QuerySource for UnavailableSource {
         &self,
         _: &str,
         _: Option<&str>,
-        _: Option<i64>,
+        _: Option<&str>,
     ) -> Result<Vec<TimelineItem>, QueryError> {
         Err(QueryError::Unavailable {
             detail: UNAVAILABLE.to_owned(),
@@ -1127,7 +1130,7 @@ impl QuerySource for MemorySource {
         &self,
         key: &str,
         filter: Option<&str>,
-        cursor: Option<i64>,
+        cursor: Option<&str>,
     ) -> Result<Vec<TimelineItem>, QueryError> {
         // The memory source is the test stand-in for `/live`. It does not open
         // a socket. Callers that need the real stream still see UnavailableSource.
@@ -1135,9 +1138,15 @@ impl QuerySource for MemorySource {
         Ok(self.sessions[index]
             .timeline
             .iter()
-            .filter(|row| match cursor {
-                Some(after) => row.id > after,
-                None => true,
+            .filter(|row| {
+                match cursor.and_then(|value| {
+                    value
+                        .rsplit_once(',')
+                        .and_then(|(_, id)| id.parse::<i64>().ok())
+                }) {
+                    Some(after) => row.id > after,
+                    None => true,
+                }
             })
             .filter(|row| match filter {
                 Some(text) if !text.trim().is_empty() => row_matches_filter(row, text),
@@ -1893,6 +1902,7 @@ pub(crate) fn sample_source() -> MemorySource {
         item: SessionItem {
             public_id: "s-7k2m".to_owned(),
             user_id: None,
+            user_label: None,
             name: Some("demo".to_owned()),
             mode: "launch".to_owned(),
             agent: Some("example-agent".to_owned()),
@@ -2037,8 +2047,17 @@ pub(crate) fn sample_source() -> MemorySource {
     source
 }
 
-/// `sessions list --since` with a relative-to-now form is refused. RFC 3339 is
-/// converted. `now_ns` is not used for the RFC path.
+/// Current UTC time in nanoseconds for relative CLI time filters. A pre-epoch
+/// system clock is treated as the epoch rather than inventing a negative time.
+#[must_use]
+pub(crate) fn current_time_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            duration.as_nanos().min(i64::MAX as u128) as i64
+        })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -2291,6 +2310,34 @@ mod tests {
         assert!(body.contains("\"cat\": \"gap\""), "{body}");
         assert!(body.contains("\"level\": \"E1\""), "{body}");
         insta::assert_snapshot!("timeline_follow_json", body);
+    }
+
+    #[test]
+    fn relative_since_is_resolved_against_the_current_time_anchor() {
+        assert_eq!(super::resolve_time("-10m", None, 600_000_000_000), Ok(0));
+    }
+
+    #[test]
+    fn procs_filter_keeps_the_matching_process_and_its_context() {
+        let source = sample_source();
+        let outcome = procs::run("s-7k2m", false, Some("helper"), false, &source).expect("procs");
+        assert_eq!(outcome.code, exit::OK);
+        let rendered = text(&outcome.stdout);
+        assert!(rendered.contains("helper"), "{rendered}");
+        assert!(!rendered.contains("not-matched"), "{rendered}");
+    }
+
+    #[test]
+    fn flows_filter_keeps_only_matching_network_rows() {
+        let source = sample_source();
+        let outcome =
+            flows::run("s-7k2m", Some("example.test"), None, None, true, &source).expect("flows");
+        assert_eq!(outcome.code, exit::OK);
+        let document: serde_json::Value =
+            serde_json::from_slice(&outcome.stdout).expect("flows JSON");
+        let rows = document["flows"].as_array().expect("flow rows");
+        assert_eq!(rows.len(), 2, "{document}");
+        assert!(rows.iter().all(|row| row["domain"] == "example.test"));
     }
 
     #[test]

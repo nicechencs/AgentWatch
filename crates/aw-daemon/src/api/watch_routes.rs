@@ -18,7 +18,7 @@
 use serde_json::{json, Value};
 
 use super::auth::{random_secret, Caller};
-use super::routes::{error_response, ApiResponse, ApiState};
+use super::routes::{check_mutation_owner, error_response, ApiResponse, ApiState};
 use crate::sample::SampleTarget;
 use crate::watch::{now_ns, PendingLaunch, WatchRequest, ADOPT_TIMEOUT_NS};
 
@@ -777,9 +777,8 @@ pub(super) fn attach(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u
         let Some((db_id, owner, mode, ended, name, agent)) = row else {
             return Err(error_response(404, "not_found", "session not found"));
         };
-        if owner != caller.user_id && !caller.admin {
-            return Err(error_response(404, "not_found", "session not found"));
-        }
+        let requested_owner = value.get("owner").and_then(Value::as_str);
+        check_mutation_owner(caller, sid, &owner, requested_owner)?;
         if ended.is_some() || db_id == 1 {
             return Err(error_response(
                 409,

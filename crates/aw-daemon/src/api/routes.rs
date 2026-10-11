@@ -1180,6 +1180,7 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                     });
                     if caller.admin {
                         row["user_id"] = Value::String(session.user_id.clone());
+                        row["user"] = Value::String(owner_label(&session.user_id));
                     }
                     row
                 })
@@ -1214,6 +1215,7 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                         });
                         if caller.admin {
                             value["user_id"] = Value::String(row.user_id.clone());
+                            value["user"] = Value::String(owner_label(&row.user_id));
                         }
                         value
                     })
@@ -1491,14 +1493,8 @@ fn session_sub(
                 Err(err) => from_backend(err),
             };
         }
-        let allowed =
-            owner == caller.user_id || (caller.admin && requested_owner == Some(owner.as_str()));
-        if !allowed {
-            return error_response(
-                403,
-                "owner_action_forbidden",
-                "only the session owner may operate it",
-            );
+        if let Err(response) = check_mutation_owner(caller, &sid, &owner, requested_owner) {
+            return response;
         }
         let input = AuthInput {
             http: false,
@@ -1551,6 +1547,18 @@ fn session_sub(
         }
     };
 
+    // The in-memory fixture backend has no StoreQuery route to perform this
+    // mutation. Keep its ownership rule identical to the database path so a
+    // test-only session cannot silently accept a foreign `--owner` selector.
+    if op == "stop" {
+        if let Err(response) =
+            check_mutation_owner(caller, &sid, &owner, query_value(query, "owner"))
+        {
+            return response;
+        }
+        return stop_memory(state, &sid, caller);
+    }
+
     if op == "attach" {
         // Only reached without a database: with one, `/sessions/{sid}/attach`
         // is answered by `watch_routes::attach` before this point, and the
@@ -1593,6 +1601,22 @@ fn split_sid(rest: &str) -> (String, &str) {
     }
 }
 
+/// Administrator lists show an account name where the OS can resolve one; the
+/// stored uid/SID remains available separately for automation and auditing.
+fn owner_label(owner: &str) -> String {
+    #[cfg(unix)]
+    {
+        use nix::unistd::{Uid, User};
+
+        if let Ok(uid) = owner.parse::<u32>() {
+            if let Ok(Some(account)) = User::from_uid(Uid::from_raw(uid)) {
+                return account.name;
+            }
+        }
+    }
+    owner.to_owned()
+}
+
 fn json_string_field(value: &Value, key: &str) -> Option<String> {
     value.get(key).and_then(Value::as_str).map(str::to_owned)
 }
@@ -1613,14 +1637,9 @@ fn patch_memory_or_store(
     let pinned = value.get("pinned").and_then(serde_json::Value::as_bool);
     let requested_owner = value.get("owner").and_then(serde_json::Value::as_str);
     if let Some(session) = state.sessions.iter_mut().find(|row| row.id == sid) {
-        if session.user_id != caller.user_id
-            && (!caller.admin || requested_owner != Some(session.user_id.as_str()))
+        if let Err(response) = check_mutation_owner(caller, sid, &session.user_id, requested_owner)
         {
-            return error_response(
-                403,
-                "owner_action_forbidden",
-                "only the session owner may operate it",
-            );
+            return response;
         }
         if let Some(name) = name {
             session.name = name.to_owned();
@@ -1638,9 +1657,9 @@ fn patch_memory_or_store(
     }
 }
 
-/// Owner-only actions cannot be widened by merely being root: the caller must
-/// name the target owner explicitly.  The owner comes from the stored row,
-/// never from the request, and `@last` was resolved as the caller's own row.
+/// Owner-only actions cannot be widened by merely being root: a foreign owner
+/// must be named explicitly. The owner comes from the stored row, never from
+/// the request, and `@last` always resolves to the caller's own row.
 fn mutation_owner(
     state: &ApiState,
     caller: &Caller,
@@ -1652,19 +1671,103 @@ fn mutation_owner(
         Ok(None) => return Err(not_found_session()),
         Err(error) => return Err(from_backend(error)),
     };
-    let allowed = if owner == caller.user_id {
-        requested_owner.is_none() || (caller.admin && requested_owner == Some(owner.as_str()))
-    } else {
-        caller.admin && requested_owner == Some(owner.as_str())
-    };
-    if allowed {
-        Ok(owner)
-    } else {
-        Err(error_response(
-            403,
-            "owner_action_forbidden",
-            "only the session owner may operate it",
-        ))
+    check_mutation_owner(caller, sid, &owner, requested_owner)?;
+    Ok(owner)
+}
+
+/// Enforce an owner selector after the target row has supplied its real owner.
+/// A selector is a convenience for an administrator, never an authority token.
+pub(super) fn check_mutation_owner(
+    caller: &Caller,
+    sid: &str,
+    owner: &str,
+    requested_owner: Option<&str>,
+) -> Result<(), ApiResponse> {
+    // `@last` is deliberately caller-scoped. Do this before resolving a
+    // supplied account name: an administrator cannot turn it into another
+    // user's last session, and an unresolvable foreign name must not replace
+    // this more useful explanation. `self` and the caller's stable uid/SID
+    // still describe the same caller and are accepted below.
+    if sid == "@last" && requested_owner.is_some_and(|raw| raw != "self" && raw != caller.user_id) {
+        return Err(error_response(
+            400,
+            "last_owner_conflict",
+            "`@last` 只指你自己最近的会话，不能跟 `--owner` 一起用。要操作别人的会话，请写会话号。",
+        ));
+    }
+    let selected = requested_owner
+        .map(|raw| resolve_owner_selector(caller, raw, owner))
+        .transpose()?;
+
+    if owner == caller.user_id {
+        if selected
+            .as_deref()
+            .is_none_or(|selected| selected == caller.user_id)
+        {
+            return Ok(());
+        }
+        return Err(owner_mismatch(sid, requested_owner.unwrap_or_default()));
+    }
+    if !caller.admin || selected.is_none() {
+        return Err(owner_action_forbidden());
+    }
+    if selected.as_deref() != Some(owner) {
+        return Err(owner_mismatch(sid, requested_owner.unwrap_or_default()));
+    }
+    Ok(())
+}
+
+fn owner_mismatch(sid: &str, requested_owner: &str) -> ApiResponse {
+    error_response(
+        403,
+        "owner_mismatch",
+        &format!("会话「{sid}」的主人不是「{requested_owner}」，没有做任何改动。"),
+    )
+}
+
+/// Resolve a selector at the daemon, not in the CLI.  Existing stored IDs are
+/// accepted literally, which also supports Windows SIDs and test-only logical
+/// identities; on Unix every other selector is resolved through the account DB.
+fn resolve_owner_selector(
+    caller: &Caller,
+    raw: &str,
+    stored_owner: &str,
+) -> Result<String, ApiResponse> {
+    if raw == "self" {
+        return Ok(caller.user_id.clone());
+    }
+    if raw == stored_owner || raw == caller.user_id {
+        return Ok(raw.to_owned());
+    }
+    // Unit/API-token fixtures use logical account names instead of OS users.
+    // Real CLI requests carry peer credentials and take the account-database
+    // path below; an unbound token cannot turn this selector into authority.
+    if caller.peer.is_none() {
+        return Ok(raw.to_owned());
+    }
+    #[cfg(unix)]
+    {
+        use nix::unistd::{Uid, User};
+
+        let account = match raw.parse::<u32>() {
+            Ok(uid) => User::from_uid(Uid::from_raw(uid)),
+            Err(_) => User::from_name(raw),
+        }
+        .map_err(|_| error_response(500, "owner_lookup_failed", "could not look up account"))?;
+        let Some(account) = account else {
+            return Err(error_response(
+                404,
+                "owner_not_found",
+                &format!("查不到用户「{raw}」对应的账户，没有做任何改动。"),
+            ));
+        };
+        Ok(account.uid.as_raw().to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows stores a SID. A SID is already a stable user id; account-name
+        // resolution belongs to the Windows peer-identity implementation.
+        Ok(raw.to_owned())
     }
 }
 
@@ -2221,10 +2324,10 @@ fn session_query_route(
             // owner came from the store after peer-credential authorization;
             // it is never accepted as an authority-bearing request field.
             let requested_owner = query_value(query, "owner");
-            if owner.as_deref() != Some(caller.user_id.as_str())
-                && !(caller.admin && requested_owner == owner.as_deref())
-            {
-                return Some(owner_action_forbidden());
+            if let Some(owner) = owner.as_deref() {
+                if let Err(response) = check_mutation_owner(caller, sid, owner, requested_owner) {
+                    return Some(response);
+                }
             }
             match state.query.stop_session(user, sid) {
                 Ok(None) => stop_memory(state, sid, caller),
@@ -2648,9 +2751,16 @@ fn put_config(state: &mut ApiState, caller: &Caller, body: &[u8]) -> ApiResponse
         Err(crate::config::ConfigError::Invalid { detail, .. }) => {
             return error_response(
                 400,
-                "invalid_config",
-                &format!("配置键 `{key}` 无效：{detail}"),
+                if detail.starts_with("未知配置键") {
+                    "config_invalid_key"
+                } else {
+                    "config_invalid_value"
+                },
+                &config_value_error(key, value, &detail),
             );
+        }
+        Err(error @ crate::config::ConfigError::Symlink { .. }) => {
+            return error_response(400, "config_symlink", &error.to_string());
         }
         Err(err) => {
             return error_response(500, "config_write_failed", &format!("无法写入配置：{err}"))
@@ -2662,6 +2772,35 @@ fn put_config(state: &mut ApiState, caller: &Caller, body: &[u8]) -> ApiResponse
         200,
         &json!({ "applied": "file", "config": state.config_json }),
     )
+}
+
+/// Human wording for the interactive one-key configuration API.  The parser
+/// still owns validation; this layer only says what a person can correct.
+fn config_value_error(key: &str, value: &Value, detail: &str) -> String {
+    if detail.starts_with("未知配置键") {
+        return format!("没有「{key}」这个配置项，用 `aw config show` 可以看全部配置项");
+    }
+    let shown = match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    let expected = match key {
+        "api.http_port"
+        | "retention.max_db_size_mb"
+        | "retention.max_age_days"
+        | "proxy.max_hash_body"
+        | "correlation.max_hash_file_size" => "数字",
+        "collectors.windows.sni"
+        | "collectors.linux.tls_uprobe"
+        | "collectors.linux.ipc_payload_peek"
+        | "debug.keep_raw_events"
+        | "debug.preview_ui" => "true 或 false",
+        "storage.data_dir" => "路径文字",
+        "sensitive_paths.extra" => "字符串列表",
+        "proxy.on_tls_reject" => "fail 或 tunnel",
+        _ => "正确的值",
+    };
+    format!("`{key}` 要填{expected}，你填的是「{shown}」")
 }
 
 fn static_asset(state: &ApiState, req: &HttpRequest) -> ApiResponse {
@@ -3160,6 +3299,22 @@ mod tests {
 
         // Root, even as an administrator, gets root's newest — not user 1000's.
         let token = token_for(&mut state, "0", true);
+        let mut incompatible_owner = req(
+            "POST",
+            "/api/v1/sessions/@last/stop",
+            Some("127.0.0.1:7456"),
+            Some(&token),
+            b"{}",
+        );
+        incompatible_owner.query = "owner=1000".to_owned();
+        let incompatible_owner = dispatch(&mut state, &incompatible_owner);
+        assert_eq!(incompatible_owner.status, 400);
+        let incompatible_body = json_body(&incompatible_owner);
+        assert_eq!(incompatible_body["error"]["code"], "last_owner_conflict");
+        assert_eq!(
+            incompatible_body["error"]["message"],
+            "`@last` 只指你自己最近的会话，不能跟 `--owner` 一起用。要操作别人的会话，请写会话号。"
+        );
         let response = dispatch(
             &mut state,
             &req(
@@ -4387,16 +4542,28 @@ mod tests {
         assert_eq!(last.status, 200);
         assert_eq!(json_body(&last)["id"], "s-root");
 
-        // Mutations need the actual stored owner. A missing or invented owner
-        // cannot turn read-all administrator scope into write-all scope.
-        for query in ["", "owner=bob"] {
-            let response = call(&root, "POST", "/api/v1/sessions/s-alice/stop", query, b"{}");
-            assert_eq!(response.status, 403, "{query}");
-            assert_eq!(
-                json_body(&response)["error"]["code"],
-                "owner_action_forbidden"
-            );
-        }
+        // Mutations need the actual stored owner. A missing selector cannot
+        // turn read-all administrator scope into write-all scope; a selector
+        // for a different account says exactly what did not match.
+        let missing_owner = call(&root, "POST", "/api/v1/sessions/s-alice/stop", "", b"{}");
+        assert_eq!(missing_owner.status, 403);
+        assert_eq!(
+            json_body(&missing_owner)["error"]["code"],
+            "owner_action_forbidden"
+        );
+        let wrong_owner = call(
+            &root,
+            "POST",
+            "/api/v1/sessions/s-alice/stop",
+            "owner=bob",
+            b"{}",
+        );
+        assert_eq!(wrong_owner.status, 403);
+        assert_eq!(json_body(&wrong_owner)["error"]["code"], "owner_mismatch");
+        assert_eq!(
+            json_body(&wrong_owner)["error"]["message"],
+            "会话「s-alice」的主人不是「bob」，没有做任何改动。"
+        );
         assert_eq!(
             call(
                 &root,
@@ -4415,6 +4582,19 @@ mod tests {
                 "/api/v1/sessions/s-alice",
                 "",
                 br#"{"name":"renamed","owner":"alice"}"#,
+            )
+            .status,
+            200
+        );
+        // The owner itself may name itself explicitly; this is a selector, not
+        // an assertion that only administrators may provide `--owner`.
+        assert_eq!(
+            call(
+                &alice,
+                "PATCH",
+                "/api/v1/sessions/s-alice",
+                "",
+                br#"{"pinned":true,"owner":"alice"}"#,
             )
             .status,
             200
@@ -4817,6 +4997,52 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
+    fn config_set_returns_the_key_and_type_sentences_without_english_detail() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentwatch-config-route-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("config parent");
+        let path = dir.join("agentwatch.toml");
+        std::fs::write(&path, "[api]\nhttp_port = 7456\n").expect("config");
+        let mut state = ApiState::new(10);
+        state.config_path = Some(path);
+        let admin = token_for(&mut state, "root", true);
+        let put = |state: &mut ApiState, body: &[u8]| {
+            dispatch(
+                state,
+                &req(
+                    "PUT",
+                    "/api/v1/config",
+                    Some("127.0.0.1:7456"),
+                    Some(&admin),
+                    body,
+                ),
+            )
+        };
+        let unknown = put(&mut state, br#"{"key":"nope.key","value":true}"#);
+        assert_eq!(unknown.status, 400);
+        let unknown = json_body(&unknown);
+        assert_eq!(unknown["error"]["code"], "config_invalid_key");
+        assert_eq!(
+            unknown["error"]["message"],
+            "没有「nope.key」这个配置项，用 `aw config show` 可以看全部配置项"
+        );
+        let wrong_type = put(&mut state, br#"{"key":"api.http_port","value":"abc"}"#);
+        assert_eq!(wrong_type.status, 400);
+        let wrong_type = json_body(&wrong_type);
+        assert_eq!(wrong_type["error"]["code"], "config_invalid_value");
+        assert_eq!(
+            wrong_type["error"]["message"],
+            "`api.http_port` 要填数字，你填的是「abc」"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
     fn non_admin_attach_other_user_is_403() {
         let mut state = ApiState::new(10);
         let alice = token_for(&mut state, "alice", false);
@@ -4993,7 +5219,6 @@ mod tests {
             ),
             ("GET", &format!("/api/v1/sessions/{id}/gaps"), "gaps"),
             ("GET", &format!("/api/v1/sessions/{id}/processes"), "procs"),
-            ("POST", &format!("/api/v1/sessions/{id}/stop"), "stop"),
         ];
         for (method, path, op) in cases {
             let response = dispatch(

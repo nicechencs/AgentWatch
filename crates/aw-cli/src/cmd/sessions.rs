@@ -67,7 +67,8 @@ fn list(
     source: &dyn QuerySource,
 ) -> io::Result<Outcome> {
     let since_ns = match since {
-        Some(text) => match super::query::resolve_time(text, None, 0) {
+        Some(text) => match super::query::resolve_time(text, None, super::query::current_time_ns())
+        {
             Ok(ns) => Some(ns),
             Err(detail) => {
                 return Ok(super::error_outcome(
@@ -80,19 +81,6 @@ fn list(
         },
         None => None,
     };
-    // `--since -10m` is relative to now. This card has no clock injection on the
-    // list path beyond `resolve_time(..., now_ns = 0)` for RFC 3339 and `+`.
-    // A relative-to-now form cannot be anchored, so refuse it instead of using 0.
-    if let Some(text) = since {
-        if text.trim().starts_with('-') {
-            return Ok(super::error_outcome(
-                exit::USAGE,
-                "usage",
-                "`sessions list --since` 的相对当前时间（-10m）需要此构建没有的时钟；请传入 RFC 3339",
-                mode == OutputMode::Json,
-            ));
-        }
-    }
     let query = SessionQuery {
         agent,
         active_only: active,
@@ -280,6 +268,7 @@ pub(crate) fn query_outcome(err: QueryError, json: bool) -> Outcome {
         QueryError::Permission { .. } => (exit::PERMISSION, "permission_denied"),
         QueryError::IdentityFailure { code, .. } => (exit::PERMISSION, *code),
         QueryError::BadArgument { .. } => (exit::USAGE, "usage"),
+        QueryError::Unreachable { .. } => (exit::UNREACHABLE, "daemon_unreachable"),
         QueryError::Unavailable { .. } => (exit::GENERAL, "not_connected"),
     };
     super::error_outcome(code, machine, &err.to_string(), json)
@@ -352,6 +341,34 @@ mod tests {
             String::from_utf8(outcome.stderr).expect("utf8"),
             "aw: 已取消，没有删除任何会话\n"
         );
+    }
+
+    #[test]
+    fn daemon_unreachable_query_uses_exit_3_without_transport_detail() {
+        struct Dead;
+        impl Transport for Dead {
+            fn exchange(&mut self, _: &ApiRequest) -> Result<ApiReply, ClientError> {
+                Err(ClientError::Unreachable {
+                    detail: "socket: connection refused".to_owned(),
+                })
+            }
+        }
+        let mut source = HttpQuerySource::with_transport(endpoint(), Dead);
+        let outcome = run(
+            &SessionsCmd::List {
+                since: None,
+                agent: None,
+                active: false,
+                limit: None,
+            },
+            false,
+            &mut source,
+        )
+        .expect("outcome");
+        assert_eq!(outcome.code, exit::UNREACHABLE);
+        let text = String::from_utf8(outcome.stderr).expect("utf8");
+        assert!(text.contains("连不上 AgentWatch 后台"), "{text}");
+        assert!(!text.contains("connection refused"), "{text}");
     }
 
     /// `@last` goes to the daemon as `@last`. The printed id is the one the

@@ -46,6 +46,10 @@ pub const SOCKET_FILE: &str = "api.sock";
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a busy pipe is retried.
 pub const BUSY_RETRY: Duration = Duration::from_secs(2);
+/// Largest complete HTTP reply accepted from the local channel.  Export data
+/// is streamed through a separate path; accepting an unbounded ordinary API
+/// reply would let a bogus peer allocate without limit.
+const MAX_REPLY_BYTES: usize = 64 * 1024 * 1024;
 
 /// `ERROR_PIPE_BUSY`: every pipe instance is connected.
 const ERROR_PIPE_BUSY: i32 = 231;
@@ -483,6 +487,9 @@ fn dechunk(mut raw: &[u8]) -> Result<Vec<u8>, DialError> {
         if raw.len() < size {
             return Err(DialError::Broken("short chunk".to_owned()));
         }
+        if out.len().saturating_add(size) > MAX_REPLY_BYTES {
+            return Err(DialError::Broken("reply exceeds 64 MiB".to_owned()));
+        }
         out.extend_from_slice(&raw[..size]);
         raw = raw.get(size + 2..).unwrap_or(&[]);
     }
@@ -553,15 +560,27 @@ fn read_framed<S: Read>(stream: &mut S) -> Result<Vec<u8>, DialError> {
     let mut out = Vec::new();
     let mut buf = [0_u8; 8 * 1024];
     loop {
-        if let Some(total) = framed_len(&out) {
+        if let Some(total) = framed_len(&out)? {
             if out.len() >= total {
                 out.truncate(total);
                 return Ok(out);
             }
         }
         match stream.read(&mut buf) {
-            Ok(0) => return Ok(out),
-            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Ok(0) => {
+                if framed_len(&out)?.is_some() {
+                    return Err(DialError::Broken(
+                        "reply ended before declared Content-Length".to_owned(),
+                    ));
+                }
+                return Ok(out);
+            }
+            Ok(n) => {
+                if out.len().saturating_add(n) > MAX_REPLY_BYTES {
+                    return Err(DialError::Broken("reply exceeds 64 MiB".to_owned()));
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(err) => return Err(io_broken("read", &err)),
         }
@@ -570,17 +589,33 @@ fn read_framed<S: Read>(stream: &mut S) -> Result<Vec<u8>, DialError> {
 
 /// Total reply length (head + body) once the head is complete and carries a
 /// `Content-Length`; `None` while the head is incomplete or has no length.
-fn framed_len(bytes: &[u8]) -> Option<usize> {
-    let end = bytes.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
-    let head = std::str::from_utf8(&bytes[..end]).ok()?;
+fn framed_len(bytes: &[u8]) -> Result<Option<usize>, DialError> {
+    let Some(end) = bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|end| end + 4)
+    else {
+        return Ok(None);
+    };
+    let head = std::str::from_utf8(&bytes[..end])
+        .map_err(|_| DialError::Broken("non-UTF-8 HTTP headers".to_owned()))?;
     let length = head.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
         name.trim()
             .eq_ignore_ascii_case("content-length")
             .then(|| value.trim().parse::<usize>().ok())
             .flatten()
-    })?;
-    end.checked_add(length)
+    });
+    let Some(length) = length else {
+        return Ok(None);
+    };
+    let total = end
+        .checked_add(length)
+        .ok_or_else(|| DialError::Broken("reply Content-Length overflows".to_owned()))?;
+    if total > MAX_REPLY_BYTES {
+        return Err(DialError::Broken("reply exceeds 64 MiB".to_owned()));
+    }
+    Ok(Some(total))
 }
 
 fn io_broken(what: &str, err: &io::Error) -> DialError {
@@ -632,13 +667,32 @@ mod framing_tests {
         let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nok".to_vec();
         assert!(read_framed(&mut ThenError(io::Cursor::new(reply))).is_err());
     }
+
+    #[test]
+    fn eof_before_declared_content_length_is_an_error() {
+        let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nok".to_vec();
+        let error = read_framed(&mut io::Cursor::new(reply)).expect_err("short reply");
+        assert!(matches!(error, super::DialError::Broken(_)));
+    }
+
+    #[test]
+    fn declared_reply_larger_than_cap_is_an_error() {
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            super::MAX_REPLY_BYTES + 1
+        );
+        let error =
+            read_framed(&mut io::Cursor::new(reply.into_bytes())).expect_err("oversized reply");
+        assert!(matches!(error, super::DialError::Broken(_)));
+    }
 }
 
 #[cfg(unix)]
 mod platform {
+    use std::io::{self, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{classify, roundtrip, socket_path_too_long, DialError};
 
@@ -656,9 +710,50 @@ mod platform {
             )));
         }
         let mut stream = UnixStream::connect(path).map_err(|err| classify(&err, path))?;
-        let _ = stream.set_read_timeout(Some(timeout));
-        let _ = stream.set_write_timeout(Some(timeout));
-        roundtrip(&mut stream, request)
+        let deadline = Instant::now() + timeout;
+        let mut bounded = DeadlineStream {
+            stream: &mut stream,
+            deadline,
+        };
+        roundtrip(&mut bounded, request)
+    }
+
+    /// Unix socket timeouts apply to a single `read(2)`.  Re-arm them with
+    /// the remaining time before every operation so a peer which dribbles one
+    /// byte just under the per-read timeout cannot extend an exchange forever.
+    struct DeadlineStream<'a> {
+        stream: &'a mut UnixStream,
+        deadline: Instant,
+    }
+
+    impl DeadlineStream<'_> {
+        fn remaining(&self) -> io::Result<Duration> {
+            self.deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::TimedOut, "local channel exchange deadline")
+                })
+        }
+    }
+
+    impl Read for DeadlineStream<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let remaining = self.remaining()?;
+            self.stream.set_read_timeout(Some(remaining))?;
+            self.stream.read(buf)
+        }
+    }
+
+    impl Write for DeadlineStream<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let remaining = self.remaining()?;
+            self.stream.set_write_timeout(Some(remaining))?;
+            self.stream.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
     }
 }
 

@@ -34,7 +34,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         code: "no_sessions",
-        zh: "还没有你的会话，@last 无处可指",
+        zh: "你还没有会话",
         en: Some("this account has no sessions"),
     },
     Row {
@@ -58,6 +58,26 @@ const ROWS: &[Row] = &[
         en: Some("only the session owner may operate it"),
     },
     Row {
+        code: "owner_not_found",
+        zh: "查不到这个用户对应的账户",
+        en: None,
+    },
+    Row {
+        code: "owner_mismatch",
+        zh: "会话主人和指定用户不一致",
+        en: None,
+    },
+    Row {
+        code: "last_owner_conflict",
+        zh: "@last 只能指向自己的会话",
+        en: None,
+    },
+    Row {
+        code: "owner_lookup_failed",
+        zh: "后台没能查询这个用户的账户",
+        en: Some("could not look up account"),
+    },
+    Row {
         code: "not_your_process",
         zh: "不能接管其他用户的进程，需要管理员权限",
         // The daemon sends one of two messages with this code (attach names the
@@ -71,7 +91,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         code: "program_not_found",
-        zh: "找不到这个程序或工作目录",
+        zh: "找不到程序，请检查名字或路径",
         en: Some("the program or the working directory was not found"),
     },
     Row {
@@ -162,6 +182,21 @@ const ROWS: &[Row] = &[
         en: None,
     },
     Row {
+        code: "config_invalid_key",
+        zh: "配置项不存在",
+        en: None,
+    },
+    Row {
+        code: "config_invalid_value",
+        zh: "配置值不正确",
+        en: None,
+    },
+    Row {
+        code: "config_symlink",
+        zh: "配置文件不能是链接",
+        en: None,
+    },
+    Row {
         code: "config_path_unavailable",
         zh: "后台没有可写的配置文件",
         en: Some("后台没有可写的配置文件"),
@@ -207,6 +242,11 @@ const ROWS: &[Row] = &[
         code: "db_busy",
         zh: "会话数据库正忙",
         en: Some("The session database is busy (the service is writing)."),
+    },
+    Row {
+        code: "db_read_only_newer",
+        zh: "这份记录是更新版本的 AgentWatch 写的，现在只能查看，不能新建或修改。请升级 AgentWatch。",
+        en: None,
     },
     Row {
         code: "export",
@@ -282,7 +322,7 @@ pub(crate) fn write_status(
     f: &mut fmt::Formatter<'_>,
     status: u16,
     code: Option<&str>,
-    _message: &str,
+    message: &str,
     waited_seconds: Option<u64>,
 ) -> fmt::Result {
     let Some(code) = code.filter(|code| !code.is_empty()) else {
@@ -303,6 +343,21 @@ pub(crate) fn write_status(
             "后台 {} 秒没有回应，这次请求没有完成。",
             waited_seconds.unwrap_or(5)
         );
+    }
+    // These three messages are constructed solely from the operator's config
+    // path/key/value by the daemon.  Unlike its English diagnostics, repeating
+    // them tells the operator exactly what to change.
+    if matches!(
+        code,
+        "config_invalid_key"
+            | "config_invalid_value"
+            | "config_symlink"
+            | "owner_not_found"
+            | "owner_mismatch"
+            | "last_owner_conflict"
+            | "db_read_only_newer"
+    ) {
+        return f.write_str(message);
     }
     let Some(row) = ROWS.iter().find(|row| row.code == code) else {
         return write!(f, "后台返回了未识别的错误（HTTP {status}）");
@@ -432,7 +487,7 @@ mod tests {
                 "this account has no sessions",
                 None
             ),
-            "还没有你的会话，@last 无处可指"
+            "你还没有会话"
         );
     }
 

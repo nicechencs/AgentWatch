@@ -64,6 +64,8 @@ export function SessionsPage() {
     refetchInterval: refreshListWhileRecording,
   });
   const stats = useQuery({ queryKey: ["db-stats"], queryFn: () => api.dbStats() });
+  const doctor = useQuery({ queryKey: ["doctor"], queryFn: () => api.doctor() });
+  const databaseReadOnly = doctor.data?.database_read_only === true;
 
   const agents = useMemo(() => {
     const names = new Set<string>();
@@ -103,13 +105,19 @@ export function SessionsPage() {
     <main className="px-4 py-3">
       <div className="flex items-center gap-3">
         <h1 className="text-base font-semibold">{t("sessions.title")}</h1>
-        <Link to="/new" className="rounded bg-ink px-2 py-1 text-xs text-paper">
-          + {t("sessions.new")}
-        </Link>
+        {databaseReadOnly ? (
+          <span aria-disabled="true" className="rounded bg-ink px-2 py-1 text-xs text-paper opacity-50">+ {t("sessions.new")}</span>
+        ) : (
+          <Link to="/new" className="rounded bg-ink px-2 py-1 text-xs text-paper">
+            + {t("sessions.new")}
+          </Link>
+        )}
         <span className="ml-auto text-xs text-ink-faint">
           {stats.data ? <Disk stats={stats.data} /> : null}
         </span>
       </div>
+
+      {databaseReadOnly ? <p role="alert" className="mt-2 rounded border border-gap/40 bg-gap/10 px-3 py-2 text-xs text-ink">{t("database.readOnlyNewer")}</p> : null}
 
       <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
         <SearchBox onQuery={setQ} />
@@ -173,7 +181,8 @@ export function SessionsPage() {
               <SessionRow
                 key={session.public_id}
                 session={session}
-                ownerActions={!admin || session.user_id === me?.user_id}
+                ownerActions={(!admin || session.user_id === me?.user_id) && !databaseReadOnly}
+                actionsDisabledByReadOnly={databaseReadOnly}
                 showUser={admin}
                 checked={picked.has(session.public_id)}
                 renaming={renaming === session.public_id}
@@ -281,12 +290,13 @@ function Disk({ stats }: { stats: DbStats }) {
 }
 
 function SessionRow({
-  session, checked, renaming, ownerActions, showUser, onToggle, onOpen, onRenameStart, onRename, onPin, onStop, stopping, stopNotice, onDelete,
+  session, checked, renaming, ownerActions, actionsDisabledByReadOnly, showUser, onToggle, onOpen, onRenameStart, onRename, onPin, onStop, stopping, stopNotice, onDelete,
 }: {
   session: Session;
   checked: boolean;
   renaming: boolean;
   ownerActions: boolean;
+  actionsDisabledByReadOnly: boolean;
   showUser: boolean;
   onToggle: () => void;
   onOpen: () => void;
@@ -305,6 +315,7 @@ function SessionRow({
   const active = status.kind === "recording";
   const duration = session.ended_ns ? formatDuration((session.ended_ns - session.started_ns) / 1_000_000) : active ? "…" : "–";
   const purged = Boolean(session.purged);
+  const actionTitle = !ownerActions ? (actionsDisabledByReadOnly ? t("database.readOnlyNewer") : t("sessions.ownerOnly")) : undefined;
 
   return (
     <tr className={`border-b border-line/70 ${purged ? "text-ink-faint" : "hover:bg-paper-sunken"}`}>
@@ -358,14 +369,14 @@ function SessionRow({
         {session.stats?.gap_count ? <span className="text-gap">{session.stats.gap_count}</span> : <Count value={session.stats?.gap_count ?? 0} />}
       </td>
       <td className="px-2 py-1"><Bytes value={session.stats?.bytes} /></td>
-      {showUser ? <td className="px-2 py-1">{session.user_id || "–"}</td> : null}
+      {showUser ? <td className="px-2 py-1">{(session.user ?? session.user_id) || "–"}</td> : null}
       <td className="px-2 py-1 text-right">
         {purged ? null : (
           <span className="inline-flex gap-2 text-ink-faint">
-            <button type="button" disabled={!ownerActions} title={!ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onRenameStart}>{t("sessions.rename")}</button>
-            <button type="button" disabled={!ownerActions} title={!ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onPin}>{session.pinned ? t("sessions.unpin") : t("sessions.pin")}</button>
-            {active ? <button type="button" disabled={!ownerActions || stopping} title={!ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onStop}>{stopping ? t("session.stopping") : t("session.stop")}</button> : null}
-            <button type="button" disabled={!ownerActions} title={!ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onDelete}>{t("sessions.delete")}</button>
+            <button type="button" disabled={!ownerActions} title={actionTitle} onClick={onRenameStart}>{t("sessions.rename")}</button>
+            <button type="button" disabled={!ownerActions} title={actionTitle} onClick={onPin}>{session.pinned ? t("sessions.unpin") : t("sessions.pin")}</button>
+            {active ? <button type="button" disabled={!ownerActions || stopping} title={actionTitle} onClick={onStop}>{stopping ? t("session.stopping") : t("session.stop")}</button> : null}
+            <button type="button" disabled={!ownerActions} title={actionTitle} onClick={onDelete}>{t("sessions.delete")}</button>
             <button
               type="button"
               disabled={exporter.pending !== null}
@@ -384,7 +395,7 @@ function SessionRow({
 }
 
 /**
- * Status as text, not only a glyph: 「● 录制中」「○ 已停止」. A pinned session
+ * Status as text, not only a glyph: 「● 记录中」「○ 已停止」. A pinned session
  * keeps its recording state and adds the pin.
  */
 function StatusCell({ status, purged, pinned }: { status: ReturnType<typeof sessionStatus>; purged: boolean; pinned: boolean }) {

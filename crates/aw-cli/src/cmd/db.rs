@@ -421,10 +421,17 @@ impl DbApi for HttpDbApi {
             let reason = body
                 .get("reason")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("此调用者无法取得数据库统计");
-            return Err(DbApiError::Failed {
-                detail: clip_db(reason),
-            });
+                .unwrap_or_default();
+            return if reason == "db_stats_unavailable_for_user" {
+                Err(DbApiError::Forbidden {
+                    detail: "普通用户看不到整个数据库的统计，请用管理员运行".to_owned(),
+                })
+            } else {
+                // Do not surface a daemon implementation detail to the terminal.
+                Err(DbApiError::Failed {
+                    detail: "后台没有提供数据库统计".to_owned(),
+                })
+            };
         }
         let tables = match body.get("tables") {
             None | Some(serde_json::Value::Null) => Vec::new(),
@@ -1280,6 +1287,28 @@ mod tests {
         prompts: Vec<String>,
     }
 
+    struct StatsDeniedApi;
+
+    impl DbApi for StatsDeniedApi {
+        fn stats(&mut self) -> Result<DbStatsView, DbApiError> {
+            Err(DbApiError::Forbidden {
+                detail: "普通用户看不到整个数据库的统计，请用管理员运行".to_owned(),
+            })
+        }
+
+        fn vacuum(&mut self) -> Result<String, DbApiError> {
+            unreachable!("stats test only")
+        }
+
+        fn migrate(&mut self, _: bool) -> Result<MigrateReport, DbApiError> {
+            unreachable!("stats test only")
+        }
+
+        fn purge(&mut self, _: &PurgeBody) -> Result<PurgeResult, DbApiError> {
+            unreachable!("stats test only")
+        }
+    }
+
     impl Confirm for Answer {
         fn confirm(&mut self, prompt: &str) -> Confirmation {
             self.prompts.push(prompt.to_owned());
@@ -1316,6 +1345,28 @@ mod tests {
         assert_eq!(
             String::from_utf8(outcome.stderr).expect("utf8"),
             "aw: 已取消，没有删除任何会话\n"
+        );
+    }
+
+    #[test]
+    fn stats_for_a_normal_user_is_exit_4_with_the_public_explanation() {
+        let mut api = StatsDeniedApi;
+        let mut confirm = Answer {
+            answer: Confirmation::Confirmed,
+            prompts: Vec::new(),
+        };
+        let outcome = run(
+            DbOp::Stats,
+            false,
+            &Admin(false),
+            &clock(),
+            &mut api,
+            &mut confirm,
+        );
+        assert_eq!(outcome.code, exit::PERMISSION);
+        assert_eq!(
+            String::from_utf8(outcome.stderr).expect("utf8"),
+            "aw: 普通用户看不到整个数据库的统计，请用管理员运行\n"
         );
     }
 

@@ -303,6 +303,10 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
                 .get("scan_pending")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            fast_exit_may_be_missed: body
+                .get("fast_exit_may_be_missed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 

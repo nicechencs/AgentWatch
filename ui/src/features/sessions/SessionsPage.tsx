@@ -384,7 +384,7 @@ function SessionRow({
 }
 
 /**
- * Status as text, not only a glyph: 「● 录制中」「○ 已停止」. A pinned session
+ * Status as text, not only a glyph: 「● 记录中」「○ 已停止」. A pinned session
  * keeps its recording state and adds the pin.
  */
 function StatusCell({ status, purged, pinned }: { status: ReturnType<typeof sessionStatus>; purged: boolean; pinned: boolean }) {

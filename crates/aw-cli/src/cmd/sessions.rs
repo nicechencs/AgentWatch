@@ -24,14 +24,28 @@ pub(crate) fn run(
     json: bool,
     source: &mut dyn QuerySource,
 ) -> io::Result<Outcome> {
+    run_optional(Some(cmd), json, source)
+}
+
+/// Bare `aw sessions` is the same listing as `aw sessions list`.
+pub(crate) fn run_default(json: bool, source: &mut dyn QuerySource) -> io::Result<Outcome> {
+    run_optional(None, json, source)
+}
+
+fn run_optional(
+    cmd: Option<&SessionsCmd>,
+    json: bool,
+    source: &mut dyn QuerySource,
+) -> io::Result<Outcome> {
     let mode = OutputMode::from_json_flag(json);
     match cmd {
-        SessionsCmd::List {
+        None => list(None, None, false, None, mode, source),
+        Some(SessionsCmd::List {
             since,
             agent,
             active,
             limit,
-        } => list(
+        }) => list(
             since.as_deref(),
             agent.clone(),
             *active,
@@ -39,21 +53,23 @@ pub(crate) fn run(
             mode,
             source,
         ),
-        SessionsCmd::Show { session } => show(session, mode, source),
-        SessionsCmd::Rename {
+        Some(SessionsCmd::Show { session }) => show(session, mode, source),
+        Some(SessionsCmd::Rename {
             session,
             name,
             owner,
-        } => rename(session, name, owner.as_deref(), mode, source),
-        SessionsCmd::Pin { session, owner } => pin(session, true, owner.as_deref(), mode, source),
-        SessionsCmd::Unpin { session, owner } => {
+        }) => rename(session, name, owner.as_deref(), mode, source),
+        Some(SessionsCmd::Pin { session, owner }) => {
+            pin(session, true, owner.as_deref(), mode, source)
+        }
+        Some(SessionsCmd::Unpin { session, owner }) => {
             pin(session, false, owner.as_deref(), mode, source)
         }
-        SessionsCmd::Delete {
+        Some(SessionsCmd::Delete {
             sessions,
             yes,
             owner,
-        } => delete(sessions, *yes, owner.as_deref(), mode, source),
+        }) => delete(sessions, *yes, owner.as_deref(), mode, source),
     }
 }
 
@@ -169,13 +185,26 @@ fn delete(
     mode: OutputMode,
     source: &mut dyn QuerySource,
 ) -> io::Result<Outcome> {
-    if !yes && !confirm_delete(sessions.len()) {
-        return Ok(super::error_outcome(
-            exit::USAGE,
-            "usage",
-            "现在不在终端里，没法确认删除。确定要删的话，请加上 `--yes`（删除后无法恢复）",
-            mode == OutputMode::Json,
-        ));
+    if !yes {
+        match confirm_delete(sessions.len()) {
+            DeleteConfirmation::Confirmed => {}
+            DeleteConfirmation::Cancelled => {
+                return Ok(super::error_outcome(
+                    exit::CANCELLED,
+                    "cancelled",
+                    "已取消，没有删除任何会话",
+                    mode == OutputMode::Json,
+                ));
+            }
+            DeleteConfirmation::Unavailable => {
+                return Ok(super::error_outcome(
+                    exit::USAGE,
+                    "usage",
+                    "现在不在终端里，没法确认删除。确定要删的话，请加上 `--yes`（删除后无法恢复）",
+                    mode == OutputMode::Json,
+                ));
+            }
+        }
     }
     match source.delete_sessions(sessions, owner) {
         Ok(removed) => {
@@ -193,10 +222,16 @@ fn delete(
     }
 }
 
+enum DeleteConfirmation {
+    Confirmed,
+    Cancelled,
+    Unavailable,
+}
+
 /// Ask only on an interactive terminal; redirected input must never block.
-fn confirm_delete(count: usize) -> bool {
+fn confirm_delete(count: usize) -> DeleteConfirmation {
     if !io::stdin().is_terminal() {
-        return false;
+        return DeleteConfirmation::Unavailable;
     }
     let _ = write!(
         io::stderr(),
@@ -204,11 +239,17 @@ fn confirm_delete(count: usize) -> bool {
     );
     let _ = io::stderr().flush();
     let mut answer = String::new();
-    io::stdin().read_line(&mut answer).is_ok()
-        && matches!(
-            answer.trim().to_ascii_lowercase().as_str(),
-            "是" | "y" | "yes"
-        )
+    if io::stdin().read_line(&mut answer).is_err() {
+        return DeleteConfirmation::Unavailable;
+    }
+    if matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "是" | "y" | "yes"
+    ) {
+        DeleteConfirmation::Confirmed
+    } else {
+        DeleteConfirmation::Cancelled
+    }
 }
 
 pub(crate) fn write_ok(

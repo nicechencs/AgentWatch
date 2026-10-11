@@ -104,7 +104,7 @@ pub(crate) struct UnwiredProxy;
 
 const CA_INFO_UNWIRED: &str = "`aw proxy ca-info` 本版本未接入";
 const ROTATE_CA_UNWIRED: &str = "`aw proxy rotate-ca` 本版本未接入";
-const TRUST_UNWIRED: &str = "后台代理 API 未接通；aw proxy 不会读取 ca.key。请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）";
+const TRUST_UNWIRED: &str = "`aw proxy trust` 本版本未接入";
 
 impl ProxyApi for UnwiredProxy {
     fn ca_info(&mut self) -> Result<CaInfoView, String> {

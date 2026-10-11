@@ -438,6 +438,7 @@
   "procs.nameNa": "Name unavailable",
   "procs.nameNaTip": "The executable path could not be read (not enough permission, or the process had exited)",
   "procs.exitNaTip": "The exit code was not read (process polling does not see a non-child's exit status)",
+  "procs.fastExitMayBeMissed": "This session records by periodically reading the process table; short-lived programs may be missing.",
   "coverage.notCollectedShort": "Not collected",
   "coverage.notCollectedTip": "This version does not collect {kind} (process sampling only)",
   "coverage.notCollected": "Not collected: this version does not collect {kind} (process sampling only). No data here does not mean nothing happened.",

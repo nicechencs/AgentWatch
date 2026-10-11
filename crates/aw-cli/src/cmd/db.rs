@@ -248,6 +248,9 @@ pub(crate) trait DbApi {
     ///
     /// A daemon or transport failure. The daemon, not this trait, decides
     /// which sessions the caller may delete.
+    fn preview_purge(&mut self, body: &PurgeBody) -> Result<usize, DbApiError>;
+
+    /// Delete the sessions shown by [`Self::preview_purge`].
     fn purge(&mut self, body: &PurgeBody) -> Result<PurgeResult, DbApiError>;
 }
 
@@ -340,7 +343,7 @@ pub(crate) struct PurgeBody {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct UnwiredApi;
 
-const UNWIRED: &str = "后台数据库 API 未接通；GET /api/v1/db/stats 仍是占位实现，所以此命令不会打开数据库。请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）";
+const UNWIRED: &str = "后台数据库 API 本版本未接入";
 
 impl DbApi for UnwiredApi {
     fn stats(&mut self) -> Result<DbStatsView, DbApiError> {
@@ -362,6 +365,12 @@ impl DbApi for UnwiredApi {
     }
 
     fn purge(&mut self, _: &PurgeBody) -> Result<PurgeResult, DbApiError> {
+        Err(DbApiError::Unreachable {
+            detail: UNWIRED.to_owned(),
+        })
+    }
+
+    fn preview_purge(&mut self, _: &PurgeBody) -> Result<usize, DbApiError> {
         Err(DbApiError::Unreachable {
             detail: UNWIRED.to_owned(),
         })
@@ -503,6 +512,27 @@ impl DbApi for HttpDbApi {
             steps,
             detail: opt_db_string(&body, "detail")?,
         })
+    }
+
+    fn preview_purge(&mut self, body: &PurgeBody) -> Result<usize, DbApiError> {
+        let payload = json!({
+            "older_than": body.older_than,
+            "all": body.all,
+            "dry_run": true,
+        });
+        let value = self.call(&crate::client::ApiRequest::post_json(
+            "/api/v1/db/purge",
+            &payload,
+        ))?;
+        match value.get("would_purge") {
+            Some(serde_json::Value::Array(rows)) => Ok(rows.len()),
+            Some(_) => Err(DbApiError::Failed {
+                detail: "字段 `would_purge` 不是数组".to_owned(),
+            }),
+            None => Err(DbApiError::Failed {
+                detail: "后台返回的数据缺少字段 `would_purge`".to_owned(),
+            }),
+        }
     }
 
     fn purge(&mut self, body: &PurgeBody) -> Result<PurgeResult, DbApiError> {
@@ -732,19 +762,25 @@ fn purge_api(args: PurgeArgs<'_>, api: &mut dyn DbApi, confirm: &mut dyn Confirm
             json,
         );
     }
-    let confirmed = yes || confirm.confirm("将删除 N 个会话，删除后无法恢复。确定吗？[是/否]");
-    if !confirmed {
-        return super::error_outcome(
-            exit::USAGE,
-            "usage",
-            "现在不在终端里，没法确认删除。确定要删的话，请加上 `--yes`（删除后无法恢复）",
-            json,
-        );
-    }
     let body = PurgeBody {
         older_than: older_than.map(str::to_owned),
         all,
     };
+    if !yes {
+        let count = match api.preview_purge(&body) {
+            Ok(count) => count,
+            Err(err) => return api_error(err, json),
+        };
+        let prompt = format!("将删除 {count} 个会话，删除后无法恢复。确定吗？[是/否]");
+        if !confirm.confirm(&prompt) {
+            return super::error_outcome(
+                exit::USAGE,
+                "usage",
+                "现在不在终端里，没法确认删除。确定要删的话，请加上 `--yes`（删除后无法恢复）",
+                json,
+            );
+        }
+    }
     match api.purge(&body) {
         Ok(result) => purge_outcome(&result, json),
         Err(err) => api_error(err, json),

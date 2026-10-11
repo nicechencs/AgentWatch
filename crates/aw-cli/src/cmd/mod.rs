@@ -269,7 +269,7 @@ fn channel_command(cli: &Cli, env_token: Option<String>, json: bool) -> Option<O
 fn is_query(command: &Command) -> bool {
     matches!(
         command,
-        Command::Sessions(_)
+        Command::Sessions { .. }
             | Command::Timeline { .. }
             | Command::Procs { .. }
             | Command::Flows { .. }
@@ -864,7 +864,8 @@ fn query_command(
     source: &mut dyn QuerySource,
 ) -> io::Result<Option<Outcome>> {
     match command {
-        Command::Sessions(cmd) => Ok(Some(sessions::run(cmd, json, source)?)),
+        Command::Sessions { command: Some(cmd) } => Ok(Some(sessions::run(cmd, json, source)?)),
+        Command::Sessions { command: None } => Ok(Some(sessions::run_default(json, source)?)),
         Command::Timeline {
             session,
             filter,
@@ -1545,6 +1546,7 @@ mod tests {
         assert_eq!(outcome.code, exit::OK, "{}", text(&outcome.stderr));
         assert_eq!(http.opened, 0);
         let help = text(&outcome.stdout);
+        assert!(help.contains("用法：aw [选项] <命令>"), "{help}");
         assert!(!help.contains('\u{1b}'), "help must be plain text");
         for name in [
             "run", "attach", "stop", "ps", "sessions", "timeline", "procs", "files", "flows",
@@ -1575,7 +1577,7 @@ mod tests {
         let mut http = script(200, "{}");
         let root = run(&["--lang", "zh", "--help"], None, &mut http);
         let root_help = text(&root.stdout);
-        assert!(root_help.contains("用法:"), "{root_help}");
+        assert!(root_help.contains("用法：aw [选项] <命令>"), "{root_help}");
         assert!(!root_help.contains("agents"), "{root_help}");
         assert!(!root_help.contains("mcp-tap"), "{root_help}");
         assert!(!root_help.contains("proxy"), "{root_help}");
@@ -1586,6 +1588,7 @@ mod tests {
         let run_text = text(&run_help.stdout);
         assert!(run_text.contains("只交给被启动的程序，不发给后台"));
         assert!(run_text.contains("关闭脱敏（本版本未接入）"));
+        assert!(run_text.contains(aw_platform::NO_DAEMON_HELP), "{run_text}");
         let attach = run(&["attach", "--help"], None, &mut http);
         let attach_help = text(&attach.stdout);
         assert_eq!(attach.code, exit::OK, "{attach_help}");
@@ -1596,6 +1599,33 @@ mod tests {
         let placeholder = run(&["agents"], None, &mut http);
         assert_eq!(placeholder.code, exit::NOT_IN_BUILD);
         assert_eq!(text(&placeholder.stderr), "aw: `agents` 本版本未接入\n");
+    }
+
+    #[test]
+    fn bare_sessions_dispatches_to_list_and_keeps_json() {
+        let bare_args = vec!["sessions".to_owned(), "--json".to_owned()];
+        let list_args = vec![
+            "sessions".to_owned(),
+            "list".to_owned(),
+            "--json".to_owned(),
+        ];
+
+        let mut bare_http = script(200, "{}");
+        let mut bare_source = super::query::MemorySource::new();
+        let bare = execute_args_with(&bare_args, None, &mut bare_http, &mut bare_source)
+            .expect("bare sessions dispatch");
+        assert_eq!(bare.code, exit::OK, "{}", text(&bare.stderr));
+
+        let mut list_http = script(200, "{}");
+        let mut list_source = super::query::MemorySource::new();
+        let listed = execute_args_with(&list_args, None, &mut list_http, &mut list_source)
+            .expect("sessions list dispatch");
+        assert_eq!(listed.code, exit::OK, "{}", text(&listed.stderr));
+        assert_eq!(bare.stdout, listed.stdout);
+        let document: serde_json::Value = serde_json::from_slice(&bare.stdout).expect("JSON list");
+        assert_eq!(document["sessions"], serde_json::json!([]));
+        assert_eq!(bare_http.opened, 0);
+        assert_eq!(list_http.opened, 0);
     }
 
     #[test]

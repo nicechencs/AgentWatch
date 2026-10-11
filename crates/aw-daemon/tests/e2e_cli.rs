@@ -311,6 +311,26 @@ fn daemon_restart_releases_locks_before_every_replacement() {
     }
 }
 
+#[test]
+fn bare_sessions_matches_sessions_list_json_against_a_real_daemon() {
+    let daemon = Daemon::start(As::Me);
+    let bare = daemon.aw(&["sessions", "--json"]);
+    let listed = daemon.aw(&["sessions", "list", "--json"]);
+    assert!(
+        bare.status.success(),
+        "bare sessions: {}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    assert!(
+        listed.status.success(),
+        "sessions list: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let bare: Value = serde_json::from_slice(&bare.stdout).expect("bare JSON");
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("list JSON");
+    assert_eq!(bare, listed);
+}
+
 /// A config update patches one schema key in the source TOML; it must neither
 /// replace unrelated sections nor accept a typo as an inert setting.
 #[test]

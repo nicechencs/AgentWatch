@@ -1721,6 +1721,26 @@ fn with_scan_pending(mut response: ApiResponse, pending: bool) -> ApiResponse {
     response
 }
 
+/// Mark only process responses for sessions that periodically list the process
+/// table. This is a fact about the collection method, not an inferred event.
+fn with_fast_exit_may_be_missed(
+    mut response: ApiResponse,
+    recorded_by_process_table_listing: bool,
+) -> ApiResponse {
+    if !recorded_by_process_table_listing || response.status != 200 {
+        return response;
+    }
+    let Ok(mut body) = serde_json::from_slice::<Value>(&response.body) else {
+        return response;
+    };
+    let Some(object) = body.as_object_mut() else {
+        return response;
+    };
+    object.insert("fast_exit_may_be_missed".to_owned(), Value::Bool(true));
+    response.body = serde_json::to_vec(&body).unwrap_or(response.body);
+    response
+}
+
 /// Stored session rows use [`std::env::consts::OS`] when they are created.
 /// Older rows may have a nullable platform, so keep the API usable without
 /// changing the representation of newly-created rows.
@@ -1782,6 +1802,12 @@ fn stored_collectors_json(stored: &str) -> serde_json::Value {
         })
         .collect();
     serde_json::Value::Array(collectors)
+}
+
+fn stored_collectors_include_poll(stored: &str) -> bool {
+    serde_json::from_str::<Vec<String>>(stored)
+        .map(|names| names.iter().any(|name| name == "poll"))
+        .unwrap_or(false)
 }
 
 /// The poll collector: process table samples everywhere; connection table
@@ -2198,10 +2224,21 @@ fn session_query_route(
             Err(err) => from_backend(err),
         },
         ("GET", "timeline/histogram") => map_opt(state.query.histogram(user, sid, &parsed)),
-        ("GET", "processes") => with_scan_pending(
-            map_opt(state.query.processes(user, sid, &parsed)),
-            state.pending_scans.contains(sid),
-        ),
+        ("GET", "processes") => {
+            let recorded_by_process_table_listing = state
+                .query
+                .session_summary(user, sid)
+                .ok()
+                .flatten()
+                .is_some_and(|summary| stored_collectors_include_poll(&summary.collectors));
+            with_fast_exit_may_be_missed(
+                with_scan_pending(
+                    map_opt(state.query.processes(user, sid, &parsed)),
+                    state.pending_scans.contains(sid),
+                ),
+                recorded_by_process_table_listing,
+            )
+        }
         ("GET", "flows") => map_opt(state.query.flows(user, sid, &parsed)),
         ("GET", "traffic") => map_opt(state.query.traffic(user, sid, &parsed)),
         ("GET", "dns") => map_opt(state.query.dns(user, sid, &parsed)),

@@ -36,7 +36,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         code: "no_sessions",
-        zh: "还没有你的会话，@last 无处可指",
+        zh: "你还没有会话",
         en: Some("this account has no sessions"),
     },
     Row {
@@ -73,7 +73,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         code: "program_not_found",
-        zh: "找不到这个程序或工作目录",
+        zh: "找不到程序，请检查名字或路径",
         en: Some("the program or the working directory was not found"),
     },
     Row {
@@ -465,7 +465,7 @@ mod tests {
         );
         assert_eq!(
             render(404, Some("no_sessions"), "this account has no sessions"),
-            "还没有你的会话，@last 无处可指"
+            "你还没有会话"
         );
     }
 

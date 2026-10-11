@@ -29,6 +29,8 @@ use std::{fs, io};
 
 pub(crate) struct CurrentPlatform;
 
+pub const NO_DAEMON_HELP: &str = "不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序会跟着结束。子程序要是自己脱离了进程组（比如在后台另起服务），在 Mac 上不保证会跟着结束。";
+
 #[derive(Clone, Copy)]
 struct DataDirPolicy {
     expected_uid: u32,

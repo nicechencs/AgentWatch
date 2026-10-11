@@ -480,7 +480,7 @@ pub(crate) fn run_to(
             return error_outcome(
                 exit::GENERAL,
                 "not_found",
-                &format!("找不到会话 `{typed}`"),
+                &format!("找不到会话「{typed}」"),
                 json,
             );
         }
@@ -978,7 +978,7 @@ mod tests {
         assert_eq!(outcome.code, exit::GENERAL);
         assert_eq!(
             String::from_utf8(outcome.stderr).expect("utf8"),
-            "aw: 找不到会话 `s-someone-else`\n"
+            "aw: 找不到会话「s-someone-else」\n"
         );
     }
 

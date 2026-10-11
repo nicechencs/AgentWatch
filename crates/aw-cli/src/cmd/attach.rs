@@ -118,9 +118,8 @@ pub(crate) enum ControlError {
 impl std::fmt::Display for ControlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unreachable { detail } => write!(
-                f,
-                "连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：{detail}"
+            Self::Unreachable { .. } => f.write_str(
+                "连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（只运行程序，不做记录）。",
             ),
             Self::Forbidden { detail } => write!(
                 f,

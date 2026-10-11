@@ -34,13 +34,13 @@ pub(crate) fn run(
         Err(error) if error.no_sessions() => super::error_outcome(
             error.exit_code(),
             error.machine_code(),
-            "还没有你的会话，@last 无处可指",
+            "你还没有会话",
             json,
         ),
         Err(error) if error.not_found() => super::error_outcome(
             error.exit_code(),
             error.machine_code(),
-            &format!("找不到会话 `{key}`"),
+            &format!("找不到会话「{key}」"),
             json,
         ),
         Err(error) => super::attach::control_outcome(error, json),
@@ -188,7 +188,7 @@ mod tests {
         assert_eq!(outcome.code, exit::NOT_FOUND);
         assert_eq!(
             String::from_utf8(outcome.stderr).expect("utf8"),
-            "aw: 找不到会话 `s-missing`\n"
+            "aw: 找不到会话「s-missing」\n"
         );
     }
 
@@ -290,7 +290,7 @@ mod tests {
         let outcome = run("no-such-name", None, false, &mut Unknown);
         assert_eq!(
             String::from_utf8(outcome.stderr).expect("utf8"),
-            "aw: 找不到会话 `no-such-name`\n"
+            "aw: 找不到会话「no-such-name」\n"
         );
     }
 }

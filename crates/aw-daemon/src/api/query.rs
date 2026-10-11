@@ -1091,7 +1091,7 @@ impl SessionQuery for StoreQuery {
             return Ok(serde_json::json!({
                 "scope": "caller",
                 "available": false,
-                "reason": "per-user db stats is not exported by aw-store",
+                "reason": "caller_scope_stats_unavailable",
             }));
         }
         let mut store = Store::open_runtime(&path).map_err(map_store)?;

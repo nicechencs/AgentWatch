@@ -222,6 +222,9 @@ pub(crate) struct ProcessList {
     pub nodes: Vec<ProcItem>,
     /// The initial full process-tree scan is still running.
     pub scan_pending: bool,
+    /// This session recorded its process table by periodically listing it, so
+    /// a process that exits between observations can be absent.
+    pub fast_exit_may_be_missed: bool,
 }
 
 /// One flow, or one group of flows.
@@ -1172,6 +1175,7 @@ impl QuerySource for MemorySource {
                 return Ok(ProcessList {
                     nodes: roots,
                     scan_pending: false,
+                    fast_exit_may_be_missed: false,
                 });
             }
             let mut flat = Vec::new();
@@ -1179,12 +1183,14 @@ impl QuerySource for MemorySource {
             return Ok(ProcessList {
                 nodes: flat,
                 scan_pending: false,
+                fast_exit_may_be_missed: false,
             });
         }
         if tree {
             Ok(ProcessList {
                 nodes: roots,
                 scan_pending: false,
+                fast_exit_may_be_missed: false,
             })
         } else {
             let mut flat = Vec::new();
@@ -1192,6 +1198,7 @@ impl QuerySource for MemorySource {
             Ok(ProcessList {
                 nodes: flat,
                 scan_pending: false,
+                fast_exit_may_be_missed: false,
             })
         }
     }
@@ -2300,7 +2307,7 @@ mod tests {
         assert_eq!(outcome.code, exit::OK);
         let rendered = text(&outcome.stdout);
         assert_evidence_column(&rendered);
-        assert!(rendered.contains("P1 脱敏为占位"), "{rendered}");
+        assert!(rendered.contains("（已隐藏）"), "{rendered}");
         assert!(rendered.contains("不可得"), "{rendered}");
         assert!(rendered.contains("退出码"), "{rendered}");
         assert!(rendered.contains("7"), "{rendered}");

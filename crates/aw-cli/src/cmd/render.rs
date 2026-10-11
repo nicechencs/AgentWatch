@@ -407,7 +407,9 @@ fn walk(nodes: &[ProcItem], depth: usize, tree: bool, out: &mut Vec<(ProcItem, u
 
 /// P1 redaction is a placeholder. The column says so on every row, including
 /// rows whose argv was not observed.
+/// Stable marker for JSON and exports. It is not shown in terminal tables.
 pub(crate) const ARGV_NOTE: &str = "P1 脱敏为占位";
+const ARGV_DISPLAY: &str = "（已隐藏）";
 
 pub(crate) fn procs_table(nodes: &[ProcItem], tree: bool) -> Table {
     Table {
@@ -415,9 +417,9 @@ pub(crate) fn procs_table(nodes: &[ProcItem], tree: bool) -> Table {
             "proc".to_owned(),
             "pid".to_owned(),
             "exe".to_owned(),
-            "argv".to_owned(),
+            "命令".to_owned(),
             "退出码".to_owned(),
-            "redaction".to_owned(),
+            "打码".to_owned(),
         ],
         rows: flatten_proc_rows(nodes, tree)
             .into_iter()
@@ -432,10 +434,12 @@ pub(crate) fn procs_table(nodes: &[ProcItem], tree: bool) -> Table {
                         format!("{indent}{}", node.proc_uid),
                         node.pid.to_string(),
                         opt_text(node.exe_name.as_deref()),
-                        opt_text(node.argv_redacted.as_deref()),
+                        node.argv_redacted
+                            .as_ref()
+                            .map_or_else(|| "不可得".to_owned(), |_| ARGV_DISPLAY.to_owned()),
                         node.exit_code
                             .map_or_else(|| "没采".to_owned(), |code| code.to_string()),
-                        ARGV_NOTE.to_owned(),
+                        ARGV_DISPLAY.to_owned(),
                     ],
                     evidence: node.evidence,
                 }

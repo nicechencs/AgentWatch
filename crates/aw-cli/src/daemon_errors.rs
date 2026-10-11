@@ -140,6 +140,11 @@ const ROWS: &[Row] = &[
         en: Some("the program did not switch to the caller's account and was stopped"),
     },
     Row {
+        code: "discard_not_empty",
+        zh: "启动失败清理被拒绝：会话已经记录了根进程之外的信息",
+        en: Some("the launch already recorded a process beyond its root"),
+    },
+    Row {
         code: "env_reserved",
         // The daemon's message already is this sentence, with the variable's name
         // filled in, so it is shown as is rather than repeated after a stock line.

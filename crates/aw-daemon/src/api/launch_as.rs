@@ -233,7 +233,9 @@ pub(crate) fn reserved_env_response(name: &str) -> ApiResponse {
 /// Environment a dropped launch starts with, built from scratch: the target
 /// account's `HOME`/`USER`/`LOGNAME`/`SHELL`, the fixed `PATH`, then the
 /// request's `env`. The daemon's own environment is not read. A root daemon's
-/// `LANG`, `HOME`, sockets, and tokens therefore cannot reach the child.
+/// `HOME`, sockets, and tokens therefore cannot reach the child.  The App and
+/// CLI may explicitly forward the caller's `LANG`/`LC_ALL`/`TZ` as request
+/// values; they are ordinary, non-reserved additions.
 ///
 /// `extra` must already have been checked with [`reserved_env_var`]: this
 /// refuses to merge a reserved name rather than override the account's value.
@@ -271,6 +273,9 @@ pub(crate) enum SpawnAsError {
         step: &'static str,
         error: std::io::Error,
     },
+    /// A Unix held child reported its `chdir`/`execve` failure through the
+    /// close-on-exec pipe.  Preserve the classification to the route.
+    TypedProgram(aw_platform::SpawnFailure),
     /// The account switch itself failed or could not be checked: 500.
     Drop(String),
 }
@@ -668,6 +673,7 @@ pub(crate) fn spawn_as(
 #[cfg(target_os = "macos")]
 fn platform_spawn_error(error: aw_platform::PlatformError) -> SpawnAsError {
     match error {
+        aw_platform::PlatformError::Spawn(kind) => SpawnAsError::TypedProgram(kind),
         aw_platform::PlatformError::Io(inner) => {
             let step = if inner.to_string().starts_with("chdir:") {
                 "chdir"
@@ -1000,7 +1006,11 @@ mod tests {
         std::env::set_var("LANG", "daemon-lang");
         let me = nix::unistd::getuid().as_raw();
         let who = super::lookup(me).expect("this account");
-        let extra = [("AW_RV".to_owned(), "1".to_owned())];
+        let extra = [
+            ("AW_RV".to_owned(), "1".to_owned()),
+            ("LANG".to_owned(), "zh_TW.UTF-8".to_owned()),
+            ("TZ".to_owned(), "Asia/Taipei".to_owned()),
+        ];
         let got = super::base_env(&who, &extra);
         let mut got_lines: Vec<String> = got
             .iter()
@@ -1015,14 +1025,19 @@ mod tests {
             format!("SHELL={}", path(&who.shell)),
             format!("PATH={}", super::DEFAULT_PATH),
             "AW_RV=1".to_owned(),
+            "LANG=zh_TW.UTF-8".to_owned(),
+            "TZ=Asia/Taipei".to_owned(),
         ];
         want.sort();
         assert_eq!(
             got_lines, want,
-            "base env is not exactly the five plus AW_RV"
+            "base env is not exactly the five plus requested values"
         );
         assert!(!got.iter().any(|(key, _)| key == "AW_HOLD_SENTINEL"));
-        assert!(!got.iter().any(|(key, _)| key == "LANG"));
+        assert_eq!(
+            got.iter().find(|(key, _)| key == "LANG"),
+            Some(&("LANG".to_owned(), "zh_TW.UTF-8".to_owned()))
+        );
         std::env::remove_var("AW_HOLD_SENTINEL");
         std::env::remove_var("LANG");
     }
@@ -1080,6 +1095,9 @@ mod tests {
         match error {
             super::SpawnAsError::Program { .. } => {
                 panic!("a bare sh was reported as a program error; the search did not find it")
+            }
+            super::SpawnAsError::TypedProgram(_) => {
+                panic!("a bare sh was reported as a typed program error")
             }
             super::SpawnAsError::Drop(step) => {
                 assert!(

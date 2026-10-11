@@ -33,6 +33,48 @@ fn channel_path() -> std::path::PathBuf {
     channel::pinned_path(channel::channel_path(&|key| std::env::var(key).ok()))
 }
 
+/// Adds the desktop user's locale to a direct App launch request.
+///
+/// The daemon intentionally starts the child from a scrubbed account
+/// environment.  Forward only these user-facing settings, never its complete
+/// application environment (which could contain credentials or sockets).
+fn launch_body_with_user_locale<F>(method: &str, target: &str, body: String, get: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if method != "POST" || target.split('?').next() != Some("/api/v1/sessions") {
+        return body;
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return body;
+    };
+    if value.get("mode").and_then(serde_json::Value::as_str) != Some("launch") {
+        return body;
+    }
+    let Some(request) = value.as_object_mut() else {
+        return body;
+    };
+    let locale: Vec<(String, String)> = ["LANG", "LC_ALL", "TZ"]
+        .into_iter()
+        .filter_map(|name| get(name).map(|value| (name.to_owned(), value)))
+        .collect();
+    if locale.is_empty() {
+        return body;
+    }
+    let env = request
+        .entry("env".to_owned())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(env) = env.as_object_mut() else {
+        return body;
+    };
+    for (name, value) in locale {
+        // The window, not arbitrary UI JSON, is authoritative for these
+        // values: a direct App launch must use the desktop user's locale.
+        env.insert(name, serde_json::Value::String(value));
+    }
+    serde_json::to_string(&value).unwrap_or(body)
+}
+
 /// Forward one API request to the daemon. `target` is the path plus query.
 /// Each call runs on its own blocking thread: a large export does not hold up
 /// other requests.
@@ -47,7 +89,12 @@ async fn aw_request(
     body: Option<String>,
 ) -> Result<channel::Reply, Failure> {
     let path = channel_path();
-    let body = body.unwrap_or_default();
+    let body = launch_body_with_user_locale(
+        &method,
+        &target,
+        body.unwrap_or_default(),
+        |key| std::env::var(key).ok(),
+    );
     tauri::async_runtime::spawn_blocking(move || channel::exchange(&path, &method, &target, &body))
         .await
         .map_err(|err| Failure::broken(&format!("request task failed: {err}")))?
@@ -161,6 +208,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::launch_body_with_user_locale;
+
     /// T1: a normal build (default features) loads the bundled pages.
     #[test]
     fn default_build_serves_the_bundled_ui() {
@@ -170,5 +219,33 @@ mod tests {
                 "default features must include custom-protocol"
             );
         }
+    }
+
+    #[test]
+    fn direct_launch_forwards_only_set_user_locale_values() {
+        let body = launch_body_with_user_locale(
+            "POST",
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["tool"]}"#.to_owned(),
+            |name| match name {
+                "LANG" => Some("zh_TW.UTF-8".to_owned()),
+                "TZ" => Some("Asia/Taipei".to_owned()),
+                _ => None,
+            },
+        );
+        let value: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(value) => value,
+            Err(error) => panic!("request json: {error}"),
+        };
+        assert_eq!(value["env"]["LANG"], "zh_TW.UTF-8");
+        assert_eq!(value["env"]["TZ"], "Asia/Taipei");
+        assert!(value["env"].get("LC_ALL").is_none());
+    }
+
+    #[test]
+    fn unset_locale_does_not_add_an_env_object() {
+        let original = r#"{"mode":"launch","argv":["tool"]}"#.to_owned();
+        let body = launch_body_with_user_locale("POST", "/api/v1/sessions", original.clone(), |_| None);
+        assert_eq!(body, original);
     }
 }

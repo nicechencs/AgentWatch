@@ -1,5 +1,5 @@
 //! `POST /sessions` (attach / launch), `POST /sessions/run`,
-//! `POST /sessions/{sid}/adopt`, `POST /sessions/{sid}/attach`.
+//! `POST /sessions/{sid}/adopt`, `POST /sessions/{sid}/attach`, and discard.
 //!
 //! Each inserts or finds the `sessions` row and queues a
 //! [`WatchRequest::Start`] for the foreground loop ([`crate::watch`]), which
@@ -15,6 +15,7 @@
 //!   and a process table to the sampler; otherwise it answers 503
 //!   `collector_unavailable` and creates nothing.
 
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 use super::auth::{random_secret, Caller};
@@ -469,6 +470,9 @@ fn create_inner(
                         super::launch_as::SpawnAsError::Program { step, error } => {
                             spawn_error(step, cwd.as_deref(), &argv, &error)
                         }
+                        super::launch_as::SpawnAsError::TypedProgram(kind) => {
+                            typed_spawn_error(kind, cwd.as_deref(), &argv)
+                        }
                         super::launch_as::SpawnAsError::Drop(step) => {
                             drop_failed(caller.user_id.parse().unwrap_or(0), &step)
                         }
@@ -484,6 +488,9 @@ fn create_inner(
                             .map_err(|err| match err {
                                 super::launch_as::SpawnAsError::Program { step, error } => {
                                     spawn_error(step, cwd.as_deref(), &argv, &error)
+                                }
+                                super::launch_as::SpawnAsError::TypedProgram(kind) => {
+                                    typed_spawn_error(kind, cwd.as_deref(), &argv)
                                 }
                                 super::launch_as::SpawnAsError::Drop(step) => {
                                     drop_failed(who.uid, &step)
@@ -584,6 +591,9 @@ fn spawn_as_self(
             super::launch_as::SpawnAsError::Program { step, error } => {
                 spawn_error(step, cwd, argv, &error)
             }
+            super::launch_as::SpawnAsError::TypedProgram(kind) => {
+                typed_spawn_error(kind, cwd, argv)
+            }
             super::launch_as::SpawnAsError::Drop(step) => {
                 tracing::error!(step, "same-account launch failed");
                 error_response(
@@ -598,6 +608,7 @@ fn spawn_as_self(
         super::launch_as::SpawnAsError::Program { step, error } => {
             spawn_error(step, cwd, argv, &error)
         }
+        super::launch_as::SpawnAsError::TypedProgram(kind) => typed_spawn_error(kind, cwd, argv),
         super::launch_as::SpawnAsError::Drop(step) => {
             tracing::error!(step, "same-account launch failed");
             error_response(
@@ -788,6 +799,80 @@ pub(super) fn record_exit(
         Ok(ApiResponse::json(
             200,
             &json!({ "id": sid, "exit_code": stored }),
+        ))
+    };
+    match inner() {
+        Ok(response) | Err(response) => response,
+    }
+}
+
+/// `POST /sessions/{sid}/discard` removes a launch that failed before `exec`.
+///
+/// The CLI reaches this only after it adopted a held child and its close-on-exec
+/// report says `chdir` or `execve` failed.  The caller must own the session and
+/// the transaction refuses any process other than the adopted root, so a
+/// normal recorded session can never be erased through this narrow cleanup.
+pub(super) fn discard(state: &mut ApiState, caller: &Caller, sid: &str) -> ApiResponse {
+    let mut inner = || -> Result<ApiResponse, ApiResponse> {
+        let path = db_path(state)?;
+        require_writable_database(&path)?;
+        let mut conn = aw_store::open_connection(&path)
+            .map_err(|_| error_response(500, "store", "cannot open the database"))?;
+        let tx = conn
+            .transaction()
+            .map_err(|_| error_response(500, "store", "cannot begin session discard"))?;
+        let row: Option<(i64, String, Option<i64>)> = tx
+            .query_row(
+                "SELECT id, user_id, root_proc_uid FROM sessions WHERE public_id = ?1",
+                [sid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| error_response(500, "store", "cannot inspect the failed session"))?;
+        let Some((db_id, owner, root_proc_uid)) = row else {
+            return Err(error_response(404, "not_found", "session not found"));
+        };
+        // This cleanup is intentionally stricter than ordinary stop/delete:
+        // an administrator cannot discard another caller's failed launch.
+        if owner != caller.user_id {
+            return Err(error_response(404, "not_found", "session not found"));
+        }
+        let extra_processes: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM processes \
+                 WHERE session_id = ?1 AND (?2 IS NULL OR proc_uid != ?2)",
+                rusqlite::params![db_id, root_proc_uid],
+                |row| row.get(0),
+            )
+            .map_err(|_| error_response(500, "store", "cannot inspect session processes"))?;
+        if extra_processes != 0 {
+            return Err(error_response(
+                409,
+                "discard_not_empty",
+                "the launch already recorded a process beyond its root",
+            ));
+        }
+        // `processes` and all other session tables use ON DELETE CASCADE.  The
+        // session row and its root row therefore disappear in this one SQLite
+        // transaction; no empty session can be observed after commit.
+        tx.execute("DELETE FROM sessions WHERE id = ?1", [db_id])
+            .map_err(|_| error_response(500, "store", "cannot discard the failed session"))?;
+        tx.commit()
+            .map_err(|_| error_response(500, "store", "cannot finish session discard"))?;
+
+        state.pending_launches.remove(sid);
+        state.pending_scans.remove(sid);
+        // The adopt route queued Start before the CLI releases its gate.  Do
+        // not let that queued sampler resurrect output after the row is gone.
+        state.watch_requests.retain(|request| {
+            !matches!(request, WatchRequest::Start { target, .. } if target.public_id == sid)
+        });
+        // If a foreground tick already consumed Start, stop the owned watcher
+        // before its next write.  A non-running id is harmless to the manager.
+        state.watch_requests.push(WatchRequest::Stop { db_id });
+        Ok(ApiResponse::json(
+            200,
+            &json!({ "id": sid, "discarded": true }),
         ))
     };
     match inner() {
@@ -1012,6 +1097,41 @@ fn spawn_error(
             &format!("程序「{program}」没有执行权限，请检查文件权限后再试。"),
         ),
         _ => error_response(400, "spawn_failed", "the program could not be started"),
+    }
+}
+
+/// Map the close-on-exec pipe's typed failure to the API's stable code and the
+/// reviewed human wording without parsing a platform error string.
+fn typed_spawn_error(
+    failure: aw_platform::SpawnFailure,
+    cwd: Option<&str>,
+    argv: &[String],
+) -> ApiResponse {
+    let program = argv.first().map(String::as_str).unwrap_or("");
+    match failure {
+        aw_platform::SpawnFailure::ProgramNotFound => error_response(
+            400,
+            "program_not_found",
+            &format!("找不到程序「{program}」，请检查名字或路径"),
+        ),
+        aw_platform::SpawnFailure::ProgramNotPermitted => error_response(
+            400,
+            "program_not_permitted",
+            &format!("程序「{program}」没有执行权限，请检查文件权限后再试。"),
+        ),
+        aw_platform::SpawnFailure::CwdNotFound => error_response(
+            400,
+            "cwd_not_found",
+            &format!("找不到工作目录「{}」", cwd.unwrap_or(".")),
+        ),
+        aw_platform::SpawnFailure::CwdNotPermitted => error_response(
+            400,
+            "program_not_permitted",
+            &format!(
+                "没有权限进入工作目录「{}」，请换一个目录或检查权限。",
+                cwd.unwrap_or(".")
+            ),
+        ),
     }
 }
 

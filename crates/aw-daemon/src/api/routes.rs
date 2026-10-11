@@ -1247,6 +1247,9 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
             if let Some(sid) = rest.strip_suffix("/attach") {
                 return super::watch_routes::attach(state, caller, sid, &req.body);
             }
+            if let Some(sid) = rest.strip_suffix("/discard") {
+                return super::watch_routes::discard(state, caller, sid);
+            }
         }
     }
 
@@ -3671,6 +3674,95 @@ mod tests {
         assert_eq!(status, 400, "{body}");
         assert_eq!(body["error"]["code"], "program_not_found");
         assert_eq!(session_count(&db), before, "a failed launch writes no row");
+
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["/etc/passwd"]}"#,
+        );
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["error"]["code"], "program_not_permitted");
+        assert_eq!(
+            body["error"]["message"],
+            "程序「/etc/passwd」没有执行权限，请检查文件权限后再试。"
+        );
+        assert_eq!(
+            session_count(&db),
+            before,
+            "a refused App launch writes no row"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The caller owns cleanup only for its own adopted launch, and only while
+    /// it contains the root row the failed hold stage created.  Deleting the
+    /// session in the same transaction cascades that row away.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn discard_removes_an_adopted_root_only_for_its_owner() {
+        let (dir, db) = seeded_db("discard-adopted", "");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let me = crate::sample::current_user_id();
+        let token = token_for(&mut state, &me, false);
+        let other = token_for(&mut state, "another-user", false);
+        let before = session_count(&db);
+        let (_, created) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions/run",
+            r#"{"argv":["sleep","30"]}"#,
+        );
+        let sid = created["id"].as_str().expect("id").to_owned();
+        let ticket = created["ticket"].as_str().expect("ticket").to_owned();
+        let adopt = format!("/api/v1/sessions/{sid}/adopt");
+        assert_eq!(
+            post(
+                &mut state,
+                &token,
+                &adopt,
+                &format!(r#"{{"ticket":"{ticket}","pid":{pid}}}"#),
+            )
+            .0,
+            200
+        );
+        assert_eq!(session_count(&db), before + 1);
+        let root_rows: i64 = aw_store::open_connection(&db)
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM processes p JOIN sessions s ON s.id = p.session_id WHERE s.public_id = ?1",
+                    [&sid],
+                    |r| r.get(0),
+                )
+            })
+            .expect("root row");
+        assert_eq!(root_rows, 1);
+        let discard = format!("/api/v1/sessions/{sid}/discard");
+        assert_eq!(post(&mut state, &other, &discard, "").0, 404);
+        assert_eq!(session_count(&db), before + 1, "other user changed nothing");
+        let (status, body) = post(&mut state, &token, &discard, "");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["discarded"], true);
+        assert_eq!(session_count(&db), before);
+        let leftover: i64 = aw_store::open_connection(&db)
+            .and_then(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM processes p JOIN sessions s ON s.id = p.session_id WHERE s.public_id = ?1",
+                    [&sid],
+                    |r| r.get(0),
+                )
+            })
+            .expect("rows after discard");
+        assert_eq!(leftover, 0);
+        let _ = child.kill();
+        let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -68,7 +68,9 @@ dependencies = [
 name = "aw-channel"
 version = "0.1.0"
 dependencies = [
+ "aw-collector-windows",
  "aw-platform",
+ "tokio",
 ]
 
 [[package]]

@@ -198,8 +198,8 @@ pub enum DialError {
     Unreachable(String),
     /// The socket or pipe exists but this user may not open it.
     Forbidden(String),
-    /// A Windows named pipe opened, but its server process was neither
-    /// LocalSystem nor this client user. No request bytes were sent.
+    /// A Windows named pipe opened, but its owner did not meet the installed
+    /// service rule. No request bytes were sent.
     UntrustedServer(String),
     /// A Windows named pipe opened, but its owner could not be queried before
     /// a request was sent. This is deliberately distinct from a queried,
@@ -514,7 +514,7 @@ pub fn exchange_raw(path: &Path, request: &[u8], timeout: Duration) -> Result<Ve
 /// pipe. It is Windows-only because Unix-domain sockets do not use `File`.
 #[cfg(windows)]
 pub fn open_pipe_client(path: &Path) -> Result<std::fs::File, DialError> {
-    platform::open_pipe_client(path, None)
+    platform::open_pipe_client(path, None, None)
 }
 
 /// Test hook for a connected pipe whose trusted owners are intentionally
@@ -525,7 +525,18 @@ pub fn open_pipe_client_with_trusted_owners(
     path: &Path,
     trusted_owners: &[&str],
 ) -> Result<std::fs::File, DialError> {
-    platform::open_pipe_client(path, Some(trusted_owners))
+    platform::open_pipe_client(path, Some(trusted_owners), None)
+}
+
+/// Test hook for a connected pipe with an injected AgentWatch service state.
+/// Production callers must use [`open_pipe_client`], which reads the SCM.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn open_pipe_client_with_service_status_for_test(
+    path: &Path,
+    service_status: &aw_platform::PipeServiceStatus,
+) -> Result<std::fs::File, DialError> {
+    platform::open_pipe_client(path, None, Some(service_status))
 }
 
 /// Opens a Windows pipe at `SECURITY_ANONYMOUS` for daemon integration tests.
@@ -534,7 +545,20 @@ pub fn open_pipe_client_with_trusted_owners(
 #[cfg(windows)]
 #[doc(hidden)]
 pub fn open_anonymous_pipe_client_for_test(path: &Path) -> Result<std::fs::File, DialError> {
-    platform::open_pipe_client_with_qos(path, 0, None)
+    platform::open_pipe_client_with_qos(path, 0, None, None)
+}
+
+/// Test-only exchange that follows the production pipe-open path while using
+/// an injected AgentWatch service state.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn exchange_raw_with_service_status_for_test(
+    path: &Path,
+    request: &[u8],
+    timeout: Duration,
+    service_status: &aw_platform::PipeServiceStatus,
+) -> Result<Vec<u8>, DialError> {
+    platform::exchange_raw_with_service_status(path, request, timeout, service_status)
 }
 
 fn roundtrip<S: Read + Write>(stream: &mut S, bytes: &[u8]) -> Result<Vec<u8>, DialError> {
@@ -686,14 +710,21 @@ mod platform {
     pub(super) fn open_pipe_client(
         path: &Path,
         trusted_owners: Option<&[&str]>,
+        service_status: Option<&aw_platform::PipeServiceStatus>,
     ) -> Result<File, DialError> {
-        open_pipe_client_with_qos(path, SECURITY_IDENTIFICATION, trusted_owners)
+        open_pipe_client_with_qos(
+            path,
+            SECURITY_IDENTIFICATION,
+            trusted_owners,
+            service_status,
+        )
     }
 
     pub(super) fn open_pipe_client_with_qos(
         path: &Path,
         security_qos_flags: u32,
         trusted_owners: Option<&[&str]>,
+        service_status: Option<&aw_platform::PipeServiceStatus>,
     ) -> Result<File, DialError> {
         let pipe = std::fs::OpenOptions::new()
             .read(true)
@@ -705,18 +736,25 @@ mod platform {
         // Validate the pipe object's owner before any request byte leaves this
         // client: the public pipe name can be claimed while agentwatchd is
         // stopped or restarting.
-        let checked = match trusted_owners {
-            Some(owners) => {
+        let checked = match (trusted_owners, service_status) {
+            (Some(owners), None) => {
+                // Kept for the existing reverse-test seam. Product paths do
+                // not use an allowlist override.
                 aw_platform::verify_pipe_server_for_owners(pipe.as_raw_handle(), owners)
             }
-            None => aw_platform::verify_pipe_server(pipe.as_raw_handle()),
+            (None, Some(service_status)) => aw_platform::verify_pipe_server_with_service_status(
+                pipe.as_raw_handle(),
+                service_status,
+            ),
+            (None, None) => aw_platform::verify_pipe_server(pipe.as_raw_handle()),
+            (Some(_), Some(_)) => unreachable!("test hooks cannot be combined"),
         };
         match checked {
             Ok(()) => Ok(pipe),
             Err(error @ aw_platform::PipeServerVerificationError::CannotQuery { .. }) => {
                 Err(DialError::ServerVerificationUnavailable(error.to_string()))
             }
-            Err(error @ aw_platform::PipeServerVerificationError::NotDaemon) => {
+            Err(error @ aw_platform::PipeServerVerificationError::NotDaemon { .. }) => {
                 Err(DialError::UntrustedServer(error.to_string()))
             }
         }
@@ -727,11 +765,29 @@ mod platform {
         request: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, DialError> {
+        exchange_raw_with_service_status_inner(path, request, timeout, None)
+    }
+
+    pub(super) fn exchange_raw_with_service_status(
+        path: &Path,
+        request: &[u8],
+        timeout: Duration,
+        service_status: &aw_platform::PipeServiceStatus,
+    ) -> Result<Vec<u8>, DialError> {
+        exchange_raw_with_service_status_inner(path, request, timeout, Some(service_status))
+    }
+
+    fn exchange_raw_with_service_status_inner(
+        path: &Path,
+        request: &[u8],
+        timeout: Duration,
+        service_status: Option<&aw_platform::PipeServiceStatus>,
+    ) -> Result<Vec<u8>, DialError> {
         let started = Instant::now();
         // A named pipe opens like a file. All instances busy is a short wait,
         // not "not running".
         let mut pipe = loop {
-            match open_pipe_client(path, None) {
+            match open_pipe_client(path, None, service_status) {
                 Ok(pipe) => break pipe,
                 Err(error) => {
                     if matches!(error, DialError::Busy(_)) && started.elapsed() < BUSY_RETRY {
@@ -1195,4 +1251,129 @@ fn tests_is_root() -> bool {
         .unwrap_or(true);
     let _ = std::fs::remove_file(&probe);
     root
+}
+
+/// Real Windows pipe-owner tests. The first test deliberately takes the
+/// production pipe name: a same-user process that creates it before the
+/// service must be refused when SCM says the service is installed.
+#[cfg(all(test, windows))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod windows_pipe_owner_tests {
+    use std::ffi::OsStr;
+    use std::io::ErrorKind;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::thread;
+    use std::time::Duration;
+
+    use aw_collector_windows::pipe::{create_server, pipe_sddl};
+    use aw_platform::PipeServiceStatus;
+    use tokio::net::windows::named_pipe::NamedPipeServer;
+    use tokio::runtime::Builder;
+    use tokio::time::timeout;
+
+    use super::{
+        exchange_raw_with_service_status_for_test, open_pipe_client_with_service_status_for_test,
+        DialError, WINDOWS_PIPE,
+    };
+
+    static PIPE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn runtime() -> tokio::runtime::Runtime {
+        Builder::new_current_thread().enable_time().build().unwrap()
+    }
+
+    async fn assert_no_request_bytes(pipe: &NamedPipeServer) {
+        match timeout(Duration::from_secs(1), pipe.readable()).await {
+            Ok(Ok(())) => match pipe.try_read(&mut [0_u8; 64]) {
+                Ok(0) => {}
+                Err(error) if error.kind() == ErrorKind::BrokenPipe => {}
+                Ok(count) => panic!("refused server received {count} request bytes"),
+                Err(error) => panic!("could not check refused server bytes: {error}"),
+            },
+            Ok(Err(error)) if error.kind() == ErrorKind::BrokenPipe => {}
+            Ok(Err(error)) => panic!("refused pipe readiness failed: {error}"),
+            Err(_) => panic!("client did not close the refused pipe"),
+        }
+    }
+
+    #[test]
+    fn installed_service_refuses_a_same_user_server_without_sending_or_falling_back() {
+        let _lock = PIPE_TEST_LOCK.lock().unwrap();
+        runtime().block_on(async {
+            let path = PathBuf::from(WINDOWS_PIPE);
+            let sddl = pipe_sddl().expect("current-user pipe SDDL");
+            let first = create_server(OsStr::new(WINDOWS_PIPE), true, &sddl)
+                .expect("fake server owns the public pipe first");
+            // If the client were to retry/fall back after refusing the first
+            // instance, this second same-user instance would accept it.
+            let second = create_server(OsStr::new(WINDOWS_PIPE), false, &sddl)
+                .expect("second fake pipe instance");
+            let status = PipeServiceStatus::Installed { binary_path: None };
+            let request = b"must-not-reach-the-fake-server".to_vec();
+            let client = thread::spawn(move || {
+                exchange_raw_with_service_status_for_test(
+                    &path,
+                    &request,
+                    Duration::from_secs(1),
+                    &status,
+                )
+            });
+
+            let first_connection = first.connect();
+            let second_connection = second.connect();
+            tokio::pin!(first_connection, second_connection);
+            let connected_to_first = tokio::select! {
+                result = &mut first_connection => {
+                    result.expect("first fake server connection");
+                    true
+                }
+                result = &mut second_connection => {
+                    result.expect("second fake server connection");
+                    false
+                }
+            };
+            let error = client
+                .join()
+                .expect("client thread")
+                .expect_err("must refuse");
+            assert!(matches!(error, DialError::UntrustedServer(_)), "{error}");
+
+            if connected_to_first {
+                assert_no_request_bytes(&first).await;
+                assert!(
+                    timeout(Duration::from_millis(200), second.connect())
+                        .await
+                        .is_err(),
+                    "client retried a second same-user pipe instance"
+                );
+            } else {
+                assert_no_request_bytes(&second).await;
+                assert!(
+                    timeout(Duration::from_millis(200), first.connect())
+                        .await
+                        .is_err(),
+                    "client retried a second same-user pipe instance"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn no_service_allows_a_same_user_development_pipe() {
+        let _lock = PIPE_TEST_LOCK.lock().unwrap();
+        runtime().block_on(async {
+            let sddl = pipe_sddl().expect("current-user pipe SDDL");
+            let _server = create_server(OsStr::new(WINDOWS_PIPE), true, &sddl)
+                .expect("same-user development server");
+            let client = open_pipe_client_with_service_status_for_test(
+                std::path::Path::new(WINDOWS_PIPE),
+                &PipeServiceStatus::NotInstalled,
+            );
+            assert!(
+                client.is_ok(),
+                "development pipe must remain usable: {client:?}"
+            );
+        });
+    }
 }

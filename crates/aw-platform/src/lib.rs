@@ -165,9 +165,16 @@ pub enum PipeServerVerificationError {
     CannotQuery {
         operation: &'static str,
         win32_error: u32,
+        /// Diagnostic detail for logs and JSON output only. Human-facing
+        /// wording stays with the channel error category.
+        detail: Option<String>,
     },
     /// The owner SID was read successfully but is not trusted as a daemon.
-    NotDaemon,
+    NotDaemon {
+        /// Diagnostic detail for logs and JSON output only. This may name a
+        /// local image path, never a request or credential.
+        detail: Option<String>,
+    },
 }
 
 impl fmt::Display for PipeServerVerificationError {
@@ -176,16 +183,52 @@ impl fmt::Display for PipeServerVerificationError {
             Self::CannotQuery {
                 operation,
                 win32_error,
-            } => write!(
-                f,
-                "named-pipe server owner query failed: {operation} (Win32 error {win32_error})"
-            ),
-            Self::NotDaemon => f.write_str("named-pipe server owner is not trusted"),
+                detail,
+            } => {
+                write!(
+                    f,
+                    "named-pipe server owner query failed: {operation} (Win32 error {win32_error})"
+                )?;
+                if let Some(detail) = detail {
+                    write!(f, "; {detail}")?;
+                }
+                Ok(())
+            }
+            Self::NotDaemon { detail } => {
+                f.write_str("named-pipe server owner is not trusted")?;
+                if let Some(detail) = detail {
+                    write!(f, ": {detail}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
 
 impl std::error::Error for PipeServerVerificationError {}
+
+/// The observed installation state for the Windows `AgentWatch` SCM service.
+///
+/// An SCM query failure is intentionally distinct from no service: callers
+/// must fail closed and require a LocalSystem-owned pipe in that case.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipeServiceStatus {
+    /// The SCM reports that the service does not exist. A foreground,
+    /// same-user development daemon is allowed in this mode.
+    NotInstalled,
+    /// The service exists, whether or not it is currently running.
+    Installed {
+        /// The executable parsed from `QueryServiceConfigW`, when available.
+        binary_path: Option<PathBuf>,
+    },
+    /// SCM could not determine whether the service exists. Treat this exactly
+    /// like an installed service and retain the detail for diagnostics.
+    QueryFailed {
+        operation: &'static str,
+        win32_error: u32,
+    },
+}
 impl From<std::io::Error> for PlatformError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
@@ -428,10 +471,10 @@ pub fn identify_pipe_peer(
     windows::identify_pipe_peer(handle)
 }
 
-/// Refuse a Windows named-pipe server unless its pipe-object owner is
-/// LocalSystem or the same user as this client. This is the client-side half
-/// of protecting the well-known pipe name from a process that claimed it
-/// while the daemon was stopped.
+/// Refuse a Windows named-pipe server unless its pipe-object owner follows
+/// the installed-service rule. When `AgentWatch` is installed, only
+/// LocalSystem is accepted; without that service, a same-user development
+/// daemon is also accepted.
 #[cfg(windows)]
 pub fn verify_pipe_server(
     handle: std::os::windows::io::RawHandle,
@@ -439,8 +482,21 @@ pub fn verify_pipe_server(
     windows::verify_pipe_server(handle)
 }
 
-/// Testable form of [`verify_pipe_server`] with an explicit trusted-owner
-/// allowlist. Product callers must use [`verify_pipe_server`].
+/// Testable form of [`verify_pipe_server`] with an injected SCM observation.
+/// Product callers use [`verify_pipe_server`], whose observation comes from
+/// the local SCM. This hook keeps the same production decision path testable
+/// without installing a service.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn verify_pipe_server_with_service_status(
+    handle: std::os::windows::io::RawHandle,
+    service_status: &PipeServiceStatus,
+) -> Result<(), PipeServerVerificationError> {
+    windows::verify_pipe_server_with_service_status(handle, service_status)
+}
+
+/// Testable owner-allowlist form retained for the existing reverse tests.
+/// Product callers must use [`verify_pipe_server`] or the service-status hook.
 #[cfg(windows)]
 #[doc(hidden)]
 pub fn verify_pipe_server_for_owners(

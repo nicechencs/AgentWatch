@@ -25,9 +25,10 @@ use windows::Win32::Security::Authorization::{
 use windows::Win32::Security::{
     GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetSidSubAuthority,
     GetSidSubAuthorityCount, GetTokenInformation, RevertToSelf, TokenElevation,
-    TokenIntegrityLevel, TokenUser, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-    TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
+    TokenIntegrityLevel, TokenOwner, TokenUser, ACL, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_OWNER, TOKEN_QUERY,
+    TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FindClose, FindFirstFileW, FindNextFileW,
@@ -123,14 +124,20 @@ fn is_machine_data_dir(path: &Path, default: &Path) -> bool {
 #[derive(Clone)]
 enum DataDirPolicy {
     Machine,
-    Owner(String),
+    /// An unelevated daemon may use a non-official directory made by its
+    /// token. Windows applies TokenOwner (the token's default owner), rather
+    /// than TokenUser, to newly created objects on some account policies.
+    Owner {
+        token_user_sid: String,
+        default_owner_sid: String,
+    },
 }
 
 impl DataDirPolicy {
     fn acl(&self) -> DataDirAcl<'_> {
         match self {
             Self::Machine => DataDirAcl::Machine,
-            Self::Owner(sid) => DataDirAcl::Owner(sid),
+            Self::Owner { token_user_sid, .. } => DataDirAcl::Owner(token_user_sid),
         }
     }
 
@@ -139,7 +146,13 @@ impl DataDirPolicy {
             // A privileged process needs a machine-owned directory even when
             // --data-dir names a non-default location.
             Self::Machine => owner == SYSTEM_SID || owner == ADMINISTRATORS_SID,
-            Self::Owner(sid) => owner == sid,
+            // Only the token user. `default_owner_sid` equals it by
+            // construction (see `data_dir_policy_for_token`); a group such as
+            // Administrators is never trusted for a non-elevated daemon.
+            Self::Owner {
+                token_user_sid,
+                default_owner_sid,
+            } => owner == token_user_sid || owner == default_owner_sid,
         }
     }
 
@@ -148,11 +161,28 @@ impl DataDirPolicy {
     }
 }
 
-fn data_dir_policy_for_token(sid: String, elevated: bool) -> DataDirPolicy {
+fn data_dir_policy_for_token(
+    sid: String,
+    default_owner_sid: String,
+    elevated: bool,
+) -> DataDirPolicy {
     if elevated || sid == SYSTEM_SID {
+        // Elevated: the token's default owner is BUILTIN\Administrators, which
+        // the machine policy already accepts (with SYSTEM).
         DataDirPolicy::Machine
     } else {
-        DataDirPolicy::Owner(sid)
+        // A non-elevated user daemon trusts its default owner only when it is
+        // the token user itself. It must never accept an Administrators-owned
+        // (or any other group-owned) directory.
+        let default_owner_sid = if default_owner_sid == sid {
+            default_owner_sid
+        } else {
+            sid.clone()
+        };
+        DataDirPolicy::Owner {
+            token_user_sid: sid,
+            default_owner_sid,
+        }
     }
 }
 
@@ -667,6 +697,36 @@ fn sid_for_token(token: HANDLE) -> Result<String, PlatformError> {
     sid_text(user.User.Sid)
 }
 
+/// Return the SID that Windows uses as the default owner for objects created
+/// by this token. It is an identity from the daemon's own kernel token, never
+/// from a caller or a configurable path.
+fn default_owner_sid_for_token(token: HANDLE) -> Result<String, PlatformError> {
+    let mut bytes = 0_u32;
+    // SAFETY: this is the documented TokenOwner sizing query.
+    #[allow(unsafe_code)]
+    let _ = unsafe { GetTokenInformation(token, TokenOwner, None, 0, &mut bytes) };
+    if bytes == 0 {
+        return Err(io_error(Error::from_win32()));
+    }
+    let mut storage = vec![0_u64; (bytes as usize).div_ceil(size_of::<u64>())];
+    // SAFETY: storage is aligned and contains at least `bytes` writable bytes.
+    #[allow(unsafe_code)]
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenOwner,
+            Some(storage.as_mut_ptr().cast()),
+            bytes,
+            &mut bytes,
+        )
+    }
+    .map_err(io_error)?;
+    // SAFETY: successful TokenOwner writes TOKEN_OWNER at the beginning of storage.
+    #[allow(unsafe_code)]
+    let owner = unsafe { &*storage.as_ptr().cast::<TOKEN_OWNER>() };
+    sid_text(owner.Owner)
+}
+
 fn elevated_for_token(token: HANDLE) -> Result<bool, PlatformError> {
     let mut elevation = TOKEN_ELEVATION::default();
     let mut bytes = 0_u32;
@@ -763,6 +823,25 @@ fn current_token_owner() -> Result<Owner, PlatformError> {
     let owner = owner_for_token(token);
     close(token);
     owner
+}
+
+/// Build the data-directory policy solely from the daemon's current token.
+/// TokenOwner is included because it is the SID Windows actually assigns to a
+/// newly created object when the token's default owner differs from TokenUser.
+fn current_data_dir_policy() -> Result<DataDirPolicy, PlatformError> {
+    let mut token = HANDLE::default();
+    // SAFETY: GetCurrentProcess is a valid pseudo-handle and `token` is
+    // writable output storage for an owned token handle.
+    #[allow(unsafe_code)]
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.map_err(io_error)?;
+    let policy = (|| {
+        let sid = sid_for_token(token)?;
+        let default_owner_sid = default_owner_sid_for_token(token)?;
+        let elevated = elevated_for_token(token)?;
+        Ok(data_dir_policy_for_token(sid, default_owner_sid, elevated))
+    })();
+    close(token);
+    policy
 }
 
 fn image_for_process(process: HANDLE) -> Option<PathBuf> {
@@ -1660,17 +1739,11 @@ impl Platform for CurrentPlatform {
         Ok(rows)
     }
     fn secure_data_dir(&self, path: &Path) -> Result<PathBuf, PlatformError> {
-        let Owner::Windows { sid, elevated, .. } = current_token_owner()? else {
-            return Err(PlatformError::Invalid {
-                capability: "secure_data_dir",
-                detail: "current process is not a Windows account",
-            });
-        };
         let default = self.default_data_dir()?;
-        // Elevation and the token user are the daemon's own kernel-authenticated
-        // identity. A privileged daemon cannot bypass machine ownership by
-        // selecting a custom location.
-        let policy = data_dir_policy_for_token(sid, elevated);
+        // Token elevation and owner SIDs are read from the daemon's own
+        // kernel-authenticated identity. A privileged daemon cannot bypass
+        // machine ownership by selecting a custom location.
+        let policy = current_data_dir_policy()?;
         secure_data_dir_with_policy(path, &default, policy)
     }
     fn default_data_dir(&self) -> Result<PathBuf, PlatformError> {
@@ -1717,11 +1790,15 @@ mod tests {
         PeerIdentity, Platform, PlatformError, ReapOutcome, SpawnRequest, UnsupportedKind,
     };
     use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use windows::core::PCWSTR;
     use windows::Win32::Foundation::{HLOCAL, PSID};
-    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSidToSidW, GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT,
+    };
     use windows::Win32::Security::{
         GetAce, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateSymbolicLinkW, FILE_ALL_ACCESS, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
@@ -1821,6 +1898,52 @@ mod tests {
         ))
     }
 
+    /// Give a fixture the exact owner its test claims it has. In particular,
+    /// an elevated GitHub runner's TokenOwner is Administrators, while the
+    /// fixture can represent a normal user's pre-created directory.
+    fn set_fixture_owner(path: &Path, owner: &str) -> Result<(), PlatformError> {
+        let (handle, _) = open_data_object(path)?;
+        let owner_wide: Vec<u16> = std::ffi::OsStr::new(owner)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut owner_sid = PSID::default();
+        // SAFETY: owner_wide is a NUL-terminated SID string and owner_sid is
+        // writable output storage for a LocalAlloc result.
+        #[allow(unsafe_code)]
+        let converted =
+            unsafe { ConvertStringSidToSidW(PCWSTR(owner_wide.as_ptr()), &mut owner_sid) };
+        if let Err(error) = converted {
+            close(handle);
+            return Err(super::io_error(error));
+        }
+        // SAFETY: handle is an open file or directory handle and owner_sid is
+        // live until SetSecurityInfo finishes below.
+        #[allow(unsafe_code)]
+        let result = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                owner_sid,
+                PSID::default(),
+                None,
+                None,
+            )
+        }
+        .ok()
+        .map_err(super::io_error);
+        // SAFETY: ConvertStringSidToSidW allocated owner_sid with LocalAlloc.
+        #[allow(unsafe_code)]
+        let _ = unsafe { windows::Win32::Foundation::LocalFree(HLOCAL(owner_sid.0.cast())) };
+        close(handle);
+        result
+    }
+
+    fn user_data_dir_policy(sid: String) -> DataDirPolicy {
+        data_dir_policy_for_token(sid.clone(), sid, false)
+    }
+
     #[test]
     fn process_capabilities_are_honest() {
         assert_eq!(
@@ -1882,11 +2005,135 @@ mod tests {
         Ok(())
     }
 
+    /// Fixture: give `path` an unprotected DACL that lets Everyone, Users and
+    /// Authenticated Users write, with inheritable ACEs (the opposite of what
+    /// the daemon leaves behind).
+    fn set_world_writable_dacl(path: &Path) -> Result<(), PlatformError> {
+        let (handle, _) = open_data_object(path)?;
+        let sddl: Vec<u16> =
+            std::ffi::OsStr::new("D:(A;OICI;FA;;;WD)(A;OICI;FA;;;BU)(A;OICI;FA;;;AU)")
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: NUL-terminated SDDL; Windows writes a LocalAlloc descriptor.
+        #[allow(unsafe_code)]
+        let converted = unsafe {
+            super::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl.as_ptr()),
+                super::SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+        };
+        if let Err(error) = converted {
+            close(handle);
+            return Err(super::io_error(error));
+        }
+        let mut present = windows::Win32::Foundation::BOOL(0);
+        let mut defaulted = windows::Win32::Foundation::BOOL(0);
+        let mut dacl: *mut super::ACL = std::ptr::null_mut();
+        // SAFETY: descriptor is live until LocalFree below; outputs writable.
+        #[allow(unsafe_code)]
+        let result = unsafe {
+            super::GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+        }
+        .map_err(super::io_error)
+        .and_then(|()| {
+            // SAFETY: `dacl` points into the live descriptor; handle is open.
+            #[allow(unsafe_code)]
+            unsafe {
+                SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    PSID::default(),
+                    PSID::default(),
+                    Some(dacl.cast_const()),
+                    None,
+                )
+            }
+            .ok()
+            .map_err(super::io_error)
+        });
+        // SAFETY: descriptor came from the SDDL conversion above.
+        #[allow(unsafe_code)]
+        let _ = unsafe { windows::Win32::Foundation::LocalFree(HLOCAL(descriptor.0.cast())) };
+        close(handle);
+        result
+    }
+
+    /// Review 15:07 (b): an elevated daemon given an Administrators-owned dir
+    /// whose DACL is world-writable (plus a world-writable file inside) must
+    /// not keep that DACL: it is replaced by the protected SYSTEM +
+    /// Administrators DACL, with no Everyone/Users/Authenticated Users ACE.
+    #[test]
+    fn elevated_admin_owned_dir_with_world_writable_dacl_is_corrected() -> Result<(), PlatformError>
+    {
+        let root = temp_dir("world-writable");
+        let data = root.join("data");
+        std::fs::create_dir_all(&data)?;
+        std::fs::write(data.join("state"), b"x")?;
+        if let Err(error) = set_fixture_owner(&data, ADMINISTRATORS_SID)
+            .and_then(|()| set_fixture_owner(&data.join("state"), ADMINISTRATORS_SID))
+        {
+            let _ = std::fs::remove_dir_all(&root);
+            eprintln!("skipped: cannot set an Administrators owner here ({error:?})");
+            return Ok(());
+        }
+        set_world_writable_dacl(&data)?;
+        set_world_writable_dacl(&data.join("state"))?;
+        let policy = data_dir_policy_for_token(
+            "S-1-5-21-10-20-30-1001".to_owned(),
+            ADMINISTRATORS_SID.to_owned(),
+            true,
+        );
+        let secured = secure_data_dir_with_policy(&data, &root.join("official"), policy);
+        let mut readbacks = Vec::new();
+        for path in [data.clone(), data.join("state")] {
+            let (handle, _) = open_data_object(&path)?;
+            readbacks.push(read_dacl(handle));
+            let Owner::Windows { sid: owner, .. } = current_token_owner()? else {
+                close(handle);
+                return Err(PlatformError::Invalid {
+                    capability: "secure_data_dir",
+                    detail: "current process is not a Windows account",
+                });
+            };
+            let _ = set_data_dir_dacl(handle, DataDirAcl::Owner(&owner));
+            close(handle);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        secured?;
+        for readback in readbacks {
+            let readback = readback?;
+            assert!(readback.protected, "inheritance must be disabled");
+            let mut sids: Vec<&str> = readback
+                .aces
+                .iter()
+                .map(|(sid, _, _)| sid.as_str())
+                .collect();
+            sids.sort_unstable();
+            assert_eq!(sids, vec![SYSTEM_SID, ADMINISTRATORS_SID], "{readback:?}");
+            for broad in ["S-1-1-0", "S-1-5-32-545", "S-1-5-11"] {
+                assert!(!sids.contains(&broad), "{broad} ACE survived");
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn machine_data_dir_refuses_a_precreated_normal_owner() -> Result<(), PlatformError> {
         let root = temp_dir("foreign-owner");
         let data = root.join("data");
         std::fs::create_dir_all(&data)?;
+        let Owner::Windows { sid, .. } = current_token_owner()? else {
+            return Err(PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "current process is not a Windows account",
+            });
+        };
+        set_fixture_owner(&data, &sid)?;
         let Err(error) =
             secure_data_dir_with_policy(&data, &root.join("official"), DataDirPolicy::Machine)
         else {
@@ -1906,44 +2153,71 @@ mod tests {
         Ok(())
     }
 
+    /// Review 15:07: a non-elevated token must never accept an
+    /// Administrators-owned directory, whatever its default owner says. Token
+    /// info is mocked, so this runs the same on an elevated CI runner.
+    #[test]
+    fn non_elevated_token_refuses_an_administrators_owned_dir() {
+        let user = "S-1-5-21-10-20-30-1001".to_owned();
+        for default_owner in [ADMINISTRATORS_SID.to_owned(), user.clone()] {
+            let policy = data_dir_policy_for_token(user.clone(), default_owner, false);
+            assert!(!policy.accepts_owner(ADMINISTRATORS_SID));
+            assert!(policy.accepts_owner(&user));
+        }
+        // Elevated with default owner Administrators: accepted (machine policy).
+        let elevated = data_dir_policy_for_token(user.clone(), ADMINISTRATORS_SID.to_owned(), true);
+        assert!(elevated.accepts_owner(ADMINISTRATORS_SID));
+        assert!(!elevated.accepts_owner(&user));
+    }
+
     #[test]
     fn data_dir_policy_matrix_uses_only_the_daemon_token() {
         let user = "S-1-5-21-10-20-30-1001".to_owned();
+        let default_owner = ADMINISTRATORS_SID.to_owned();
         let other = "S-1-5-21-10-20-30-1002";
         for (policy, official, owner, allowed) in [
-            // A normal token can only use a self-owned non-official dir.
+            // A normal token can use a non-official dir owned by its user SID
+            // and no other owner, even if its default owner is a group.
             (
-                data_dir_policy_for_token(user.clone(), false),
+                data_dir_policy_for_token(user.clone(), default_owner.clone(), false),
                 true,
                 user.as_str(),
                 false,
             ),
             (
-                data_dir_policy_for_token(user.clone(), false),
+                data_dir_policy_for_token(user.clone(), default_owner.clone(), false),
                 true,
                 SYSTEM_SID,
                 false,
             ),
             (
-                data_dir_policy_for_token(user.clone(), false),
+                data_dir_policy_for_token(user.clone(), default_owner.clone(), false),
                 true,
                 other,
                 false,
             ),
             (
-                data_dir_policy_for_token(user.clone(), false),
+                data_dir_policy_for_token(user.clone(), default_owner.clone(), false),
                 false,
                 user.as_str(),
                 true,
             ),
+            // Non-elevated token whose default owner is Administrators: an
+            // Administrators-owned dir is refused (review 15:07).
             (
-                data_dir_policy_for_token(user.clone(), false),
+                data_dir_policy_for_token(user.clone(), default_owner.clone(), false),
+                false,
+                default_owner.as_str(),
+                false,
+            ),
+            (
+                data_dir_policy_for_token(user.clone(), default_owner.clone(), false),
                 false,
                 SYSTEM_SID,
                 false,
             ),
             (
-                data_dir_policy_for_token(user.clone(), false),
+                data_dir_policy_for_token(user.clone(), default_owner.clone(), false),
                 false,
                 other,
                 false,
@@ -1951,37 +2225,37 @@ mod tests {
             // An elevated token cannot use either official or custom dirs
             // owned by the normal token.
             (
-                data_dir_policy_for_token(user.clone(), true),
+                data_dir_policy_for_token(user.clone(), default_owner.clone(), true),
                 true,
                 SYSTEM_SID,
                 true,
             ),
             (
-                data_dir_policy_for_token(user.clone(), true),
+                data_dir_policy_for_token(user.clone(), default_owner.clone(), true),
                 true,
                 ADMINISTRATORS_SID,
                 true,
             ),
             (
-                data_dir_policy_for_token(user.clone(), true),
+                data_dir_policy_for_token(user.clone(), default_owner.clone(), true),
                 true,
                 user.as_str(),
                 false,
             ),
             (
-                data_dir_policy_for_token(user.clone(), true),
+                data_dir_policy_for_token(user.clone(), default_owner.clone(), true),
                 false,
                 SYSTEM_SID,
                 true,
             ),
             (
-                data_dir_policy_for_token(user.clone(), true),
+                data_dir_policy_for_token(user.clone(), default_owner.clone(), true),
                 false,
                 ADMINISTRATORS_SID,
                 true,
             ),
             (
-                data_dir_policy_for_token(user.clone(), true),
+                data_dir_policy_for_token(user.clone(), default_owner.clone(), true),
                 false,
                 user.as_str(),
                 false,
@@ -2002,7 +2276,7 @@ mod tests {
                 detail: "current process is not a Windows account",
             });
         };
-        let Err(error) = secure_data_dir_with_policy(&root, &root, DataDirPolicy::Owner(sid))
+        let Err(error) = secure_data_dir_with_policy(&root, &root, user_data_dir_policy(sid))
         else {
             return Err(PlatformError::Invalid {
                 capability: "secure_data_dir",
@@ -2033,10 +2307,12 @@ mod tests {
                 detail: "current process is not a Windows account",
             });
         };
+        set_fixture_owner(&data, &sid)?;
+        set_fixture_owner(&secret, &sid)?;
         secure_data_dir_with_policy(
             &data,
             &root.join("official"),
-            DataDirPolicy::Owner(sid.clone()),
+            user_data_dir_policy(sid.clone()),
         )?;
         let (handle, is_directory) = open_data_object(&data)?;
         assert!(is_directory);
@@ -2084,7 +2360,8 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             return Err(super::io_error(windows::core::Error::from_win32()));
         }
-        let policy = DataDirPolicy::Owner(sid.clone());
+        set_fixture_owner(&data, &sid)?;
+        let policy = user_data_dir_policy(sid.clone());
         let final_error =
             secure_data_dir_with_policy(&link, &root.join("official"), policy.clone());
         let ancestor_error = secure_data_dir_with_policy(
@@ -2109,7 +2386,7 @@ mod tests {
             return Err(super::io_error(windows::core::Error::from_win32()));
         }
         let nested_error =
-            secure_data_dir_with_policy(&data, &root.join("official"), DataDirPolicy::Owner(sid));
+            secure_data_dir_with_policy(&data, &root.join("official"), user_data_dir_policy(sid));
         let _ = std::fs::remove_dir_all(&root);
         for error in [final_error, ancestor_error, nested_error] {
             assert!(matches!(

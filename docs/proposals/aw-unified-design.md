@@ -1,15 +1,26 @@
 # AgentWatch #147 统一设计：底层五类 + 对外五件事
 
 > 拟提交为 `docs/proposals/aw-unified-design.md`。作者 Coding-bot。第 2 版 2026-10-11 13:45（台北），按 review-bot 13:40 的打回意见（`/workspace/aw-unified-design-review.md`，挡-1～挡-4、拆活前要补 1～11、建议 1～5）、PM 13:04/13:13/13:23/13:24 的决定、UI审查+review 13:25 的决定改过。逐条对照见文末 **I 节**。
-> 代码基线：`origin/feat/cross-platform` = **185fc77**（含 4e6b68a / 95b49ff / 3d95803）。下文 file:line 按这个基线核对；标「本地」的是还没推的工作区；标「证明工作区」的是 `/workspace/aw-xplat-prove`（从 185fc77 新建，只做测量，不推）。
+> **第 3.1 版 2026-10-11 14:40（台北）**：#147 已合进 dev（f7ea22f），本文改为直接推到 `dev`。加了：A3 行 id 按表分三类、`replay_writes` 去留、seq 分配和迁移；Test-bot 对 6a11d6d 的回归项；A1 PATH 解析、附加组、终端前台、采集 crate 禁用清单；超时常量定为 12 秒；c21dcec 剩下的三处；在 dev tip 上的复测数字（H3）；E 节改成「每一步单独推到 dev」。
+> 代码基线：最早按 `origin/feat/cross-platform` = **185fc77**（含 4e6b68a / 95b49ff / 3d95803）核对；第 3.1 版新增内容按 **`origin/dev` = f7ea22f**（跟 feat/cross-platform 的 ef28f88 树完全相同）核对，标了「dev」的 file:line 是这一版的。下文其余 file:line 按 185fc77；标「本地」的是还没推的工作区；标「证明工作区」的是 `/workspace/aw-xplat-prove`（从 185fc77 新建，只做测量，不推）。
 > 依据：review-bot 各轮审查（`/workspace/aw147-*review*.md`、`aw-full-review.md`、`aw-unified-design-review.md`），Test-bot 复测（`/tmp/agentwatch-143/dblock-da57.txt`、`retest-2511990.txt`、`attach-timing-probe.txt`），UI审查 定稿（`/workspace/qa-issues/UI-147-wording.md`），PM 真机结果和 12:12–13:25 的决定。
 > 以后 #147 剩下的改动都按这份来做，不再一条一条补。每类都写了：根本原因（对着代码核过，两处「待证」已用数字证实，见 **H 节**）、三个系统统一的规矩、收进来的已报问题、用什么测试来验证、放进哪个提交。
 > **PM 13:24：#147 已定的事一条都不砍。** 下面每一条都在 E 节有提交号；没有提交号的只有明确标了「下一包」的。
 
-## 0. 各路现状（13:45）
+## 0. 各路现状（14:40，#147 已合进 dev f7ea22f）
 
 | 路 | 提交 / 工作区 | 状态 |
 |---|---|---|
+| winpipe A（回完话不再断开管道、按长度读） | 4e6b68a，已在 dev | review 有条件通过，看 dev 上的 Windows CI |
+| winpipe B（按管道属主核对服务端） | 93a6cfa，已在 dev | 等 review |
+| Linux 门控泄漏 | c21dcec，已在 dev（Linux 改走 `unix/hold.rs`，不再用 sh 门控） | 在 dev tip 上 48×300 零泄漏、40 路并发启动 400/400（H3）；剩下三处见 A1「c21dcec 剩下的」 |
+| DB 第二、三轮 + 附着修复 | da00935、6a11d6d、36abe45，已在 dev | 附着在 dev tip 上 57–148ms（H3）；行 id 换成（会话, 来源, seq）、Test-bot 回归项在第 5b 步 |
+| 文案（管道核对两句、wording-lint 禁「安全」） | 1efe176，已在 dev | 并进第 8b 步继续 |
+| Windows 第三轮 | 345d216，已在 dev | `--no-daemon` 的 Linux/Mac 看门进程是过渡做法（文末说明），第 4 步换掉 |
+| Mac 第二轮（95b49ff，review 打回） | 已在 dev | 改法并进 A1，第 4 步做 |
+| 统一设计 v2 / v3 | 0aff6cb、ef28f88（feat/cross-platform），本版直接推 dev | — |
+
+---|---|---|
 | winpipe A（回完话不再断开管道、按长度读） | 4e6b68a 已推 | review 有条件通过，过关条件是 185fc77 或之后的 Windows CI 绿 |
 | Mac 第二轮（fork 后在子进程里挂住） | 95b49ff 已推 | **review 打回**（`aw147-95b49ff-3d95803-review.md`：子进程里分配内存和 unsetenv、放行失败留僵尸、文档顺序写反、兄弟挂住进程继承写端、SIGPIPE 被继承）。改法并进 A1，第 4 步做 |
 | Windows 数据目录 ACL + 句柄 | 3d95803 已推 | **review 打回**（数据目录太严 → Mac/Win CI 整片红；子项和联接；检查到使用之间有空档）。放宽规则见 A4 规矩 6，第 0 步做 |
@@ -31,6 +42,11 @@
   1. **读端泄漏给同时启动的兄弟进程**：48 线程并发时 30.3% 的子程序手里拿着别人的门控读端。读端泄漏**不会**让 EOF 迟到（EOF 只看写端），它违反的是「子程序只拿白名单里的 fd」。
   2. **门控 fd 号 ≥ 10 时目标根本跑不起来**：门控脚本是 `/bin/sh -c 'read -r _ <&{fd} … exec {fd}<&-'`（418-420 行），Ubuntu 的 `/bin/sh` 是 dash，dash 只认一位数的 fd，`<&10` 报 `Bad fd number` 退 2，目标一行都没跑。并发时父进程里同时开着的管道多，fd 号很快过 10，所以 67.8% 的子程序是这样死的；单线程只要 fd 号 ≥ 10 也**必然**失败（`gated_spawn_works_when_the_gate_fd_number_is_ten_or_more` 修前稳定 Exited(2)）。后台本身常驻 fd 多，这一条在真后台里比在测试里更容易踩到。
   - `unix/hold.rs:130-133` 的 `PIPE_LOCK` 只保护 Mac 那条路，Linux 不用它。
+  - **c21dcec（已在 dev）已经修掉上面两条**：Linux 的 `spawn_gate`（dev `linux/mod.rs:296-304`）直接调 `crate::unix::hold::spawn`，不再有 sh 门控，所以证明工作区那份「dup2 到 3」的补丁**不再需要**，第 4 步也不再拿它。dev tip 上复测零泄漏（H3）。
+  - **c21dcec 剩下的三处**（都在第 4 步改）：
+    1. **没有用 `pipe2`**：dev `hold.rs:532-548` `pipe_cloexec` 还是先 `pipe()` 再两次 `fcntl`，中间别的线程 fork 会把管道带走。Linux 上改成 `pipe2(O_CLOEXEC)` 一步建好；Mac 没有 pipe2，照规矩 1 `pipe()` 后马上 FD_CLOEXEC，再由子进程的关 fd 循环兜住。
+    2. **附加组用的是连接方报的**：Linux 这边的组来自 `/proc/<pid>/status` 的 `Groups:`（dev `linux/mod.rs:107`、126-144 `peer_groups`，注释自己写着 best-effort），`hold.rs:99-108` 再拿它 `setgroups`。连接方在连上之后可以改自己的组（比如 `newgrp`），读 `/proc` 跟连接时刻也不是同一时刻。改成规矩 4：后台按用户 `getgrouplist` 重新算。
+    3. **子进程里还在分配内存**：dev `hold.rs:391`/409 `clear_preload`（`unsetenv`），508/510 两个 `collect()`。照规矩 3 改。
   - CI 上 `command_spawner_*` 偶发失败到底是哪条断言：**CI 日志还没拿到**，按上面两条推断是第 2 条（退 2），要 Test-bot 或 PM 贴一次失败日志确认（I 节列为未完成项）。
 - **Mac 挂住（95b49ff，review 打回）**：fork 后不再重新执行自己这一点修好了，但 `aw147-95b49ff-3d95803-review.md` 实测出：
   - 子进程里分配内存：`hold.rs:454-458` `exec()` 里 `collect()` 两个 Vec；`hold.rs:356-364` `clear_preload` 调 `unsetenv`（不在异步信号安全列表里，glibc/macOS 还要拿环境锁，多线程后台可能卡死）。`clear_preload` 本身也没用：execve 传的是另外准备好的环境。
@@ -57,20 +73,26 @@
 2. **只有一个启动函数 + 禁用 Command（PM 13:23）**：后台和 aw-platform 里起程序一律走 `aw_platform` 的同一个启动函数，它在「建管道 → fork 返回」期间拿一把全局启动锁（`SPAWN_LOCK`，取代只管 Mac 的 `PIPE_LOCK`）。`aw-daemon/clippy.toml` 和 `aw-platform` 加 `disallowed_methods`：`std::process::Command::new`、`libc::fork`、`libc::posix_spawn*`、`nix::unistd::fork`，只有启动模块本身 `#[allow]`。锁是第二道防线，第一道是规矩 1 的子进程关 fd。
    - **明确不覆盖的**（review 会查，这里写死）：
      - **第三方 crate 自己起进程或 fork**（依赖里的 `Command`、`libc::fork`、`system()`）：clippy 只查我们自己的代码，管不到依赖。缓解：我们的 fd 一律 CLOEXEC，所以依赖起的程序拿不到门控管道；依赖自己开的 fd 如果没设 CLOEXEC，会被我们起的子程序继承——这一条由规矩 1 的子进程关 fd 兜住，不靠锁。依赖起的程序的生死不归启动契约管。`cargo deny`/审查清单里列出现在依赖树里会起进程的 crate（第 4 步提交时附清单）。
+     - **采集 crate 里直接起系统命令**（dev 上现有四处）：`aw-collector-macos/src/privilege.rs:17` 调 `/usr/bin/id`，`aw-collector-windows/src/privilege.rs:48` 调 `whoami`，`aw-collector-poll/src/host.rs:202` 调 `netstat`，`aw-collector-macos/src/sni.rs:304` 调 `tcpdump`。这些在后台进程里跑，会在启动锁之外 fork。**决定**：采集 crate 也加进 `disallowed_methods`；`id`、`whoami`、`netstat` 三处改成直接调系统接口（`getgroups`/`getgrouplist`、`GetTokenInformation`、读 `/proc/net/*` 或 `sysctl`/`GetExtendedTcpTable`），不再起进程；`tcpdump` 是 Mac 抓 SNI 的唯一办法，改成走统一启动函数（拿启动锁、只给白名单 fd），在源码里 `#[allow]` 并写明原因。`host.rs:373`/409 是测试里重新运行测试二进制，放在 `#[cfg(test)]` 里允许。
+     - **依赖里会起进程的代码要扫出来**：clippy 只查我们自己的源码，所以 CI 加一个 `xtask spawn-audit`：对 `cargo vendor` 出来的依赖源码搜 `Command::new`、`fork(`、`posix_spawn`、`system(`、`CreateProcess`，结果跟仓库里的白名单文件 `docs/spawning-deps.txt` 比，多出来就红。另外检查依赖树里的 tokio 没有打开 `process` feature（`cargo tree -e features -i tokio` 里不能出现 `process`；dev 根 `Cargo.toml:60` 现在是 `rt-multi-thread, net, time, macros`，没有），这样 `tokio::process::Command` 进不来。
      - **aw-cli 和桌面 App 自己的进程**：ban 只在 `aw-daemon` 和 `aw-platform`。aw-cli 里 `--no-daemon` / `aw run` 起目标程序那条路**要改走同一个启动函数**（第 4 步），但 aw-cli 其他自己起的进程（如 `daemon install` 调系统服务管理器、打开浏览器）、桌面 App（Tauri）起后台或子窗口，都不在 ban 和启动锁的范围里，也不走门控。
      - **别的进程里的 fork**：锁只在后台/aw 进程内有效，管不到别的进程。
      - **不是我们起的程序**：`attach --pid` 附着的现有进程、它的子孙，启动契约一概不管（它们本来就不是我们起的）。
      - Windows 上依赖用 `CreateProcess` 且 `bInheritHandles=TRUE` 起程序时，会继承我们所有可继承句柄——所以规矩 1 要求我们自己的句柄一律不可继承，只在 HANDLE_LIST 里临时给子进程。
 3. **fork 和 exec 之间只做异步信号安全的事**：
-   - argv/envp 的指针数组（NULL 结尾）在父进程里准备好，子进程只读，不再 `collect()`；删掉 `clear_preload`；删掉假测试 `caller_preload_is_absent_before_exec`，换成「请求 env 只给 `AW_RV=1`，目标跑 `/usr/bin/env`，输出**正好**一行」。
+   - argv/envp 的指针数组（NULL 结尾）在父进程里准备好，子进程只读，不再 `collect()`；删掉 `clear_preload`；删掉假测试 `caller_preload_is_absent_before_exec`，换成比对**完整集合**的环境测试（见文末「启动程序时的环境变量」）：目标跑 `/usr/bin/env`，后台起的程序输出正好是 HOME、USER、LOGNAME、SHELL、PATH 加请求给的那几项；`aw run` 默认模式和 `--no-daemon` 输出跟 aw 自己的环境（加请求项）完全一样。原来两条「请求只给 `AW_RV=1`，输出正好一行」的老测试是按「环境从零开始、什么都不给」写的，跟 PM 13:44–13:47 的决定冲突，**改成上面这两条**，不再断言只有一行。
    - 子进程里只允许：close/close_range、dup2、fcntl、setpgid、setsid、setgroups、setgid、setuid、get*id、chdir、sigaction、sigprocmask、read、write、execve、_exit、prctl（Linux）。
    - execve 之前把 1..NSIG-1 的信号处理全部 `sigaction` 成 SIG_DFL，`sigprocmask(SIG_SETMASK, 空集)`，目标的 SigIgn / SigBlk 都是 0（修 SIGPIPE 继承，Linux/Mac 一致）。
    - **报错管道**：再建一根 CLOEXEC 的报错管道，子进程哪一步失败（建管道、切身份、自检、chdir、execve）就写「步骤 + errno」再 `_exit`；父进程放行后读到 EOF = exec 成功，读到数据 = 失败原因。121-127 这些码只进日志，不再冒充程序退出码。
    - release 写失败时 pid 不丢：当场 `waitpid`，再按报错管道的内容返回带步骤的错误（「找不到工作目录「路径」」等，A5 表）。
 4. **切身份**：顺序 fork → setgroups → setgid → setuid → 自检 → chdir → 堵在门控上等放行 → execve。文档三处按这个顺序改。
-   - **附加组一律由后台按用户重新加载**：Linux 和 Mac 都用 `launch_as::login_groups`（`getgrouplist`）在**父进程里**算好传进去，**不用连接方报上来的组**（Linux SO_PEERCRED 本来就拿不到附加组，Mac 永远是 None）。Mac `setgroups` 最多 16 个（NGROUPS_MAX）：超出时截断到前 16 个、写日志、doctor 里提示（少给组只会少权限，不会多权限）——**这一条请 PM 确认，另一种选择是拒绝并报中文**。
+   - **附加组一律由后台按用户重新加载**：Linux 和 Mac 都用 `launch_as::login_groups`（`getgrouplist`）在**父进程里**算好传进去，**不用连接方报上来的组**（Linux SO_PEERCRED 本来就拿不到附加组，Mac 永远是 None）。**Mac 照 initgroups 的语义加载**（PM 13:47 已定，不截断也不拒绝）：组列表在 fork 之前用 `getgrouplist` 解析（缓冲区不够就加大重试），子进程里只做系统调用，不做任何查询；macOS 上用带 gmuid 的 `initgroups` 系统调用开启动态成员解析，或者用准备好的列表 `setgroups`。系统仍然只给一部分时记日志、doctor 如实显示。细节见文末「Mac 附加组超过 16 个」。Linux 同样按 `getgrouplist`，不用 `/proc/<pid>/status` 的 `Groups:`（c21dcec 剩下的第 2 处）。
    - 自检：`getuid/geteuid/getgid/getegid` 都对，`setgid(0)` 和 `setuid(0)` 都必须失败，不对就按「切身份失败」退出。
-   - 后台起程序时，程序名在父进程里按调用方的 PATH 解析成绝对路径，找不到回 400 `program_not_found`（不再静默 127）。
+   - **程序名怎么找（PATH）**：execve 不查 PATH，`execvp` 又不是异步信号安全的，所以分两半做：
+     - **父进程只拼候选列表，不碰文件系统**：程序名里带 `/` 就只有它自己一个候选；不带 `/` 就把目标会看到的 PATH（后台起的程序是请求给的 PATH，没给就是固定的 `DEFAULT_PATH`，dev `launch_as.rs:54-55`；aw 自己起的是 aw 的 PATH）按 `:` 拆开，每一项拼上程序名，做成一个 C 字符串数组在 fork 之前备好。空项按当前目录处理（跟 shell 一致），相对目录项照样拼。
+     - **子进程在切完身份之后挨个 `execve`**：返回 ENOENT/ENOTDIR 就试下一个；EACCES 记下来接着试；全都失败时，报错管道写「找不到程序」（全是 ENOENT/ENOTDIR）或「没有权限」（碰到过 EACCES），父进程回 400，码用 `daemon_errors.rs` 里已有的 `program_not_found` / `program_not_permitted`（码名不改，不再静默 127）。`program_not_permitted` 现在的中文「没有权限运行这个程序或进入工作目录」跟 `program_not_found` 一样把程序和工作目录混在一句里，要拆成程序、工作目录两句；**wording 文件里还没有这两句，请 UI审查 定**（I 节未完成项）。
+     - **root 后台从不以 root 身份去看调用方的目录**：不 `stat`、不 `access`、不 `canonicalize`。现在 dev `hold.rs:201-224` `resolve_program` 在父进程里（root 身份）按 PATH 找文件，会让 root 替调用方去看它自己看不了的目录（能用来探测别人目录里有没有某个文件），也会在「找的时候」和「exec 的时候」之间被换掉。改掉后所有判断都在目标用户身份下由内核做。
+     - 测试（root CI）：PATH 里第一项是只有 root 能进的目录（`0700 root`），里面放一个同名程序，第二项是用户自己的目录 → 跑的是第二项那个；PATH 里只有那个 root 目录 → 报「找不到程序」，不是跑了 root 那个；程序名带 `/` 指到只有 root 能读的文件 → 报 `program_not_permitted`。
 5. **挂住期间**：创建方（aw 或后台）一死，子程序必须退出，而且目标程序一行都没跑过。Unix 靠门控管道读到 EOF 后 `_exit`（规矩 1 保证没有别人拿着写端，所以 EOF 不会被拖），Windows 靠 Job 的 `KILL_ON_JOB_CLOSE`。
 6. **放行以后谁来收尾**——**只有起程序的是 aw 时（`aw run` 默认模式和 `--no-daemon`），才把程序跟 aw 绑在一起；起程序的是后台时一律不绑**，后台崩了程序照样跑，会话标成「记录已中断（后台重启）」。
    - 绑定由一个**看门进程**来做，不指望 aw 自己（aw 被 SIGKILL 后一行代码都跑不了）：
@@ -94,10 +116,11 @@
    - PDEATHSIG 的三个坑写进实现注释并各有测试：setuid 会清掉它，所以要在切完身份**之后**再设；设完马上查 `getppid()` 是否已经变了（父进程可能先死）；它跟的是**发起 fork 的那个线程**，fork 看门进程要在活得跟 aw 一样长的线程（主线程）里做。
    - 信号：默认模式下 aw 收到的 SIGINT、SIGTERM、SIGHUP 原样转发给程序的进程组，跟 `--no-daemon` 一样（Linux 经看门进程转发，见上）；aw 的退出码 = 128+信号号（SIGINT → 130）。`ProcessGroupForwarder` 每 10ms 醒一次（`run.rs:1049`）改成阻塞等信号。
    - 能保证的范围：**Linux（有没有 cgroup v2 都一样，靠看门进程当 subreaper）和 Windows（Job）都保证程序和它的所有子孙**跟着结束，包括自己 `setsid`/`setpgid` 出去的、中间那一层先退出留下来的；例外只有两种：子孙换成了别的用户（`sudo` 一类），记日志并如实报「还有 N 个子程序没能结束」。**Mac 是唯一的例外**：只保证直接子程序和留在同一进程组里的孙程序，脱离进程组的孙程序不保证——这是唯一一处「这个系统不支持」。
-7. **终端前台**（`--no-daemon` 和 Mac `aw run` 两种模式都要覆盖）：
+7. **终端前台**（Linux 和 Mac 的 `aw run` 默认模式、`--no-daemon` 都要覆盖。Linux 默认模式也一样：c21dcec 以后 Linux 默认模式走 `hold.rs`，程序同样在自己的进程组里，`launch/unix_linux.rs:756` 的 `process_group(0)` 也是，所以 Linux 默认模式同样会卡在 SIGTTIN，不能只修 Mac）：
    - 在终端里时，子程序进程组用 `tcsetpgrp` 设成前台；aw 调 `tcsetpgrp` 前后**挡住 SIGTTOU**（否则 aw 自己在后台组时会被停住）。
    - aw 用 `waitpid(…, WUNTRACED)` 看到子程序被 Ctrl+Z 停住时：把终端前台拿回给自己原来的组，再给自己发 SIGTSTP 停下；`fg` 后（SIGCONT）把前台再交给子程序组并 `killpg(SIGCONT)`，不卡住。
    - 正常结束、aw 因信号退出、**aw panic**（panic hook 里）都把前台还给原来的组。
+   - **aw 被 SIGKILL 或直接崩掉时，由看门进程还前台**：aw 起程序时把「原来的前台组号」和终端 fd 交给看门进程（Linux 是规矩 6 的 subreaper 看门进程，Mac 是 kqueue 看门进程；两者在终端里时都跟 aw 同一个会话，所以有权 `tcsetpgrp`）。看门进程发现 aw 死了以后，**先**检查终端前台是不是还是程序的组，是的话挡住 SIGTTOU、`tcsetpgrp(终端, 原来的前台组)`，**再**跑清理循环。原来的组已经不存在时（比如 shell 也没了）就不还，只做清理。测试：pty 里起 `sh -c 'read x'`，SIGKILL aw，pty 的前台组变回 shell 的组，shell 能接着读输入。
    - 不在终端里时保持单独的进程组，不调 tcsetpgrp。
 8. **出错怎么报**：每一步各有自己的错误码，从报错管道回传，用户看到的是 A5 表里的中文。
 9. **等待一律有上限**（Windows 973 行改掉）。超时是出错，用定稿的两句超时错误报，不用「不可得」：等程序结束超时报「等了 {N} 秒，程序还没结束」；等后台回复超时报「后台 {N} 秒没有回应，这次请求没有完成。」（码 `daemon_timeout`，见 B1 码表）。
@@ -109,7 +132,9 @@
 - **fd 号 ≥ 10 的门控**：`gated_spawn_works_when_the_gate_fd_number_is_ten_or_more`；
 - **挂住阶段**的 `/proc/<pid>/fd` 也只有白名单；A、B 同时挂着时只中止 A，A 在 100ms 内退出；
 - 挂住时杀掉创建方，目标程序没执行过；
-- 目标的 SigIgn、SigBlk 都是 0；目标环境正好只有请求给的那几项；
+- 目标的 SigIgn、SigBlk 都是 0；目标环境跟规矩 3 那两条完整集合一模一样（后台起的、aw 起的各一条，取代原来「正好一行」的两条老测试）；
+- PATH：规矩 4 那三条 root CI 测试；附加组：用户属于 20 个组时，Mac 上目标看到的组跟 `id -G <用户>` 一样（Mac CI 用 `dscl` 建测试用户），Linux 上跟 `getgrouplist` 一样、不跟连接方在连上后 `newgrp` 改出来的组；
+- **40 路并发启动零失败（验收项）**：临时 root 后台上 40 个 `aw run -- sh -c 'exit 3'` 同时起、连跑 10 轮，400 次全部退 3，没有一次失败或卡住；dev tip 上已测 400/400（H3），脚本 `/workspace/aw-prove-out/run40.sh` 进 `scripts/perf/`；
 - cwd 不存在：release 返回「工作目录」类错误，`/proc/<pid>` 不是 Z；
 - 切身份自检：egid 不对、`setgid(0)` 成功都会退出（root CI 跑）；附加组等于 `getgrouplist` 的结果而不是连接方报的；
 - **aw 起的程序**：放行后用 SIGHUP / SIGTERM / SIGKILL 杀 aw，直接子程序和**同一进程组里**的孙程序 2 秒内都没了（三个系统都断言）；Linux 和 Windows 上**自己 setsid 出去的孙程序也没了**（Linux 不依赖 cgroup）；Mac 只断言同组的；
@@ -152,6 +177,12 @@
 | `--no-daemon` 帮助（Linux/Windows 统一句，Mac 单独一句） | UI审查+review 13:25 / 13:51 | 没改 | 第 4 步（帮助快照在第 8b 步） |
 | `.cmd` 找不到 / 转义 | PM 真机 | 没修 | 第 6 步 |
 | 缺「信号杀掉」「SIGINT」测试、Mac 转发测试 | review | 没写 | 第 4 步 |
+| c21dcec 剩下的：没用 pipe2、附加组用连接方报的、子进程里分配 | review（c21dcec） | 没修 | 第 4 步 |
+| root 后台以 root 身份按调用方 PATH 找程序（`resolve_program`） | review | 设计已定（规矩 4） | 第 4 步 |
+| 采集 crate 直接起 `id`/`whoami`/`netstat`/`tcpdump`；依赖起进程没人查；tokio process feature | review | 设计已定（规矩 2） | 第 4 步 |
+| Linux 默认模式也会卡终端；aw 被杀后没人还前台 | review | 设计已定（规矩 7） | 第 4 步 |
+| 两条「环境正好一行」老测试跟环境决定冲突 | review | 设计已定（规矩 3） | 第 4 步 |
+| 40 路并发启动零失败 | PM | dev tip 400/400（H3） | 第 4 步（进 CI 的缩小版：10 路 × 5 轮） |
 
 ## A2. 一问一答：一次请求从开始到结束
 
@@ -172,7 +203,7 @@
 
 **统一规矩**（写进接口文档「请求生命周期」一节，**跟第 5 步同一个提交或更早**，见 E 节第 −1 步）：
 1. **按长度读完就算结束**。读到 EOF 但长度不够算出错（`DialError::Broken`）；回复上限 16 MiB；三个系统都有总超时。
-2. **超时一张表**：客户端超时 = 后台最长处理时间 + 余量。`BUSY_TIMEOUT` 8 秒 + 2 秒余量，客户端统一 15 秒，写成 `aw-core` 里的常量，两头都引用它。
+2. **超时一张表**：客户端超时 = 后台最长处理时间 + 余量。**定为 12 秒**（跟 6a11d6d 已经推的代码一致，dev `aw-cli/src/client.rs:346` 现在是写死的 `Duration::from_secs(12)`；原来这里写的 15 秒作废）：规矩 6 以后一个请求最多只等一次库锁，`BUSY_TIMEOUT` 8 秒 + 4 秒余量够用。写成 `aw-core` 里的常量 `aw_core::timeouts::{BUSY_TIMEOUT, CLIENT_REQUEST_TIMEOUT}`（后者 = 前者 + 4 秒），`aw-store/src/connection.rs`、`aw-cli/src/client.rs`、App 的 IPC 客户端都引用它，不再各写一个数；超时那句里的 {N} 也从这个常量取。第 5b 步改。
 3. **对面断了就撤回**：建会话、附着这类会写库的请求，回复写不回去时后台把刚建的会话撤掉或收尾成「附着失败」（`end_reason=attach_failed`），日志记英文原因。
 4. **只有「取名字」放到回复之后**：没给名字时的 `attach_target_name_for_pid`（`watch_routes.rs:296-297` 扫整机进程表，314 行调用）挪到回复之后，扫完之前会话显示「正在读取进程…」。**`check_pid_owner`（`watch_routes.rs:164-176`，按 pid 读身份、核对主人）必须照旧在回复之前同步做完，不能一起挪走**（D1）。这条只是顺手优化，不是附着慢的根因。
 5. **后台负责计时**：`--duration` 作为请求字段交给后台，到点由后台收尾。
@@ -215,9 +246,17 @@
 - **FTS 写入不能安全重写**：`fts::upsert`（`fts.rs:103-123`）先按 UNINDEXED 的 `src_id` DELETE 再 INSERT，既慢（全表扫描，H2）又让「同一批写两遍」依赖一次全表扫描。改法见 A2 规矩 7（新行直接 INSERT、改/删按 rowid）。
 
 **统一规矩**：
-1. **行 id =（会话 id, 采集来源, seq）**（PM 13:44 定，取代按内容哈希的做法）：每个采集来源在**产生事件时**（进批之前）给每一行分配单调递增的 seq，所以整批重写时带的是同一批 seq；后台重启或会话恢复时，每个（会话, 来源）的计数从库里的 `MAX(seq)` 接着往下数，绝不复用。表上建 `UNIQUE(session_id, source, seq)`，写入用 `ON CONFLICT DO NOTHING`。内容完全相同的两个事件仍然是两行。已有的行由迁移按 rowid 顺序补 seq。da00935（DB 第二轮）里的按内容哈希 id（`replay.rs`，64 位 FNV）是过渡做法，由下一轮 DB 换掉。
-   - 测试：内容相同的两个事件写成两行；分块写到一半失败后重写整批，没有重复；重启后 seq 接着数，不撞号。
-   - FTS 搜索行跟着主表走：主表这一行真插进去了才写搜索行（36abe45）；改名、retention、删会话时按 rowid 删搜索行（映射表 + 迁移，下一轮 DB，仍在 #147）。
+1. **行 id =（会话 id, 采集来源, seq）**（PM 13:44 定，取代按内容哈希的做法），但**按表分三类**，不是每张表都一样处理（第 5b 步）：
+   - **事件表（只追加）**：`process_images`、`dns`、`gaps`、HTTP 行。主键 =（`session_id`, `source`, `seq`），`UNIQUE` 约束 + `ON CONFLICT DO NOTHING`。整批重写时带的是同一批 seq，所以不会重复；内容完全相同的两个事件 seq 不同，照样是两行。
+   - **实体表（同一个东西会被反复更新）**：`sessions`（`id`）、`processes`（`session_id, proc_uid`）、`net_flows`（`id`）。主键还是现在的自然键，不改成 seq；每一行多一列 `last_seq`（最后一次更新它的那一行事件的 seq）。写入用 `ON CONFLICT DO UPDATE … WHERE excluded.last_seq > 表.last_seq`，更新时每一列要么用新值覆盖、要么 `COALESCE` 保留第一次的值，**不准 `+=`**。这样同一批写两遍结果一样，旧批晚到也盖不掉新值。
+   - **累计表**：`net_flow_buckets`（`flow_id, bucket_ns`）。现在 dev `sink.rs:851-856` 是 `bytes_up = 表.bytes_up + excluded.bytes_up`，同一批写两遍就加两遍，这正是 `replay_writes` 要挡的。改成：**采集端在内存里记每个（流, 时间桶）到目前为止的总数，每次写当前总数**，库里 `DO UPDATE SET bytes_* = excluded.bytes_* WHERE excluded.last_seq > 表.last_seq`，只覆盖不累加。
+   - **来源（source）**：一个会话里每个采集器实例一个固定名字（`poll`、`ebpf`、`etw`、`kqueue`、`sni`，后台自己写的会话行和缺口行用 `daemon`）。同一个会话里同一种采集器只会有一个；以后真有两个，名字带序号（`poll#2`）。
+   - **seq 怎么分**：每个（会话, 来源）一个计数器，采集器在**产生事件时**（进批之前）取号，所以整批重写时号不变。计数器的下一个值存在新表 `seq_next(session_id, source, next)`，**跟这一批数据在同一个事务里**更新成「这批最大的 seq + 1」。后台重启或会话恢复时从 `seq_next` 接着数。崩溃前取了号、还没提交的那几个号会被重新用掉，但那些号在库里本来就没有行，不会撞。
+   - **跟现有 `process_images.seq` 撞名**：这一列现在的意思是「同一个进程第几次 exec」（dev `sink.rs:713` 的 `UNIQUE(session_id, proc_uid, seq)`），跟行 id 的 seq 不是一回事。**迁移里改名为 `exec_seq`**（`ALTER TABLE … RENAME COLUMN`，SQLite 3.25 起支持），查询、导出、API 的 JSON 字段同步改成 `exec_seq`；API 里旧名 `seq` 再保留一个版本当别名，在接口文档里标「将删除」。行 id 那一列在所有事件表里统一叫 `seq`。
+   - **迁移（0012）**：事件表加 `source TEXT NOT NULL DEFAULT 'legacy'`、`seq INTEGER`，按 `ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY 时间列, rowid)` 补 seq，再建 `UNIQUE(session_id, source, seq)`；实体表和累计表加 `last_seq INTEGER NOT NULL DEFAULT 0`；按现有数据填好 `seq_next`。老会话的来源一律 `legacy`，新事件不会再用这个名字。迁移在一个事务里做完，中途失败整个回滚，库保持老样子（老版本照样能打开）。
+   - **`replay_writes` 去掉**（da00935 / 迁移 0011 加的按内容哈希的「已写过」表，dev `replay.rs`）：上面三类规矩各自保证重写不重复以后，它就多余了，而且它本身有毛病：内容相同的两个正常事件会被当成重复丢掉（跟「相同事件写成两行」冲突），每写一行多写一行，表只涨不缩（retention 还得专门清它），64 位 FNV 有碰撞的可能。0012 在新键建好以后 `DROP TABLE replay_writes`，删掉 `replay.rs` 和 `sink.rs` 里的 `replay::claim` 调用。
+   - 测试：内容相同的两个事件写成两行；分块写到一半失败后重写整批，三类表都没有重复、没有缺；同一批流量桶写两遍，字节数不翻倍；旧批晚于新批到达，实体表和桶的值不倒退；重启后 seq 从 `seq_next` 接着数，不撞号；拿一份 0011 的库迁到 0012，行数不变、`exec_seq` 等于原来的 `seq`、`replay_writes` 没了；迁移中途注入失败，库还是 0011 的样子。
+   - FTS 搜索行跟着主表走：主表这一行真插进去了才写搜索行（36abe45）；改名、retention、删会话时按 rowid 删搜索行（映射表 + 迁移，第 5b 步）。
 2. **会话只由后台收尾**：结束写失败要记 error 并重试，下次启动时把留下的「录制中」统一标成「记录已中断（后台重启）」。
 3. 旧库：只读打开比自己新的库（`db_read_only_newer`）；不是 WAL 的旧库先尝试转换，失败给中文提示；`db_busy` 按实际等待秒数映射。
 
@@ -225,7 +264,15 @@
 - 分块写到第 2 块时注入失败，再重放整批，按 id 和按内容都没有重复，也没有缺；
 - `end()` 注入写失败，重启后会话标成「记录已中断」；
 - Test-bot 的 `dbintegrity.py` 压力脚本跑通，`adopt_timeout` 比例 < 5%；
-- `retention::age_then_size_keeps_pinned_and_active` 变绿（这是 8fff164 现在挡着推送的那一条）。
+- `retention::age_then_size_keeps_pinned_and_active` 变绿（6a11d6d 已修）。
+- **Test-bot 对 6a11d6d 的回归项**（都进第 5b 步，每条一个测试）：
+  1. **读不拿写锁**：列表、show、timeline、stats、导出只开读事务（`BEGIN DEFERRED`，不 `BEGIN IMMEDIATE`），有一个采样写事务占着写锁时，读请求照样 ≤ 0.3 秒返回；
+  2. **小批写不排在大事务后面**：一次只写几行的（会话行、结束状态、缺口）不跟采样大批共用一个事务，单个采样写事务时长 ≤ 1 秒（超过记 warn）；
+  3. **`Watches::end` 写失败要重试**：注入一次 busy，结束状态最终写进去了，不是吞掉；重试用尽时记 error，下次启动标「记录已中断（后台重启）」；
+  4. **busy 报的秒数是真等了多久**：`db_busy` 里的 {N} 取 `waited_seconds`（实际等待），不是写死的 8；
+  5. **只读打开新版库那句中文**：库比程序新时只读打开，CLI 和 App 显示 wording 文件里那一句（B1 码表的 `db_read_only_newer`），断言原文；
+  6. **到时结束、出错结束的原因用中文**：`--duration` 到点结束显示「到时间了，已停止记录」类的定稿句，出错结束显示对应的错误句，不露 `duration`、`error` 这种英文原因码（以 wording 文件为准）；
+  7. **`--duration` 从会话建好那一刻开始计**：不是从命令行发请求时、也不是从第一次采样时；测试：`attach --duration 2s`，`ended_at - created_at` 在 2±0.3 秒以内。
 
 | 问题 | 来源 | 状态 | 进哪个提交 |
 |---|---|---|---|
@@ -238,6 +285,10 @@
 | PATCH 回复 pinned=null 时显示「没采」 | Test-bot B | 老问题 | DB 轮（PATCH 回复带上真实的 pinned 值） |
 | FTS 写入每行全表扫描 DELETE（附着慢的根因） | Test-bot / review 挡-1 / H2 | **已证实**，证明工作区验证了一半修法 | 第 5 步 |
 | `database_busy_tests::lock_past_busy_timeout…` Mac 失败（watch_routes.rs:932） | review（95b49ff CI） | 没修 | 第 5 步 |
+| 行 id 只说了「会话, 来源, seq」，没分实体表 / 累计表；桶 `+=` 不能重写；`process_images.seq` 撞名；没有迁移方案 | review | 设计已定（规矩 1） | 第 5b 步 |
+| `replay_writes` 留不留 | review | 定了：去掉 | 第 5b 步 |
+| Test-bot 6a11d6d 回归 7 条 | Test-bot | 设计已定（上面测试 1–7） | 第 5b 步 |
+| 客户端超时 12 秒（代码）跟 15 秒（文档）不一致 | review | 定为 12 秒，进 aw-core 常量 | 第 5b 步 |
 
 ## A4. 安全和权限：先确认对方是谁，再给权限
 
@@ -567,23 +618,26 @@
 
 # 第五部分 E. #147 提交计划（顺序、每一步 CI 都是绿的）
 
-先说清楚现状：**185fc77 这一版 CI 还没全绿**。Mac 一整片红（`ensure_data_dir_creates_a_temp_tree`、`secure_data_dir_*`、`e2e_macos::daemon_samples_long_running_program`、`second_instance_*` 等，报错全是「data directory path contains a symlink」，根子在 3d95803 的数据目录检查太严），另有 `database_busy_tests::lock_past_busy_timeout…`（`watch_routes.rs:932`）属 DB 那一路。所以第 0 步先让 tip 变绿。后面每个提交都要求三系统 `cargo test --workspace --no-fail-fast` + clippy（Linux/Win/Mac）+ desktop 全绿才推；第 8b 步之前推前本地跑 `cargo xtask wording-lint` 只允许违例数比基线少，**第 8b 步起由 CI 卡**。
+**#147 已经合进 dev（f7ea22f），下面每一步都单独推到 `dev`，不再攒成一个 PR**：每一步先 rebase 到最新的 `origin/dev`，本地三系统能跑的都跑过、CI 绿了才算这一步完成，**绝不 force push**；某一步推上去以后 CI 红了，下一次推的就是修它的提交，不回滚别人的提交。表里「已推」的是已经在 dev 上的提交。
 
-**PM 13:24：已定进 #147 的一条不砍。** 下表每一行都要做完 #147 才算完。
+当时的现状：**185fc77 这一版 CI 还没全绿**。Mac 一整片红（`ensure_data_dir_creates_a_temp_tree`、`secure_data_dir_*`、`e2e_macos::daemon_samples_long_running_program`、`second_instance_*` 等，报错全是「data directory path contains a symlink」，根子在 3d95803 的数据目录检查太严），另有 `database_busy_tests::lock_past_busy_timeout…`（`watch_routes.rs:932`）属 DB 那一路。所以第 0 步先让 tip 变绿。后面每个提交都要求三系统 `cargo test --workspace --no-fail-fast` + clippy（Linux/Win/Mac）+ desktop 全绿才推；第 8b 步之前推前本地跑 `cargo xtask wording-lint` 只允许违例数比基线少，**第 8b 步起由 CI 卡**。
+
+**PM 13:24：已定进 #147 的一条不砍。** 下表每一行都要做完，#147 的事才算完（#147 本身已合，剩下的都按下表一条一条推到 dev）。
 
 | # | 提交（路） | 内容 | 为什么这时 CI 能绿 | 用什么验证 |
 |---|---|---|---|---|
-| −1 | **文档先行**（只改文档，单独推） | architecture.md 按实际重写（内部通道 + 手写路由、crate 表补 aw-platform/aw-channel、「谁启动程序」改对）；ADR-0005 标「部分被取代」；接口文档加「启动契约」（A1 规矩）、「请求生命周期」（A2 规矩）两节；Mac 三处顺序写反的改掉（`macos.md:128`、`api-and-cli.md:186`，`launch_as.rs:423-428` 注释在第 4 步一起改） | 只改文档，CI 不受影响；规矩先落文档，后面的代码对着它写（review 要补 8） | crate 表跟 `cargo metadata` 对照脚本 |
+| −1 | **文档先行**（只改文档，单独推；本文 0aff6cb / ef28f88 / 本版） | architecture.md 按实际重写（内部通道 + 手写路由、crate 表补 aw-platform/aw-channel、「谁启动程序」改对）；ADR-0005 标「部分被取代」；接口文档加「启动契约」（A1 规矩）、「请求生命周期」（A2 规矩）两节；Mac 三处顺序写反的改掉（`macos.md:128`、`api-and-cli.md:186`，`launch_as.rs:423-428` 注释在第 4 步一起改） | 只改文档，CI 不受影响；规矩先落文档，后面的代码对着它写（review 要补 8） | crate 表跟 `cargo metadata` 对照脚本 |
 | 0 | **tip 变绿**：Mac 收尾 + 数据目录放宽（aw-xplat-macfix / aw-xplat-win） | A4 规矩 6 的 Unix 部分和规则判断（是不是管理员只看自己令牌、正式目录规范化后比、非管理员不碰正式目录、上级目录检查、系统链接放行、子项检查）；Windows 用 `SHGetKnownFolderPath`、建前拒绝；DACL 测试预期改对；数据目录报错中文按 wording 文件 | 修的就是现在红的那一片 | Mac/Win/Linux CI 全绿；A4 的数据目录矩阵（Windows 句柄化部分在第 6 步补完） |
 | 1 | winpipe A 的过关 | 不改代码，看第 0 步之后的 Windows CI | — | Win CI 绿 + PM 开发模式真机连跑 5 条命令都成功 |
 | 2 | **安全快修**（CLI 路，单独先推） | `--data-dir` 只在 `test-data-dir` feature 里；CI 加 release 行为检查（`--help` 没有、传了报参数错、目录还在；`test-hold-delay` 同样）；`--owner` 统一走 `mutation_owner`（stop / attach 加进程也是），主人的会话 + `--owner 别人` 拒绝，主人带 `--owner=自己` 放行，后台解析用户名，「找不到用户」「查不到…对应的账户」两句，用户列显示用户名，管理员按会话名只找自己的；**内存会话分支放进 `#[cfg(test)]`**；改掉原来断言「主人带 `--owner=自己` 被拒」的测试；通知 Test-bot 改用测试版跑 `--purge --data-dir` | 后台和 CLI 一起改、测试一起加，不碰平台层 | A4 的参数化表；release 检查；release 走不到内存分支 |
-| 3 | winpipe B | 查管道归谁（GetSecurityInfo）；`aw hook` 走带保护的打开函数；改注释；反向测试；clippy 禁止直接打开管道 | 只动 Windows 和 aw-channel | 匿名级别被拒、对面不是后台时一个字节都不发 |
-| 4 | **启动契约**（aw-xplat-macfix，Linux 门控并进来） | A1 规矩 1–11：Linux 门控修法（父进程一直 CLOEXEC、子进程 dup2 到 3 + close_range，证明工作区的补丁 `/workspace/aw-prove-out/linux-gate-fix.patch` 和压力测试 `crates/aw-platform/tests/gate_concurrent_spawn.rs` 直接拿过来）；Mac `pipe()` 后马上 FD_CLOEXEC + 子进程原始循环关 fd；唯一启动函数 + `SPAWN_LOCK` + clippy 禁 `Command::new`/`fork`；子进程里不分配、删 `clear_preload`、信号复位、报错管道、release 失败不丢 pid；附加组按 `getgrouplist`；自检补两项；程序名解析；看门进程（Linux PDEATHSIG+killpg/cgroup.kill，Mac kqueue）；只绑 aw 起的程序；默认模式信号转发；tcsetpgrp（SIGTTOU、WUNTRACED、panic）；`--no-daemon` 帮助统一句；依赖里会起进程的 crate 清单 | 第 0 步之后 Mac 已绿；Linux/Mac 共用 hold.rs；Windows Job 部分如果没法在同一提交里绿，拆到第 6 步 | `gate_concurrent_spawn` 48×20 零泄漏（压力 48×300 零泄漏）、fd≥10 门控通过、A1 共用测试全部 |
-| 5 | DB 第二+三轮 + 附着修复（aw-xplat-fix） | 8fff164 + retention 修复 + `lock_past_busy_timeout` 修复；A2 规矩 2–7：超时一张表、撤回、只把取名字挪到回复之后（`check_pid_owner` 留在前面）、后台计时 `--duration`、**大锁里不碰库**、**FTS 新行不先 DELETE、改/删按 rowid**；「正在读取进程…」状态；按测量决定规矩 8（常驻写连接、列表计数） | 8fff164 的 retention 失败修完才推；A2 的 CLI 部分跟后台同一个提交，不会出现两头不一致的中间版本 | **同一个 200MB 库 + 2–3 个整机会话在采样，attach 单进程和 `--pid 1` 各 5 次都 ≤ 1.5 秒、POST ≤ 0.3 秒**；CI 缩小版；命令行被杀后会话照样按时结束；dbintegrity 压力测试 |
-| 6 | Windows 第三轮（aw-xplat-win） | `.cmd` 转义、整棵进程树 Job（接第 4 步）、等待有上限、PPID 复用；数据目录句柄化（`OPEN_REPARSE_POINT` + `SetSecurityInfo`、带安全描述符建目录、子项）+ 真建 junction/symlink 的测试 | 只动 Windows | Win CI + 真机清单 + 数据目录矩阵 Windows 那几格 |
+| 3 | winpipe B（**已推 93a6cfa**） | 查管道归谁（GetSecurityInfo）；`aw hook` 走带保护的打开函数；改注释；反向测试；clippy 禁止直接打开管道 | 只动 Windows 和 aw-channel | 匿名级别被拒、对面不是后台时一个字节都不发 |
+| 4 | **启动契约**（aw-xplat-macfix；Linux 门控泄漏**已推 c21dcec**，改走 hold.rs、压力测试 `crates/aw-platform/tests/gate_concurrent_spawn.rs` 已在 dev，所以证明工作区的 dash/dup2-到-3 补丁**不再拿**） | A1 规矩 1–11：c21dcec 剩下的三处（Linux `pipe2`、附加组按 `getgrouplist`、子进程里不分配）；PATH 父进程拼候选、子进程切身份后挨个 execve；采集 crate 禁 Command + `xtask spawn-audit` + tokio 不开 process；Mac `pipe()` 后马上 FD_CLOEXEC + 子进程原始循环关 fd；唯一启动函数 + `SPAWN_LOCK` + clippy 禁 `Command::new`/`fork`；子进程里不分配、删 `clear_preload`、信号复位、报错管道、release 失败不丢 pid；附加组按 `getgrouplist`；自检补两项；程序名解析；看门进程（Linux：aw → 看门进程 → 程序，subreaper、SIGSTOP 再 SIGKILL 循环、pid+ppid+启动时间；Mac kqueue），替换 345d216 的 sh 看门进程；只绑 aw 起的程序；默认模式信号转发；tcsetpgrp（Linux/Mac 的默认模式和 `--no-daemon`、SIGTTOU、WUNTRACED、panic、aw 被杀后看门进程还前台）；`--no-daemon` 帮助（Linux/Windows 统一句，Mac 单独一句）；环境测试按完整集合；依赖里会起进程的 crate 清单 | 第 0 步之后 Mac 已绿；Linux/Mac 共用 hold.rs；Windows Job 部分如果没法在同一提交里绿，拆到第 6 步 | `gate_concurrent_spawn` 48×20 零泄漏（压力 48×300 零泄漏，dev tip 已是 0/14400）、40 路并发启动零失败、A1 共用测试全部 |
+| 5 | DB 第二+三轮 + 附着修复（**已推 da00935、6a11d6d、36abe45**；剩下的进 5b） | 8fff164 + retention 修复 + `lock_past_busy_timeout` 修复；A2 规矩 2–7：超时一张表、撤回、只把取名字挪到回复之后（`check_pid_owner` 留在前面）、后台计时 `--duration`、**大锁里不碰库**、**FTS 新行不先 DELETE、改/删按 rowid**；「正在读取进程…」状态；按测量决定规矩 8（常驻写连接、列表计数） | 8fff164 的 retention 失败修完才推；A2 的 CLI 部分跟后台同一个提交，不会出现两头不一致的中间版本 | **同一个 200MB 库 + 2–3 个整机会话在采样，attach 单进程和 `--pid 1` 各 5 次都 ≤ 1.5 秒、POST ≤ 0.3 秒**；CI 缩小版；命令行被杀后会话照样按时结束；dbintegrity 压力测试 |
+| 5b | **DB 第四轮：行 id 按三类表 + 回归项**（aw-xplat-fix） | A3 规矩 1：事件表（会话, 来源, seq）、实体表 `last_seq` 防倒退、桶改成写当前总数；`seq_next`；`process_images.seq` → `exec_seq`；迁移 0012；去掉 `replay_writes`；FTS 改/删按 rowid；Test-bot 6a11d6d 回归 7 条；超时常量 12 秒进 aw-core；A2 规矩 6 剩下的（读请求不进大锁） | 迁移和写入同一个提交，没有「新代码 + 老表」的中间版本；API 的 `seq` 别名保留，UI 不跟着红 | A3 测试全部；0011 → 0012 迁移测试；附着验收（H3 的 D/I 组）不回退 |
+| 6 | Windows 第三轮（aw-xplat-win，**部分已推 345d216**） | `.cmd` 转义、整棵进程树 Job（接第 4 步）、等待有上限、PPID 复用；数据目录句柄化（`OPEN_REPARSE_POINT` + `SetSecurityInfo`、带安全描述符建目录、子项）+ 真建 junction/symlink 的测试 | 只动 Windows | Win CI + 真机清单 + 数据目录矩阵 Windows 那几格 |
 | 7 | winpipe C + 三系统连接上限（aw-xplat-winpipe） | 句柄生命周期、doctor 真测、App `unidentified_peer`；**aw-channel 分帧三系统修复**（半截回复、16 MiB 上限、总超时）；**Unix 服务端连接数上限、每请求总时限、线程池**（review 要补 7） | aw-channel 改动影响 Unix，所以放在第 5 步之后、超时常量已经定下来再做 | 16 个不读 + 16 个慢慢发的客户端时其他请求照样 200（Unix + Win）；半截回复报错（Unix + Win） |
 | 8a | **错误码枚举**（B1） | `ErrorCode` 从 `daemon_errors.rs` 生成，码名不改；`error_response` 只收枚举；`json!` 拼的 5 种收进来，`not_implemented` 统一格式；`xtask error-lint`；`error-codes.json` 和 errors.ts 生成；扫字面量的测试换成「每个值都有中文」 | 码名不变，没有断言会变红 | 每个码有中文和退出码；error-lint 为 0 |
-| 8b | **文字表**（A5，CLI 文案第三轮并进来） | `zh.toml` + wording 文件对照测试；`daemon_errors.rs` 中文照 wording 文件改；`check-147-wording.sh` 全部禁用词/必须句并进 `xtask wording-lint`，扫 `///`；帮助快照（三系统）；四种说法；「没采」全部替换；C2 状态表 | 违例清零和打开 CI 检查在同一个提交 | wording-lint 在 CI 里为 0；帮助快照 |
+| 8b | **文字表**（A5，CLI 文案第三轮并进来；**一部分已推 1efe176**） | `zh.toml` + wording 文件对照测试；`daemon_errors.rs` 中文照 wording 文件改；`check-147-wording.sh` 全部禁用词/必须句并进 `xtask wording-lint`，扫 `///`；帮助快照（三系统）；四种说法；「没采」全部替换；C2 状态表 | 违例清零和打开 CI 检查在同一个提交 | wording-lint 在 CI 里为 0；帮助快照 |
 | 9 | CLI 退出码 + `--follow` 轮询 + 导出时区（CLI 路） | 按表改代码（3/6/4/取消）；`--follow` 按游标轮询，Windows 也能用；导出带 tz | 依赖第 8b 步的 key | 退出码表逐条测试；follow 每秒有输出、会话结束就退出；`TZ=Asia/Taipei` 导出是 UTC+08:00 |
 | 10 | **能力报一次 + 拒绝未接入字段**（B3，提到 B2 前面） | `/capabilities` 替掉 doctor 那套，会话能力照旧跟会话存；新建页变灰；后台 400；只报全局和调用者自己的 | 依赖第 8b 步的说法 | 后台 400 测试；jsdom；老会话 fixture；不泄漏别人的东西 |
 | 11 | filter 统一（B2） | aw-store 改用 aw-core 的 AST；`kind` 值校验；`exe` 接上；README 和占位例子 | 解析器替换一次性，老的子集测试迁到 aw-core | 共用测试表；README 示例 doc 测试 |
@@ -672,6 +726,21 @@
 - 推荐修法（写进 A2 规矩 6、7，第 5 步）：① FTS 新行直接 INSERT，改/删按 rowid（映射表或确定性 rowid），不再按 UNINDEXED 列 DELETE；② 全局大锁里不碰库，读请求不进大锁；③ 采样写事务时长进日志；④ 两头超时一张表。扫进程表挪到回复之后只是顺手优化（只挪取名字，`check_pid_owner` 留在前面）。
 - 没测的：会话列表每行现数 `session_counts` 在大锁里的耗时（这次没同时刷列表）；Mac / Windows 上的同样测量。
 
+## H3. 在 dev tip（f7ea22f，含 c21dcec / 6a11d6d / 36abe45）上复测（14:20–14:35）
+
+同一台机器、`CARGO_BUILD_JOBS=4`、release 构建、临时 root 后台 + 临时数据目录 + 临时 socket，没碰 root 后台 pid 607359。
+
+| 项目 | 做法 | 结果 |
+|---|---|---|
+| 门控泄漏（现在 Linux 走 hold.rs） | `AW_GATE_STRESS_ROUNDS=300 cargo test --release -p aw-platform --test gate_concurrent_spawn`，48 线程 × 300 轮 | spawned=14400，leaking_children=0，leaked_fds=0，other_failures=0，50.9 秒；fd≥10 那条也过（输出 `/workspace/aw-prove-out/gate-36abe45.txt`） |
+| 40 路并发启动（经后台） | `/workspace/aw-prove-out/run40.sh 10 40`：40 个 `aw run -- sh -c 'exit 3'` 同时起，10 轮 | **400/400 都退 3，0 失败**，共 25.7 秒（`run40-36abe45.txt`） |
+| 附着 D 组 | 207MB 库 + 后台自带 + 3 个 `--pid 1` 在采样，`attach --pid 1 --duration 1s` × 5 | 5/5，墙钟 **57–111ms** |
+| 附着 I 组 | 207MB 库 + 后台自带 + 2 个 `--pid 1` 在采样，附着单个进程 × 5 | 5/5，墙钟 **65–148ms** |
+
+- 墙钟比 H2 的「修后」少了约 1 秒，是因为 6a11d6d 把 `--duration` 交给后台计时，命令行建好会话就返回（输出「监控已附着；后台会在 --duration 到时…」），墙钟里不再含那 1 秒。远低于验收线（≤ 1.5 秒、POST ≤ 0.3 秒）。
+- 这一版构建里没有计时探针，所以没有每一步的分解数字，也没有「采样器单次写最长」；要分解数字得把探针补丁再打到 dev 上。
+- Mac 这一步的 CI 结果：本机拿不到，请 PM / Test-bot 看 dev 上 f7ea22f 之后那次 Mac CI。
+
 ---
 
 # I. 本版对照 review 13:40 打回意见（逐条）
@@ -702,7 +771,7 @@
 
 **同时写进来的其他决定**：PM 13:13（Mac 原始循环关 fd + `pipe()` 后马上 FD_CLOEXEC）→ A1 规矩 1；PM 13:23（唯一启动函数 + 全局启动锁 + clippy 禁 Command）→ A1 规矩 2，并写明**不覆盖**的范围；UI审查+review 13:25（码名以 daemon_errors.rs 为准、中文以 wording 文件为准；check-147-wording.sh 并进 xtask 并扫 `///`；`--no-daemon` 帮助三系统统一）→ A5、A1 规矩 11；`aw147-95b49ff-3d95803-review.md` 的挡合并和合并前要收各条 → A1、A4 的问题表。
 
-**还没完成、需要别人给的**：`command_spawner_*` 在 CI 上失败的原始日志（Test-bot / PM）；Mac `setgroups` 超过 16 个时截断还是拒绝（PM）；数据目录另外三种失败的中文（UI审查）；`option_not_wired` 的中文（UI审查）。
+**还没完成、需要别人给的**：`command_spawner_*` 在 CI 上失败的原始日志（Test-bot / PM）；数据目录另外三种失败的中文（UI审查）；`option_not_wired` 的中文（UI审查）。
 
 
 ## 补充决定（PM 13:44–13:51，提交前加入）

@@ -414,24 +414,11 @@ impl SpawnedChild for PlatformChild {
     }
 
     fn release(&mut self) -> Result<(), (&'static str, String)> {
-        #[cfg(unix)]
-        let pid = self
-            .held
-            .as_ref()
-            .map(|child| child.pid())
-            .ok_or_else(|| ("spawn_failed", "启动闸门已经放行".to_owned()))?;
-        // The child takes the terminal before it reads this release gate. Set
-        // up relays and the restoration guard first, so an error return or
-        // panic after the handoff cannot strand the terminal on the child.
-        let mut terminal = crate::launch::terminal::TerminalChild::new(pid)
-            .map_err(|error| ("spawn_failed", error))?;
-        terminal.expect_child_foreground();
         let Some(held) = self.held.take() else {
-            return Ok(());
+            return Err(("spawn_failed", "启动闸门已经放行".to_owned()));
         };
         match held.release() {
             Ok(released) => {
-                self.terminal = Some(terminal);
                 self.released = Some(released);
                 Ok(())
             }
@@ -459,6 +446,9 @@ impl SpawnedChild for PlatformChild {
             );
             let _ = released.wait();
         }
+        // The guard is armed as soon as spawn succeeds, including an adopt or
+        // release failure before a `ReleasedChild` exists.
+        self.terminal.take();
     }
 }
 
@@ -521,17 +511,6 @@ impl SpawnedChild for PlatformGatedChild {
     }
 
     fn release(&mut self) -> Result<(), (&'static str, String)> {
-        #[cfg(unix)]
-        let pid = self
-            .held
-            .as_ref()
-            .map(|child| child.pid())
-            .ok_or_else(|| ("spawn_failed", "启动闸门已经放行".to_owned()))?;
-        #[cfg(unix)]
-        let mut terminal = crate::launch::terminal::TerminalChild::new(pid)
-            .map_err(|error| ("spawn_failed", error))?;
-        #[cfg(unix)]
-        terminal.expect_child_foreground();
         let held = self
             .held
             .take()
@@ -539,10 +518,6 @@ impl SpawnedChild for PlatformGatedChild {
         let released = held
             .release()
             .map_err(|error| platform_spawn_error(&self.program, self.cwd.as_deref(), error))?;
-        #[cfg(unix)]
-        {
-            self.terminal = Some(terminal);
-        }
         self.released = Some(released);
         Ok(())
     }
@@ -562,6 +537,8 @@ impl SpawnedChild for PlatformGatedChild {
             );
             let _ = released.wait();
         }
+        #[cfg(unix)]
+        self.terminal.take();
     }
 }
 
@@ -771,23 +748,35 @@ impl Spawner for CommandSpawner {
             // only builds candidate strings; the child tries them after it has
             // switched identity, so this process never stats a PATH directory.
             let caller = IdentifiedCaller::current_user().map_err(|_| caller_identity_error())?;
+            let terminal_decision = crate::launch::terminal::TerminalDecision::before_fork();
             let request = SpawnRequest {
                 command: std::iter::once(program.clone())
                     .chain(args.iter().cloned())
                     .collect(),
                 cwd: spec.cwd.as_ref().map(std::path::PathBuf::from),
                 env: spec.env.clone(),
+                terminal_handoff: terminal_decision.handoff_requested(),
                 env_source: aw_platform::EnvSource::Inherit,
             };
             let held = platform()
                 .spawn_suspended(&caller, &request)
                 .map_err(|error| platform_spawn_error(program, spec.cwd.as_deref(), error))?;
+            // The held child can perform its handoff before it reads the gate.
+            // Build this guard immediately after `spawn_suspended`, rather
+            // than at release, so adopt and every other early error restores
+            // aw's foreground group.
+            let mut terminal = crate::launch::terminal::TerminalChild::new(
+                held.pid(),
+                terminal_decision,
+            )
+            .map_err(|error| ("spawn_failed", error))?;
+            terminal.expect_child_foreground();
             Ok(Box::new(PlatformGatedChild {
                 held: Some(held),
                 released: None,
                 program: program.clone(),
                 cwd: spec.cwd.clone(),
-                terminal: None,
+                terminal: Some(terminal),
             }))
         }
         #[cfg(target_os = "macos")]
@@ -799,23 +788,31 @@ impl Spawner for CommandSpawner {
             // after the identity switch. This process does not stat PATH.
             let caller = aw_platform::IdentifiedCaller::current_user()
                 .map_err(|_| caller_identity_error())?;
+            let terminal_decision = crate::launch::terminal::TerminalDecision::before_fork();
             let request = aw_platform::SpawnRequest {
                 command: std::iter::once(program.clone())
                     .chain(args.iter().cloned())
                     .collect(),
                 cwd: spec.cwd.clone().map(std::path::PathBuf::from),
                 env: spec.env.clone(),
+                terminal_handoff: terminal_decision.handoff_requested(),
                 env_source: aw_platform::EnvSource::Inherit,
             };
             let held = aw_platform::platform()
                 .spawn_suspended(&caller, &request)
                 .map_err(|error| platform_spawn_error(program, spec.cwd.as_deref(), error))?;
+            let mut terminal = crate::launch::terminal::TerminalChild::new(
+                held.pid(),
+                terminal_decision,
+            )
+            .map_err(|error| ("spawn_failed", error))?;
+            terminal.expect_child_foreground();
             Ok(Box::new(PlatformChild {
                 held: Some(held),
                 released: None,
                 program: program.clone(),
                 cwd: spec.cwd.clone(),
-                terminal: None,
+                terminal: Some(terminal),
             }))
         }
         #[cfg(windows)]
@@ -829,6 +826,7 @@ impl Spawner for CommandSpawner {
                 command: spec.command.clone(),
                 cwd: spec.cwd.as_ref().map(Into::into),
                 env: spec.env.clone(),
+                terminal_handoff: false,
                 env_source: aw_platform::EnvSource::Inherit,
             };
             let held = platform()
@@ -885,6 +883,7 @@ impl Launcher for PlatformLauncher {
             command: spec.command.clone(),
             cwd: spec.cwd.as_ref().map(Into::into),
             env: spec.env.clone(),
+            terminal_handoff: false,
             env_source: aw_platform::EnvSource::Inherit,
         };
         let program = spec.command.first().map(String::as_str).unwrap_or("");
@@ -1050,7 +1049,10 @@ fn launch_linux_with_started(
                 .map_err(|error| io_spawn_dispatch_error(program, spec.cwd.as_deref(), error))?;
             let pid = spawned.id();
             started(pid);
-            let mut terminal = crate::launch::terminal::TerminalChild::new(pid)
+            let mut terminal = crate::launch::terminal::TerminalChild::new(
+                pid,
+                crate::launch::terminal::TerminalDecision::before_fork(),
+            )
                 .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
             terminal
                 .give_child_foreground()

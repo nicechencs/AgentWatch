@@ -13,10 +13,11 @@
 //!    and gid, and that `setuid(0)` fails. Nothing the caller supplied is used
 //!    while the process is still root.
 //! 2. `chdir` to the caller's directory only after that switch.
-//! 3. When stdin is a terminal, make this new process group its foreground
-//!    group before the gate can be read. This prevents an immediately-reading
-//!    target from being stopped with `SIGTTIN` in the release-to-parent-handoff
-//!    window.
+//! 3. When the request says the creator owns stdin's foreground terminal, make
+//!    this new process group foreground before the gate can be read. This
+//!    prevents an immediately-reading target from being stopped with `SIGTTIN`
+//!    in the release-to-parent-handoff window. The decision belongs to the
+//!    caller before `fork`; this platform layer never infers it from `isatty`.
 //! 4. Block on a `read` of the gate pipe. EOF (the creator died, or aborted
 //!    before release) `_exit`s without exec. One byte means release: close the
 //!    pipe and `execve` the target. The target's environment is the pointer
@@ -94,9 +95,9 @@ struct Prepared {
     /// `_exit`s; a successful `execve` closes it (it is `CLOEXEC`) and the parent
     /// sees EOF. The parent keeps the read end.
     report: std::os::fd::RawFd,
-    /// Captured in the parent. `isatty` is not part of the post-fork path.
-    /// When true, the child must take the terminal before it reads the gate.
-    stdin_is_tty: bool,
+    /// Captured by the caller before `fork`. When true, the child must take
+    /// the terminal before it reads the gate.
+    terminal_handoff: bool,
 }
 
 struct PreparedSwitch {
@@ -110,6 +111,13 @@ pub(crate) fn spawn(
     request: &SpawnRequest,
 ) -> Result<Box<dyn HeldChild>, PlatformError> {
     spawn_inner(caller, request, None)
+}
+
+/// Check an exited direct child with `waitid(WNOWAIT)`.  The caller remains
+/// responsible for the single later `waitpid`, after it has cleaned the group
+/// while the leader's pid cannot yet be reused.
+pub(crate) fn peek_exit_without_reaping(pid: u32) -> std::io::Result<Option<ReapOutcome>> {
+    ffi::peek_exit_without_reaping(pid)
 }
 
 #[cfg(test)]
@@ -240,7 +248,7 @@ fn spawn_inner(
         gate_read: std::os::fd::AsRawFd::as_raw_fd(&gate_read),
         stdout: stdout.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
         report: std::os::fd::AsRawFd::as_raw_fd(&report_write),
-        stdin_is_tty: ffi::stdin_is_tty(),
+        terminal_handoff: request.terminal_handoff,
     };
     // SAFETY: the child calls only async-signal-safe functions, then `_exit`
     // or `execve`. It does not return. The parent closes its copy of the read
@@ -529,7 +537,7 @@ impl GateStep {
 /// The only `unsafe` for the launch path.
 #[allow(unsafe_code)]
 mod ffi {
-    use super::{GateStep, PlatformError, Prepared};
+    use super::{GateStep, PlatformError, Prepared, ReapOutcome};
     use std::ffi::{CString, OsStr};
     use std::io;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -542,14 +550,44 @@ mod ffi {
         }
     }
 
-    /// This runs in the parent, before `fork`, so the child only consumes a
-    /// boolean prepared by the creator rather than calling a non-syscall
-    /// terminal helper after a multi-threaded fork.
-    pub(super) fn stdin_is_tty() -> bool {
-        unsafe {
-            // SAFETY: stdin is a process-owned descriptor. `isatty` neither
-            // retains nor writes through a caller pointer.
-            libc::isatty(libc::STDIN_FILENO) == 1
+    pub(super) fn peek_exit_without_reaping(pid: u32) -> io::Result<Option<ReapOutcome>> {
+        let mut info = unsafe {
+            // SAFETY: a zeroed siginfo_t is the documented initial value for
+            // `waitid(WNOHANG)`, where the kernel leaves it zero when no child
+            // state is available.
+            std::mem::MaybeUninit::<libc::siginfo_t>::zeroed().assume_init()
+        };
+        let result = unsafe {
+            // SAFETY: `info` is valid writable storage and this process owns
+            // the specified direct child. WNOWAIT deliberately preserves its
+            // status for the caller's one later blocking waitpid.
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let child_pid = unsafe {
+            // SAFETY: `waitid` initialized `info`; the accessor is valid for
+            // a SIGCHLD siginfo_t and returns zero for WNOHANG/no event.
+            info.si_pid()
+        };
+        if child_pid == 0 {
+            return Ok(None);
+        }
+        let status = unsafe {
+            // SAFETY: a nonzero child pid means this is a populated SIGCHLD
+            // result, for which si_status is the documented exit/signal value.
+            info.si_status()
+        };
+        match info.si_code {
+            libc::CLD_EXITED => Ok(Some(ReapOutcome::Exited(status))),
+            libc::CLD_KILLED | libc::CLD_DUMPED => Ok(Some(ReapOutcome::Signaled(status))),
+            _ => Ok(None),
         }
     }
 
@@ -632,7 +670,7 @@ mod ffi {
     /// the child then waits for its creator's release/abort so the parent's
     /// gate write cannot race a closed read end.
     pub(super) fn child_take_foreground(prepared: &Prepared) {
-        if !prepared.stdin_is_tty {
+        if !prepared.terminal_handoff {
             return;
         }
         if handoff_stdin_to_own_group() {
@@ -649,7 +687,7 @@ mod ffi {
     /// limited to terminal launches: non-terminal callers may intentionally
     /// arrange their own signal handling.
     pub(super) fn child_restore_terminal_signal_defaults(prepared: &Prepared) {
-        if !prepared.stdin_is_tty {
+        if !prepared.terminal_handoff {
             return;
         }
         for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP] {
@@ -1140,6 +1178,7 @@ mod tests {
             ],
             cwd: None,
             env: vec![("AW_TEST_CODE".to_owned(), "5".to_owned())],
+            terminal_handoff: false,
             env_source: crate::EnvSource::Inherit,
         };
         let held = super::spawn(&caller, &request).expect("held");
@@ -1170,6 +1209,7 @@ mod tests {
             ],
             cwd: None,
             env: Vec::new(),
+            terminal_handoff: false,
             env_source: crate::EnvSource::Inherit,
         };
         let mut held = super::spawn(&caller, &request).expect("held");
@@ -1216,6 +1256,7 @@ mod tests {
             command: vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
             cwd: Some(std::path::PathBuf::from("/")),
             env: Vec::new(),
+            terminal_handoff: false,
             env_source: crate::EnvSource::Inherit,
         };
         let held = super::spawn(&caller, &request).expect("held");
@@ -1237,6 +1278,7 @@ mod tests {
             command: vec!["aw-no-such-prog-xyz".to_owned()],
             cwd: Some(std::path::PathBuf::from("/")),
             env: Vec::new(),
+            terminal_handoff: false,
             env_source: crate::EnvSource::Inherit,
         };
         let held = super::spawn(&caller, &request).expect("held");
@@ -1308,6 +1350,7 @@ mod tests {
                 command: vec![path.to_string_lossy().into_owned()],
                 cwd: Some(std::path::PathBuf::from("/")),
                 env: Vec::new(),
+                terminal_handoff: false,
                 env_source: EnvSource::Exact,
             };
             let held = super::spawn(&caller, &request).expect("held child");
@@ -1343,6 +1386,7 @@ mod tests {
                 std::process::id()
             ))),
             env: Vec::new(),
+            terminal_handoff: false,
             env_source: crate::EnvSource::Inherit,
         };
         let held = super::spawn(&caller, &request).expect("held");
@@ -1375,6 +1419,7 @@ mod tests {
                 "PATH".to_owned(),
                 format!("{}:/no/such/aw-path", dir.display()),
             )],
+            terminal_handoff: false,
             env_source: crate::EnvSource::Inherit,
         };
         let held = super::spawn(&caller, &request).expect("held");
@@ -1404,6 +1449,7 @@ mod tests {
             command: vec!["./aw-rel-script".to_owned()],
             cwd: Some(dir.clone()),
             env: Vec::new(),
+            terminal_handoff: false,
             env_source: crate::EnvSource::Inherit,
         };
         let held = super::spawn(&caller, &request).expect("held");
@@ -1438,6 +1484,7 @@ mod tests {
             command: vec!["/usr/bin/env".to_owned()],
             cwd: None,
             env,
+            terminal_handoff: false,
             env_source: EnvSource::Exact,
         };
         let held = super::spawn_capturing_stdout(&caller, &request, capture).expect("held");

@@ -9,6 +9,9 @@ use std::collections::HashMap;
 use std::io;
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
+
+const LEFTOVER_GRACE: Duration = Duration::from_secs(2);
 
 /// A setup failure which means the watchdog must not start the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,14 +89,28 @@ struct ProcessIdentity {
     state: u8,
 }
 
-/// Freeze, kill, rescan, and reap every current descendant of this watchdog.
+/// Terminate, freeze, kill, rescan, and reap every current descendant of this
+/// watchdog.
 ///
 /// A signal is sent only after rereading `/proc/<pid>/stat` and matching the
 /// pid, parent pid, and start time captured in the scan. This avoids signaling
-/// a reused pid. `SIGSTOP` precedes `SIGKILL` so a forking descendant cannot
-/// race the kill scan by creating a new child between the two phases.
+/// a reused pid. Every cleanup begins with SIGTERM and a two-second grace
+/// period; only survivors are frozen and killed. SIGHUP is never a cleanup
+/// signal: it belongs solely to an actual terminal disconnect path.
 pub fn cleanup_watchdog_descendants() {
     let self_pid = std::process::id() as libc::pid_t;
+    for target in descendants_of(self_pid, &process_snapshot()) {
+        signal_if_same(target, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + LEFTOVER_GRACE;
+    while Instant::now() < deadline {
+        reap_children();
+        if descendants_of(self_pid, &process_snapshot()).is_empty() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
     loop {
         let snapshot = process_snapshot();
         let targets = descendants_of(self_pid, &snapshot);
@@ -114,7 +131,7 @@ pub fn cleanup_watchdog_descendants() {
             signal_if_same(target, libc::SIGKILL);
         }
         reap_children();
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 

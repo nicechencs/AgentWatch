@@ -13,8 +13,6 @@
 /// Ordering tests for the suspended launch. The live spawn is [`spawn`].
 #[allow(dead_code)]
 mod launch;
-mod spawn;
-pub use spawn::{gate_main, GATE_ARG};
 
 use crate::{
     Capability, CapabilityStatus, IdentifiedCaller, Owner, PeerIdentity, Platform, PlatformError,
@@ -104,7 +102,7 @@ impl Platform for CurrentPlatform {
         caller: &IdentifiedCaller,
         request: &SpawnRequest,
     ) -> Result<Box<dyn crate::HeldChild>, PlatformError> {
-        spawn::spawn(caller, request)
+        crate::unix::hold::spawn(caller, request)
     }
 
     fn process_identity(&self, pid: u32) -> Result<Option<ProcessEntry>, PlatformError> {

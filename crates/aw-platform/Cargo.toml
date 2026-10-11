@@ -14,16 +14,13 @@ test-hold-delay = []
 nix = { version = "0.30", default-features = false, features = ["fs", "process", "socket", "user"] }
 aw-collector-linux = { path = "../aw-collector-linux" }
 
+[target.'cfg(unix)'.dependencies]
+# The macOS hold stage (fork, then block before exec) is Unix-generic so Linux
+# can test it. libc 0.2.189 is already in Cargo.lock via the macOS target.
+libc = "=0.2.189"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 aw-collector-macos = { path = "../aw-collector-macos" }
-# The hold stage reads its spec as data. MIT OR Apache-2.0, already in
-# Cargo.lock (aw-daemon pins the same versions). macOS only: the Linux gate
-# does not parse a spec.
-serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive", "std"] }
-serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
-# libc 0.2.189 is already in Cargo.lock (via sysinfo). Pinned so `--locked`
-# resolves it. Used for proc_pidinfo / proc_listallpids / posix_spawn FFI.
-libc = "=0.2.189"
 # getpeereid and LOCAL_PEERPID. `user` + `socket` are the features aw-daemon
 # already enables; no new crate version.
 nix = { version = "0.30", default-features = false, features = ["user", "socket"] }

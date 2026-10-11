@@ -19,10 +19,11 @@ use std::path::{Path, PathBuf};
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(target_os = "macos")]
-pub use macos::gate_main;
-#[cfg(target_os = "macos")]
-pub use macos::GATE_ARG;
+// The macOS hold stage is a forked child, not a re-exec. It is Unix-generic so
+// Linux can test the same code; only the macOS `Platform` calls it. Linux
+// launch behavior is unchanged.
+#[cfg(unix)]
+pub(crate) mod unix;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "linux")]

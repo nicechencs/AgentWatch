@@ -125,7 +125,7 @@ macOS 是三平台中**风险最高**的一个：原生能力依赖 Apple 审批
 
 macOS 没有与 cgroup 或 Job 等价的、能自动覆盖后代进程的公开机制。所以统一采用**进程树跟踪**：
 
-1. 启动模式：`aw run` 和后台新建会话都经 `aw-platform` 起一个闸门，闸门是本程序自己的一份副本。闸门用写死的环境启动（只有 `PATH=/usr/bin:/bin`），工作目录是 `/`，argv 只有 `aw-mac-gate`。程序、工作目录、环境变量都当数据写进一根管道，不放进闸门自己的环境、参数或工作目录。闸门堵住读这根管道：读到放行的一个字节才继续，读到 EOF（创建者已死，或还没放行就中止）则不 exec 直接退出。放行之后闸门先切身份（见下），再进入调用方的工作目录，再用调用方的环境 `execve` 目标。放行之后程序不再读这根管道，所以后台重启程序继续跑。不另起看门狗，也不按 pid 发 `SIGKILL`。【待验证】这根管道和身份切换都还没在真机 macOS 上跑过。`aw run` 这条路径上，`aw` 自己是创建者：它先挂住，等后台确认纳入范围后再放行；放行前任何失败都关掉管道（闸门读到 EOF 退出）并 `waitpid`。`--cwd` 两条路径都支持：闸门切完身份（或确认不用切）之后才 `chdir`。后台新建会话时，root 后台不直接以 root 运行程序：闸门在还是 root 时不碰调用方的任何东西，先 `initgroups` → `setgid` → `setuid`，确认真实/有效 uid 都已是调用方且 `setuid(0)` 失败，才 `chdir` 再 exec；调用方就是后台自己的账户时跳过切换，其余相同。每一步失败有自己的退出码，记在日志里，不显示给用户：读不到规格 121，`initgroups` 122，`setgid` 123，`setuid` 124，切换自检失败（uid 没切过去，或 `setuid(0)` 仍成功）125，`chdir` 126，`exec` 127。调用方身份只来自连接上的 `getpeereid`（uid、gid）和 `LOCAL_PEERPID`（pid），经 `IdentifiedCaller::from_peer` 传入；认不出就拒绝，不退回后台自己的身份。
+1. 启动模式：`aw run` 和后台新建会话都经 `aw-platform` 起一个闸门。闸门就是 fork 出来的子进程，不是本程序再启动的一份副本：它在 `exec` 之前堵住读一根 `CLOEXEC` 管道。读到放行的一个字节才继续，读到 EOF（创建者已死，或还没放行就中止）则不 exec、以这一步的退出码结束。放行之后先切身份（见下），再进入调用方的工作目录，然后才 `execve`；调用方的环境变量到 `execve` 才生效，在此之前子进程的环境里没有它们，也没有调用方的 `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`。放行之后程序不再读这根管道，所以后台重启程序继续跑。不另起看门狗，也不按 pid 发 `SIGKILL`。只有一个等待者：放行前是挂住句柄里的那个子进程，放行后是放行句柄里的那一个。【待验证】这根管道和身份切换都还没在真机 macOS 上跑过。`aw run` 这条路径上，`aw` 自己是创建者：它先挂住，等后台确认纳入范围后再放行；放行前任何失败都关掉管道（子进程读到 EOF 退出）并等这一个子进程结束。`--cwd` 两条路径都支持：切完身份（或确认不用切）之后才 `chdir`，不用启动时的工作目录（那一步会在还是 root 时生效）。后台新建会话时，root 后台不直接以 root 运行程序：子进程在还是 root 时不碰调用方的目录和环境，先 `setgroups`（调用方的组）→ `setgid` → `setuid`，确认真实/有效 uid 和 gid 都已是调用方且 `setuid(0)` 失败，才 `chdir` 再 exec；调用方就是后台自己的账户时跳过切换，其余相同。每一步失败有自己的退出码，记在日志里，不显示给用户：读不到放行 121，`setgroups` 122，`setgid` 123，`setuid` 124，切换自检失败（uid 没切过去，或 `setuid(0)` 仍成功）125，`chdir` 126，`exec` 127。调用方身份只来自连接上的 `getpeereid`（uid、gid）和 `LOCAL_PEERPID`（pid），经 `IdentifiedCaller::from_peer` 传入；认不出就拒绝，不退回后台自己的身份。对端没有给出附加组时拒绝切换，不用后台自己的组顶上。
 2. daemon 在 ES 的 `fork` 事件上：父进程在范围内，就把子进程加入。使用原生 ES 时，同时把它加入 inverse mute 的范围。
 3. 辅助判断：`responsible_audit_token` 可以识别那些由 launchd 代为启动、但“责任进程”仍是目标的进程，比如 XPC 服务。这类归属标为 I。
 4. 经 `launchctl` 或 `open` 命令拉起的程序，父进程是 launchd，按 CAP-SCOPE-03 记为“链路中断”。
@@ -170,8 +170,8 @@ macOS 的 `sockaddr_un` 是 `sun_len: u8`、`sun_family`、`sun_path: [c_char; 1
 
 > **未在真机验证。** 下面这些都只在 Linux 上交叉编译过（`aarch64-apple-darwin` 的 `aw-platform` 通过 clippy；`aw-cli` 与 `aw-daemon` 的 macOS 目标编不过，因为 `ring`、`aws-lc-sys`、`libsqlite3-sys` 的构建脚本需要 macOS SDK），没有在一台 Mac 上运行过：
 >
-> - 闸门管道：创建者被杀（写端关闭、闸门读到 EOF）后，程序是否还没 exec 就退出；放行（写入一个字节）之后程序是否跑起来，并且不再因为后台重启被杀掉。
-> - 闸门进程的 `initgroups` / `setgid` / `setuid` 是否把附加组也带上，以及 `setuid(0)` 的自检。切换发生在 `chdir` 和使用调用方环境之前；闸门自己的环境只有 `PATH=/usr/bin:/bin`。
+> - 闸门管道：创建者被杀（写端关闭、fork 出的子进程读到 EOF）后，程序是否还没 exec 就退出；放行（写入一个字节）之后程序是否跑起来，并且不再因为后台重启被杀掉。
+> - 子进程的 `setgroups` / `setgid` / `setuid` 是否把附加组也带上，以及 `setuid(0)` 的自检。切换发生在 `chdir` 和 `execve` 之前；调用方的环境（包括 `DYLD_INSERT_LIBRARIES`）只在 `execve` 时生效。
 > - 长程序能被采样：后台启动 `sleep 20`，会话的进程列表里出现这个 pid。CI 上这条不需要 root。
 > - `proc_pidinfo(PROC_PIDTBSDINFO)` 读出的 uid/gid 与启动时间，和 `KERN_PROCARGS2` 的 argv 布局。
 > - `getpeereid` 与 `LOCAL_PEERPID` 是否对本地套接字给出对端 uid 和 pid。

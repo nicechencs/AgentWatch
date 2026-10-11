@@ -20,10 +20,11 @@
 //!   itself runs. The daemon then reads `/proc/<pid>/status` again and kills
 //!   the program unless all four uids and gids and the group list are the
 //!   caller's.
-//! - Daemon runs as root on macOS: `aw-platform` spawns a suspended gate that
-//!   switches with `initgroups` / `setgid` / `setuid` and execs only after the
-//!   switch sticks (【待验证】, not run on a real Mac). The session route still
-//!   answers 503 before reaching it, because the poll sampler is Linux-only.
+//! - Daemon runs as root on macOS: `aw-platform` forks the program and the
+//!   child switches with `setgroups` / `setgid` / `setuid` before it execs,
+//!   and only after the switch sticks (【待验证】, not run on a real Mac). The
+//!   session route still answers 503 before reaching it, because the poll
+//!   sampler is Linux-only.
 //! - Unknown identity (not a number, no passwd entry, group list unreadable),
 //!   a non-root daemon asked to start a program for another account, or any
 //!   platform without a Unix account switch (Windows: no caller-token launch
@@ -419,14 +420,15 @@ fn root_gid_regained(primary_gid: u32, setgid_succeeded: bool) -> bool {
     primary_gid != 0 && setgid_succeeded
 }
 
-/// macOS: `aw-platform` starts a hold stage of this binary with a fixed
-/// environment. The stage blocks on a pipe. On release it switches with
-/// `initgroups` / `setgid` / `setuid` (skipped when the caller is already this
-/// account), checks the switch stuck and that `setuid(0)` fails, and only then
-/// enters `cwd` and execs. The program, directory and environment travel as
-/// data on the pipe, never as the stage's own environment. A failed step exits
-/// with its own code (121–127) and the program never runs as root. The
-/// returned handle reaps only this child. 【待验证】not run on a real Mac.
+/// macOS: `aw-platform` forks and holds the child before exec. The child
+/// blocks on a pipe. On release it switches with `setgroups` / `setgid` /
+/// `setuid` (skipped when the caller is already this account), checks the
+/// switch stuck and that `setuid(0)` fails, and only then enters `cwd` and
+/// returns so the target is exec'd with the caller's environment. That
+/// environment is applied at exec, never while the child is still root. A
+/// failed step exits with its own code (121–127) and the program never runs
+/// as root. The returned handle reaps only this child. 【待验证】not run on a
+/// real Mac.
 ///
 /// `peer` is the identity `getpeereid` returned for this connection. A caller
 /// with no peer (a UI token) cannot be launched: rebuilding the account from

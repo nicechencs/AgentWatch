@@ -335,9 +335,9 @@ impl SpawnedChild for ProcessChild {
     }
 }
 
-/// macOS `aw run` child. `aw-platform` starts it with
-/// `POSIX_SPAWN_START_SUSPENDED` and holds the watchdog pipe, so this CLI is
-/// the creator: dropping the hold before `release` kills the program. After
+/// macOS `aw run` child. `aw-platform` forks it and the child blocks on the
+/// gate pipe before exec, so this CLI is the creator: dropping the hold before
+/// `release` closes the pipe and the child exits without running. After
 /// `release` the returned handle reaps only this child. 【待验证】not run on a
 /// real Mac.
 #[cfg(target_os = "macos")]

@@ -88,7 +88,7 @@ pub enum RuntimeError {
     Config(String),
 
     /// The data directory could not be created. No other directory was used.
-    #[error("无法安全使用数据目录「{}」：{source}", path.display())]
+    #[error("{source}")]
     DataDir {
         /// Directory we tried to create.
         path: PathBuf,
@@ -550,7 +550,7 @@ pub fn run_foreground(
     config_path: Option<&Path>,
 ) -> Result<(), RuntimeError> {
     let data_dir = resolve_data_dir(config).map_err(|err| RuntimeError::Config(err.to_string()))?;
-    ensure_data_dir(&data_dir).map_err(|source| RuntimeError::DataDir {
+    let data_dir = ensure_data_dir(&data_dir).map_err(|source| RuntimeError::DataDir {
         path: data_dir.clone(),
         source,
     })?;

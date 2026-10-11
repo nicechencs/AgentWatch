@@ -18,72 +18,260 @@ use crate::{
     Capability, CapabilityStatus, IdentifiedCaller, Owner, PeerIdentity, Platform, PlatformError,
     ProcessEntry, ProcessKey, SamplingProcess, SpawnRequest,
 };
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use nix::dir::Dir;
+use nix::fcntl::{open, openat, AtFlags, OFlag};
+use nix::sys::stat::{fchmod, fstat, fstatat, Mode, SFlag};
+use nix::unistd::{dup, fchown, geteuid, getuid, mkdir, Uid};
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 pub(crate) struct CurrentPlatform;
 
-/// Create a private daemon data directory without following a link.  `expected_uid`
-/// is kept explicit so the ownership refusal is testable without chowning a
-/// directory on the host running the test.
-fn secure_data_dir_for_owner(path: &Path, expected_uid: u32) -> Result<(), PlatformError> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let existed = validate_directory_path(&absolute)?;
-    if existed && fs::symlink_metadata(&absolute)?.uid() != expected_uid {
-        return Err(PlatformError::Invalid {
-            capability: "secure_data_dir",
-            detail: "data directory owner is not the daemon user",
-        });
-    }
-    fs::create_dir_all(&absolute)?;
-    if !validate_directory_path(&absolute)? {
-        return Err(PlatformError::Invalid {
-            capability: "secure_data_dir",
-            detail: "data directory disappeared while it was being created",
-        });
-    }
-    if fs::symlink_metadata(&absolute)?.uid() != expected_uid {
-        return Err(PlatformError::Invalid {
-            capability: "secure_data_dir",
-            detail: "data directory owner changed while it was being secured",
-        });
-    }
-    fs::set_permissions(&absolute, fs::Permissions::from_mode(0o700))?;
-    Ok(())
+#[derive(Clone, Copy)]
+struct DataDirPolicy {
+    expected_uid: u32,
+    privileged: bool,
+    /// Custom paths cannot relax the privileged-daemon ownership rule.
+    official_path: bool,
 }
 
-/// Return whether the final component existed. `symlink_metadata` deliberately
-/// sees a symlink itself, which rejects both a data-dir symlink and one in its
-/// parent chain before the daemon opens a database or log below it.
-fn validate_directory_path(path: &Path) -> Result<bool, PlatformError> {
+impl DataDirPolicy {
+    fn for_daemon(real_uid: u32, effective_uid: u32, official_path: bool) -> Self {
+        Self {
+            expected_uid: if real_uid == 0 { 0 } else { effective_uid },
+            privileged: real_uid == 0,
+            official_path,
+        }
+    }
+
+    fn accepts_owner(self, owner: u32) -> bool {
+        owner == self.expected_uid
+    }
+
+    fn permits_path(self) -> bool {
+        !self.official_path || self.privileged
+    }
+}
+
+struct ResolvedDataDir {
+    canonical: PathBuf,
+    create_base: PathBuf,
+    missing: Vec<std::ffi::OsString>,
+}
+
+fn invalid<T>(detail: &'static str) -> Result<T, PlatformError> {
+    Err(PlatformError::Invalid {
+        capability: "secure_data_dir",
+        detail,
+    })
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, PlatformError> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+/// Resolve existing ancestors before use. A final link is refused; a trusted
+/// root/self-owned ancestor link is accepted only under a non-swappable (or
+/// sticky) parent. This permits the system `/tmp` and `/var` aliases.
+fn resolve_data_dir_path(
+    path: &Path,
+    policy: DataDirPolicy,
+) -> Result<ResolvedDataDir, PlatformError> {
+    let absolute = absolute_path(path)?;
+    let components: Vec<_> = absolute.components().collect();
     let mut current = PathBuf::new();
-    for component in path.components() {
+    for (index, component) in components.iter().enumerate() {
         current.push(component.as_os_str());
         match fs::symlink_metadata(&current) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
-                    return Err(PlatformError::Invalid {
-                        capability: "secure_data_dir",
-                        detail: "data directory path contains a symlink",
-                    });
-                }
-                if !metadata.is_dir() {
-                    return Err(PlatformError::Invalid {
-                        capability: "secure_data_dir",
-                        detail: "data directory path contains a non-directory",
-                    });
+                    if index + 1 == components.len() {
+                        return invalid("data directory path contains a symlink");
+                    }
+                    if metadata.uid() != 0 && metadata.uid() != policy.expected_uid {
+                        return invalid("data directory ancestor symlink owner is not trusted");
+                    }
+                    let Some(parent) = current.parent() else {
+                        return invalid("data directory ancestor symlink has no parent");
+                    };
+                    let parent_metadata = fs::metadata(parent)?;
+                    if parent_metadata.mode() & 0o022 != 0 && parent_metadata.mode() & 0o1000 == 0 {
+                        return invalid("data directory ancestor is writable by other users");
+                    }
+                } else if !metadata.is_dir() {
+                    return invalid("data directory path contains a non-directory");
+                } else if index + 1 < components.len()
+                    && metadata.mode() & 0o022 != 0
+                    && metadata.mode() & 0o1000 == 0
+                {
+                    return invalid("data directory ancestor is writable by other users");
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(parent) = current.parent() else {
+                    return invalid("data directory has no existing ancestor");
+                };
+                let create_base = fs::canonicalize(parent)?;
+                let missing = components[index..]
+                    .iter()
+                    .map(|item| item.as_os_str().to_os_string())
+                    .collect::<Vec<_>>();
+                let canonical = missing
+                    .iter()
+                    .fold(create_base.clone(), |path, item| path.join(item));
+                return Ok(ResolvedDataDir {
+                    canonical,
+                    create_base,
+                    missing,
+                });
+            }
             Err(error) => return Err(error.into()),
         }
     }
-    Ok(true)
+    let canonical = fs::canonicalize(&absolute)?;
+    Ok(ResolvedDataDir {
+        create_base: canonical.clone(),
+        canonical,
+        missing: Vec::new(),
+    })
+}
+
+fn create_missing_directories(
+    resolved: &ResolvedDataDir,
+    policy: DataDirPolicy,
+) -> Result<(), PlatformError> {
+    let mut current = resolved.create_base.clone();
+    for name in &resolved.missing {
+        current.push(name);
+        match mkdir(&current, Mode::S_IRWXU) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::EEXIST) => {
+                // If a racing creator supplied this component, inspect and
+                // repair only the pinned O_NOFOLLOW descriptor.
+                let handle = open_final_directory(&current)?;
+                secure_handle(&handle, true, policy)?;
+            }
+            Err(error) => return Err(nix_error(error)),
+        }
+    }
+    Ok(())
+}
+
+fn open_final_directory(path: &Path) -> Result<OwnedFd, PlatformError> {
+    open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        if error == nix::errno::Errno::ELOOP {
+            PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "data directory path contains a symlink",
+            }
+        } else {
+            nix_error(error)
+        }
+    })
+}
+
+fn secure_handle(
+    handle: &OwnedFd,
+    is_directory: bool,
+    policy: DataDirPolicy,
+) -> Result<(), PlatformError> {
+    let metadata = fstat(handle).map_err(nix_error)?;
+    if !policy.accepts_owner(metadata.st_uid) {
+        return invalid("data directory owner is not the daemon user");
+    }
+    if policy.privileged {
+        fchown(handle, Some(Uid::from_raw(policy.expected_uid)), None).map_err(nix_error)?;
+    }
+    let mode = if is_directory {
+        Mode::S_IRWXU
+    } else {
+        Mode::S_IRUSR | Mode::S_IWUSR
+    };
+    fchmod(handle, mode).map_err(nix_error)
+}
+
+fn secure_directory_tree(directory: &OwnedFd, policy: DataDirPolicy) -> Result<(), PlatformError> {
+    secure_handle(directory, true, policy)?;
+    let mut entries = Dir::from_fd(dup(directory).map_err(nix_error)?).map_err(nix_error)?;
+    for entry in entries.iter() {
+        let entry = entry.map_err(nix_error)?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let metadata = fstatat(directory, name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(nix_error)?;
+        let kind = SFlag::from_bits_truncate(metadata.st_mode);
+        if kind == SFlag::S_IFLNK {
+            return invalid("data directory contains a symlink");
+        }
+        if kind == SFlag::S_IFDIR {
+            let child = openat(
+                directory,
+                name,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(nix_error)?;
+            secure_directory_tree(&child, policy)?;
+        } else if kind == SFlag::S_IFREG {
+            let child = openat(
+                directory,
+                name,
+                OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(nix_error)?;
+            secure_handle(&child, false, policy)?;
+        } else {
+            return invalid("data directory contains an unsupported file type");
+        }
+    }
+    Ok(())
+}
+
+fn nix_error(error: nix::errno::Errno) -> PlatformError {
+    PlatformError::Io(io::Error::from_raw_os_error(error as i32))
+}
+
+fn secure_data_dir_with_policy(
+    path: &Path,
+    default: &Path,
+    policy: DataDirPolicy,
+) -> Result<PathBuf, PlatformError> {
+    let resolved = resolve_data_dir_path(path, policy)?;
+    let default = resolve_data_dir_path(default, policy)?;
+    let policy = DataDirPolicy {
+        official_path: resolved.canonical == default.canonical,
+        ..policy
+    };
+    if !policy.permits_path() {
+        return invalid("official data directory requires a privileged daemon");
+    }
+    create_missing_directories(&resolved, policy)?;
+    let directory = open_final_directory(&resolved.canonical)?;
+    secure_directory_tree(&directory, policy)?;
+    Ok(resolved.canonical)
+}
+
+#[cfg(test)]
+fn secure_data_dir_for_owner(path: &Path, expected_uid: u32) -> Result<(), PlatformError> {
+    secure_data_dir_with_policy(
+        path,
+        Path::new("/Library/Application Support/AgentWatch"),
+        DataDirPolicy::for_daemon(expected_uid, expected_uid, false),
+    )
+    .map(drop)
 }
 
 /// Why a per-pid group list cannot be read. Kept as the documented reason even
@@ -182,14 +370,16 @@ impl Platform for CurrentPlatform {
         Ok(self.process_table()?.iter().map(sampling_from).collect())
     }
 
-    fn secure_data_dir(&self, path: &Path) -> Result<(), PlatformError> {
-        let Owner::Unix { euid, .. } = self.current_owner()? else {
-            return Err(PlatformError::Invalid {
-                capability: "secure_data_dir",
-                detail: "current process is not a Unix account",
-            });
-        };
-        secure_data_dir_for_owner(path, euid)
+    fn secure_data_dir(&self, path: &Path) -> Result<PathBuf, PlatformError> {
+        // Use only the daemon's kernel-provided IDs. Do not derive a policy
+        // from a requester, environment variable, or command-line argument.
+        let real_uid = getuid().as_raw();
+        let effective_uid = geteuid().as_raw();
+        secure_data_dir_with_policy(
+            path,
+            Path::new("/Library/Application Support/AgentWatch"),
+            DataDirPolicy::for_daemon(real_uid, effective_uid, false),
+        )
     }
 
     fn default_data_dir(&self) -> Result<PathBuf, PlatformError> {
@@ -506,7 +696,7 @@ mod ffi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
     #[test]
     fn procargs_splits_argc_exe_and_argv() {
@@ -586,6 +776,153 @@ mod tests {
             PlatformError::Invalid {
                 capability: "secure_data_dir",
                 detail: "data directory owner is not the daemon user",
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn secure_data_dir_accepts_the_system_tmp_alias() -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "agentwatch-platform-macos-tmp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let data = root.join("data");
+        let uid = geteuid().as_raw();
+        let canonical = secure_data_dir_with_policy(
+            &data,
+            Path::new("/Library/Application Support/AgentWatch"),
+            DataDirPolicy::for_daemon(uid, uid, false),
+        )?;
+        let created = data.is_dir();
+        let expected = std::fs::canonicalize(&data)?;
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(created);
+        assert_eq!(canonical, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn secure_data_dir_refuses_final_symlink_but_accepts_trusted_ancestor(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "agentwatch-platform-macos-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::create_dir_all(&target)?;
+        symlink(&target, &link)?;
+        let uid = std::fs::metadata(&root)?.uid();
+        let Err(error) = secure_data_dir_for_owner(&link, uid) else {
+            return Err("a data-dir symlink must be refused".into());
+        };
+        assert!(matches!(
+            error,
+            PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "data directory path contains a symlink",
+            }
+        ));
+        secure_data_dir_for_owner(&link.join("data"), uid)?;
+        let created = target.join("data").is_dir();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(created);
+        Ok(())
+    }
+
+    #[test]
+    fn data_dir_policy_matrix_requires_admin_for_official_paths() {
+        for (real_uid, effective_uid, official_path, owner, allowed) in [
+            (1000, 1000, true, 1000, false),
+            (1000, 1000, true, 0, false),
+            (1000, 1000, true, 1001, false),
+            (1000, 1000, false, 1000, true),
+            (1000, 1000, false, 0, false),
+            (1000, 1000, false, 1001, false),
+            (0, 0, true, 0, true),
+            (0, 0, true, 1000, false),
+            (0, 0, true, 1001, false),
+            (0, 0, false, 0, true),
+            (0, 0, false, 1000, false),
+            (0, 0, false, 1001, false),
+        ] {
+            let policy = DataDirPolicy::for_daemon(real_uid, effective_uid, official_path);
+            assert_eq!(
+                policy.permits_path() && policy.accepts_owner(owner),
+                allowed,
+                "real={real_uid}, effective={effective_uid}, official={official_path}, owner={owner}"
+            );
+        }
+    }
+
+    #[test]
+    fn secure_data_dir_refuses_the_official_path_for_a_user_daemon(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "agentwatch-platform-macos-official-user-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        std::fs::create_dir_all(&root)?;
+        let uid = std::fs::metadata(&root)?.uid();
+        let Err(error) =
+            secure_data_dir_with_policy(&root, &root, DataDirPolicy::for_daemon(1000, uid, false))
+        else {
+            return Err("a normal daemon must not use the official location".into());
+        };
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(matches!(
+            error,
+            PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "official data directory requires a privileged daemon",
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn secure_data_dir_corrects_self_owned_files_and_refuses_nested_links(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "agentwatch-platform-macos-tree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let data = root.join("data");
+        let target = root.join("target");
+        std::fs::create_dir_all(&data)?;
+        std::fs::create_dir_all(&target)?;
+        let uid = std::fs::metadata(&data)?.uid();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o777))?;
+        std::fs::write(data.join("secret"), b"metadata only")?;
+        std::fs::set_permissions(data.join("secret"), std::fs::Permissions::from_mode(0o666))?;
+        secure_data_dir_for_owner(&data, uid)?;
+        let directory_mode = std::fs::metadata(&data)?.permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(data.join("secret"))?.permissions().mode() & 0o777;
+        assert_eq!(directory_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        symlink(&target, data.join("evil"))?;
+        let Err(error) = secure_data_dir_for_owner(&data, uid) else {
+            return Err("a nested data-dir symlink must be refused".into());
+        };
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(matches!(
+            error,
+            PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "data directory contains a symlink",
             }
         ));
         Ok(())

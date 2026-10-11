@@ -40,36 +40,50 @@ pub fn default_config_path() -> io::Result<PathBuf> {
 ///
 /// Returns the platform permission/ownership error. Does not fall back to
 /// another directory and never follows a symlink/reparse point.
-pub fn ensure_data_dir(dir: &Path) -> io::Result<()> {
+pub fn ensure_data_dir(dir: &Path) -> io::Result<PathBuf> {
     aw_platform::platform()
         .secure_data_dir(dir)
         .map_err(|error| secure_data_dir_error(dir, error))
 }
 
 fn secure_data_dir_error(dir: &Path, error: aw_platform::PlatformError) -> io::Error {
-    if matches!(
-        error,
-        aw_platform::PlatformError::Invalid {
-            capability: "secure_data_dir",
-            detail: "data directory owner is not trusted"
-                | "data directory owner is not the daemon user"
-                | "data directory owner changed while it was being secured",
+    // The platform error preserves diagnostic detail, but a daemon's terminal
+    // must only show one of the reviewed Chinese explanations. In particular,
+    // do not print errno text here: it is platform-dependent and often English.
+    let message = match error {
+        aw_platform::PlatformError::Invalid { detail, .. }
+            if detail.contains("symlink") || detail.contains("reparse point") =>
+        {
+            format!(
+                "数据目录「{}」是一个链接，后台不会顺着链接写数据，所以没有启动。请换成普通目录后再启动后台。",
+                dir.display()
+            )
         }
-    ) {
-        let message = if cfg!(windows) {
+        aw_platform::PlatformError::Invalid {
+            detail: "official data directory requires a privileged daemon",
+            ..
+        } => format!(
+            "正式数据目录「{}」只能由管理员运行的后台使用。请用管理员运行后台，或者换一个自己的目录。",
+            dir.display()
+        ),
+        aw_platform::PlatformError::Invalid { detail, .. }
+            if detail.contains("writable by other users") || detail.contains("owner-only") =>
+        {
             format!(
-                "数据目录「{}」不是由系统或管理员创建的，为了安全，后台不会使用它。请删除这个目录后再启动后台。",
+                "数据目录「{}」别的用户也能写，后台没有启动。请把权限改成只有你自己能写，或者换一个目录。",
                 dir.display()
             )
-        } else {
-            format!(
-                "数据目录「{}」不是由后台账户创建的，为了安全，后台不会使用它。请删除这个目录后再启动后台。",
-                dir.display()
-            )
-        };
-        return io::Error::new(io::ErrorKind::PermissionDenied, message);
-    }
-    platform_error(error)
+        }
+        aw_platform::PlatformError::Io(_) => format!(
+            "数据目录「{}」的权限改不过来，后台没有启动。原因：系统拒绝了这次操作。请删掉这个目录后再启动后台。",
+            dir.display()
+        ),
+        _ => format!(
+            "数据目录「{}」不归管理员所有，可能被别人改过。为防万一，后台没有启动。请删掉这个目录后再启动后台。",
+            dir.display()
+        ),
+    };
+    io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
 
 fn platform_error(error: aw_platform::PlatformError) -> io::Error {
@@ -88,7 +102,8 @@ fn platform_error(error: aw_platform::PlatformError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_data_dir;
+    use super::{ensure_data_dir, secure_data_dir_error};
+    use std::path::Path;
 
     #[test]
     fn ensure_data_dir_creates_a_temp_tree() -> std::io::Result<()> {
@@ -129,11 +144,60 @@ mod tests {
         let Err(error) = ensure_data_dir(&link) else {
             return Err(std::io::Error::other("a data-dir symlink must be refused"));
         };
+        let expected = format!(
+            "数据目录「{}」是一个链接，后台不会顺着链接写数据，所以没有启动。请换成普通目录后再启动后台。",
+            link.display()
+        );
         let _ = std::fs::remove_dir_all(&root);
-        if error.kind() == std::io::ErrorKind::InvalidInput {
+        if error.kind() == std::io::ErrorKind::PermissionDenied && error.to_string() == expected {
             Ok(())
         } else {
             Err(error)
+        }
+    }
+
+    #[test]
+    fn secure_data_dir_errors_use_the_reviewed_templates() {
+        let path = Path::new("/example/data");
+        let cases = [
+            (
+                aw_platform::PlatformError::Invalid {
+                    capability: "secure_data_dir",
+                    detail: "data directory path contains a symlink",
+                },
+                "数据目录「/example/data」是一个链接，后台不会顺着链接写数据，所以没有启动。请换成普通目录后再启动后台。",
+            ),
+            (
+                aw_platform::PlatformError::Invalid {
+                    capability: "secure_data_dir",
+                    detail: "official data directory requires a privileged daemon",
+                },
+                "正式数据目录「/example/data」只能由管理员运行的后台使用。请用管理员运行后台，或者换一个自己的目录。",
+            ),
+            (
+                aw_platform::PlatformError::Invalid {
+                    capability: "secure_data_dir",
+                    detail: "data directory ancestor is writable by other users",
+                },
+                "数据目录「/example/data」别的用户也能写，后台没有启动。请把权限改成只有你自己能写，或者换一个目录。",
+            ),
+            (
+                aw_platform::PlatformError::Io(std::io::Error::from_raw_os_error(13)),
+                "数据目录「/example/data」的权限改不过来，后台没有启动。原因：系统拒绝了这次操作。请删掉这个目录后再启动后台。",
+            ),
+            (
+                aw_platform::PlatformError::Invalid {
+                    capability: "secure_data_dir",
+                    detail: "data directory owner is not the daemon user",
+                },
+                "数据目录「/example/data」不归管理员所有，可能被别人改过。为防万一，后台没有启动。请删掉这个目录后再启动后台。",
+            ),
+        ];
+        for (platform_error, expected) in cases {
+            assert_eq!(
+                secure_data_dir_error(path, platform_error).to_string(),
+                expected
+            );
         }
     }
 }

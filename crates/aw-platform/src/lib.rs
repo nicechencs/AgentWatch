@@ -391,7 +391,10 @@ pub trait Platform: Send + Sync {
     /// any file below it. Implementations reject a pre-existing directory
     /// owned by somebody other than the account allowed for that location,
     /// and reject links/reparse points rather than following them.
-    fn secure_data_dir(&self, path: &Path) -> Result<(), PlatformError>;
+    /// Returns the canonical, securely opened-and-checked directory path. The
+    /// daemon must use this path for subsequent opens so a benign system alias
+    /// such as macOS `/tmp` is never resolved again after hardening.
+    fn secure_data_dir(&self, path: &Path) -> Result<PathBuf, PlatformError>;
     fn default_data_dir(&self) -> Result<PathBuf, PlatformError>;
     fn default_config_path(&self) -> Result<PathBuf, PlatformError>;
     fn is_privileged(&self) -> Option<bool>;

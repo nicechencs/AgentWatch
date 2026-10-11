@@ -883,7 +883,7 @@ mod attach_target_name_tests {
 mod database_busy_tests {
     use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use rusqlite::{Transaction, TransactionBehavior};
 
@@ -901,6 +901,7 @@ mod database_busy_tests {
         drop(aw_store::Store::open_runtime(&path).expect("runtime store"));
 
         let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
         let writer_path = path.clone();
         let writer = thread::spawn(move || {
             let conn = aw_store::open_connection(&writer_path).expect("writer connection");
@@ -912,8 +913,13 @@ mod database_busy_tests {
             )
             .expect("writer row");
             ready_tx.send(()).expect("signal writer");
-            thread::sleep(aw_store::BUSY_TIMEOUT + Duration::from_secs(1));
+            // Keep the write transaction open until `insert_session` has
+            // returned. A fixed sleep starts before the attempted write; a
+            // loaded CI runner can delay that write until after the lock has
+            // expired, which tests success rather than the timeout path.
+            let release = release_rx.recv_timeout(aw_store::BUSY_TIMEOUT + Duration::from_secs(5));
             tx.commit().expect("writer commit");
+            release
         });
         ready_rx.recv().expect("writer ready");
 
@@ -929,23 +935,48 @@ mod database_busy_tests {
             write_session_row: true,
             root_hint: None,
         };
-        let response = insert_session(&path, &mut target).expect_err("busy response");
-        assert_eq!(response.status, 503);
+        let started = Instant::now();
+        let result = insert_session(&path, &mut target);
+        let elapsed = started.elapsed();
+        let release_sent = release_tx.send(()).is_ok();
+        let writer_release = writer.join().expect("writer thread");
+        let outcome = match &result {
+            Ok(()) => "Ok(())".to_owned(),
+            Err(response) => format!(
+                "Err(status={}, body={})",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            ),
+        };
+        let diagnostic = format!(
+            "insert_session elapsed={elapsed:?}; outcome={outcome}; \
+             release_sent={release_sent}; writer_release={writer_release:?}"
+        );
+        let response = result.expect_err(&format!("busy response; {diagnostic}"));
+        assert!(release_sent, "writer release channel closed; {diagnostic}");
+        assert!(
+            writer_release.is_ok(),
+            "writer hold limit elapsed; {diagnostic}"
+        );
+        assert_eq!(response.status, 503, "{diagnostic}");
         let body: serde_json::Value = serde_json::from_slice(&response.body).expect("busy JSON");
-        assert_eq!(body["error"]["code"], "db_busy");
+        assert_eq!(body["error"]["code"], "db_busy", "{diagnostic}");
         let waited = body["error"]["waited_seconds"]
             .as_u64()
             .expect("measured seconds");
-        assert!(waited >= aw_store::BUSY_TIMEOUT.as_secs());
+        assert!(waited >= aw_store::BUSY_TIMEOUT.as_secs(), "{diagnostic}");
         assert_eq!(
             body["error"]["message"],
-            format!("The session database is busy (the service is writing). Waited {waited} s and still couldn't get in; try again later.")
+            format!("The session database is busy (the service is writing). Waited {waited} s and still couldn't get in; try again later."),
+            "{diagnostic}"
         );
-        assert!(body["error"]["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("database is locked")
-                || detail.contains("database is busy")));
-        writer.join().expect("writer thread");
+        assert!(
+            body["error"]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("database is locked")
+                    || detail.contains("database is busy")),
+            "{diagnostic}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

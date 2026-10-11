@@ -912,26 +912,34 @@ fn self_cgroup_relative() -> Result<std::path::PathBuf, String> {
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 fn move_and_wait(
-    mut spawned: std::process::Child,
+    spawned: std::process::Child,
     session: &std::path::Path,
 ) -> Result<LaunchResult, LaunchError> {
-    use std::os::unix::process::ExitStatusExt;
-
     let pid = spawned.id();
+    let mut terminal =
+        super::terminal::TerminalChild::new(pid).map_err(|_| LaunchError::WaitFailed {
+            detail: "无法安装程序信号转发".to_owned(),
+        })?;
+    terminal
+        .give_child_foreground()
+        .map_err(|_| LaunchError::WaitFailed {
+            detail: "无法切换终端前台程序组".to_owned(),
+        })?;
     let procs = session.join("cgroup.procs");
     let write = std::fs::write(&procs, format!("{pid}"));
+    // `TerminalChild` is now the one WUNTRACED waiter for this direct child.
+    // `Child` owns no descriptor on Unix, and must not call its plain `wait`.
+    drop(spawned);
     if let Err(err) = write {
         // The program has already started (spawn comes before the move), so
         // killing it would lose the user's work and re-running would run it
         // twice. Keep it, drop the unused cgroup, track by process tree.
         let _ = std::fs::remove_dir(session);
-        let status = spawned.wait().map_err(|err| LaunchError::WaitFailed {
-            detail: format!("等待失败：{err}"),
+        let code = terminal.wait().map_err(|_| LaunchError::WaitFailed {
+            detail: "等待程序结束失败".to_owned(),
         })?;
         return Ok(LaunchResult {
-            code: status
-                .code()
-                .or_else(|| status.signal().map(|signal| 128 + signal)),
+            code: Some(code),
             pid,
             cgroup_path: String::new(),
             detail: format!(
@@ -941,15 +949,12 @@ fn move_and_wait(
             scoped: false,
         });
     }
-    let status = spawned.wait().map_err(|err| LaunchError::WaitFailed {
-        detail: format!("等待失败：{err}"),
+    let code = terminal.wait().map_err(|_| LaunchError::WaitFailed {
+        detail: "等待程序结束失败".to_owned(),
     })?;
-    let code = status
-        .code()
-        .or_else(|| status.signal().map(|signal| 128 + signal));
     let _ = std::fs::remove_dir(session);
     Ok(LaunchResult {
-        code,
+        code: Some(code),
         pid,
         cgroup_path: session.display().to_string(),
         detail: format!(

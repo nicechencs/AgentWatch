@@ -18,6 +18,12 @@
 #[path = "unix_linux.rs"]
 mod unix_linux;
 
+// The foreground terminal belongs to the CLI, not to a collector or the
+// suspended-launch implementation.  Both Unix launch paths use this one
+// waiter after the target has its own process group.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod terminal;
+
 /// Present only on Linux. [`unix_linux::LocalCgroupHost`] creates a cgroup v2
 /// session directory when the caller is delegated, and refuses otherwise.
 #[cfg(target_os = "linux")]

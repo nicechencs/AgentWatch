@@ -27,22 +27,16 @@
 //! Command text, environment values, and the working directory are inputs to
 //! the launcher. They are not written to stdout, stderr, or an error string.
 
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+use aw_platform::PlatformError;
+#[cfg(windows)]
+use aw_platform::ReapOutcome;
+#[cfg(any(target_os = "linux", windows))]
+use aw_platform::{platform, HeldChild, IdentifiedCaller, ReleasedChild, SpawnRequest};
+use aw_proxy::{plan_injection, Injection, ProxyOnReject};
 use std::io::{self, Write};
 #[cfg(not(any(unix, windows)))]
 use std::process::{Child, Command};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
-    Arc,
-};
-
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
-use aw_platform::PlatformError;
-#[cfg(any(target_os = "linux", windows))]
-use aw_platform::{
-    platform, HeldChild, IdentifiedCaller, ReapOutcome, ReleasedChild, SpawnRequest,
-};
-use aw_proxy::{plan_injection, Injection, ProxyOnReject};
 
 use serde_json::{json, Value};
 
@@ -313,7 +307,7 @@ fn spawn_error_text_for(program: &str, error: &std::io::Error) -> String {
 }
 
 /// Plain Chinese sentence when waiting for the started program failed.
-#[cfg(any(not(windows), test))]
+#[cfg(any(not(any(unix, windows)), test))]
 pub(crate) fn wait_error_text(_error: &std::io::Error) -> String {
     "等待程序结束失败".to_owned()
 }
@@ -363,6 +357,7 @@ struct PlatformChild {
     program: String,
     /// The working directory the caller asked for, for the directory sentence.
     cwd: Option<String>,
+    terminal: Option<crate::launch::terminal::TerminalChild>,
 }
 
 #[cfg(target_os = "macos")]
@@ -379,14 +374,15 @@ impl SpawnedChild for PlatformChild {
         let Some(child) = self.released.take() else {
             return Err("程序还被挂住，不能等待它结束".to_owned());
         };
-        match child.wait() {
-            Ok(aw_platform::ReapOutcome::Exited(code)) => Ok(code),
-            // Unix shells conventionally expose a signal result as 128+signo.
-            Ok(aw_platform::ReapOutcome::Signaled(signal)) => Ok(128 + signal),
-            Ok(aw_platform::ReapOutcome::StillRunning) => Err("等了很久，程序还没结束".to_owned()),
-            Err(aw_platform::PlatformError::Io(error)) => Err(wait_error_text(&error)),
-            Err(error) => Err(platform_child_error(error).1),
-        }
+        let mut terminal = self
+            .terminal
+            .take()
+            .ok_or_else(|| "终端等待尚未准备好".to_owned())?;
+        // The released platform handle is consumed here.  On Unix it owns a
+        // direct child and has no other resources; `TerminalChild` becomes the
+        // sole `waitpid(WUNTRACED)` caller so it can implement job control.
+        drop(child);
+        terminal.wait()
     }
 
     fn release(&mut self) -> Result<(), String> {
@@ -395,6 +391,12 @@ impl SpawnedChild for PlatformChild {
         };
         match held.release() {
             Ok(released) => {
+                let mut terminal = crate::launch::terminal::TerminalChild::new(released.pid())?;
+                if let Err(error) = terminal.give_child_foreground() {
+                    self.released = Some(released);
+                    return Err(error);
+                }
+                self.terminal = Some(terminal);
                 self.released = Some(released);
                 Ok(())
             }
@@ -408,8 +410,15 @@ impl SpawnedChild for PlatformChild {
         if let Some(mut held) = self.held.take() {
             let _ = held.abort();
         }
-        if let Some(mut released) = self.released.take() {
-            let _ = released.try_reap();
+        if let Some(released) = self.released.take() {
+            if let Some(terminal) = self.terminal.take() {
+                drop(terminal);
+            }
+            let _ = crate::launch::terminal::forward_to_group(
+                released.pid(),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            let _ = released.wait();
         }
     }
 }
@@ -426,6 +435,8 @@ struct PlatformGatedChild {
     program: String,
     /// The working directory the caller asked for, for the directory sentence.
     cwd: Option<String>,
+    #[cfg(unix)]
+    terminal: Option<crate::launch::terminal::TerminalChild>,
 }
 
 #[cfg(any(target_os = "linux", windows))]
@@ -439,26 +450,34 @@ impl SpawnedChild for PlatformGatedChild {
     }
 
     fn wait(&mut self) -> Result<i32, String> {
-        let child = self
-            .released
-            .take()
-            .ok_or_else(|| "无法等待尚未放行的程序".to_owned())?;
-        match child
-            .wait()
-            .map_err(|error| platform_child_error(error).1)?
+        #[cfg(unix)]
         {
-            ReapOutcome::Exited(code) => Ok(code),
-            ReapOutcome::Signaled(signo) => {
-                #[cfg(windows)]
-                {
-                    Ok(signo)
-                }
-                #[cfg(not(windows))]
-                {
-                    Ok(128 + signo)
-                }
+            let child = self
+                .released
+                .take()
+                .ok_or_else(|| "无法等待尚未放行的程序".to_owned())?;
+            let mut terminal = self
+                .terminal
+                .take()
+                .ok_or_else(|| "终端等待尚未准备好".to_owned())?;
+            // See PlatformChild: consuming the Unix release object leaves a
+            // single WUNTRACED waiter for this direct child.
+            drop(child);
+            terminal.wait()
+        }
+        #[cfg(windows)]
+        {
+            let child = self
+                .released
+                .take()
+                .ok_or_else(|| "无法等待尚未放行的程序".to_owned())?;
+            match child
+                .wait()
+                .map_err(|error| platform_child_error(error).1)?
+            {
+                ReapOutcome::Exited(code) | ReapOutcome::Signaled(code) => Ok(code),
+                ReapOutcome::StillRunning => Ok(exit::GENERAL),
             }
-            ReapOutcome::StillRunning => Ok(exit::GENERAL),
         }
     }
 
@@ -467,16 +486,36 @@ impl SpawnedChild for PlatformGatedChild {
             .held
             .take()
             .ok_or_else(|| "启动闸门已经放行".to_owned())?;
-        self.released =
-            Some(held.release().map_err(|error| {
-                platform_spawn_error(&self.program, self.cwd.as_deref(), error).1
-            })?);
+        let released = held
+            .release()
+            .map_err(|error| platform_spawn_error(&self.program, self.cwd.as_deref(), error).1)?;
+        #[cfg(unix)]
+        {
+            let mut terminal = crate::launch::terminal::TerminalChild::new(released.pid())?;
+            if let Err(error) = terminal.give_child_foreground() {
+                self.released = Some(released);
+                return Err(error);
+            }
+            self.terminal = Some(terminal);
+        }
+        self.released = Some(released);
         Ok(())
     }
 
     fn kill_and_reap(&mut self) {
         if let Some(mut held) = self.held.take() {
             let _ = held.abort();
+        }
+        #[cfg(unix)]
+        if let Some(released) = self.released.take() {
+            if let Some(terminal) = self.terminal.take() {
+                drop(terminal);
+            }
+            let _ = crate::launch::terminal::forward_to_group(
+                released.pid(),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            let _ = released.wait();
         }
     }
 }
@@ -592,6 +631,7 @@ impl Spawner for CommandSpawner {
                 released: None,
                 program: program.clone(),
                 cwd: spec.cwd.clone(),
+                terminal: None,
             }))
         }
         #[cfg(target_os = "macos")]
@@ -619,6 +659,7 @@ impl Spawner for CommandSpawner {
                 released: None,
                 program: program.clone(),
                 cwd: spec.cwd.clone(),
+                terminal: None,
             }))
         }
         #[cfg(windows)]
@@ -744,7 +785,6 @@ pub(crate) struct PlatformLauncher;
 #[cfg(target_os = "linux")]
 impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
-        let forwarder = ProcessGroupForwarder::new()?;
         launch_linux_with_started(
             spec,
             &mut |program, argv, cwd, env, started| {
@@ -757,12 +797,13 @@ impl Launcher for PlatformLauncher {
                     started,
                 )
             },
-            &mut |pid| forwarder.set_pid(pid),
+            &mut |_| {},
         )
     }
 
     fn forward_interrupt(&mut self, pid: u32) -> Result<(), LaunchDispatchError> {
-        forward_unix_signal(pid, nix::sys::signal::Signal::SIGINT)
+        crate::launch::terminal::forward_to_group(pid, nix::sys::signal::Signal::SIGINT)
+            .map_err(|detail| LaunchDispatchError::NotImplemented { detail })
     }
 }
 
@@ -850,28 +891,26 @@ fn launch_linux_with_started(
             for (key, value) in &spec.env {
                 child.env(key, value);
             }
-            let mut spawned =
-                child
-                    .spawn()
-                    .map_err(|error| LaunchDispatchError::NotImplemented {
-                        detail: format!(
-                            "{}；cgroup 不可用，已改按进程树跟踪，仍没能启动",
-                            spawn_error_text(&error)
-                        ),
-                    })?;
+            let spawned = child
+                .spawn()
+                .map_err(|error| LaunchDispatchError::NotImplemented {
+                    detail: format!(
+                        "{}；cgroup 不可用，已改按进程树跟踪，仍没能启动",
+                        spawn_error_text(&error)
+                    ),
+                })?;
             let pid = spawned.id();
             started(pid);
-            let status = spawned
-                .wait()
-                .map_err(|error| LaunchDispatchError::NotImplemented {
-                    detail: wait_error_text(&error),
-                })?;
-            use std::os::unix::process::ExitStatusExt;
+            let mut terminal = crate::launch::terminal::TerminalChild::new(pid)
+                .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
+            terminal
+                .give_child_foreground()
+                .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
+            drop(spawned);
             Ok(Launched {
-                code: status
-                    .code()
-                    .or_else(|| status.signal().map(|signal| 128 + signal))
-                    .unwrap_or(exit::GENERAL),
+                code: terminal
+                    .wait()
+                    .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?,
                 pid,
                 note: Some(PID_TREE_FALLBACK_NOTE),
                 sampling: spec.no_daemon,
@@ -936,13 +975,11 @@ pub(crate) struct PlatformLauncher;
 #[cfg(target_os = "macos")]
 impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
-        let forwarder = ProcessGroupForwarder::new()?;
         let mut child = CommandSpawner
             .spawn(spec)
             .map_err(|(_code, detail)| LaunchDispatchError::NotImplemented { detail })?;
         let pid = child.pid();
         make_child_process_group(pid)?;
-        forwarder.set_pid(pid);
         child
             .release()
             .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
@@ -958,108 +995,8 @@ impl Launcher for PlatformLauncher {
     }
 
     fn forward_interrupt(&mut self, pid: u32) -> Result<(), LaunchDispatchError> {
-        forward_unix_signal(pid, nix::sys::signal::Signal::SIGINT)
-    }
-}
-
-/// Safe foreground signal relay for a `--no-daemon` target.  The target gets
-/// its own process group before this is armed, so the relay reaches ordinary
-/// descendants too.  The registrations are removed before `aw` returns.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-struct ProcessGroupForwarder {
-    pid: Arc<AtomicI32>,
-    pending: Arc<AtomicUsize>,
-    done: Arc<AtomicBool>,
-    registrations: Vec<signal_hook::SigId>,
-    worker: Option<std::thread::JoinHandle<()>>,
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-impl ProcessGroupForwarder {
-    fn new() -> Result<Self, LaunchDispatchError> {
-        use nix::sys::signal::Signal;
-
-        let pid = Arc::new(AtomicI32::new(0));
-        let pending = Arc::new(AtomicUsize::new(0));
-        let done = Arc::new(AtomicBool::new(false));
-        let mut registrations = Vec::new();
-        for signal in [Signal::SIGINT, Signal::SIGTERM] {
-            match signal_hook::flag::register_usize(
-                signal as i32,
-                Arc::clone(&pending),
-                signal as usize,
-            ) {
-                Ok(id) => registrations.push(id),
-                Err(error) => {
-                    for id in registrations {
-                        let _ = signal_hook::low_level::unregister(id);
-                    }
-                    return Err(LaunchDispatchError::NotImplemented {
-                        detail: format!("无法安装中断转发：{error}"),
-                    });
-                }
-            }
-        }
-        let worker_pid = Arc::clone(&pid);
-        let worker_pending = Arc::clone(&pending);
-        let worker_done = Arc::clone(&done);
-        let worker = std::thread::Builder::new()
-            .name("aw-run-signal-relay".to_owned())
-            .spawn(move || {
-                while !worker_done.load(Ordering::Relaxed) {
-                    let number = worker_pending.swap(0, Ordering::Relaxed);
-                    let child = worker_pid.load(Ordering::Relaxed);
-                    if number != 0 && child > 0 {
-                        let signal = if number == Signal::SIGTERM as usize {
-                            Signal::SIGTERM
-                        } else {
-                            Signal::SIGINT
-                        };
-                        let _ = forward_unix_signal(child as u32, signal);
-                    } else if number != 0 {
-                        // A signal arriving during spawn is still delivered as
-                        // soon as the child process group has a pid.
-                        worker_pending.store(number, Ordering::Relaxed);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            })
-            .map_err(|error| {
-                for id in registrations.drain(..) {
-                    let _ = signal_hook::low_level::unregister(id);
-                }
-                LaunchDispatchError::NotImplemented {
-                    detail: format!("无法启动中断转发：{error}"),
-                }
-            })?;
-        Ok(Self {
-            pid,
-            pending,
-            done,
-            registrations,
-            worker: Some(worker),
-        })
-    }
-
-    fn set_pid(&self, pid: u32) {
-        if let Ok(pid) = i32::try_from(pid) {
-            self.pid.store(pid, Ordering::Relaxed);
-        }
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-impl Drop for ProcessGroupForwarder {
-    fn drop(&mut self) {
-        self.done.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-        for id in self.registrations.drain(..) {
-            let _ = signal_hook::low_level::unregister(id);
-        }
-        // Keep the flag allocated until after unregistering its callbacks.
-        let _ = self.pending.load(Ordering::Relaxed);
+        crate::launch::terminal::forward_to_group(pid, nix::sys::signal::Signal::SIGINT)
+            .map_err(|detail| LaunchDispatchError::NotImplemented { detail })
     }
 }
 
@@ -1073,23 +1010,6 @@ fn make_child_process_group(pid: u32) -> Result<(), LaunchDispatchError> {
     let child = nix::unistd::Pid::from_raw(pid);
     nix::unistd::setpgid(child, child).map_err(|error| LaunchDispatchError::NotImplemented {
         detail: format!("无法为子进程建立进程组：{error}"),
-    })
-}
-
-/// Forward one terminal signal to the spawned Unix process group. The signal
-/// number is never formatted from user input.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn forward_unix_signal(
-    pid: u32,
-    signal: nix::sys::signal::Signal,
-) -> Result<(), LaunchDispatchError> {
-    let pid = i32::try_from(pid).map_err(|_| LaunchDispatchError::NotImplemented {
-        detail: "子进程号超出 Unix pid 范围".to_owned(),
-    })?;
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pid), signal).map_err(|error| {
-        LaunchDispatchError::NotImplemented {
-            detail: format!("无法转发中断给子进程：{error}"),
-        }
     })
 }
 

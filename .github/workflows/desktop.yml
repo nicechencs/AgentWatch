@@ -9,6 +9,9 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Manual run of the 3-OS gate on a chosen ref (e.g. the dev tip):
+  #   gh workflow run desktop.yml --ref dev
+  workflow_dispatch:
 
 concurrency:
   group: desktop-${{ github.ref }}

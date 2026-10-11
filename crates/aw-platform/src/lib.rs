@@ -205,7 +205,8 @@ impl PlatformError {
 /// outcome, but the stable categories intentionally differ for diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipeServerVerificationError {
-    /// The pipe object's owner SID could not be queried.
+    /// The service image, pipe-server process, or either canonical path could
+    /// not be queried.
     CannotQuery {
         operation: &'static str,
         win32_error: u32,
@@ -213,7 +214,7 @@ pub enum PipeServerVerificationError {
         /// wording stays with the channel error category.
         detail: Option<String>,
     },
-    /// The owner SID was read successfully but is not trusted as a daemon.
+    /// Both images were read successfully but do not identify the same daemon.
     NotDaemon {
         /// Diagnostic detail for logs and JSON output only. This may name a
         /// local image path, never a request or credential.
@@ -231,7 +232,7 @@ impl fmt::Display for PipeServerVerificationError {
             } => {
                 write!(
                     f,
-                    "named-pipe server owner query failed: {operation} (Win32 error {win32_error})"
+                    "named-pipe server image query failed: {operation} (Win32 error {win32_error})"
                 )?;
                 if let Some(detail) = detail {
                     write!(f, "; {detail}")?;
@@ -239,7 +240,7 @@ impl fmt::Display for PipeServerVerificationError {
                 Ok(())
             }
             Self::NotDaemon { detail } => {
-                f.write_str("named-pipe server owner is not trusted")?;
+                f.write_str("named-pipe server image is not the installed daemon")?;
                 if let Some(detail) = detail {
                     write!(f, ": {detail}")?;
                 }
@@ -253,18 +254,18 @@ impl std::error::Error for PipeServerVerificationError {}
 
 /// The observed installation state for the Windows `AgentWatch` SCM service.
 ///
-/// An SCM query failure is intentionally distinct from no service: callers
-/// must fail closed and require a LocalSystem-owned pipe in that case.
+/// Every state other than a configured executable fails server verification.
+/// Keeping the states distinct preserves the diagnostic for `--json` without
+/// making a missing or unreadable service a development-mode exception.
 #[cfg(windows)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipeServiceStatus {
-    /// The SCM reports that the service does not exist. A foreground,
-    /// same-user development daemon is allowed in this mode.
+    /// The SCM reports that the service does not exist.
     NotInstalled,
     /// The service exists, whether or not it is currently running.
     Installed {
-        /// The executable parsed from `QueryServiceConfigW`, when available.
-        binary_path: Option<PathBuf>,
+        /// The executable parsed from `QueryServiceConfigW`.
+        binary_path: PathBuf,
     },
     /// SCM could not determine whether the service exists. Treat this exactly
     /// like an installed service and retain the detail for diagnostics.
@@ -344,9 +345,9 @@ pub struct SpawnRequest {
     pub env: Vec<(String, String)>,
     /// Where the target's environment comes from.
     ///
-    /// The privileged daemon path passes [`EnvSource::Exact`]: the child gets
-    /// exactly `env` and nothing of this process. `aw run` and `--no-daemon`
-    /// pass [`EnvSource::Inherit`]: they already run as the user, and the child
+    /// The privileged daemon path passes [`EnvSource::Exact`] or, on Windows,
+    /// [`EnvSource::AccountProfile`]. `aw run` and `--no-daemon` pass
+    /// [`EnvSource::Inherit`]: they already run as the user, and the child
     /// keeps this process's environment with `env` applied on top. There is no
     /// default that inherits. A caller that forgets the field does not compile.
     pub env_source: EnvSource,
@@ -364,6 +365,11 @@ pub enum EnvSource {
     /// is not read. The privileged daemon path uses this so a root daemon cannot
     /// hand its own variables to the target.
     Exact,
+    /// A Windows base environment from the OS-authenticated caller's token,
+    /// then `SpawnRequest::env` overlays. This is never allowed to fall back
+    /// to the daemon's process token.
+    #[cfg(windows)]
+    AccountProfile,
 }
 impl fmt::Debug for SpawnRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -400,11 +406,31 @@ pub enum ReapOutcome {
 pub struct PeerIdentity {
     owner: Owner,
     pid: Option<u32>,
+    #[cfg(windows)]
+    caller_token: Option<windows::CallerToken>,
 }
 impl PeerIdentity {
     #[allow(dead_code)] // constructed by OS modules that identify peers in this build
     pub(crate) fn new(owner: Owner, pid: Option<u32>) -> Self {
-        Self { owner, pid }
+        Self {
+            owner,
+            pid,
+            #[cfg(windows)]
+            caller_token: None,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn with_windows_token(
+        owner: Owner,
+        pid: Option<u32>,
+        caller_token: windows::CallerToken,
+    ) -> Self {
+        Self {
+            owner,
+            pid,
+            caller_token: Some(caller_token),
+        }
     }
     pub fn owner(&self) -> &Owner {
         &self.owner
@@ -416,22 +442,35 @@ impl PeerIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentifiedCaller {
     owner: Owner,
+    #[cfg(windows)]
+    caller_token: Option<windows::CallerToken>,
 }
 impl IdentifiedCaller {
     /// The only way to name a caller who connected. `PeerIdentity` is built
     /// inside this crate from an OS credential, so a uid and gid from a
     /// request cannot become a caller.
     pub fn from_peer(peer: PeerIdentity) -> Self {
-        Self { owner: peer.owner }
+        Self {
+            owner: peer.owner,
+            #[cfg(windows)]
+            caller_token: peer.caller_token,
+        }
     }
 
     pub fn current_user() -> Result<Self, PlatformError> {
         Ok(Self {
             owner: platform().current_owner()?,
+            #[cfg(windows)]
+            caller_token: Some(windows::current_process_caller_token()?),
         })
     }
     pub fn owner(&self) -> &Owner {
         &self.owner
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn windows_token(&self) -> Option<&windows::CallerToken> {
+        self.caller_token.as_ref()
     }
 }
 
@@ -538,10 +577,10 @@ pub fn identify_pipe_peer(
     windows::identify_pipe_peer(handle)
 }
 
-/// Refuse a Windows named-pipe server unless its pipe-object owner follows
-/// the installed-service rule. When `AgentWatch` is installed, only
-/// LocalSystem is accepted; without that service, a same-user development
-/// daemon is also accepted.
+/// Refuse a Windows named-pipe server unless the process holding it has the
+/// same canonical image path as the installed `AgentWatch` service. The
+/// comparison fails closed when the service, process, or either image path
+/// cannot be queried.
 #[cfg(windows)]
 pub fn verify_pipe_server(
     handle: std::os::windows::io::RawHandle,
@@ -561,16 +600,6 @@ pub fn verify_pipe_server_with_service_status(
     windows::verify_pipe_server_with_service_status(handle, service_status)
 }
 
-/// Testable owner-allowlist form retained for the existing reverse tests.
-/// Product callers must use [`verify_pipe_server`] or the service-status hook.
-#[cfg(all(windows, any(test, feature = "test-support")))]
-pub fn verify_pipe_server_for_owners(
-    handle: std::os::windows::io::RawHandle,
-    trusted_owners: &[&str],
-) -> Result<(), PipeServerVerificationError> {
-    windows::verify_pipe_server_for_owners(handle, trusted_owners)
-}
-
 /// Record that a complete Windows named-pipe request made the round trip after
 /// the peer checks. `aw doctor` uses this runtime fact rather than advertising
 /// peer identification merely because this build contains the API.
@@ -581,17 +610,18 @@ pub fn note_pipe_peer_identification() {
 
 /// Build the minimal environment for a program launched by the Windows daemon.
 ///
-/// On Windows this is built from the current account's profile, not from the
-/// daemon process environment. Other systems have their own account-environment
-/// builders, so asking for the Windows form is explicit unsupported there.
+/// On Windows this is built from `caller`'s profile token, not from the
+/// daemon process token or environment. Other systems have their own
+/// account-environment builders, so asking for the Windows form is explicit
+/// unsupported there.
 #[cfg(windows)]
-pub fn account_base_env() -> Result<Vec<(String, String)>, PlatformError> {
-    windows::account_base_env()
+pub fn account_base_env(caller: &IdentifiedCaller) -> Result<Vec<(String, String)>, PlatformError> {
+    windows::account_base_env(caller)
 }
 
 /// Windows account-profile environments are not available on this OS.
 #[cfg(not(windows))]
-pub fn account_base_env() -> Result<Vec<(String, String)>, PlatformError> {
+pub fn account_base_env(_caller: &IdentifiedCaller) -> Result<Vec<(String, String)>, PlatformError> {
     Err(PlatformError::Unsupported {
         capability: "account_base_env",
         os: std::env::consts::OS,

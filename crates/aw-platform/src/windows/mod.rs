@@ -89,6 +89,72 @@ const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 /// Matches `WindowsServiceDef::service_name` and the installer `sc.exe` plan.
 const AGENTWATCH_SERVICE_NAME: &str = "AgentWatch";
 
+/// An owned duplicate of an OS-authenticated caller token. It is carried from
+/// the named-pipe identity check to a later launch request, after the pipe
+/// thread has reverted impersonation. The raw value is intentionally never
+/// formatted or exposed outside this module.
+#[derive(Clone)]
+pub(crate) struct CallerToken(std::sync::Arc<OwnedCallerToken>);
+
+struct OwnedCallerToken(HANDLE);
+
+impl std::fmt::Debug for CallerToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CallerToken(..)")
+    }
+}
+
+impl PartialEq for CallerToken {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for CallerToken {}
+
+impl CallerToken {
+    fn from_owned(handle: HANDLE) -> Self {
+        Self(std::sync::Arc::new(OwnedCallerToken(handle)))
+    }
+
+    fn handle(&self) -> HANDLE {
+        self.0.0
+    }
+}
+
+impl Drop for OwnedCallerToken {
+    fn drop(&mut self) {
+        close(self.0);
+    }
+}
+
+pub(crate) fn current_process_caller_token() -> Result<CallerToken, PlatformError> {
+    let mut source = HANDLE::default();
+    // SAFETY: the current-process pseudo-handle is valid and `source` is
+    // writable storage for a token handle that this function owns.
+    #[allow(unsafe_code)]
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut source) }.map_err(io_error)?;
+    let mut duplicate = HANDLE::default();
+    // SAFETY: both process pseudo-handles refer to this process; `source` is
+    // live and `duplicate` is writable storage for the independently owned
+    // same-access duplicate.
+    #[allow(unsafe_code)]
+    let copied = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            source,
+            GetCurrentProcess(),
+            &mut duplicate,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    close(source);
+    copied.map_err(io_error)?;
+    Ok(CallerToken::from_owned(duplicate))
+}
+
 pub fn note_pipe_peer_identification() {
     PIPE_PEER_IDENTIFICATION_WORKS.store(true, Ordering::Release);
 }
@@ -960,21 +1026,14 @@ struct ProfileEnvironmentBlock {
 }
 
 impl ProfileEnvironmentBlock {
-    fn for_current_process_token() -> Result<Self, PlatformError> {
-        let mut token = HANDLE::default();
-        // SAFETY: the current-process pseudo-handle is valid and `token` is
-        // writable storage for the owned TOKEN_QUERY handle.
-        #[allow(unsafe_code)]
-        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
-            .map_err(io_error)?;
-
+    fn for_token(token: HANDLE) -> Result<Self, PlatformError> {
         let mut pointer = std::ptr::null_mut();
-        // SAFETY: `token` is an open token for the current process; `pointer`
-        // is valid writable storage. Passing false prevents inheriting the
-        // daemon environment into the account-profile environment block.
+        // SAFETY: `token` is the owned duplicate of the OS-authenticated
+        // caller's token and remains live in `CallerToken`; `pointer` is valid
+        // writable storage. Passing false prevents inheriting the daemon
+        // environment into the account-profile environment block.
         #[allow(unsafe_code)]
         let created = unsafe { CreateEnvironmentBlock(&mut pointer, token, false) };
-        close(token);
         created.map_err(io_error)?;
         if pointer.is_null() {
             return Err(PlatformError::Invalid {
@@ -1101,12 +1160,18 @@ fn account_base_env_from_profile(
     Ok(values)
 }
 
-/// Build the Windows launch base environment from the current account profile.
+/// Build the Windows launch base environment from the caller's account profile.
 ///
 /// `CreateEnvironmentBlock` consults the account profile/registry. Passing
-/// `bInherit = FALSE` ensures no daemon-process variables are copied in.
-pub fn account_base_env() -> Result<Vec<(String, String)>, PlatformError> {
-    let block = ProfileEnvironmentBlock::for_current_process_token()?;
+/// `bInherit = FALSE` ensures no daemon-process variables are copied in. A
+/// caller without the token captured from its authenticated pipe peer is
+/// refused; it must never fall back to the daemon's own process token.
+pub fn account_base_env(caller: &IdentifiedCaller) -> Result<Vec<(String, String)>, PlatformError> {
+    let token = caller.windows_token().ok_or(PlatformError::Invalid {
+        capability: "account_base_env",
+        detail: "caller token is unavailable",
+    })?;
+    let block = ProfileEnvironmentBlock::for_token(token.handle())?;
     let filtered = filter_profile_environment_entries(block.entries());
     ACCOUNT_BASE_ENV_INVALID_UTF16_ENTRIES
         .fetch_add(filtered.invalid_utf16_entries, Ordering::Relaxed);
@@ -1120,28 +1185,34 @@ pub fn windows_reserved_env_name(name: &str) -> bool {
 }
 
 fn image_for_process(process: HANDLE) -> Option<PathBuf> {
+    image_for_process_checked(process).ok()
+}
+
+fn image_for_process_checked(process: HANDLE) -> Result<PathBuf, Error> {
     let mut capacity = 260_usize;
+    let mut last_error = None;
     while capacity <= 32_768 {
         let mut buffer = vec![0_u16; capacity];
         let mut length = capacity as u32;
         // SAFETY: buffer is writable UTF-16 output storage, with matching length.
         #[allow(unsafe_code)]
-        if unsafe {
+        match unsafe {
             QueryFullProcessImageNameW(
                 process,
                 PROCESS_NAME_FORMAT(0),
                 PWSTR(buffer.as_mut_ptr()),
                 &mut length,
             )
-        }
-        .is_ok()
-        {
-            buffer.truncate(length as usize);
-            return Some(PathBuf::from(OsString::from_wide(&buffer)));
+        } {
+            Ok(()) => {
+                buffer.truncate(length as usize);
+                return Ok(PathBuf::from(OsString::from_wide(&buffer)));
+            }
+            Err(error) => last_error = Some(error),
         }
         capacity *= 2;
     }
-    None
+    Err(last_error.unwrap_or_else(Error::from_win32))
 }
 
 fn entry(pid: u32, ppid: Option<u32>) -> Result<Option<ProcessEntry>, PlatformError> {
@@ -1680,8 +1751,14 @@ pub fn identify_pipe_peer(
             win32_error,
         }
     });
-    close(token);
-    let peer = owner.map(|owner| PeerIdentity::new(owner, Some(pid)))?;
+    let owner = match owner {
+        Ok(owner) => owner,
+        Err(error) => {
+            close(token);
+            return Err(error);
+        }
+    };
+    let peer = PeerIdentity::with_windows_token(owner, Some(pid), CallerToken::from_owned(token));
     note_pipe_peer_identification();
     Ok(peer)
 }
@@ -1728,14 +1805,9 @@ impl Drop for PipeImpersonation {
     }
 }
 
-/// Verify the owner of the connected pipe object itself. This deliberately
-/// does not inspect the server process token: ordinary users can read the
-/// pipe object's `READ_CONTROL` owner even when the daemon runs as LocalSystem
-/// and its process token is inaccessible to them.
-///
-/// An installed AgentWatch service makes LocalSystem the sole trusted owner.
-/// A same-user pipe is a development-only exception when the service does not
-/// exist. A failed SCM query is deliberately treated as installed.
+/// Verify that the connected pipe belongs to the executable configured for
+/// the installed AgentWatch service. A pipe object's owner is insufficient:
+/// another LocalSystem process can create one with the same owner.
 pub fn verify_pipe_server(
     handle: std::os::windows::io::RawHandle,
 ) -> Result<(), PipeServerVerificationError> {
@@ -1747,57 +1819,15 @@ pub fn verify_pipe_server(
 ///
 /// The production caller gets that observation from [`service_status_from_scm`].
 /// Keeping the status explicit gives Windows integration tests a way to prove
-/// that a connected same-user peer receives zero request bytes when a service
-/// is installed, without installing one on the runner.
+/// the refusal happens before request bytes are written, without installing a
+/// service on the runner.
 pub fn verify_pipe_server_with_service_status(
     handle: std::os::windows::io::RawHandle,
     service_status: &PipeServiceStatus,
 ) -> Result<(), PipeServerVerificationError> {
-    let scm_detail = service_status_detail(service_status);
-    let owner_sid = pipe_owner_sid(HANDLE(handle as isize))
-        .map_err(|error| with_verification_detail(error, scm_detail.clone()))?;
-    let current_sid = if matches!(service_status, PipeServiceStatus::NotInstalled) {
-        Some(
-            current_pipe_client_sid()
-                .map_err(|error| with_verification_detail(error, scm_detail.clone()))?,
-        )
-    } else {
-        None
-    };
-    if trusted_pipe_owner(&owner_sid, service_status, current_sid.as_deref()) {
-        Ok(())
-    } else {
-        let image_detail = installed_service_image_detail(HANDLE(handle as isize), service_status);
-        Err(PipeServerVerificationError::NotDaemon {
-            detail: combine_verification_details(scm_detail, image_detail),
-        })
-    }
-}
-
-/// Explicit owner allowlist used only by existing test helpers. It is not a
-/// product decision path: production calls use SCM-derived service status.
-#[cfg(any(test, feature = "test-support"))]
-pub fn verify_pipe_server_for_owners(
-    handle: std::os::windows::io::RawHandle,
-    trusted_owners: &[&str],
-) -> Result<(), PipeServerVerificationError> {
-    let owner_sid = pipe_owner_sid(HANDLE(handle as isize))?;
-    if trusted_owners.contains(&owner_sid.as_str()) {
-        Ok(())
-    } else {
-        Err(PipeServerVerificationError::NotDaemon { detail: None })
-    }
-}
-
-fn trusted_pipe_owner(
-    owner_sid: &str,
-    service_status: &PipeServiceStatus,
-    current_sid: Option<&str>,
-) -> bool {
-    if owner_sid == LOCAL_SYSTEM_SID {
-        return true;
-    }
-    matches!(service_status, PipeServiceStatus::NotInstalled) && current_sid == Some(owner_sid)
+    let installed_image = service_image_from_status(service_status)?;
+    let server_image = pipe_server_image_path(HANDLE(handle as isize))?;
+    verify_pipe_server_images(&server_image, installed_image)
 }
 
 fn service_status_from_scm() -> PipeServiceStatus {
@@ -1841,7 +1871,7 @@ fn service_status_from_scm() -> PipeServiceStatus {
 
 fn service_binary_path(
     service: windows::Win32::Security::SC_HANDLE,
-) -> Result<Option<PathBuf>, (&'static str, u32)> {
+) -> Result<PathBuf, (&'static str, u32)> {
     let mut bytes = 0_u32;
     // SAFETY: this is the documented size query. `bytes` is writable and the
     // null config pointer is paired with a zero buffer length.
@@ -1880,7 +1910,7 @@ fn service_binary_path(
     #[allow(unsafe_code)]
     let command = unsafe { config.lpBinaryPathName.to_string() }
         .map_err(|_| ("QueryServiceConfigW(binary path)", 0))?;
-    Ok(service_image_from_command(&command))
+    service_image_from_command(&command).ok_or(("QueryServiceConfigW(binary path)", 0))
 }
 
 fn service_image_from_command(command: &str) -> Option<PathBuf> {
@@ -1891,11 +1921,27 @@ fn service_image_from_command(command: &str) -> Option<PathBuf> {
             .filter(|end| *end > 0)
             .map(|end| PathBuf::from(&quoted[..end]));
     }
-    command
-        .split_ascii_whitespace()
-        .next()
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
+    let mut prefix = String::new();
+    let mut longest_exe = None;
+    let mut longest_existing_exe = None;
+    for part in command.split_ascii_whitespace() {
+        if !prefix.is_empty() {
+            prefix.push(' ');
+        }
+        prefix.push_str(part);
+        let candidate = PathBuf::from(&prefix);
+        let is_exe = candidate
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
+        if !is_exe {
+            continue;
+        }
+        if candidate.is_file() {
+            longest_existing_exe = Some(candidate.clone());
+        }
+        longest_exe = Some(candidate);
+    }
+    longest_existing_exe.or(longest_exe)
 }
 
 fn service_query_failed(operation: &'static str, error: Error) -> PipeServiceStatus {
@@ -1909,203 +1955,95 @@ fn win32_error(error: Error) -> u32 {
     error.code().0 as u32 & 0xffff
 }
 
-fn service_status_detail(status: &PipeServiceStatus) -> Option<String> {
+fn service_image_from_status(
+    status: &PipeServiceStatus,
+) -> Result<&Path, PipeServerVerificationError> {
     match status {
+        PipeServiceStatus::Installed { binary_path } => Ok(binary_path),
+        PipeServiceStatus::NotInstalled => Err(PipeServerVerificationError::CannotQuery {
+            operation: "OpenServiceW(AgentWatch)",
+            win32_error: ERROR_SERVICE_DOES_NOT_EXIST.0 as u32,
+            detail: Some("AgentWatch service is not installed".to_owned()),
+        }),
         PipeServiceStatus::QueryFailed {
             operation,
             win32_error,
-        } => Some(format!(
-            "{operation} failed (Win32 error {win32_error}); treating AgentWatch as installed and requiring a LocalSystem-owned pipe"
-        )),
-        PipeServiceStatus::NotInstalled | PipeServiceStatus::Installed { .. } => None,
-    }
-}
-
-fn with_verification_detail(
-    error: PipeServerVerificationError,
-    detail: Option<String>,
-) -> PipeServerVerificationError {
-    match error {
-        PipeServerVerificationError::CannotQuery {
+        } => Err(PipeServerVerificationError::CannotQuery {
             operation,
-            win32_error,
-            detail: existing,
-        } => PipeServerVerificationError::CannotQuery {
-            operation,
-            win32_error,
-            detail: combine_verification_details(existing, detail),
-        },
-        PipeServerVerificationError::NotDaemon { detail: existing } => {
-            PipeServerVerificationError::NotDaemon {
-                detail: combine_verification_details(existing, detail),
-            }
-        }
+            win32_error: *win32_error,
+            detail: Some("AgentWatch service configuration could not be queried".to_owned()),
+        }),
     }
 }
 
-fn combine_verification_details(first: Option<String>, second: Option<String>) -> Option<String> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(format!("{first}; {second}")),
-        (Some(detail), None) | (None, Some(detail)) => Some(detail),
-        (None, None) => None,
-    }
-}
-
-fn installed_service_image_detail(
-    pipe: HANDLE,
-    service_status: &PipeServiceStatus,
-) -> Option<String> {
-    let PipeServiceStatus::Installed {
-        binary_path: Some(installed_path),
-    } = service_status
-    else {
-        return None;
-    };
-    let server_path = pipe_server_image_path(pipe)?;
-    installed_service_image_detail_for_paths(installed_path, &server_path)
-}
-
-fn installed_service_image_detail_for_paths(
-    installed_path: &Path,
-    server_path: &Path,
-) -> Option<String> {
-    (!same_image_path(server_path, installed_path)).then(|| {
-        format!(
-            "pipe is held by {}, not the installed agentwatchd",
-            server_path.display()
-        )
-    })
-}
-
-fn pipe_server_image_path(pipe: HANDLE) -> Option<PathBuf> {
+fn pipe_server_image_path(pipe: HANDLE) -> Result<PathBuf, PipeServerVerificationError> {
     let mut pid = 0_u32;
     // SAFETY: `pipe` is the connected client handle. The PID output is valid
     // for the duration of this call.
     #[allow(unsafe_code)]
-    unsafe { GetNamedPipeServerProcessId(pipe, &mut pid) }.ok()?;
+    unsafe { GetNamedPipeServerProcessId(pipe, &mut pid) }.map_err(|error| {
+        PipeServerVerificationError::CannotQuery {
+            operation: "GetNamedPipeServerProcessId",
+            win32_error: win32_error(error),
+            detail: None,
+        }
+    })?;
+    if pid == 0 {
+        return Err(PipeServerVerificationError::CannotQuery {
+            operation: "GetNamedPipeServerProcessId",
+            win32_error: 0,
+            detail: Some("named-pipe server reported process id zero".to_owned()),
+        });
+    }
     // SAFETY: this asks only for limited query access to the named-pipe server
     // process. The returned handle is closed before this helper returns.
     #[allow(unsafe_code)]
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
-    let image = image_for_process(process);
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.map_err(
+        |error| PipeServerVerificationError::CannotQuery {
+            operation: "OpenProcess(pipe server)",
+            win32_error: win32_error(error),
+            detail: None,
+        },
+    )?;
+    let image = image_for_process_checked(process).map_err(|error| {
+        PipeServerVerificationError::CannotQuery {
+            operation: "QueryFullProcessImageNameW(pipe server)",
+            win32_error: win32_error(error),
+            detail: None,
+        }
+    });
     close(process);
     image
 }
 
-fn same_image_path(left: &Path, right: &Path) -> bool {
-    let Some(left) = canonical_image_path(left) else {
-        return false;
-    };
-    let Some(right) = canonical_image_path(right) else {
-        return false;
-    };
-    left.as_os_str()
+fn verify_pipe_server_images(
+    server_image: &Path,
+    installed_image: &Path,
+) -> Result<(), PipeServerVerificationError> {
+    let server_image = canonical_image_path(server_image, "canonicalize(pipe server image)")?;
+    let installed_image = canonical_image_path(installed_image, "canonicalize(service image)")?;
+    if server_image
+        .as_os_str()
         .to_string_lossy()
-        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
-}
-
-fn canonical_image_path(path: &Path) -> Option<PathBuf> {
-    std::fs::canonicalize(path)
-        .ok()
-        .or_else(|| lexical_absolute_path(path))
-}
-
-fn lexical_absolute_path(path: &Path) -> Option<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
+        .eq_ignore_ascii_case(&installed_image.as_os_str().to_string_lossy())
+    {
+        Ok(())
     } else {
-        std::env::current_dir().ok()?.join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    Some(normalized)
-}
-
-fn current_pipe_client_sid() -> Result<String, PipeServerVerificationError> {
-    match CurrentPlatform.current_owner() {
-        Ok(Owner::Windows { sid, .. }) => Ok(sid),
-        Ok(Owner::Unix { .. }) => Err(PipeServerVerificationError::CannotQuery {
-            operation: "GetTokenInformation(current process)",
-            win32_error: 0,
-            detail: None,
-        }),
-        Err(error) => Err(PipeServerVerificationError::CannotQuery {
-            operation: "GetTokenInformation(current process)",
-            win32_error: platform_win32_error(&error),
-            detail: None,
-        }),
+        Err(PipeServerVerificationError::NotDaemon {
+            detail: Some("pipe server image does not match installed AgentWatch service image".to_owned()),
+        })
     }
 }
 
-fn pipe_owner_sid(pipe: HANDLE) -> Result<String, PipeServerVerificationError> {
-    let mut owner = PSID::default();
-    let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: `pipe` is this process's open client handle. The output pointers
-    // are writable and the returned LocalAlloc descriptor is freed below.
-    #[allow(unsafe_code)]
-    let status = unsafe {
-        GetSecurityInfo(
-            pipe,
-            SE_KERNEL_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            Some(&mut owner),
-            None,
-            None,
-            None,
-            Some(&mut descriptor),
-        )
-    };
-    if status.is_err() {
-        return Err(PipeServerVerificationError::CannotQuery {
-            operation: "GetSecurityInfo(pipe owner)",
-            win32_error: status.0,
-            detail: None,
-        });
-    }
-    let result = pipe_sid_text(owner).map_err(|error| PipeServerVerificationError::CannotQuery {
-        operation: "ConvertSidToStringSidW(pipe owner)",
-        win32_error: error.code().0 as u32 & 0xffff,
+fn canonical_image_path(
+    path: &Path,
+    operation: &'static str,
+) -> Result<PathBuf, PipeServerVerificationError> {
+    std::fs::canonicalize(path).map_err(|error| PipeServerVerificationError::CannotQuery {
+        operation,
+        win32_error: error.raw_os_error().unwrap_or_default() as u32,
         detail: None,
-    });
-    // SAFETY: successful GetSecurityInfo allocated `descriptor` with LocalAlloc.
-    #[allow(unsafe_code)]
-    let _ = unsafe { LocalFree(HLOCAL(descriptor.0.cast())) };
-    result
-}
-
-fn pipe_sid_text(sid: PSID) -> Result<String, Error> {
-    if sid.0.is_null() {
-        return Err(Error::from_win32());
-    }
-    let mut text = PWSTR::null();
-    // SAFETY: `sid` is valid for the duration of this call; Windows allocates
-    // a NUL-terminated string which is freed below on every outcome.
-    #[allow(unsafe_code)]
-    unsafe { ConvertSidToStringSidW(sid, &mut text) }?;
-    // SAFETY: a successful conversion returned a NUL-terminated LocalAlloc
-    // string. `to_string` copies it before the allocation is freed.
-    #[allow(unsafe_code)]
-    let result = unsafe { text.to_string() };
-    // SAFETY: ConvertSidToStringSidW allocated `text` with LocalAlloc.
-    #[allow(unsafe_code)]
-    let _ = unsafe { LocalFree(HLOCAL(text.0.cast())) };
-    result.map_err(|_| Error::from_win32())
-}
-
-fn platform_win32_error(error: &PlatformError) -> u32 {
-    match error {
-        PlatformError::Io(inner) => inner.raw_os_error().unwrap_or_default() as u32,
-        PlatformError::PipePeerNotIdentified { win32_error, .. } => *win32_error as u32,
-        _ => 0,
-    }
+    })
 }
 
 impl Platform for CurrentPlatform {
@@ -2152,15 +2090,25 @@ impl Platform for CurrentPlatform {
             return Err(no("spawn_suspended_for_other_user"));
         }
         let mut command = command_line(&request.command)?;
-        // Exact starts from no inherited name at all. `environment_from` sorts
-        // and deduplicates keys case-insensitively for the Unicode block that
-        // CreateProcessW receives; Inherit intentionally retains its existing
-        // process-environment behavior.
+        // Exact starts from no inherited name at all. AccountProfile instead
+        // starts from the OS-authenticated caller token, never this daemon's
+        // token. `environment_from` sorts and deduplicates keys
+        // case-insensitively for the Unicode block that CreateProcessW
+        // receives; Inherit intentionally retains its existing process
+        // environment behavior.
         let mut env = match request.env_source {
             crate::EnvSource::Exact => {
                 environment_from(std::iter::empty::<(OsString, OsString)>(), &request.env)
             }
             crate::EnvSource::Inherit => environment(&request.env),
+            crate::EnvSource::AccountProfile => {
+                let base = account_base_env(caller)?;
+                environment_from(
+                    base.into_iter()
+                        .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+                    &request.env,
+                )
+            }
         };
         let inherited = InheritedStdHandles::for_current_process()?;
         let attributes = AttributeList::with_handles(&inherited.handles)?;

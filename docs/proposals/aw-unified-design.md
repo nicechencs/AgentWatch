@@ -1,6 +1,7 @@
 # AgentWatch #147 统一设计：底层五类 + 对外五件事
 
 > 拟提交为 `docs/proposals/aw-unified-design.md`。作者 Coding-bot。第 2 版 2026-10-11 13:45（台北），按 review-bot 13:40 的打回意见（`/workspace/aw-unified-design-review.md`，挡-1～挡-4、拆活前要补 1～11、建议 1～5）、PM 13:04/13:13/13:23/13:24 的决定、UI审查+review 13:25 的决定改过。逐条对照见文末 **I 节**。
+> **第 3.4 版 2026-10-11 15:30（台北）**：按 review 对 3.3 的打回（`/workspace/aw-unified-design-review-v4.md`，挡 1–3）改：第 0a 步改成 7 件（加 `--purge --data-dir`、Mac `hold.rs` 环境泄漏、Windows 基础环境），LANG/LC_ALL/TZ 由客户端带；启动顺序改成先拿锁、开监听，迁移期间回 `db_migrating`；事件表新行的 id 交给 SQLite，老的负数哈希 id 在 0012 里重新编号；另按 review 的建议补了 `aw run` 的第三个查找函数、只写一次的列只收权威值、seq 非空、全局缺口的键、用真实 SQL 重测迁移（5.2 秒）、只有「服务不存在」才算没装。
 > **第 3.3 版 2026-10-11 15:10（台北）**：按 review 对 3.1 的打回（`/workspace/aw-unified-design-review-v3.md`，挡 2、3、4）和 PM 14:31 改：PATH 跳过空项和 `.`、相对名按目标工作目录、两条启动路共用一个查找函数、Windows PATHEXT；新增第 0a 步安全快修；dev 只能手动跑 CI；行 id 新列叫 `sampler`、保留 `id` 主键、计数器归后台不归采样器实例、按列合并、流量用 MAX；其余 8 张表归类；0012 迁移在 207MB 库上实测；FTS 三个删除触发器按 rowid。
 > **第 3.1 版 2026-10-11 14:40（台北）**：#147 已合进 dev（f7ea22f），本文改为直接推到 `dev`。加了：A3 行 id 按表分三类、`replay_writes` 去留、seq 分配和迁移；Test-bot 对 6a11d6d 的回归项；A1 PATH 解析、附加组、终端前台、采集 crate 禁用清单；超时常量定为 12 秒；c21dcec 剩下的三处；在 dev tip 上的复测数字（H3）；E 节改成「每一步单独推到 dev」。
 > 代码基线：最早按 `origin/feat/cross-platform` = **185fc77**（含 4e6b68a / 95b49ff / 3d95803）核对；第 3.1 版新增内容按 **`origin/dev` = f7ea22f**（跟 feat/cross-platform 的 ef28f88 树完全相同）核对，标了「dev」的 file:line 是这一版的。下文其余 file:line 按 185fc77；标「本地」的是还没推的工作区；标「证明工作区」的是 `/workspace/aw-xplat-prove`（从 185fc77 新建，只做测量，不推）。
@@ -44,10 +45,11 @@
   2. **门控 fd 号 ≥ 10 时目标根本跑不起来**：门控脚本是 `/bin/sh -c 'read -r _ <&{fd} … exec {fd}<&-'`（418-420 行），Ubuntu 的 `/bin/sh` 是 dash，dash 只认一位数的 fd，`<&10` 报 `Bad fd number` 退 2，目标一行都没跑。并发时父进程里同时开着的管道多，fd 号很快过 10，所以 67.8% 的子程序是这样死的；单线程只要 fd 号 ≥ 10 也**必然**失败（`gated_spawn_works_when_the_gate_fd_number_is_ten_or_more` 修前稳定 Exited(2)）。后台本身常驻 fd 多，这一条在真后台里比在测试里更容易踩到。
   - `unix/hold.rs:130-133` 的 `PIPE_LOCK` 只保护 Mac 那条路，Linux 不用它。
   - **c21dcec（已在 dev）已经修掉上面两条**：Linux 的 `spawn_gate`（dev `linux/mod.rs:296-304`）直接调 `crate::unix::hold::spawn`，不再有 sh 门控，所以证明工作区那份「dup2 到 3」的补丁**不再需要**，第 4 步也不再拿它。dev tip 上复测零泄漏（H3）。
-  - **c21dcec 剩下的三处**（都在第 4 步改）：
+  - **c21dcec 剩下的，加上 review 3.3 找出的 macOS 环境泄漏**（第 3 条在第 0a 步，其余第 4 步）：
     1. **没有用 `pipe2`**：dev `hold.rs:532-548` `pipe_cloexec` 还是先 `pipe()` 再两次 `fcntl`，中间别的线程 fork 会把管道带走。Linux 上改成 `pipe2(O_CLOEXEC)` 一步建好；Mac 没有 pipe2，照规矩 1 `pipe()` 后马上 FD_CLOEXEC，再由子进程的关 fd 循环兜住。
     2. **附加组用的是连接方报的**：Linux 这边的组来自 `/proc/<pid>/status` 的 `Groups:`（dev `linux/mod.rs:107`、126-144 `peer_groups`，注释自己写着 best-effort），`hold.rs:99-108` 再拿它 `setgroups`。连接方在连上之后可以改自己的组（比如 `newgrp`），读 `/proc` 跟连接时刻也不是同一时刻。改成规矩 4：后台按用户 `getgrouplist` 重新算。
-    3. **子进程里还在分配内存**：dev `hold.rs:391`/409 `clear_preload`（`unsetenv`），508/510 两个 `collect()`。照规矩 3 改。
+    3. **macOS 后台起的程序拿到后台的整套环境**（review 3.3 挡 1）：macOS 不管是不是同一个账户都走 `launch_as::spawn_as`（`launch_as.rs:437-456`）→ `hold.rs` 的 `spawn_suspended`，而 `hold.rs:123-130` 先拿 `std::env::vars()`（后台自己的环境）再叠请求的变量，所以 root 后台替别的用户起程序时，把 root 后台的环境交给了对方。改法：`SpawnRequest` 加 `inherit_env: bool`，`aw run` 自己起程序时传 true（照旧继承用户自己的环境，`hold.rs` 那段注释说的就是这个场景），**后台的调用一律传 false**，从基础集合开始拼（见文末「启动程序时的环境变量」）。**第 0a 步做。**
+    4. **子进程里还在分配内存**：dev `hold.rs:391`/409 `clear_preload`（`unsetenv`），508/510 两个 `collect()`。照规矩 3 改。
   - CI 上 `command_spawner_*` 偶发失败到底是哪条断言：**CI 日志还没拿到**，按上面两条推断是第 2 条（退 2），要 Test-bot 或 PM 贴一次失败日志确认（I 节列为未完成项）。
 - **Mac 挂住（95b49ff，review 打回）**：fork 后不再重新执行自己这一点修好了，但 `aw147-95b49ff-3d95803-review.md` 实测出：
   - 子进程里分配内存：`hold.rs:454-458` `exec()` 里 `collect()` 两个 Vec；`hold.rs:356-364` `clear_preload` 调 `unsetenv`（不在异步信号安全列表里，glibc/macOS 还要拿环境锁，多线程后台可能卡死）。`clear_preload` 本身也没用：execve 传的是另外准备好的环境。
@@ -89,7 +91,7 @@
 4. **切身份**：顺序 fork → setgroups → setgid → setuid → 自检 → chdir → 堵在门控上等放行 → execve。文档三处按这个顺序改。
    - **附加组一律由后台按用户重新加载**：Linux 和 Mac 都用 `launch_as::login_groups`（`getgrouplist`）在**父进程里**算好传进去，**不用连接方报上来的组**（Linux SO_PEERCRED 本来就拿不到附加组，Mac 永远是 None）。**Mac 照 initgroups 的语义加载**（PM 13:47 已定，不截断也不拒绝）：组列表在 fork 之前用 `getgrouplist` 解析（缓冲区不够就加大重试），子进程里只做系统调用，不做任何查询；macOS 上用带 gmuid 的 `initgroups` 系统调用开启动态成员解析，或者用准备好的列表 `setgroups`。系统仍然只给一部分时记日志、doctor 如实显示。细节见文末「Mac 附加组超过 16 个」。Linux 同样按 `getgrouplist`，不用 `/proc/<pid>/status` 的 `Groups:`（c21dcec 剩下的第 2 处）。
    - 自检：`getuid/geteuid/getgid/getegid` 都对，`setgid(0)` 和 `setuid(0)` 都必须失败，不对就按「切身份失败」退出。
-   - **程序名怎么找（PATH，review 挡 2 + PM 定）**：execve 不查 PATH，`execvp` 又不是异步信号安全的，所以分两半做。**挂住启动（`unix/hold.rs`）和 Linux root 后台的 helper（dev `aw-daemon/src/api/launch_as.rs:216` 起的 `spawn_as`，helper 副本里 exec 目标）这两条路调同一个查找函数** `aw_platform::program::candidates(name, cwd, path) -> Vec<CString>`，不各写一份；helper 那条路跑同一组 PATH 测试。
+   - **程序名怎么找（PATH，review 挡 2 + PM 定）**：execve 不查 PATH，`execvp` 又不是异步信号安全的，所以分两半做。**挂住启动（`unix/hold.rs`）和 Linux root 后台的 helper（dev `aw-daemon/src/api/launch_as.rs:216` 起的 `spawn_as`，helper 副本里 exec 目标）这两条路调同一个查找函数** `aw_platform::program::candidates(name, cwd, path) -> Vec<CString>`，不各写一份；helper 那条路跑同一组 PATH 测试。**第三个查找函数** `aw-cli/src/cmd/run.rs:642` `resolve_program`（`aw run` 默认模式和 `--no-daemon` 都先走它，677 行把空项当成「.」）也删掉，改调同一个 `candidates`，所以 `aw run` 也跳过空项和 `.`：同一个程序名，`aw run` 找得到、App 找不到这种情况不再出现（行为变化写进发版说明：要跑当前目录里的程序请写 `./程序`）。
      - **用哪个 PATH**：后台替人起的程序一律用固定的 `DEFAULT_PATH`（dev `launch_as.rs:54-55`）。请求里**不能**给 PATH（PM 定，给了就 400 `env_reserved`，见文末「启动程序时的环境变量」），所以查找永远不受请求影响。aw 自己起的程序（默认模式、`--no-daemon`）用 aw 的 PATH。
      - **工作目录一律是绝对路径**：相对的工作目录由调用方（aw、App）先换成绝对路径再发给后台；后台收到相对路径直接 400 `bad_request`（这是客户端的 bug，不是用户写错），不替它拼。没给工作目录时按目标用户的 HOME。
      - **父进程只拼候选列表，不碰文件系统**（不 `stat`、不 `access`、不 `canonicalize`）：
@@ -97,8 +99,8 @@
        - 程序名带 `/` 但不是绝对路径（`./x`、`bin/x`）：候选是「目标的绝对工作目录 + 名字」这一个，不再查 PATH（子进程是先 chdir 再 execve，但这里拼成绝对路径，不依赖 chdir 有没有成功）；
        - 程序名不带 `/`：把 PATH 按 `:` 拆开，**空项、`.`、所有相对目录项一律跳过**（不当成当前目录，防「工作目录里放一个同名程序就被运行」），剩下的绝对目录每项拼上程序名，做成 C 字符串数组在 fork 之前备好；一项都不剩时直接报 `program_not_found`，不 fork。
      - **子进程在切完身份之后挨个 `execve`**：返回 ENOENT/ENOTDIR 就试下一个；EACCES 记下来接着试；全都失败时，报错管道写「找不到程序」（全是 ENOENT/ENOTDIR）或「没有权限」（碰到过 EACCES），父进程回 400 `program_not_found` 或 403 `program_not_permitted`（都是 `daemon_errors.rs` 里已有的码，码名不改；不再静默 127）。`program_not_permitted` 按 UI-147-wording.md 14:30 补拆成程序、工作目录两句（码名不改，按报错管道里失败的那一步选句，见 B1 码表）。
-     - **root 后台从不以 root 身份去看调用方的目录**：现在 dev `hold.rs:201-224` `resolve_program` 在父进程里（root 身份）按 PATH 找文件，会让 root 替调用方去看它自己看不了的目录（能用来探测别人目录里有没有某个文件），也会在「找的时候」和「exec 的时候」之间被换掉。改掉后所有判断都在目标用户身份下由内核做。**这一处提前到第 0a 步**，不等第 4 步。
-     - **Windows**：同一个查找函数的 Windows 版。程序名没有后缀时按 PATHEXT 补后缀；**后台替人起的程序 PATHEXT 用固定的默认值 `.COM;.EXE;.BAT;.CMD`**，不用请求里给的，也不用后台自己的环境；PATH 同样跳过空项、`.` 和相对项，不先查当前目录（不照 `CreateProcess` 的默认顺序，也不用 `SearchPathW` 的「先当前目录」）。查到的是 `.cmd`/`.bat` 时**必须**走 `cmd.exe /c`，参数按规矩 10 逐个转义；**参数里有 CR 或 LF 就拒绝**（`cmd` 没法安全转义换行，345d216 已经这样做，这里写成规矩）。
+     - **root 后台从不以 root 身份去看调用方的目录**：要改的是 **macOS root 后台**走的 `hold.rs:141` / `hold.rs:201-224` `resolve_program`：它在父进程里（root 身份）按 PATH 找文件，会让 root 替调用方去看它自己看不了的目录（能用来探测别人目录里有没有某个文件），也会在「找的时候」和「exec 的时候」之间被换掉。改掉后所有判断都在目标用户身份下由内核做。**这一处提前到第 0a 步**，不等第 4 步。Linux 的 root helper（`launch_as.rs:344-356`）已经是切完身份才用 `Command::exec` 按 PATH 找程序，原来就是对的，**只补反向测试**；Linux 上 `hold.rs` 只被 `aw run` 以用户自己的身份调用，碰不到 root。
+     - **Windows**：同一个查找函数的 Windows 版。程序名没有后缀时按 PATHEXT 补后缀；**后台替人起的程序 PATHEXT 用固定的默认值 `.COM;.EXE;.BAT;.CMD`**，不用请求里给的，也不用后台自己的环境；PATH 同样跳过空项、`.` 和相对项，不先查当前目录（不照 `CreateProcess` 的默认顺序，也不用 `SearchPathW` 的「先当前目录」）。查到的是 `.cmd`/`.bat` 时**必须**走 `cmd.exe /c`（`cmd.exe` 用 `GetSystemDirectoryW` 拼出的绝对路径，不搜索，也不读请求或环境里的 `ComSpec`），参数按规矩 10 逐个转义；**参数里有 CR 或 LF 就拒绝**（`cmd` 没法安全转义换行，345d216 已经这样做，这里写成规矩）。
      - 测试：
        - （root CI）PATH 里第一项是只有 root 能进的目录（`0700 root`），里面放一个同名程序，第二项是用户自己的目录 → 跑的是第二项那个；PATH 里只有那个 root 目录 → 报「找不到程序」，不是跑了 root 那个；程序名带 `/` 指到只有 root 能读的文件 → 报 `program_not_permitted`；
        - PATH 带空项和 `.`（`:/usr/bin:.`），工作目录里放一个同名的可执行文件 → **不会运行它**（三系统）；
@@ -261,11 +263,19 @@
 
 **统一规矩**：
 1. **行 id =（会话 id, 采样器, seq）**（PM 13:44 定，取代按内容哈希的做法；3.3 按 review 挡 4 改）。**新列叫 `sampler`，不叫 `source`**：`source TEXT NOT NULL` 这一列 dev 上已经有了（`0001_init.sql:58/77/112/142` 的 processes、process_images、net_flows、dns，还有 file_access、http、agent_events、agent_instances、ipc_channels、agent_rpc、agent_links），意思是「哪一类采集器给的」，原样不动。**每张表的 `id INTEGER PRIMARY KEY`（也就是 rowid）保留不改**，FTS 删除触发器靠它，SQLite 也改不了主键；行 id 用一个唯一索引 `UNIQUE(session_id, sampler, seq)` 表达，不重建大表。按表分三类（第 5b 步）：
-   - **事件表（只追加）**：`process_images`、`dns`、`gaps`、`http`。加 `sampler`、`seq` 两列和上面的唯一索引，写入 `ON CONFLICT(session_id, sampler, seq) DO NOTHING`。整批重写时带的是同一批 seq，所以不会重复；内容完全相同的两个事件 seq 不同，照样是两行。
+   - **事件表（只追加）**：`process_images`、`dns`、`gaps`、`http`。加 `sampler`、`seq` 两列和上面的唯一索引，写入 `ON CONFLICT(session_id, sampler, seq) DO NOTHING`。
+     - **新行的 `id` 交给 SQLite 自己分**（`INSERT` 不给 `id`），去重**只靠**（session_id, sampler, seq）这个唯一索引。`HttpRow.id`、`DnsRow.id`、`GapRow.id` 的「没给就按内容算」（`replay::deterministic_id`，dev `sink.rs:902`、`sink.rs:938`、`http.rs:98`）删掉，不挪到别处接着用：按内容算 id，内容相同的两个事件会撞主键，主键冲突不归 `ON CONFLICT(session_id, sampler, seq)` 管，整批写入会失败。
+     - **`seq` 不能为空**：列定义 `NOT NULL DEFAULT 0`，再加 `BEFORE INSERT … WHEN NEW.seq <= 0 THEN RAISE(ABORT)` 触发器，写入层漏填 seq 时直接报错，不会悄悄绕过唯一索引。
+     - **全局缺口**（`gaps.session_id` 为 NULL，`0001_init.sql:149`）：唯一索引建在 `(IFNULL(session_id, 0), sampler, seq)` 上，键不为空，全局缺口那批重写时也不会重复；`session_id` 列本身照旧是 NULL（不填 0，免得违反外键）。`seq_next` 里全局缺口的会话键也记成 0。整批重写时带的是同一批 seq，所以不会重复；内容完全相同的两个事件 seq 不同，照样是两行。
    - **实体表（同一个东西会被反复更新）**：`sessions`（`id`）、`processes`（`session_id, proc_uid`）、`net_flows`（`id`）、`file_access`（`id`）。冲突键还是现在的自然键；每行多两列：`sampler`（**这一行归哪个采样器更新**）和 `last_seq`（那个采样器最后一次更新它用的 seq）。合并**按列写**，不用整条语句的 `WHERE`：
      - **会变的列**（最后看到的时间、计数、状态）：`CASE WHEN excluded.last_seq > 表.last_seq THEN excluded.列 ELSE 表.列 END`。**相等就不更新**（严格大于），同一批写两遍结果一样；
-     - **只写一次的列**（退出码、结束时间、可执行文件、父进程、SNI 这类）：**不管 seq 大小**一律 `COALESCE(表.列, excluded.列)`。这样 A 批（seq 100，带退出码）写失败、B 批（seq 200）先写进去以后，A 批重写时退出码照样能补上；
+     - **只写一次的列**：**不管 seq 大小**一律 `COALESCE(表.列, excluded.列)`。这样 A 批（seq 100，带退出码）写失败、B 批（seq 200）先写进去以后，A 批重写时退出码照样能补上。**这些列只收权威值**：估出来的值写 NULL 或写到另一列，不能先占住位置让后来的准确值盖不上。逐表列出：
+       - `processes`：`exit_code`、`exit_signal`、`exit_ns`（只收 waitpid / eBPF / ETW / kqueue 报的真实退出；轮询发现「进程不见了」的时间写新列 `gone_ns`，不写 `exit_ns`）、`parent_uid`、`ppid`、`user_id`、`start_ns`。dev `sink.rs:655-657` 退出那三列现在是新值优先，改成旧值优先 + 只收权威值；
+       - `net_flows`：`domain`、`domain_source`、`sni`、`alpn`（dev 已是旧值优先）；
+       - `file_access`：`path_to`、`created`；
+       - 可执行文件、命令行在 `process_images` 里，那是事件表，不算这一类。
      - **不同采样器的 seq 永远不互相比**：每张实体表写清楚哪组列归哪个采样器。`sessions` 的行由后台（`daemon`）写，采样器只通过事件表报东西，不改 sessions 的列；`processes`、`net_flows`、`file_access` 的会变列只归这一行的 `sampler`（第一次写它的那个），别的采样器给同一行的数据只能走 `COALESCE` 补空列，不能改会变列；`excluded.sampler <> 表.sampler` 时 `last_seq` 不动。以后真要多个采样器改同一列，就按（采样器, last_seq）分开记，不在这一轮做。
+     - **采样器中途换了**（比如 eBPF 退回轮询）：后台在换采样器的那个事务里把归属交过去：`UPDATE processes/net_flows/file_access SET sampler = '新的', last_seq = 0 WHERE session_id = ? AND sampler = '旧的'`，之后新采样器能接着改这些行的会变列。测试：eBPF 写过的进程，退回轮询以后「最后看到的时间」还会往前走。
    - **累计表**：`net_flow_buckets`（`flow_id, bucket_ns`）。现在 dev `sink.rs:851-856` 是 `bytes_up = 表.bytes_up + excluded.bytes_up`，同一批写两遍就加两遍。改成**采集端写这个桶到目前为止的总数**，库里一律 `bytes_* = MAX(表.bytes_*, excluded.bytes_*)`。同一个桶里的字节数只会涨，所以不管顺序、写几遍、**后台重启以后采集端从 0 重新累计**，库里的值都不会变小；不靠 `last_seq`。（同样的道理用在 `file_access` 的 opens/reads/bytes_* 上：dev `file_access.rs:199-215` 在 `partial = 1` 时做 `+=`，改成总数 + MAX。）
    - **其余 8 张表**（review 挡 4 漏洞 4）：
      - `http`：走分批写入（dev `sink.rs:576` `write_http`），归**事件表**，同上；
@@ -275,35 +285,46 @@
      - `agent_instances`、`ipc_channels`、`agent_rpc`、`agent_links`、`watch_groups`：`inter_agent.rs` 的 `store_*` 都是单行单事务，dev 上后台没有调用方，**不走分批写入，不受影响**。
    - **seq 怎么分（PM 14:31 + review 挡 4 漏洞 1）**：seq **在事件产生的那一刻**分配，写进事件本身，然后才进批；批不管重写多少次，带的都是事件里已经有的那个 seq。**写库那一层绝不分配 seq**：要是在写入时从计数表取号，重写的批会拿到一批新号，`ON CONFLICT` 挡不住，正好造成重复。
      - **计数器归后台，不归采样器实例**：后台内存里一张表 `HashMap<(会话 id, 采样器名), AtomicU64>`，采样器实例取号时按名字去这张表里拿。实例被重新建出来（attach 往已有会话里加进程、采样器出错后被重新拉起），后台没重启，计数器照样留着，接着往下数，老实例手里还挂着没写成功的批（号比库里的 MAX 大）也不会撞号。
-     - **后台启动时**：每个（会话, 采样器）从 `max(seq_next.next, 各事件表 MAX(seq) + 1)` 接着数，两者不一致记 warn。后台重启以后，内存里没写完的批本来就丢了，库里没有那些号，再用到不会撞。
+     - **后台启动时**：每个（会话, 采样器）从 `max(seq_next.next, 各事件表 MAX(seq) + 1, 各实体表 MAX(last_seq) + 1)` 接着数（实体表也要算进去，不然 `seq_next` 万一没跟上，新号比某一行的 `last_seq` 小，这一行的会变列就再也更新不了），两者不一致记 warn。后台重启以后，内存里没写完的批本来就丢了，库里没有那些号，再用到不会撞。
      - `seq_next(session_id, sampler, next)` 这张表**只是持久化的高水位**：跟这一批数据在同一个事务里推进到「这批最大的 seq + 1」，只用来让启动时不必扫各事件表求 MAX，**永远不是任何一行（包括重写的那一行）seq 的来源**。
    - **跟现有 `process_images.seq` 撞名**：这一列现在的意思是「同一个进程第几次 exec」（`UNIQUE(session_id, proc_uid, seq)`），跟行 id 的 seq 不是一回事。**迁移里改名为 `exec_seq`**（`ALTER TABLE … RENAME COLUMN`，唯一约束跟着改名），查询、导出、API 的 JSON 字段同步改成 `exec_seq`；API 里旧名 `seq` 再保留一个版本当别名，在接口文档里标「将删除」。行 id 那一列在所有事件表里统一叫 `seq`。
    - **迁移（0012）**，一个事务里做完：
      - `process_images.seq` → `exec_seq`；
-     - 事件表加 `sampler TEXT NOT NULL DEFAULT 'legacy'`、`seq INTEGER`，按 `ROW_NUMBER() OVER (PARTITION BY session_id, sampler ORDER BY 时间列, id)` 补 seq（时间列：`process_images.ts_ns`、`dns.ts_ns`、`http.ts_ns`、`gaps.from_ns`），再建 `UNIQUE(session_id, sampler, seq)`；
-     - 实体表加 `sampler TEXT NOT NULL DEFAULT 'legacy'`、`last_seq INTEGER NOT NULL DEFAULT 0`；按现有数据填好 `seq_next`；
+     - **老的负数哈希 id 重新编号**：`http`、`dns`、`gaps` 里 `id < 0` 的行（`replay::deterministic_id` 算的，最高位置 1，大小可到 2^63），按（时间列, id）顺序接在表里现有最大正数 id 后面重新编号；`http` 的 FTS 行 `src_id` 一起改。**不建映射表**：dev 上没有任何表引用 `http.id`、`dns.id`、`gaps.id`（`migrations/` 里没有 `REFERENCES http/dns/gaps`）。编号以后所有 `src_id` 都在 0..2^48 以内，套得进下面的 FTS rowid 公式；
+     - 事件表加 `sampler TEXT NOT NULL DEFAULT 'legacy'`、`seq INTEGER NOT NULL DEFAULT 0`，按 `ROW_NUMBER() OVER (PARTITION BY session_id, sampler ORDER BY 时间列, id)` 补 seq（时间列：`process_images.ts_ns`、`dns.ts_ns`、`http.ts_ns`、`gaps.from_ns`；gaps 按 `IFNULL(session_id, 0)` 分组），再建唯一索引和「seq 必填」触发器；
+     - 实体表（`processes`、`net_flows`、`file_access`）加 `sampler TEXT NOT NULL DEFAULT 'legacy'`、`last_seq INTEGER NOT NULL DEFAULT 0`，`sessions` 加 `last_seq`，`processes` 加 `gone_ns`；建 `seq_next` 并按现有数据填好；
      - FTS 重建一次，rowid 由 `(src, src_id)` 推出来（见下面 FTS 那条），三个删除触发器换成按 rowid 删；
      - `DROP TABLE replay_writes`。
      - 老会话的采样器一律 `legacy`，新事件不会再用这个名字。中途失败整个回滚，库还是 0011；
-     - **实测**（207MB 库的副本，process_images 22.7 万行、processes 24.2 万行、fts_text 22.7 万行；探针 SQL `/tmp/aw-prove/mig0012-probe.sql`，sqlite3 3.46，跟后台同一台机器）：**整个事务 3.6 秒**，其中 FTS 重建 1.5 秒、提交 1.2 秒、补 process_images 的 seq 0.5 秒，其余都在 0.15 秒以内；`integrity_check` ok。超过 2 秒，所以**迁移时后台先不开接口**，CLI 和 App 连上来看到的是「正在升级」的状态，迁移完才开接口。这句话 wording 文件里还没有，**请 UI审查 定**。
+     - **实测（3.4 用跟正式迁移一样的 SQL 重测）**：SQL 草稿 `/workspace/aw-prove-out/0012-draft.sql`（上面每一项都在里面：负数 id 重新编号、四张事件表的 sampler/seq/唯一索引/必填触发器、三张实体表和 sessions 的新列、`seq_next`、FTS 按新 rowid 重建、三个按 rowid 删的触发器（含新加的 http）、`DROP TABLE replay_writes`）。库是 207MB 那份的副本，先用 `/workspace/aw-prove-out/0012-seed-like-dev.sql` 补成 dev 上 0011 的样子（47.9 万条 `replay_writes`、5000 条负数 id 的 http 行和它们的搜索行、5000 条负数 id 的 dns 行），最后 246MB。连跑 3 次：**整个事务 5.13 / 5.17 / 5.20 秒**；其中 FTS 重建 2.3 秒、提交（含删 47.9 万条 `replay_writes`）1.4 秒、补 process_images 的 seq 0.6 秒，其余每条都在 0.15 秒以内。迁移后 `integrity_check` ok、http 的 id 是 1..5000、FTS 行数不变、`replay_writes` 没了；按网址能搜到老 http 行，删掉以后搜不到；不带 seq 的 INSERT 被拒（`seq required`）。3.3 里的 3.6 秒是只做了一部分的探针，作废。第 5b 步的验收线定为：**这份库上迁移 ≤ 8 秒**（比命令行的 12 秒等待短，留余量）。
+     - **迁移期间后台照样回话**（review 3.3 挡 2；不是「不开接口」）：见下面「启动顺序」。
      - 测试：拿一份 0011 的库迁到 0012，行数不变、`exec_seq` 等于原来的 `seq`、`replay_writes` 没了；迁移中途注入失败，库还是 0011 的样子，老版本程序照常打开；老版本程序打开 0012 的库时走「只读打开新版库」（`db_read_only_newer`）。
    - **`replay_writes` 去掉**（da00935 / 迁移 0011 加的按内容哈希的「已写过」表，dev `replay.rs`）：上面三类规矩各自保证重写不重复以后，它就多余了，而且它本身有毛病：内容相同的两个正常事件会被当成重复丢掉（跟「相同事件写成两行」冲突），每写一行多写一行，表只涨不缩，64 位 FNV 有碰撞的可能。删掉 `replay.rs` 和 `sink.rs` 里的 `replay::claim` 调用。
    - **FTS 搜索行跟主表一起写、一起删**（review 挡 4 漏洞 6）：
      - 主表这一行真插进去了才写搜索行（36abe45 已做）；
      - **fts 的 rowid 由 `(src, src_id)` 推出来**：`rowid = 来源编号 × 2^48 + src_id`（`process_images` = 1、`file_access` = 2、`http` = 3），写搜索行时显式给 rowid，删的时候 `DELETE FROM fts_text WHERE rowid = …`，走主键，不再按 UNINDEXED 的 `src_id` 扫全表。不另建映射表（省一次写）；
      - **0012 给 `http` 补删除触发器**（dev `http.rs:7-8` 自己写着 0005 没装），`file_access`、`process_images` 那两个（`0005_fts.sql:37-47`）换成按 rowid 删；
+     - 写搜索行的地方一起改：`fts::insert_new`（`http.rs:138-143`、`sink.rs` 的 `write_images`、`file_access::write_rows` 都用它）和 `fts::upsert`（`fts.rs:103-123`）都改成**显式给 rowid**、按 rowid 删；`src_id` 不在 0..2^48 以内时**报错**（`StoreError`），不默默算出一个落进别的来源号段的 rowid。0012 里也有同样的检查：重建后的行数跟原来对不上就整个回滚；
      - 实测（同一份 207MB 库）：**改前删 200 行 process_images 要 9.4 秒**（每行一次 fts 全表扫描，照这个速度删 1 万行约 8 分钟，一直占着写锁）；**改后删 1 万行 0.26 秒**，搜索行同步少了 1 万行。
-     - 测试：删会话以后，按网址、按路径、按命令行都搜不到了；在 200MB 库上删 1 万行 ≤ 2 秒。
+     - 测试：删会话以后，按网址、按路径、按命令行都搜不到了；在 200MB 库上删 1 万行 ≤ 2 秒；**迁移前放一行负数 id 的 http 行，迁移后按网址能搜到，删掉以后搜不到**；`src_id` 超出范围时写入报错，不撞上别的行。
    - **测试**：
      - **同一批重写一遍（以及分块写到一半失败后整批重写），每一行的 seq 跟第一次完全一样，新增行数为 0**（断言两次写完后每张事件表的行数和 `(sampler, seq)` 集合都不变）；写库层没有任何分配 seq 的代码路径（构造一批不带 seq 的事件直接写，报错而不是补号）；
-     - 内容相同的两个事件写成两行；
+     - 内容相同的两个事件写成两行（dns、gaps、http 三张都测，新行 id 由 SQLite 分，不报主键冲突）；全局缺口（session_id 为 NULL）那批写两遍，只有一份；
      - **采样器重建**：会话里第 1 个采样器实例有一批写失败、还挂着；建出第 2 个实例写一批；再把第 1 批重写一遍 → 两批的行都在，没有撞号；
      - **只写一次的列**：带退出码的那批晚于后面一批到达，退出码还在；同一批写两遍，会变列不变；
      - 不同采样器写同一行：后一个采样器的大 seq 不会覆盖前一个的会变列；
      - **流量**：同一批写两遍字节数不翻倍；后台重启以后还在同一个桶里，字节数不会变小；
      - 后台重启后 seq 从 `max(seq_next, MAX+1)` 接着数，不撞号。
 2. **会话只由后台收尾**：结束写失败要记 error 并重试，下次启动时把留下的「录制中」统一标成「记录已中断（后台重启）」。
-3. 旧库：只读打开比自己新的库（`db_read_only_newer`）；不是 WAL 的旧库先尝试转换，失败给中文提示；`db_busy` 按实际等待秒数映射。
+3. **启动顺序**（review 3.3 挡 2；dev 现在是先开库、跑完迁移（`runtime.rs:582`），再收尾上次的会话（608 行 `watches.recover()`），最后才 bind（620 行 http 端口、729 行内部通道），所以迁移期间客户端只能看到连不上，跟「后台没有运行」分不出来）。改成：
+   1. 先拿单实例锁；
+   2. **再开监听**，内部通道和 http 端口两个都开；
+   3. 看库要不要迁移。要的话，迁移期间**除了健康检查以外**的请求一律回 **`db_migrating`**（503，退出码 1，进 B1 码表）；健康检查回「正在升级」这个状态（`/health` 的 `state = "migrating"`）。迁移在单独的线程里做，不占着回话的线程；
+   4. 迁移完了再收尾上次的会话（`recover`）、开放全部接口；迁移失败就用已经定好的「没法转换旧版的会话数据库，后台没有启动。原因：{中文原因}。……」那句，然后退出；
+   5. Windows 服务在开始迁移**之前**就向服务管理器报 `SERVICE_RUNNING`，免得大库撞上服务管理器的启动时限；
+   6. 客户端：收到 `db_migrating` 时命令行先打「后台正在升级会话数据库，等它完成……」，接着按健康检查等，升完接着执行原来的命令；等过 12 秒还没升完就报「后台还在升级会话数据库，这次请求没有完成，请稍后再试。」，退出码 1。**这 12 秒就是 aw-core 的 `CLIENT_REQUEST_TIMEOUT`**（A2 规矩 2），不另写一个 12；第 5b 步建这个常量时，`aw-cli/src/client.rs:346` 写死的 `Duration::from_secs(12)` 一起换掉。App 顶部横条显示「后台正在升级会话数据库，完成后会自动连上，请稍等。」，保留页面外框，按钮暂时变灰（UI-147-wording.md 14:57 补）；
+   7. 测试：迁移中途发请求，回 `db_migrating`，不是连接失败；后台没运行时还是报「后台没有运行」，两种显示不一样；迁移失败时进程退出、报那句中文；Windows 服务在迁移期间状态是「正在运行」。第 5b 步做（跟 0012 同一个提交）。
+4. 旧库：只读打开比自己新的库（`db_read_only_newer`）；不是 WAL 的旧库先尝试转换，失败给中文提示；`db_busy` 按实际等待秒数映射。
 
 **测试**：
 - 分块写到第 2 块时注入失败，再重放整批，按 id 和按内容都没有重复，也没有缺；
@@ -331,10 +352,14 @@
 | FTS 写入每行全表扫描 DELETE（附着慢的根因） | Test-bot / review 挡-1 / H2 | **已证实**，证明工作区验证了一半修法 | 第 5 步 |
 | `database_busy_tests::lock_past_busy_timeout…` Mac 失败（watch_routes.rs:932） | review（95b49ff CI） | 没修 | 第 5 步 |
 | 行 id 只说了「会话, 来源, seq」，没分实体表 / 累计表；桶 `+=` 不能重写；`process_images.seq` 撞名；没有迁移方案 | review | 设计已定（规矩 1） | 第 5b 步 |
+| 删掉 `replay.rs` 后 dns/gaps/http 的 id 从哪来；老的负数哈希 id 套不进 FTS rowid 公式 | review 3.3 挡 3 | 定了：新行 id 由 SQLite 分，老负数 id 在 0012 重新编号（无映射表），超范围报错 | 第 5b 步 |
+| 迁移期间「不开接口」跟「显示正在升级」矛盾 | review 3.3 挡 2 | 定了：先拿锁、开监听，迁移期间回 `db_migrating`，迁移完再收尾、开接口 | 第 5b 步 |
+| seq 可空会绕过唯一索引；全局缺口 session_id 为 NULL 会重复 | review 3.3 | 定了：seq 非空 + 触发器；索引用 `IFNULL(session_id, 0)` | 第 5b 步 |
+| 只写一次的列先写了估计值就改不过来；eBPF 退回轮询后行改不动 | review 3.3 | 定了：只收权威值（轮询的「不见了」写 `gone_ns`）；换采样器时交归属 | 第 5b 步 |
 | 新列跟已有的 `source` 撞名；主键不能改 | review 挡 4 | 定了：新列叫 `sampler`，保留 `id`，加唯一索引 | 第 5b 步 |
 | 采样器重建后撞号；整行比 `last_seq` 丢退出码；不同采样器的 seq 互比；重启后流量总数变小 | review 挡 4 | 定了：计数器归后台、按列合并、采样器各管各的列、MAX | 第 5b 步 |
 | 其余 8 张表没归类 | review 挡 4 | 已归类 | 第 5b 步 |
-| 0012 迁移占锁多久 | review 挡 4 | 实测 3.6 秒（207MB），迁移时先不开接口 | 第 5b 步（「正在升级」那句待 UI审查） |
+| 0012 迁移占锁多久 | review 挡 4 / 3.3 | 用真实 SQL 重测 5.1–5.2 秒（207MB + 0011 补齐），验收 ≤ 8 秒；迁移期间回 `db_migrating` | 第 5b 步（「正在升级」几句已由 UI审查 14:57 定） |
 | `http` 没有 FTS 删除触发器，删掉的网址还搜得到；另两个触发器按 UNINDEXED 列删、删 200 行 9.4 秒 | review 挡 4 | 定了：rowid 由 (src, src_id) 推出，三个触发器按 rowid；实测删 1 万行 0.26 秒 | 第 5b 步 |
 | `replay_writes` 留不留 | review | 定了：去掉 | 第 5b 步 |
 | Test-bot 6a11d6d 回归 7 条 | Test-bot | 设计已定（上面测试 1–7） | 第 5b 步 |
@@ -364,7 +389,7 @@
 **统一规矩**：
 1. **所有进后台的连接都走 `aw-channel` 里同一个带保护的打开函数**：设 SQOS 识别级，发任何字节之前先确认对面是后台。`aw-cli` / App 里不许直接 `OpenOptions` 打开管道，用 clippy `disallowed_methods` 守住（跟 `aw-daemon/clippy.toml:2` 禁 `current_user` 一样）。
 2. **反查后台查的是管道本身归谁**：`GetSecurityInfo`。服务模式下管道主人是 SYSTEM，开发模式下是当前用户。「查不了」和「查到了但不是后台」分开报。
-   - **装了服务就只认 LocalSystem**：客户端自己查服务控制管理器（`OpenSCManager` + `OpenService`，能打开就算装了）来判断是不是开发模式，**不读环境变量、不看命令行参数**（这两样都能被普通用户随手改）。装了的话，管道主人必须是 LocalSystem（`S-1-5-18`），不是就报 `daemon_untrusted_server`，**绝不回退**到「主人是当前用户也行」的开发模式规则——否则普通用户进程抢先建一个同名管道就能冒充后台。只有没装服务时才按开发模式认当前用户。查服务状态本身失败时按「装了」处理（不放宽）。
+   - **装了服务就只认 LocalSystem**：客户端自己查服务控制管理器（`OpenSCManager` + `OpenService`；**只有 `OpenService` 返回 `ERROR_SERVICE_DOES_NOT_EXIST` 才算「没装」**，能打开、或者返回别的任何错误（没权限、服务管理器打不开……）都算「装了」）来判断是不是开发模式，**不读环境变量、不看命令行参数**（这两样都能被普通用户随手改）。装了的话，管道主人必须是 LocalSystem（`S-1-5-18`），不是就报 `daemon_untrusted_server`，**绝不回退**到「主人是当前用户也行」的开发模式规则——否则普通用户进程抢先建一个同名管道就能冒充后台。只有没装服务时才按开发模式认当前用户。查服务状态本身失败时按「装了」处理（不放宽），所以开发模式只在确实没装服务的机器上生效。
    - Windows 管道服务端不是 `agentwatchd`（主人对、但进程不是后台）也算「连上的不是后台」，**沿用已有那句**「连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为防内容被它拿到，这次没有发送任何内容。」（码 `daemon_untrusted_server`），不另写新句。
    - 测试（Windows CI）：装了服务时，以当前用户身份先建同名管道 → 客户端报 `daemon_untrusted_server`、一个字节都没发；没装服务时开发模式照常能连。
 3. **权限一律由后台按认出来的身份判断**。所有写操作（delete、rename、pin、**stop**、**attach 加进程**）都走同一个 `mutation_owner`：
@@ -521,6 +546,7 @@
 | `unidentified_peer` | | 后台 | 403 | 4 | 后台认不出你是哪个用户，已拒绝这次请求。请确认 `aw` 和后台是同一个版本，还不行就重启后台。 |
 | 结束原因 `duration` | | 会话结束原因（不是错误，CLI 和 App 显示） | — | — | 到了设定的时长，已自动结束 |
 | 结束原因 `error` | | 会话结束原因（结束时写库失败） | — | — | 记录已中断（写入失败） |
+| `db_migrating` | 新 | 后台（启动时迁移期间，除健康检查外的请求） | 503 | 1 | 后台正在升级会话数据库，完成后会自动连上，请稍等。（App 横条）／命令行：后台正在升级会话数据库，等它完成……；等过 12 秒：后台还在升级会话数据库，这次请求没有完成，请稍后再试。 |
 | `db_busy` | | 后台 | 503 | 1 | 会话数据库正忙（后台在写入），等了 N 秒还是没轮到，请稍后再试。 |
 
 - 数据目录那 5 个码不走 HTTP：后台启动时就失败，写进 `agentwatchd` 的标准错误和日志（日志里另带英文原因），`aw daemon start` 照原文转给用户。
@@ -648,6 +674,7 @@
 | 程序已退出（退出码 N） | 程序自己退出了，N≠0 时红色，文字里写出码 | `zh.json:78`「程序已退出」，补上退出码 |
 | 程序被信号结束（信号 N） | 程序被信号杀掉，跟非 0 退出码一样标红、有字 | 新增（UI-147-wording.md:80） |
 | 还在运行（进程）/ 记录中（会话） | 退出码为空且程序还在跑；**不写「不可得」** | UI-147-wording.md:81 |
+| 后台正在升级会话数据库，完成后会自动连上，请稍等。 | 后台启动时在迁移数据库（`db_migrating`，A3 规矩 3）；不能显示成「后台没有运行」 | 新增（UI-147-wording.md 14:57 补） |
 | 正在停止记录… | 用户按了停止，后台还在收尾 | `zh.json:85` `session.stopping`，留着 |
 | 已停止记录 | 用户按了停止 | `zh.json:81`；会话列表里的「○ 已停止」（`zh.json:77` `session.stopped`）**并进「已停止记录」**，不再用单独的「已停止」 |
 | 记录已中断（后台重启） | `daemon_restart` / `daemon_shutdown` | `zh.json:82-83` |
@@ -685,14 +712,14 @@
 | # | 提交（路） | 内容 | 为什么这时 CI 能绿 | 用什么验证 |
 |---|---|---|---|---|
 | −1 | **文档先行**（只改文档，单独推；本文 0aff6cb / ef28f88 / 本版） | architecture.md 按实际重写（内部通道 + 手写路由、crate 表补 aw-platform/aw-channel、「谁启动程序」改对）；ADR-0005 标「部分被取代」；接口文档加「启动契约」（A1 规矩）、「请求生命周期」（A2 规矩）两节；Mac 三处顺序写反的改掉（`macos.md:128`、`api-and-cli.md:186`，`launch_as.rs:423-428` 注释在第 4 步一起改） | 只改文档，CI 不受影响；规矩先落文档，后面的代码对着它写（review 要补 8） | crate 表跟 `cargo metadata` 对照脚本 |
-| 0a | **安全快修**（排在最前面，比第 0 步还早；每条一个反向测试） | ① `spawn_as_self`（dev `watch_routes.rs:539-555`）只调了 `envs(...)`、没有 `env_clear()`，后台用自己身份起程序时把**后台自己的整套环境**交给了程序 → 先 `env_clear()`，再放 5 个基础变量和请求给的变量；② `hold.rs:201-224` `resolve_program` 以 root 身份按 PATH 找程序 → 改成父进程只拼候选、子进程切身份后 execve（A1 规矩 4，先在 hold.rs 里改，不等第 4 步的统一启动函数；PATH 跳过空项、`.`、相对项）；③ Windows 数据目录能绕开 → 正式目录用 `SHGetKnownFolderPath(FOLDERID_ProgramData)`，不读 `%ProgramData%` 这类环境变量，非管理员后台在**建目录之前**就拒绝（原第 0、6 步里这一小块提前）；④ 请求里给 HOME/USER/LOGNAME/SHELL/PATH 就 400 `env_reserved`（`launch_as.rs:186-194` `base_env` 现在让请求覆盖）。`--data-dir` 只在测试 feature 里那一条仍在第 2 步，第 2 步紧跟着推 | 都是小改，不碰启动契约和看门进程，跟后面的步骤不冲突 | 反向测试：① 后台环境里放 `AW_SECRET=1`，起的程序的环境里没有它，并且跟完整集合一模一样；② root CI 上 A1 规矩 4 那三条 + 「PATH 带空项和 `.`」那条；③ 设了 `ProgramData=C:\Users\x\evil` 时后台照样用真正的 ProgramData，非管理员时目录根本没建出来；④ 5 个变量各一条，都是 400，都没有起任何进程 |
+| 0a | **安全快修**（排在最前面，比第 0 步还早；7 件，每件一个反向测试） | ① `spawn_as_self`（dev `watch_routes.rs:539-555`，Unix 和 Windows 开发模式都走它，Windows 在 474-476 行）只调了 `envs(...)`、没有 `env_clear()`，把**后台自己的整套环境**交给了程序 → 先 `env_clear()`，再放基础集合（Unix 5 个、Windows 那一组，见文末）和请求给的变量；② **macOS** root 后台在 `hold.rs:141` / 201-224 `resolve_program` 以 root 身份按 PATH 找程序 → 父进程只拼候选、子进程切身份后 execve（A1 规矩 4，先在 hold.rs 里改；PATH 跳过空项、`.`、相对项）。Linux 的 root helper 原来就是切完身份才找，**只补反向测试**；③ Windows 数据目录能绕开 → 正式目录用 `SHGetKnownFolderPath(FOLDERID_ProgramData)`（dev `windows/mod.rs:1677` 还在读 `%ProgramData%`），**非管理员后台在建目录之前就拒绝使用正式目录，自己的目录照常可用**；④ 请求里给基础变量就 400 `env_reserved`（`launch_as.rs:186-194` `base_env` 现在让请求覆盖）；Windows 上按那一组名字、**不分大小写**比（`Path` 和 `PATH` 是同一个）；⑤ `--purge --data-dir` 能删任意目录 → `--data-dir` 只在 `test-data-dir` feature 里（原第 2 步那部分提前，第 2 步不再做）；⑥ **macOS 后台起的程序拿到后台的整套环境**（`hold.rs:123-130` 先拿 `std::env::vars()`）→ `SpawnRequest` 加 `inherit_env`，`aw run` 传 true，后台一律传 false 从基础集合开始；⑦ **Windows 基础环境**：后台替人起程序时从账户配置（`CreateEnvironmentBlock(令牌, 不继承)`）里只取文末列的那一组，`ComSpec` 用 `GetSystemDirectoryW` 拼、`PATHEXT` 和 `Path` 用固定值；LANG/LC_ALL/TZ 不从后台继承，由客户端带上用户自己的 | 都是小改，不碰启动契约和看门进程，跟后面的步骤不冲突 | 反向测试：① 后台环境里放 `AW_SECRET=1`，起的程序的环境里没有它，并且**正好等于「基础集合 + 请求给的变量」**（Unix、Windows 各一条）；② macOS root CI 上 A1 规矩 4 那三条 + 「PATH 带空项和 `.`」那条，Linux helper 跑同一组；③ 设了 `ProgramData=C:\Users\x\evil` 时后台照样用真正的 ProgramData，非管理员时**正式目录**没建出来、自己的目录照常能用；④ Unix 5 个变量各一条、Windows 那一组各一条（含 `path`、`Path`、`PATH` 三种大小写），都是 400，都没有起任何进程；⑤ release 版 `aw daemon --help` 里没有 `--data-dir`，传了报参数错、目录还在；⑥ macOS 后台环境里放 `AW_SECRET=1`，后台起的程序里没有它，`aw run` 起的程序里照旧有用户自己的变量；⑦ Windows 后台替人起 `cmd /c set`，输出正好是那一组 + 请求给的变量，`SystemRoot` 在 |
 | 0 | **tip 变绿**：Mac 收尾 + 数据目录放宽（aw-xplat-macfix / aw-xplat-win） | A4 规矩 6 的 Unix 部分和规则判断（是不是管理员只看自己令牌、正式目录规范化后比、非管理员不碰正式目录、上级目录检查、系统链接放行、子项检查）；Windows 用 `SHGetKnownFolderPath`、建前拒绝；DACL 测试预期改对；数据目录报错中文按 wording 文件 | 修的就是现在红的那一片 | Mac/Win/Linux CI 全绿；A4 的数据目录矩阵（Windows 句柄化部分在第 6 步补完） |
 | 1 | winpipe A 的过关 | 不改代码，看第 0 步之后的 Windows CI | — | Win CI 绿 + PM 开发模式真机连跑 5 条命令都成功 |
-| 2 | **CLI 安全修**（`--data-dir`、`--owner`；CLI 路，紧跟第 0a 步推） | `--data-dir` 只在 `test-data-dir` feature 里；CI 加 release 行为检查（`--help` 没有、传了报参数错、目录还在；`test-hold-delay` 同样）；`--owner` 统一走 `mutation_owner`（stop / attach 加进程也是），主人的会话 + `--owner 别人` 拒绝，主人带 `--owner=自己` 放行，后台解析用户名，「找不到用户」「查不到…对应的账户」两句，用户列显示用户名，管理员按会话名只找自己的；**内存会话分支放进 `#[cfg(test)]`**；改掉原来断言「主人带 `--owner=自己` 被拒」的测试；通知 Test-bot 改用测试版跑 `--purge --data-dir` | 后台和 CLI 一起改、测试一起加，不碰平台层 | A4 的参数化表；release 检查；release 走不到内存分支 |
+| 2 | **CLI 安全修**（`--owner`；CLI 路，紧跟第 0a 步推。`--data-dir` 已提前到第 0a 步⑤，这里不再做） | CI 加 release 行为检查（`test-hold-delay` 同样只在测试 feature 里）；`--owner` 统一走 `mutation_owner`（stop / attach 加进程也是），主人的会话 + `--owner 别人` 拒绝，主人带 `--owner=自己` 放行，后台解析用户名，「找不到用户」「查不到…对应的账户」两句，用户列显示用户名，管理员按会话名只找自己的；**内存会话分支放进 `#[cfg(test)]`**；改掉原来断言「主人带 `--owner=自己` 被拒」的测试；通知 Test-bot 改用测试版跑 `--purge --data-dir` | 后台和 CLI 一起改、测试一起加，不碰平台层 | A4 的参数化表；release 检查；release 走不到内存分支 |
 | 3 | winpipe B（**已推 93a6cfa**） | 查管道归谁（GetSecurityInfo）；`aw hook` 走带保护的打开函数；改注释；反向测试；clippy 禁止直接打开管道 | 只动 Windows 和 aw-channel | 匿名级别被拒、对面不是后台时一个字节都不发 |
-| 4 | **启动契约**（aw-xplat-macfix；Linux 门控泄漏**已推 c21dcec**，改走 hold.rs、压力测试 `crates/aw-platform/tests/gate_concurrent_spawn.rs` 已在 dev，所以证明工作区的 dash/dup2-到-3 补丁**不再拿**） | A1 规矩 1–11：c21dcec 剩下的三处（Linux `pipe2`、附加组按 `getgrouplist`、子进程里不分配）；PATH 父进程拼候选、子进程切身份后挨个 execve；采集 crate 禁 Command + `xtask spawn-audit` + tokio 不开 process；Mac `pipe()` 后马上 FD_CLOEXEC + 子进程原始循环关 fd；唯一启动函数 + `SPAWN_LOCK` + clippy 禁 `Command::new`/`fork`；子进程里不分配、删 `clear_preload`、信号复位、报错管道、release 失败不丢 pid；附加组按 `getgrouplist`；自检补两项；程序名解析；看门进程（Linux：aw → 看门进程 → 程序，subreaper、SIGSTOP 再 SIGKILL 循环、pid+ppid+启动时间；Mac kqueue），替换 345d216 的 sh 看门进程；只绑 aw 起的程序；默认模式信号转发；tcsetpgrp（Linux/Mac 的默认模式和 `--no-daemon`、SIGTTOU、WUNTRACED、panic、aw 被杀后看门进程还前台）；`--no-daemon` 帮助（Linux/Windows 统一句，Mac 单独一句）；环境测试按完整集合；依赖里会起进程的 crate 清单 | 第 0 步之后 Mac 已绿；Linux/Mac 共用 hold.rs；Windows Job 部分如果没法在同一提交里绿，拆到第 6 步 | `gate_concurrent_spawn` 48×20 零泄漏（压力 48×300 零泄漏，dev tip 已是 0/14400）、40 路并发启动零失败、A1 共用测试全部 |
+| 4 | **启动契约**（aw-xplat-macfix；Linux 门控泄漏**已推 c21dcec**，改走 hold.rs、压力测试 `crates/aw-platform/tests/gate_concurrent_spawn.rs` 已在 dev，所以证明工作区的 dash/dup2-到-3 补丁**不再拿**） | A1 规矩 1–11：c21dcec 剩下的三处（Linux `pipe2`、附加组按 `getgrouplist`、子进程里不分配；macOS 环境泄漏已在第 0a 步）；PATH 父进程拼候选、子进程切身份后挨个 execve；采集 crate 禁 Command + `xtask spawn-audit` + tokio 不开 process；Mac `pipe()` 后马上 FD_CLOEXEC + 子进程原始循环关 fd；唯一启动函数 + `SPAWN_LOCK` + clippy 禁 `Command::new`/`fork`；子进程里不分配、删 `clear_preload`、信号复位、报错管道、release 失败不丢 pid；附加组按 `getgrouplist`；自检补两项；程序名解析；看门进程（Linux：aw → 看门进程 → 程序，subreaper、SIGSTOP 再 SIGKILL 循环、pid+ppid+启动时间；Mac kqueue），替换 345d216 的 sh 看门进程；只绑 aw 起的程序；默认模式信号转发；tcsetpgrp（Linux/Mac 的默认模式和 `--no-daemon`、SIGTTOU、WUNTRACED、panic、aw 被杀后看门进程还前台）；`--no-daemon` 帮助（Linux/Windows 统一句，Mac 单独一句）；环境测试按完整集合；依赖里会起进程的 crate 清单 | 第 0 步之后 Mac 已绿；Linux/Mac 共用 hold.rs；Windows Job 部分如果没法在同一提交里绿，拆到第 6 步 | `gate_concurrent_spawn` 48×20 零泄漏（压力 48×300 零泄漏，dev tip 已是 0/14400）、40 路并发启动零失败、A1 共用测试全部 |
 | 5 | DB 第二+三轮 + 附着修复（**已推 da00935、6a11d6d、36abe45**；剩下的进 5b） | 8fff164 + retention 修复 + `lock_past_busy_timeout` 修复；A2 规矩 2–7：超时一张表、撤回、只把取名字挪到回复之后（`check_pid_owner` 留在前面）、后台计时 `--duration`、**大锁里不碰库**、**FTS 新行不先 DELETE、改/删按 rowid**；「正在读取进程…」状态；按测量决定规矩 8（常驻写连接、列表计数） | 8fff164 的 retention 失败修完才推；A2 的 CLI 部分跟后台同一个提交，不会出现两头不一致的中间版本 | **同一个 200MB 库 + 2–3 个整机会话在采样，attach 单进程和 `--pid 1` 各 5 次都 ≤ 1.5 秒、POST ≤ 0.3 秒**；CI 缩小版；命令行被杀后会话照样按时结束；dbintegrity 压力测试 |
-| 5b | **DB 第四轮：行 id 按三类表 + 回归项**（aw-xplat-fix） | A3 规矩 1：事件表加 `sampler` + `seq` + 唯一索引（保留 `id` 主键）、实体表按列合并（会变列比 `last_seq`、只写一次的列 COALESCE、不同采样器不互比）、桶和 file_access 计数写总数取 MAX；计数器归后台；`seq_next` 只当高水位；FTS rowid 由 (src, src_id) 推出、`http` 补删除触发器；`process_images.seq` → `exec_seq`；迁移 0012；去掉 `replay_writes`；FTS 改/删按 rowid；Test-bot 6a11d6d 回归 7 条；超时常量 12 秒进 aw-core；A2 规矩 6 剩下的（读请求不进大锁） | 迁移和写入同一个提交，没有「新代码 + 老表」的中间版本；API 的 `seq` 别名保留，UI 不跟着红 | A3 测试全部；0011 → 0012 迁移测试（含 207MB 库上迁移 ≤ 5 秒）；附着验收（H3 的 D/I 组）和 40 路并发启动（H3）都不回退 |
+| 5b | **DB 第四轮：行 id 按三类表 + 回归项**（aw-xplat-fix） | A3 规矩 1：事件表加 `sampler` + `seq` + 唯一索引（保留 `id` 主键）、实体表按列合并（会变列比 `last_seq`、只写一次的列 COALESCE、不同采样器不互比）、桶和 file_access 计数写总数取 MAX；计数器归后台；`seq_next` 只当高水位；FTS rowid 由 (src, src_id) 推出、`http` 补删除触发器；`process_images.seq` → `exec_seq`；迁移 0012；去掉 `replay_writes`；FTS 改/删按 rowid；Test-bot 6a11d6d 回归 7 条；超时常量 12 秒进 aw-core；A2 规矩 6 剩下的（读请求不进大锁） | 迁移和写入同一个提交，没有「新代码 + 老表」的中间版本；API 的 `seq` 别名保留，UI 不跟着红 | A3 测试全部（含启动顺序、`db_migrating`）；0011 → 0012 迁移测试（含 207MB 库上迁移 ≤ 8 秒）；附着验收（H3 的 D/I 组）和 40 路并发启动（H3）都不回退 |
 | 6 | Windows 第三轮（aw-xplat-win，**部分已推 345d216**） | `.cmd` 转义、整棵进程树 Job（接第 4 步）、等待有上限、PPID 复用；数据目录句柄化（`OPEN_REPARSE_POINT` + `SetSecurityInfo`、带安全描述符建目录、子项）+ 真建 junction/symlink 的测试 | 只动 Windows | Win CI + 真机清单 + 数据目录矩阵 Windows 那几格 |
 | 7 | winpipe C + 三系统连接上限（aw-xplat-winpipe） | 句柄生命周期、doctor 真测、App `unidentified_peer`；**aw-channel 分帧三系统修复**（半截回复、16 MiB 上限、总超时）；**Unix 服务端连接数上限、每请求总时限、线程池**（review 要补 7） | aw-channel 改动影响 Unix，所以放在第 5 步之后、超时常量已经定下来再做 | 16 个不读 + 16 个慢慢发的客户端时其他请求照样 200（Unix + Win）；半截回复报错（Unix + Win） |
 | 8a | **错误码枚举**（B1） | `ErrorCode` 从 `daemon_errors.rs` 生成，码名不改；`error_response` 只收枚举；`json!` 拼的 5 种收进来，`not_implemented` 统一格式；`xtask error-lint`；`error-codes.json` 和 errors.ts 生成；扫字面量的测试换成「每个值都有中文」 | 码名不变，没有断言会变红 | 每个码有中文和退出码；error-lint 为 0 |
@@ -708,7 +735,7 @@
 - 第 0 步把数据目录放宽提前，因为它就是 Mac CI 整片红的原因；第 0 步不绿，后面每一步的「CI 绿」都无从谈起。
 - CLI 文案第三轮不单独推，并进第 8b 步，否则同一批文字要改两次。
 - A2 的后台部分（超时、撤回、后台计时、附着修复）跟 DB 轮放在同一个提交（第 5 步），否则中间会有一个两头超时不一致的版本。
-- 第 0a 步（review 3.1 挡 3）：四个已知的洞（后台环境泄漏、root 按 PATH 找程序、Windows 数据目录能绕开、请求能改基础变量）都很小，不等第 4 步这个最大的一步，放在最前面先堵上；第 2 步紧跟着推。
+- 第 0a 步（review 3.1 挡 3、3.3 挡 1）：七个已知的洞（后台环境泄漏、macOS root 按 PATH 找程序、Windows 数据目录能绕开、请求能改基础变量、`--purge --data-dir` 删任意目录、macOS 后台把自己的环境交给别的用户、Windows 清空环境后缺系统变量）都很小，不等第 4 步这个最大的一步，放在最前面先堵上；第 2 步紧跟着推。
 - 第 2 步是挡合并项里最小、最独立的，放在前面。
 
 ## F. 风险
@@ -837,7 +864,13 @@
 ## 补充决定（PM 13:44–13:51，提交前加入）
 
 ### 启动程序时的环境变量
-- **后台起的程序**（App 新建会话、以 root 起再切到用户）：环境变量从零构造，只有 HOME、USER、LOGNAME、SHELL（来自目标用户的账户，fork 前用 `getpwuid_r` 取好）和固定的 PATH，再加上请求里给的变量；绝不继承后台自己的环境，也不是「先复制再删」。**请求里给了 HOME、USER、LOGNAME、SHELL、PATH 中的任何一个就拒绝**（PM 14:30 定），回 400 `env_reserved`，一个程序都不起：「环境变量「{名}」由系统按你的账户来填，不能在请求里改。请去掉这个变量再试。」（现在 dev `launch_as.rs:186-194` `base_env` 是让请求覆盖，第 0a 步改；测试：5 个变量各一条，请求带上就 400 `env_reserved`、没有起任何进程）。查找程序用的 PATH 因此永远是固定的 `DEFAULT_PATH`（A1 规矩 4）。只对后台替人起的程序生效；`aw run` 默认模式和 `--no-daemon` 用的是用户自己的环境，不受这条限制。测试比对完整集合，不只是「没有密钥」。
+- **后台起的程序**（App 新建会话、以 root 起再切到用户，三个系统）：环境变量从零构造，**正好是「基础集合 + 请求给的变量」**，绝不继承后台自己的环境，也不是「先复制再删」。测试比对这个完整集合，不只是「没有密钥」。
+  - **Unix 基础集合**：HOME、USER、LOGNAME、SHELL（来自目标用户的账户，fork 前用 `getpwuid_r` 取好）和固定的 PATH（`DEFAULT_PATH`）。
+  - **Windows 基础集合**：从目标用户的账户配置取（`CreateEnvironmentBlock(令牌, bInherit = FALSE)`，只留下面这些名字，别的丢掉）：`SystemRoot`、`windir`、`SystemDrive`、`ComSpec`（用 `GetSystemDirectoryW` 拼成 `…\cmd.exe`）、`PATHEXT`（固定 `.COM;.EXE;.BAT;.CMD`）、`TEMP`/`TMP`、`USERPROFILE`、`USERNAME`、`USERDOMAIN`、`HOMEDRIVE`/`HOMEPATH`、`APPDATA`、`LOCALAPPDATA`、`ProgramData`、`ProgramFiles`、固定的系统 `Path`（`%SystemRoot%\system32;%SystemRoot%;%SystemRoot%\System32\Wbem;%SystemRoot%\System32\WindowsPowerShell\v1.0\`）。
+  - **LANG、LC_ALL、TZ**：**不从后台继承**（dev `launch_as.rs:184-187` 现在会把后台的这三个带过去，第 0a 步删掉）。客户端（CLI、App）把用户自己的这三个放进请求里带过来，它们**不是保留变量**，可以给。所以完整集合 = 基础集合 + 请求给的变量（通常就包括这三个）。
+  - **保留变量**：请求里给了基础集合里的任何一个名字就拒绝（PM 14:30 定），回 400 `env_reserved`，一个程序都不起：「环境变量「{名}」由系统按你的账户来填，不能在请求里改。请去掉这个变量再试。」。Unix 是那 5 个，按原样比；**Windows 是上面那一组，比较时不分大小写**（`Path`、`PATH`、`path` 是同一个变量）。dev `launch_as.rs:186-194` `base_env` 现在是让请求覆盖，第 0a 步改。测试：每个保留名各一条（Windows 加三种大小写），都是 400、没有起任何进程。查找程序用的 PATH 因此永远是固定的（A1 规矩 4）。
+  - macOS 走 `hold.rs` 的那条路同样适用：`SpawnRequest.inherit_env = false`（第 0a 步⑥）。
+  - 只对后台替人起的程序生效；`aw run` 默认模式和 `--no-daemon` 用的是用户自己的环境（`inherit_env = true`），不受这条限制。
 - **`aw run` 默认模式和 `--no-daemon`**：aw 本来就以当前用户运行、自己起程序，原样传当前用户的环境，不经过后台（PM 13:47 定）；加测试确认用户环境原样传到程序。
 - 环境里不是 UTF-8 的变量：跳过并记日志，不 panic。
 

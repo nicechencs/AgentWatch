@@ -7,6 +7,10 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "launch/terminal.rs"]
+mod terminal;
+
 #[path = "launch/unix_linux.rs"]
 mod unix_linux;
 

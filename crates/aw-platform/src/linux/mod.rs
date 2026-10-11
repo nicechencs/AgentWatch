@@ -6,6 +6,7 @@ use crate::{
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
 use nix::unistd::{pipe2, write};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -19,6 +20,80 @@ fn no(capability: &'static str) -> PlatformError {
         os: "linux",
         kind: UnsupportedKind::NotInThisBuild,
     }
+}
+
+/// Make the daemon's data directory private before it is used.  The expected
+/// owner is supplied separately so tests can exercise the hostile-existing-dir
+/// case without needing to change a real directory's ownership.
+fn secure_data_dir_for_owner(path: &Path, expected_uid: u32) -> Result<(), PlatformError> {
+    let absolute = absolute_path(path)?;
+    let existed = validate_directory_path(&absolute)?;
+    if existed {
+        let metadata = fs::symlink_metadata(&absolute)?;
+        if metadata.uid() != expected_uid {
+            return Err(PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "data directory owner is not the daemon user",
+            });
+        }
+    }
+
+    // No files are opened below the directory before this returns.  Check a
+    // second time after creation so a link or non-directory substituted while
+    // create_dir_all was running is refused rather than followed later.
+    fs::create_dir_all(&absolute)?;
+    if !validate_directory_path(&absolute)? {
+        return Err(PlatformError::Invalid {
+            capability: "secure_data_dir",
+            detail: "data directory disappeared while it was being created",
+        });
+    }
+    let metadata = fs::symlink_metadata(&absolute)?;
+    if metadata.uid() != expected_uid {
+        return Err(PlatformError::Invalid {
+            capability: "secure_data_dir",
+            detail: "data directory owner changed while it was being secured",
+        });
+    }
+    fs::set_permissions(&absolute, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, PlatformError> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+/// Return whether the final directory existed. Every existing component must
+/// be a real directory; `symlink_metadata` deliberately does not follow a
+/// symlink, so both a data-dir link and a parent link are rejected.
+fn validate_directory_path(path: &Path) -> Result<bool, PlatformError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(PlatformError::Invalid {
+                        capability: "secure_data_dir",
+                        detail: "data directory path contains a symlink",
+                    });
+                }
+                if !metadata.is_dir() {
+                    return Err(PlatformError::Invalid {
+                        capability: "secure_data_dir",
+                        detail: "data directory path contains a non-directory",
+                    });
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(true)
 }
 
 pub fn identify_unix_peer(
@@ -375,7 +450,7 @@ impl Platform for CurrentPlatform {
             | Capability::ProcessTable
             | Capability::PeerIdentity
             | Capability::ExitCode => CapabilityStatus::Available,
-            Capability::SecureDataDir => CapabilityStatus::NotInThisBuild,
+            Capability::SecureDataDir => CapabilityStatus::Available,
         }
     }
     fn spawn_suspended(
@@ -422,8 +497,14 @@ impl Platform for CurrentPlatform {
         }
         Ok(result)
     }
-    fn secure_data_dir(&self, _: &Path) -> Result<(), PlatformError> {
-        Err(no("secure_data_dir"))
+    fn secure_data_dir(&self, path: &Path) -> Result<(), PlatformError> {
+        let Owner::Unix { euid, .. } = self.current_owner()? else {
+            return Err(PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "current process is not a Unix account",
+            });
+        };
+        secure_data_dir_for_owner(path, euid)
     }
     fn default_data_dir(&self) -> Result<PathBuf, PlatformError> {
         Ok(PathBuf::from("/var/lib/agentwatch"))
@@ -465,6 +546,9 @@ pub fn os_version() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::secure_data_dir_for_owner;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
     #[cfg(feature = "test-hold-delay")]
     use super::hold_delay;
 
@@ -480,5 +564,71 @@ mod tests {
         std::env::set_var("AW_TEST_HOLD_DELAY_MS", "10001");
         assert_eq!(hold_delay(), Some(10_000));
         std::env::remove_var("AW_TEST_HOLD_DELAY_MS");
+    }
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "agentwatch-platform-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ))
+    }
+
+    #[test]
+    fn secure_data_dir_sets_owner_only_mode() -> Result<(), Box<dyn std::error::Error>> {
+        let root = temp_dir("mode");
+        let data = root.join("data");
+        std::fs::create_dir_all(&root)?;
+        let uid = std::fs::metadata(&root)?.uid();
+        secure_data_dir_for_owner(&data, uid)?;
+        let mode = std::fs::metadata(&data)?.permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(mode, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn secure_data_dir_refuses_precreated_other_owner() -> Result<(), Box<dyn std::error::Error>> {
+        let root = temp_dir("foreign-owner");
+        let data = root.join("data");
+        std::fs::create_dir_all(&data)?;
+        let actual = std::fs::metadata(&data)?.uid();
+        let expected = actual.checked_add(1).unwrap_or(actual.saturating_sub(1));
+        let Err(error) = secure_data_dir_for_owner(&data, expected) else {
+            return Err("an existing directory with another owner must be refused".into());
+        };
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(matches!(
+            error,
+            crate::PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "data directory owner is not the daemon user",
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn secure_data_dir_refuses_symlink_in_path() -> Result<(), Box<dyn std::error::Error>> {
+        let root = temp_dir("symlink");
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::create_dir_all(&target)?;
+        symlink(&target, &link)?;
+        let uid = std::fs::metadata(&root)?.uid();
+        let Err(error) = secure_data_dir_for_owner(&link.join("data"), uid) else {
+            return Err("a parent symlink must be refused".into());
+        };
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(matches!(
+            error,
+            crate::PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "data directory path contains a symlink",
+            }
+        ));
+        Ok(())
     }
 }

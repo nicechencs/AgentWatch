@@ -16,18 +16,74 @@ mod launch;
 
 use crate::{
     Capability, CapabilityStatus, IdentifiedCaller, Owner, PeerIdentity, Platform, PlatformError,
-    ProcessEntry, ProcessKey, SamplingProcess, SpawnRequest, UnsupportedKind,
+    ProcessEntry, ProcessKey, SamplingProcess, SpawnRequest,
 };
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 pub(crate) struct CurrentPlatform;
 
-fn no(capability: &'static str) -> PlatformError {
-    PlatformError::Unsupported {
-        capability,
-        os: "macos",
-        kind: UnsupportedKind::NotInThisBuild,
+/// Create a private daemon data directory without following a link.  `expected_uid`
+/// is kept explicit so the ownership refusal is testable without chowning a
+/// directory on the host running the test.
+fn secure_data_dir_for_owner(path: &Path, expected_uid: u32) -> Result<(), PlatformError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let existed = validate_directory_path(&absolute)?;
+    if existed && fs::symlink_metadata(&absolute)?.uid() != expected_uid {
+        return Err(PlatformError::Invalid {
+            capability: "secure_data_dir",
+            detail: "data directory owner is not the daemon user",
+        });
     }
+    fs::create_dir_all(&absolute)?;
+    if !validate_directory_path(&absolute)? {
+        return Err(PlatformError::Invalid {
+            capability: "secure_data_dir",
+            detail: "data directory disappeared while it was being created",
+        });
+    }
+    if fs::symlink_metadata(&absolute)?.uid() != expected_uid {
+        return Err(PlatformError::Invalid {
+            capability: "secure_data_dir",
+            detail: "data directory owner changed while it was being secured",
+        });
+    }
+    fs::set_permissions(&absolute, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Return whether the final component existed. `symlink_metadata` deliberately
+/// sees a symlink itself, which rejects both a data-dir symlink and one in its
+/// parent chain before the daemon opens a database or log below it.
+fn validate_directory_path(path: &Path) -> Result<bool, PlatformError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(PlatformError::Invalid {
+                        capability: "secure_data_dir",
+                        detail: "data directory path contains a symlink",
+                    });
+                }
+                if !metadata.is_dir() {
+                    return Err(PlatformError::Invalid {
+                        capability: "secure_data_dir",
+                        detail: "data directory path contains a non-directory",
+                    });
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(true)
 }
 
 /// Why a per-pid group list cannot be read. Kept as the documented reason even
@@ -91,9 +147,8 @@ impl Platform for CurrentPlatform {
             // `spawn_suspended` can drop to the caller, but the session route
             // still answers 503 `collector_unavailable` before it is called.
             // Reporting this as available would claim a launch the API refuses.
-            Capability::SpawnAsCaller | Capability::SecureDataDir => {
-                CapabilityStatus::NotInThisBuild
-            }
+            Capability::SpawnAsCaller => CapabilityStatus::NotInThisBuild,
+            Capability::SecureDataDir => CapabilityStatus::Available,
         }
     }
 
@@ -127,8 +182,14 @@ impl Platform for CurrentPlatform {
         Ok(self.process_table()?.iter().map(sampling_from).collect())
     }
 
-    fn secure_data_dir(&self, _: &Path) -> Result<(), PlatformError> {
-        Err(no("secure_data_dir"))
+    fn secure_data_dir(&self, path: &Path) -> Result<(), PlatformError> {
+        let Owner::Unix { euid, .. } = self.current_owner()? else {
+            return Err(PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "current process is not a Unix account",
+            });
+        };
+        secure_data_dir_for_owner(path, euid)
     }
 
     fn default_data_dir(&self) -> Result<PathBuf, PlatformError> {
@@ -445,6 +506,7 @@ mod ffi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn procargs_splits_argc_exe_and_argv() {
@@ -480,5 +542,52 @@ mod tests {
         // Pin the reason so a later edit cannot silently report an empty group
         // list as "this process has no supplementary groups".
         assert!(GROUPS_UNAVAILABLE.contains("no per-pid"));
+    }
+
+    #[test]
+    fn secure_data_dir_sets_owner_only_mode() -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "agentwatch-platform-macos-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let data = root.join("data");
+        std::fs::create_dir_all(&root)?;
+        let uid = std::fs::metadata(&root)?.uid();
+        secure_data_dir_for_owner(&data, uid)?;
+        let mode = std::fs::metadata(&data)?.permissions().mode() & 0o777;
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(mode, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn secure_data_dir_refuses_a_different_existing_owner() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = std::env::temp_dir().join(format!(
+            "agentwatch-platform-macos-owner-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data)?;
+        let actual = std::fs::metadata(&data)?.uid();
+        let expected = actual.checked_add(1).unwrap_or(actual.saturating_sub(1));
+        let Err(error) = secure_data_dir_for_owner(&data, expected) else {
+            return Err("an existing directory with another owner must be refused".into());
+        };
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(matches!(
+            error,
+            PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "data directory owner is not the daemon user",
+            }
+        ));
+        Ok(())
     }
 }

@@ -50,6 +50,7 @@ const CODE_TEXT: Record<string, string> = {
   drop_failed: "error.dropFailed",
   random_unavailable: "error.randomUnavailable",
   collector_unavailable: "error.collectorUnavailable",
+  launch_not_in_this_build: "error.launchNotInThisBuild",
   no_such_process: "error.noSuchProcess",
   no_database: "error.noDatabase",
   store_unavailable: "error.noDatabase",

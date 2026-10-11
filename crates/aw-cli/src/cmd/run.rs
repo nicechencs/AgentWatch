@@ -36,9 +36,11 @@ use std::sync::{
     Arc,
 };
 
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+use aw_platform::PlatformError;
 #[cfg(any(target_os = "linux", windows))]
 use aw_platform::{
-    platform, HeldChild, IdentifiedCaller, PlatformError, ReapOutcome, ReleasedChild, SpawnRequest,
+    platform, HeldChild, IdentifiedCaller, ReapOutcome, ReleasedChild, SpawnRequest,
 };
 use aw_proxy::{plan_injection, Injection, ProxyOnReject};
 
@@ -278,8 +280,8 @@ pub(crate) trait Spawner {
 /// is [`spawn_error_code`] and is not part of this sentence. The program and
 /// its arguments are not repeated (they can carry secrets).
 pub(crate) fn spawn_error_text(error: &std::io::Error) -> String {
-    // The code and the OS number stay out of this sentence. `spawn_failure`
-    // puts them in the log and, with `--json`, in `error.code`.
+    // The code and the OS number stay out of this sentence. The caller pairs
+    // it with `spawn_error_code` for the log and, with `--json`, `error.code`.
     match error.kind() {
         std::io::ErrorKind::NotFound => "无法启动程序：找不到这个程序或工作目录".to_owned(),
         std::io::ErrorKind::PermissionDenied => {
@@ -295,6 +297,18 @@ pub(crate) fn spawn_error_code(error: &std::io::Error) -> &'static str {
         std::io::ErrorKind::NotFound => "program_not_found",
         std::io::ErrorKind::PermissionDenied => "program_not_permitted",
         _ => "spawn_failed",
+    }
+}
+
+/// A lookup failure is the one launch error for which repeating the program
+/// name is useful and safe: it is not an argument or an environment value.
+/// Keep this wording identical on every platform, including Windows where
+/// CreateProcess performs the PATH lookup inside `aw-platform`.
+fn spawn_error_text_for(program: &str, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        format!("找不到程序「{program}」，请检查名字或路径")
+    } else {
+        spawn_error_text(error)
     }
 }
 
@@ -347,16 +361,6 @@ struct PlatformChild {
 }
 
 #[cfg(target_os = "macos")]
-impl PlatformChild {
-    fn fail(error: &aw_platform::PlatformError) -> String {
-        match error {
-            aw_platform::PlatformError::Io(inner) => spawn_error_text(inner),
-            _ => "无法启动程序：发生系统错误".to_owned(),
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
 impl SpawnedChild for PlatformChild {
     fn pid(&self) -> u32 {
         self.held
@@ -376,7 +380,7 @@ impl SpawnedChild for PlatformChild {
             Ok(aw_platform::ReapOutcome::Signaled(signal)) => Ok(128 + signal),
             Ok(aw_platform::ReapOutcome::StillRunning) => Err("等了很久，程序还没结束".to_owned()),
             Err(aw_platform::PlatformError::Io(error)) => Err(wait_error_text(&error)),
-            Err(_) => Err("等待程序结束失败".to_owned()),
+            Err(error) => Err(platform_child_error(error).1),
         }
     }
 
@@ -389,7 +393,7 @@ impl SpawnedChild for PlatformChild {
                 self.released = Some(released);
                 Ok(())
             }
-            Err(error) => Err(Self::fail(&error)),
+            Err(error) => Err(platform_child_error(error).1),
         }
     }
 
@@ -465,17 +469,41 @@ impl SpawnedChild for PlatformGatedChild {
     }
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn platform_child_error(error: PlatformError) -> (&'static str, String) {
     match error {
         PlatformError::Io(error) => (spawn_error_code(&error), spawn_error_text(&error)),
-        _ => ("spawn_failed", "无法操作被挂起的程序".to_owned()),
+        PlatformError::Unsupported {
+            kind: aw_platform::UnsupportedKind::NotInThisBuild,
+            ..
+        } => (
+            "not_in_this_build",
+            "这个操作本版本未接入：不能替其他用户启动程序。".to_owned(),
+        ),
+        PlatformError::Unsupported { .. } => (
+            "not_supported_on_this_os",
+            "这个系统不支持启动这个程序。".to_owned(),
+        ),
+        PlatformError::PeerNotIdentified { .. } => (
+            "identity_unavailable",
+            "认不出当前用户，已停止启动：系统没有提供可确认的身份。".to_owned(),
+        ),
+        PlatformError::Invalid { .. } => (
+            "spawn_failed",
+            "程序启动到一半出错，已经结束，没有运行：启动条件不符合要求".to_owned(),
+        ),
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", not(any(unix, windows))))]
-fn spawn_failure(error: &std::io::Error) -> (&'static str, String) {
-    (spawn_error_code(error), spawn_error_text(error))
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn platform_spawn_error(program: &str, error: PlatformError) -> (&'static str, String) {
+    match error {
+        PlatformError::Io(error) => (
+            spawn_error_code(&error),
+            spawn_error_text_for(program, &error),
+        ),
+        other => platform_child_error(other),
+    }
 }
 
 /// A caller identity failure is distinct from a program spawn failure.  Keep
@@ -505,7 +533,12 @@ impl Spawner for CommandSpawner {
                 .map(|(_, value)| value.clone())
                 .or_else(|| std::env::var("PATH").ok());
             let resolved = resolve_program(program, path_env.as_deref(), spec.cwd.as_deref())
-                .map_err(|error| spawn_failure(&error))?;
+                .map_err(|error| {
+                    (
+                        spawn_error_code(&error),
+                        spawn_error_text_for(program, &error),
+                    )
+                })?;
             let caller = IdentifiedCaller::current_user().map_err(|_| caller_identity_error())?;
             let request = SpawnRequest {
                 command: std::iter::once(resolved)
@@ -516,7 +549,7 @@ impl Spawner for CommandSpawner {
             };
             let held = platform()
                 .spawn_suspended(&caller, &request)
-                .map_err(platform_child_error)?;
+                .map_err(|error| platform_spawn_error(program, error))?;
             Ok(Box::new(PlatformGatedChild {
                 held: Some(held),
                 released: None,
@@ -537,7 +570,12 @@ impl Spawner for CommandSpawner {
                 .map(|(_, value)| value.clone())
                 .or_else(|| std::env::var("PATH").ok());
             let resolved = resolve_program(program, path_env.as_deref(), spec.cwd.as_deref())
-                .map_err(|error| spawn_failure(&error))?;
+                .map_err(|error| {
+                    (
+                        spawn_error_code(&error),
+                        spawn_error_text_for(program, &error),
+                    )
+                })?;
             let caller = aw_platform::IdentifiedCaller::current_user()
                 .map_err(|_| caller_identity_error())?;
             let request = aw_platform::SpawnRequest {
@@ -549,7 +587,7 @@ impl Spawner for CommandSpawner {
             };
             let held = aw_platform::platform()
                 .spawn_suspended(&caller, &request)
-                .map_err(|error| ("spawn_failed", PlatformChild::fail(&error)))?;
+                .map_err(|error| platform_spawn_error(program, error))?;
             Ok(Box::new(PlatformChild {
                 held: Some(held),
                 released: None,
@@ -557,6 +595,10 @@ impl Spawner for CommandSpawner {
         }
         #[cfg(windows)]
         {
+            let program = spec
+                .command
+                .first()
+                .ok_or_else(|| ("spawn_failed", "程序名为空".to_owned()))?;
             let caller = IdentifiedCaller::current_user().map_err(|_| caller_identity_error())?;
             let request = SpawnRequest {
                 command: spec.command.clone(),
@@ -565,7 +607,7 @@ impl Spawner for CommandSpawner {
             };
             let held = platform()
                 .spawn_suspended(&caller, &request)
-                .map_err(platform_child_error)?;
+                .map_err(|error| platform_spawn_error(program, error))?;
             Ok(Box::new(PlatformGatedChild {
                 held: Some(held),
                 released: None,
@@ -582,7 +624,12 @@ impl Spawner for CommandSpawner {
             command
                 .spawn()
                 .map(|child| Box::new(ProcessChild { child }) as Box<dyn SpawnedChild>)
-                .map_err(|error| spawn_failure(&error))
+                .map_err(|error| {
+                    (
+                        spawn_error_code(&error),
+                        spawn_error_text_for(program, &error),
+                    )
+                })
         }
     }
 }
@@ -665,7 +712,7 @@ impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
         let caller =
             IdentifiedCaller::current_user().map_err(|error| LaunchDispatchError::Platform {
-                detail: error.to_string(),
+                detail: platform_child_error(error).1,
             })?;
         let request = SpawnRequest {
             command: spec.command.clone(),
@@ -675,18 +722,21 @@ impl Launcher for PlatformLauncher {
         let held = platform()
             .spawn_suspended(&caller, &request)
             .map_err(|error| LaunchDispatchError::Platform {
-                detail: error.to_string(),
+                detail: match spec.command.first() {
+                    Some(program) => platform_spawn_error(program, error).1,
+                    None => platform_child_error(error).1,
+                },
             })?;
         let pid = held.pid();
         let released = held
             .release()
             .map_err(|error| LaunchDispatchError::Platform {
-                detail: error.to_string(),
+                detail: platform_child_error(error).1,
             })?;
         let code = match released
             .wait()
             .map_err(|error| LaunchDispatchError::Platform {
-                detail: error.to_string(),
+                detail: platform_child_error(error).1,
             })? {
             ReapOutcome::Exited(code) => code,
             ReapOutcome::Signaled(_) | ReapOutcome::StillRunning => exit::GENERAL,
@@ -2577,6 +2627,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn command_spawner_runs_a_real_child_and_forwards_its_exit_code() {
+        #[cfg(target_os = "linux")]
+        let _gate_test_guard = gate_test_guard();
         let command = vec![
             "sh".to_owned(),
             "-c".to_owned(),
@@ -2604,6 +2656,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn command_spawner_pipe_gate_holds_the_target_until_release() {
+        #[cfg(target_os = "linux")]
+        let _gate_test_guard = gate_test_guard();
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let dir = std::env::temp_dir().join(format!(
@@ -2639,6 +2693,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn command_spawner_does_not_leak_the_gate_pipe_into_the_target() {
+        let _gate_test_guard = gate_test_guard();
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let dir = std::env::temp_dir().join(format!(
@@ -2701,6 +2756,19 @@ mod tests {
         }
     }
 
+    /// `CommandSpawner` uses an inheritable gate descriptor on Linux. These
+    /// real-spawn tests must not race each other, or one test's gate can be
+    /// inherited while another test is measuring the target descriptors.
+    #[cfg(target_os = "linux")]
+    fn gate_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GATE_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        GATE_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn collector_unavailable_suggests_the_local_mode_without_spawning() {
         let command = vec!["tool".to_owned()];
@@ -2732,7 +2800,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn missing_or_non_executable_program_fails_in_chinese_before_spawn() {
-        use super::{resolve_program, spawn_error_text, CommandSpawner, Spawner};
+        use super::{resolve_program, spawn_error_text_for, CommandSpawner, Spawner};
         use crate::launch::RunSpec;
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("aw-resolve-{}", std::process::id()));
@@ -2778,7 +2846,10 @@ mod tests {
         assert_eq!(error.0, "program_not_found");
         assert_eq!(
             error.1,
-            spawn_error_text(&std::io::Error::from(std::io::ErrorKind::NotFound))
+            spawn_error_text_for(
+                "aw-no-such-prog-xyz",
+                &std::io::Error::from(std::io::ErrorKind::NotFound)
+            )
         );
         assert!(!error.1.contains("not found"), "{}", error.1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2792,6 +2863,10 @@ mod tests {
         assert_eq!(
             super::spawn_error_code(&Error::from(ErrorKind::NotFound)),
             "program_not_found"
+        );
+        assert_eq!(
+            super::spawn_error_text_for("npm", &Error::from(ErrorKind::NotFound)),
+            "找不到程序「npm」，请检查名字或路径"
         );
         let denied = super::spawn_error_text(&Error::from(ErrorKind::PermissionDenied));
         assert!(denied.contains("没有权限"));
@@ -2810,7 +2885,9 @@ mod tests {
         assert_eq!(wait, "等待程序结束失败");
         for text in [not_found, denied, other, wait] {
             assert!(
-                !text.contains("entity") && !text.contains("could not"),
+                !text.contains("entity")
+                    && !text.contains("could not")
+                    && !text.contains("platform_error"),
                 "{text}"
             );
         }

@@ -8,19 +8,28 @@ use std::collections::BTreeMap;
 use std::ffi::{c_void, OsStr, OsString};
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use windows::core::{Error, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, FILETIME, HANDLE, HLOCAL,
+    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, FILETIME, HANDLE, HLOCAL, PSID,
     WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+};
 use windows::Win32::Security::{
-    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, RevertToSelf, TokenElevation,
-    TokenIntegrityLevel, TokenUser, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-    TOKEN_USER,
+    GetSecurityDescriptorDacl, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
+    RevertToSelf, TokenElevation, TokenIntegrityLevel, TokenUser, ACL, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
+};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -36,6 +45,7 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::Pipes::{
     GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, ImpersonateNamedPipeClient,
 };
+#[allow(unused_imports)] // Kept with the named-pipe-fix import set for its boot-time helpers.
 use windows::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
 use windows::Win32::System::SystemServices::{
     SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_RID,
@@ -72,6 +82,215 @@ fn no(capability: &'static str) -> PlatformError {
     }
 }
 
+const SYSTEM_SID: &str = "S-1-5-18";
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
+enum DataDirAcl<'a> {
+    Machine,
+    Owner(&'a str),
+}
+
+impl DataDirAcl<'_> {
+    fn sddl(&self) -> String {
+        match self {
+            // `P` turns off inheritance. OI|CI applies the same two ACEs to
+            // database, WAL, lock, and log files created underneath it.
+            Self::Machine => "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)".to_owned(),
+            Self::Owner(sid) => format!("D:P(A;OICI;GA;;;{sid})"),
+        }
+    }
+}
+
+fn wide_nul(text: &OsStr) -> Vec<u16> {
+    text.encode_wide().chain(Some(0)).collect()
+}
+
+fn is_machine_data_dir(path: &Path, default: &Path) -> bool {
+    path.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&default.as_os_str().to_string_lossy())
+}
+
+/// Reject symlinks and junctions/reparse points in every existing component.
+/// The boolean tells the caller whether the final component existed before it
+/// chose to create it; a pre-created directory gets an ownership check before
+/// any ACL is altered.
+fn validate_directory_path(path: &Path) -> Result<bool, PlatformError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                let reparse = metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0;
+                if metadata.file_type().is_symlink() || reparse {
+                    return Err(PlatformError::Invalid {
+                        capability: "secure_data_dir",
+                        detail: "data directory path contains a reparse point",
+                    });
+                }
+                if !metadata.is_dir() {
+                    return Err(PlatformError::Invalid {
+                        capability: "secure_data_dir",
+                        detail: "data directory path contains a non-directory",
+                    });
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(true)
+}
+
+fn sid_text(sid: PSID) -> Result<String, PlatformError> {
+    let mut text = PWSTR::null();
+    // SAFETY: `sid` comes from a live token or security descriptor; Windows
+    // allocates a NUL-terminated LocalAlloc buffer for `text`.
+    #[allow(unsafe_code)]
+    unsafe { ConvertSidToStringSidW(sid, &mut text) }.map_err(io_error)?;
+    // SAFETY: the successful API call above produced a valid UTF-16 string.
+    #[allow(unsafe_code)]
+    let result = unsafe { text.to_string() }.map_err(|_| PlatformError::Invalid {
+        capability: "secure_data_dir",
+        detail: "SID was not valid UTF-16",
+    });
+    // SAFETY: ConvertSidToStringSidW allocated `text` with LocalAlloc.
+    #[allow(unsafe_code)]
+    let _ = unsafe { LocalFree(HLOCAL(text.0.cast())) };
+    result
+}
+
+fn owner_sid_for_path(path: &Path) -> Result<String, PlatformError> {
+    let wide = wide_nul(path.as_os_str());
+    let mut owner = PSID::default();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `wide` is NUL terminated; output pointers are valid and the
+    // descriptor remains live until its LocalFree below.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        GetNamedSecurityInfoW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            &mut descriptor,
+        )
+    }
+    .ok()
+    .map_err(io_error)
+    .and_then(|()| sid_text(owner));
+    // SAFETY: GetNamedSecurityInfoW allocates the descriptor with LocalAlloc
+    // on success; the default/null value is safe to pass to LocalFree too.
+    #[allow(unsafe_code)]
+    let _ = unsafe { LocalFree(HLOCAL(descriptor.0.cast())) };
+    result
+}
+
+fn set_data_dir_dacl(path: &Path, policy: DataDirAcl<'_>) -> Result<(), PlatformError> {
+    let sddl = policy.sddl();
+    let sddl_wide = wide_nul(OsStr::new(&sddl));
+    let path_wide = wide_nul(path.as_os_str());
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `sddl_wide` is a NUL-terminated Rust-owned SDDL string; Windows
+    // writes the returned LocalAlloc descriptor pointer into valid storage.
+    #[allow(unsafe_code)]
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            windows::core::PCWSTR(sddl_wide.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }
+    .map_err(io_error)?;
+    let mut dacl_present = windows::Win32::Foundation::BOOL(0);
+    let mut dacl_defaulted = windows::Win32::Foundation::BOOL(0);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: descriptor is the valid self-relative descriptor returned above;
+    // all output locations are writable for the duration of this function.
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    }
+    .map_err(io_error)
+    .and_then(|()| {
+        if dacl_present.0 == 0 || dacl.is_null() {
+            return Err(PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "generated data-directory DACL is absent",
+            });
+        }
+        // SAFETY: `path_wide` is NUL terminated and `dacl` points into the
+        // live descriptor. Passing DACL|PROTECTED makes inherited ProgramData
+        // ACEs disappear instead of leaving a read path for ordinary users.
+        #[allow(unsafe_code)]
+        unsafe {
+            SetNamedSecurityInfoW(
+                windows::core::PCWSTR(path_wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                PSID::default(),
+                PSID::default(),
+                Some(dacl.cast_const()),
+                None,
+            )
+        }
+        .ok()
+        .map_err(io_error)
+    });
+    // SAFETY: ConvertStringSecurityDescriptorToSecurityDescriptorW allocated
+    // the descriptor with LocalAlloc; no pointer into it is used after this.
+    #[allow(unsafe_code)]
+    let _ = unsafe { LocalFree(HLOCAL(descriptor.0.cast())) };
+    result
+}
+
+fn secure_data_dir_with_policy(
+    path: &Path,
+    expected_owner: impl Fn(&str) -> bool,
+    policy: DataDirAcl<'_>,
+) -> Result<(), PlatformError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let existed = validate_directory_path(&absolute)?;
+    if existed && !expected_owner(&owner_sid_for_path(&absolute)?) {
+        return Err(PlatformError::Invalid {
+            capability: "secure_data_dir",
+            detail: "data directory owner is not trusted",
+        });
+    }
+    std::fs::create_dir_all(&absolute)?;
+    if !validate_directory_path(&absolute)? {
+        return Err(PlatformError::Invalid {
+            capability: "secure_data_dir",
+            detail: "data directory disappeared while it was being created",
+        });
+    }
+    if !expected_owner(&owner_sid_for_path(&absolute)?) {
+        return Err(PlatformError::Invalid {
+            capability: "secure_data_dir",
+            detail: "data directory owner changed while it was being secured",
+        });
+    }
+    set_data_dir_dacl(&absolute, policy)
+}
+
 fn io_error(error: Error) -> PlatformError {
     PlatformError::Io(std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
 }
@@ -100,29 +319,31 @@ fn creation_time(process: HANDLE) -> Result<u64, PlatformError> {
     Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
 }
 
-fn filetime_value(time: FILETIME) -> u64 {
-    (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
-}
-
-/// A process-lifetime boot discriminator. The first reading derives the boot
-/// FILETIME from the system clock and monotonic tick count; retaining it avoids
-/// clock adjustments changing process identities during a daemon run. Its
-/// decimal Unix-seconds encoding intentionally matches `aw-collector-poll`'s
-/// Windows `System::boot_time()` discriminator, so sampler/root identities
-/// join rather than looking like different processes.
+/// A process-lifetime boot discriminator: the System process (pid 4) creation
+/// FILETIME. Unlike wall-clock minus uptime it is not affected by NTP or a
+/// sampling-time rounding boundary. `aw-collector-poll` calls the public
+/// wrapper below, so both identities use these exact bytes.
 fn sampling_boot_id() -> &'static Vec<u8> {
     static BOOT_ID: OnceLock<Vec<u8>> = OnceLock::new();
     BOOT_ID.get_or_init(|| {
-        // SAFETY: this Windows API returns a FILETIME value directly.
+        // SAFETY: OpenProcess requests only query access to the System process;
+        // any returned handle is closed before this helper returns.
         #[allow(unsafe_code)]
-        let now = unsafe { GetSystemTimeAsFileTime() };
-        // SAFETY: reads the system monotonic uptime counter without pointers.
-        #[allow(unsafe_code)]
-        let uptime_100ns = unsafe { GetTickCount64() }.saturating_mul(10_000);
-        unix_ns_from_filetime(filetime_value(now).saturating_sub(uptime_100ns))
-            .map(|ns| (ns / 1_000_000_000).to_string().into_bytes())
+        let system = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, 4) };
+        let Ok(system) = system else {
+            return Vec::new();
+        };
+        let created = creation_time(system).ok();
+        close(system);
+        created
+            .map(|time| time.to_string().into_bytes())
             .unwrap_or_default()
     })
+}
+
+pub(crate) fn system_boot_id() -> Option<Vec<u8>> {
+    let value = sampling_boot_id();
+    (!value.is_empty()).then(|| value.clone())
 }
 
 fn unix_ns_from_filetime(filetime: u64) -> Option<u64> {
@@ -156,20 +377,7 @@ fn sid_for_token(token: HANDLE) -> Result<String, PlatformError> {
     // SAFETY: successful TokenUser writes TOKEN_USER at the beginning of storage.
     #[allow(unsafe_code)]
     let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
-    let mut text = PWSTR::null();
-    // SAFETY: the SID points into live TokenUser storage; Windows allocates text.
-    #[allow(unsafe_code)]
-    unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) }.map_err(io_error)?;
-    // SAFETY: successful conversion returns a NUL-terminated LocalAlloc string.
-    #[allow(unsafe_code)]
-    let result = unsafe { text.to_string() }.map_err(|_| PlatformError::Invalid {
-        capability: "process_owner",
-        detail: "SID was not valid UTF-16",
-    });
-    // SAFETY: ConvertSidToStringSidW allocated text with LocalAlloc.
-    #[allow(unsafe_code)]
-    let _ = unsafe { LocalFree(HLOCAL(text.0.cast())) };
-    result
+    sid_text(user.User.Sid)
 }
 
 fn elevated_for_token(token: HANDLE) -> Result<bool, PlatformError> {
@@ -464,19 +672,18 @@ struct InheritedStdHandles {
 impl InheritedStdHandles {
     fn for_current_process() -> Result<Self, PlatformError> {
         let std_handles = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
-        let mut handles = [HANDLE::default(); 3];
-        for (slot, which) in handles.iter_mut().zip(std_handles) {
+        // Construct the owner first. Any `?` below then invokes Drop and
+        // closes duplicates already made for earlier standard streams.
+        let mut inherited = Self {
+            handles: [HANDLE::default(); 3],
+        };
+        for (slot, which) in inherited.handles.iter_mut().zip(std_handles) {
             // SAFETY: `which` names one of the current process's standard handles.
             #[allow(unsafe_code)]
             let source = unsafe { GetStdHandle(which) }.map_err(io_error)?;
-            if source.is_invalid() {
-                for handle in handles {
-                    close(handle);
-                }
-                return Err(PlatformError::Invalid {
-                    capability: "spawn_suspended",
-                    detail: "a standard handle is unavailable",
-                });
+            if source.is_invalid() || source == HANDLE::default() {
+                *slot = inheritable_nul(which)?;
+                continue;
             }
             // SAFETY: both process pseudo-handles are the current process and
             // `slot` is writable storage for one owned duplicate.
@@ -492,14 +699,46 @@ impl InheritedStdHandles {
                     DUPLICATE_SAME_ACCESS,
                 )
             } {
-                for handle in handles {
-                    close(handle);
-                }
                 return Err(io_error(error));
             }
         }
-        Ok(Self { handles })
+        Ok(inherited)
     }
+}
+
+/// An inheritable `NUL` replacement for an absent standard handle. A console
+/// detached by Task Scheduler or a GUI host must not make `aw run` refuse to
+/// start the target. Input reads EOF; output and error are discarded.
+fn inheritable_nul(
+    which: windows::Win32::System::Console::STD_HANDLE,
+) -> Result<HANDLE, PlatformError> {
+    const NUL: [u16; 4] = [b'N' as u16, b'U' as u16, b'L' as u16, 0];
+    let access = if which == STD_INPUT_HANDLE {
+        FILE_GENERIC_READ.0
+    } else {
+        FILE_GENERIC_WRITE.0
+    };
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: windows::Win32::Foundation::BOOL(1),
+    };
+    // SAFETY: NUL is a static NUL-terminated device name and the security
+    // attributes are valid for this call; the returned handle is owned by the
+    // caller and closed by InheritedStdHandles::Drop.
+    #[allow(unsafe_code)]
+    unsafe {
+        CreateFileW(
+            windows::core::PCWSTR(NUL.as_ptr()),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            Some(&attributes),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            HANDLE::default(),
+        )
+    }
+    .map_err(io_error)
 }
 
 impl Drop for InheritedStdHandles {
@@ -916,9 +1155,8 @@ impl Platform for CurrentPlatform {
             }
             // The platform primitive can validate a pipe peer's token, but the
             // daemon has not wired its launch API to that primitive yet.
-            Capability::SpawnAsCaller | Capability::SecureDataDir => {
-                CapabilityStatus::NotInThisBuild
-            }
+            Capability::SpawnAsCaller => CapabilityStatus::NotInThisBuild,
+            Capability::SecureDataDir => CapabilityStatus::Available,
         }
     }
 
@@ -1066,8 +1304,23 @@ impl Platform for CurrentPlatform {
         }
         Ok(rows)
     }
-    fn secure_data_dir(&self, _: &Path) -> Result<(), PlatformError> {
-        Err(no("secure_data_dir"))
+    fn secure_data_dir(&self, path: &Path) -> Result<(), PlatformError> {
+        let Owner::Windows { sid, .. } = self.current_owner()? else {
+            return Err(PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "current process is not a Windows account",
+            });
+        };
+        let default = self.default_data_dir()?;
+        if is_machine_data_dir(path, &default) {
+            secure_data_dir_with_policy(
+                path,
+                |owner| owner == SYSTEM_SID || owner == ADMINISTRATORS_SID,
+                DataDirAcl::Machine,
+            )
+        } else {
+            secure_data_dir_with_policy(path, |owner| owner == sid, DataDirAcl::Owner(&sid))
+        }
     }
     fn default_data_dir(&self) -> Result<PathBuf, PlatformError> {
         std::env::var_os("ProgramData")
@@ -1106,11 +1359,116 @@ pub fn os_version() -> Option<String> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{close, environment_from, trusted_pipe_server_sid, CurrentPlatform};
+    #[allow(unused_imports)] // Kept with the named-pipe-fix test import set.
+    use super::{
+        close, environment_from, owner_sid_for_path, secure_data_dir_with_policy,
+        set_data_dir_dacl, sid_text, trusted_pipe_server_sid, CurrentPlatform, DataDirAcl,
+        ADMINISTRATORS_SID, SYSTEM_SID,
+    };
     use crate::{
         platform, Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner,
         PeerIdentity, Platform, PlatformError, ReapOutcome, SpawnRequest, UnsupportedKind,
     };
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{HLOCAL, PSID};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        GetAce, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+    };
+    use windows::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct DaclReadback {
+        protected: bool,
+        aces: Vec<(String, u32, u8)>,
+    }
+
+    /// `icacls`-equivalent readback used by the ACL test. It deliberately
+    /// reads the DACL Windows stored, rather than asserting the SDDL input
+    /// string, so inheritance and unexpected Users/Everyone ACEs are visible.
+    fn read_dacl(path: &std::path::Path) -> Result<DaclReadback, PlatformError> {
+        let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: the path is NUL terminated and output storage remains live
+        // until the descriptor is released after all ACEs are read.
+        #[allow(unsafe_code)]
+        let result = unsafe {
+            GetNamedSecurityInfoW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                &mut descriptor,
+            )
+        }
+        .ok()
+        .map_err(super::io_error)
+        .and_then(|()| {
+            if dacl.is_null() {
+                return Err(PlatformError::Invalid {
+                    capability: "secure_data_dir",
+                    detail: "data-directory DACL is absent",
+                });
+            }
+            let mut control = 0_u16;
+            let mut revision = 0_u32;
+            // SAFETY: descriptor is live and came from GetNamedSecurityInfoW;
+            // both output locations are writable.
+            #[allow(unsafe_code)]
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) }
+                .map_err(super::io_error)?;
+            let mut aces = Vec::new();
+            // SAFETY: the DACL is contained in the still-live descriptor.
+            #[allow(unsafe_code)]
+            let ace_count = unsafe { (*dacl).AceCount };
+            for index in 0..u32::from(ace_count) {
+                let mut ace = std::ptr::null_mut();
+                // SAFETY: index is below AceCount and `ace` is writable
+                // storage for the address owned by the DACL.
+                #[allow(unsafe_code)]
+                unsafe { GetAce(dacl, index, &mut ace) }.map_err(super::io_error)?;
+                // SAFETY: an ACCESS_ALLOWED_ACE begins with the returned ACE
+                // address when its type says ACCESS_ALLOWED_ACE_TYPE. Other
+                // types are rejected below before their fields are used.
+                #[allow(unsafe_code)]
+                let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+                if u32::from(allowed.Header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
+                    return Err(PlatformError::Invalid {
+                        capability: "secure_data_dir",
+                        detail: "data-directory DACL has a non-allow ACE",
+                    });
+                }
+                // SAFETY: SidStart is the first u32 of the variable-length SID
+                // immediately following the fixed ACCESS_ALLOWED_ACE header.
+                let sid = PSID(std::ptr::addr_of!(allowed.SidStart).cast_mut().cast());
+                aces.push((sid_text(sid)?, allowed.Mask, allowed.Header.AceFlags));
+            }
+            Ok(DaclReadback {
+                protected: (control & SE_DACL_PROTECTED.0) != 0,
+                aces,
+            })
+        });
+        // SAFETY: GetNamedSecurityInfoW allocated the descriptor with LocalAlloc.
+        #[allow(unsafe_code)]
+        let _ = unsafe { windows::Win32::Foundation::LocalFree(HLOCAL(descriptor.0.cast())) };
+        result
+    }
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "agentwatch-platform-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ))
+    }
 
     #[test]
     fn process_capabilities_are_honest() {
@@ -1130,6 +1488,60 @@ mod tests {
             CurrentPlatform.capability(Capability::SpawnAsCaller),
             CapabilityStatus::NotInThisBuild
         );
+        assert_eq!(
+            CurrentPlatform.capability(Capability::SecureDataDir),
+            CapabilityStatus::Available
+        );
+    }
+
+    #[test]
+    fn machine_data_dir_dacl_is_exactly_system_and_administrators() -> Result<(), PlatformError> {
+        let root = temp_dir("machine-dacl");
+        let data = root.join("data");
+        std::fs::create_dir_all(&data)?;
+        set_data_dir_dacl(&data, DataDirAcl::Machine)?;
+        let readback = read_dacl(&data)?;
+        // Restore the creator's access before cleanup. This is outside the
+        // assertion: the readback above is the state the daemon leaves behind.
+        let owner = owner_sid_for_path(&data)?;
+        set_data_dir_dacl(&data, DataDirAcl::Owner(&owner))?;
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(readback.protected, "DACL inheritance must be disabled");
+        assert_eq!(readback.aces.len(), 2, "no Users/Everyone/other ACEs");
+        assert!(readback.aces.iter().all(|(_, mask, flags)| {
+            *mask == windows::Win32::Foundation::GENERIC_ALL.0 && *flags == 3
+        }));
+        let mut sids: Vec<&str> = readback
+            .aces
+            .iter()
+            .map(|(sid, _, _)| sid.as_str())
+            .collect();
+        sids.sort_unstable();
+        assert_eq!(sids, vec![SYSTEM_SID, ADMINISTRATORS_SID]);
+        Ok(())
+    }
+
+    #[test]
+    fn machine_data_dir_refuses_a_precreated_normal_owner() -> Result<(), PlatformError> {
+        let root = temp_dir("foreign-owner");
+        let data = root.join("data");
+        std::fs::create_dir_all(&data)?;
+        let Err(error) = secure_data_dir_with_policy(&data, |_| false, DataDirAcl::Machine) else {
+            return Err(PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "normal user's pre-created directory was accepted",
+            });
+        };
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(matches!(
+            error,
+            PlatformError::Invalid {
+                capability: "secure_data_dir",
+                detail: "data directory owner is not trusted",
+            }
+        ));
+        Ok(())
     }
 
     #[test]
@@ -1153,6 +1565,48 @@ mod tests {
             .expect("held Windows child");
         let released = held.release().expect("released Windows child");
         assert_eq!(released.wait().expect("reap child"), ReapOutcome::Exited(7));
+    }
+
+    #[test]
+    fn released_child_keeps_exit_code_300() {
+        let caller = IdentifiedCaller::current_user().expect("current user");
+        let request = SpawnRequest {
+            command: vec!["cmd".to_owned(), "/c".to_owned(), "exit 300".to_owned()],
+            cwd: None,
+            env: Vec::new(),
+        };
+        let released = platform()
+            .spawn_suspended(&caller, &request)
+            .expect("held Windows child")
+            .release()
+            .expect("released Windows child");
+        assert_eq!(
+            released.wait().expect("reap child"),
+            ReapOutcome::Exited(300)
+        );
+    }
+
+    #[test]
+    fn released_child_keeps_ntstatus_exit_code() {
+        let caller = IdentifiedCaller::current_user().expect("current user");
+        let request = SpawnRequest {
+            command: vec![
+                "cmd".to_owned(),
+                "/c".to_owned(),
+                "exit -1073741819".to_owned(),
+            ],
+            cwd: None,
+            env: Vec::new(),
+        };
+        let released = platform()
+            .spawn_suspended(&caller, &request)
+            .expect("held Windows child")
+            .release()
+            .expect("released Windows child");
+        assert_eq!(
+            released.wait().expect("reap child"),
+            ReapOutcome::Exited(-1_073_741_819)
+        );
     }
 
     #[test]
@@ -1227,48 +1681,32 @@ mod tests {
         ));
     }
 
-    struct StdoutRestore(windows::Win32::Foundation::HANDLE);
-
-    impl Drop for StdoutRestore {
-        fn drop(&mut self) {
-            // SAFETY: the saved handle came from GetStdHandle and remains owned
-            // by the process; this restores the test process's prior setting.
-            #[allow(unsafe_code)]
-            let _ = unsafe {
-                windows::Win32::System::Console::SetStdHandle(
-                    windows::Win32::System::Console::STD_OUTPUT_HANDLE,
-                    self.0,
-                )
-            };
-        }
+    #[test]
+    fn suspended_child_writes_to_the_explicit_stdout_pipe() {
+        // A separate test process gives its actual stdout to the suspended
+        // target. This verifies the inherited explicit handle without mutating
+        // the Rust test runner's own standard handles, so CI can run it.
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "windows::tests::suspended_child_writes_to_inherited_stdout_in_child",
+                "--nocapture",
+            ])
+            .output()
+            .expect("run child test process");
+        assert!(
+            output.status.success(),
+            "child test stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("hello"),
+            "target output was not forwarded"
+        );
     }
 
     #[test]
-    #[ignore = "changes the process stdout handle; run on a real Windows host"]
-    fn suspended_child_writes_to_the_explicit_stdout_pipe() {
-        use std::io::Read;
-        use std::os::windows::io::{FromRawHandle, OwnedHandle};
-        use std::sync::Mutex;
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::System::Console::{GetStdHandle, SetStdHandle, STD_OUTPUT_HANDLE};
-        use windows::Win32::System::Pipes::CreatePipe;
-
-        static STDOUT_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = STDOUT_LOCK.lock().expect("stdout test lock");
-        // SAFETY: STD_OUTPUT_HANDLE asks Windows for this process's stdout.
-        #[allow(unsafe_code)]
-        let previous = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) }.expect("stdout handle");
-        let mut reader = HANDLE::default();
-        let mut writer = HANDLE::default();
-        // SAFETY: both output pointers are valid writable HANDLE storage.
-        #[allow(unsafe_code)]
-        unsafe { CreatePipe(&mut reader, &mut writer, None, 0) }.expect("stdout pipe");
-        let restore = StdoutRestore(previous);
-        // SAFETY: `writer` remains open until after the child has inherited its
-        // duplicate, and restore's Drop reinstates the prior process stdout.
-        #[allow(unsafe_code)]
-        unsafe { SetStdHandle(STD_OUTPUT_HANDLE, writer) }.expect("redirect stdout");
-
+    fn suspended_child_writes_to_inherited_stdout_in_child() {
         let caller = IdentifiedCaller::current_user().expect("current user");
         let request = SpawnRequest {
             command: vec!["cmd".to_owned(), "/c".to_owned(), "echo hello".to_owned()],
@@ -1279,16 +1717,6 @@ mod tests {
             .spawn_suspended(&caller, &request)
             .expect("held Windows child");
         let released = held.release().expect("released child");
-        drop(restore);
-        close(writer);
         assert_eq!(released.wait().expect("reap child"), ReapOutcome::Exited(0));
-
-        // SAFETY: this test owns `reader` exactly once after CreatePipe.
-        #[allow(unsafe_code)]
-        let owned = unsafe { OwnedHandle::from_raw_handle(reader.0 as *mut _) };
-        let mut output = String::new();
-        let mut file = std::fs::File::from(owned);
-        file.read_to_string(&mut output).expect("read child stdout");
-        assert!(output.contains("hello"));
     }
 }

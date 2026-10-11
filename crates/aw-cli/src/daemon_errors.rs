@@ -87,6 +87,11 @@ const ROWS: &[Row] = &[
         en: Some("the poll sampler reads process identity only on Linux in this build"),
     },
     Row {
+        code: "launch_not_in_this_build",
+        zh: "Windows 上从 App 新建会话本版本未接入，请在终端里用 aw run 启动。",
+        en: Some("launching a new session from the App is not implemented on Windows; use aw run in a terminal"),
+    },
+    Row {
         code: "adopt_timeout",
         zh: "接管超时，会话已关闭",
         en: Some("adopt arrived after the timeout; the session was closed"),

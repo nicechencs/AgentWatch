@@ -88,7 +88,7 @@ pub enum RuntimeError {
     Config(String),
 
     /// The data directory could not be created. No other directory was used.
-    #[error("failed to create data directory `{}`: {source}", path.display())]
+    #[error("无法安全使用数据目录「{}」：{source}", path.display())]
     DataDir {
         /// Directory we tried to create.
         path: PathBuf,

@@ -376,8 +376,8 @@ fn create_inner(
             {
                 Err(error_response(
                     503,
-                    "collector_unavailable",
-                    "daemon session creation is not wired on Windows in this build",
+                    "launch_not_in_this_build",
+                    "Windows 上从 App 新建会话本版本未接入，请在终端里用 aw run 启动。",
                 ))
             }
             #[cfg(not(windows))]

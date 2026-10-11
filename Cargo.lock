@@ -115,6 +115,7 @@ name = "aw-collector-poll"
 version = "0.1.0"
 dependencies = [
  "aw-core",
+ "aw-platform",
  "sysinfo",
 ]
 

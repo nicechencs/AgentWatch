@@ -172,6 +172,7 @@ CLI 放行。App 的「新建会话 / 后台直接启动」在 Windows 当前明
 - 安装包：MSI（WiX），或用 `dist` 生成的安装器。代码签名用 OV/EV 证书，也可以用 Azure Trusted Signing，可以减少 SmartScreen 警告。
 - 服务崩溃自动重启：`sc failure` 配置 3 次重启。
 - ETW 会话在进程异常退出后会残留。启动时先按名字 `ControlTrace(STOP)` 停掉旧会话。
+- 数据目录 `%ProgramData%\AgentWatch` 在后台启动前移除继承 ACL，并只保留 SYSTEM 与 Administrators 的完全控制；目录（或任一父路径）是重解析点、或既有目录属主不是 SYSTEM/Administrators 时，后台拒绝使用它，不会静默接管。
 
 ## 6. 已知坑
 

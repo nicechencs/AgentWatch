@@ -28,7 +28,7 @@ App 新建会话，后台按系统认出连接方，再按那个身份启动：
 
 | 系统 | 怎么认、怎么启动 |
 |---|---|
-| Windows | 从命名管道取出客户端令牌，认出调用方。按**这个身份**以挂起方式创建，绝不用服务账户。Job Object 由后台拿着 |
+| Windows | 【本版本未接入】从命名管道取出客户端令牌，认出调用方；App 新建会话当前返回 503。绝不用服务账户启动，见 `windows.md` |
 | macOS | 本地套接字上用 `getpeereid` / `LOCAL_PEERPID` 取出对端 uid，切到这个身份再启动；接口不提供附加组，字段为 `None` |
 | Linux | `SO_PEERCRED` 认出 uid，按这个 uid 启动（现有的 launch-as） |
 
@@ -121,10 +121,10 @@ macOS 崩溃兜底用看门狗管道，不用「另起一个小看门狗发 `SIG
 
 | 系统 | 做法 |
 |---|---|
-| Windows | 关掉 ACL 继承，去掉普通用户；只留 SYSTEM 和管理员 |
-| Linux / macOS | 显式权限位：数据目录 `0700`、属 root；套接字 `0660`，放在 `agentwatch` 组里 |
+| Windows | 关掉 ACL 继承，受保护 DACL 只留 SYSTEM 和 Administrators 的完全控制；既有目录不是 SYSTEM/Administrators 所有、或路径/父路径为重解析点时拒绝启动 |
+| Linux / macOS | 显式权限位：数据目录 `0700`、属 root 或实际 daemon 用户；既有目录属主不符、或路径/父路径为符号链接时拒绝启动；套接字 `0660`，放在 `agentwatch` 组里 |
 
-在权限真正收紧之前，`secure_data_dir` 在**三个系统上都返回 `NotInThisBuild`**，绝不假装已经成功。
+后台在打开锁、日志或数据库前调用 `secure_data_dir`；三个系统均返回 `Available` 后才使用目录。Windows 测试会重新读取 DACL，断言受保护标志以及 ACE 恰为 SYSTEM 和 Administrators，不把输入的 SDDL 当作验证结果。
 
 ### 仅测试用的挂起延迟
 

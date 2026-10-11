@@ -39,6 +39,15 @@ use windows::CurrentPlatform;
 pub fn os_version() -> Option<String> {
     os_version_of()
 }
+
+/// Stable Windows boot discriminator used by every Windows process identity.
+/// It is the System process (pid 4) creation time, not wall clock minus
+/// uptime, so time synchronization and sampling at different moments cannot
+/// produce different generations for the same boot.
+#[cfg(windows)]
+pub fn windows_system_boot_id() -> Option<Vec<u8>> {
+    windows::system_boot_id()
+}
 #[cfg(target_os = "linux")]
 fn os_version_of() -> Option<String> {
     linux::os_version()
@@ -321,6 +330,10 @@ pub trait Platform: Send + Sync {
     fn process_table(&self) -> Result<Vec<ProcessEntry>, PlatformError>;
     fn sampling_process(&self, pid: u32) -> Result<Option<SamplingProcess>, PlatformError>;
     fn sampling_process_table(&self) -> Result<Vec<SamplingProcess>, PlatformError>;
+    /// Create and secure the daemon data directory before the daemon opens
+    /// any file below it. Implementations reject a pre-existing directory
+    /// owned by somebody other than the account allowed for that location,
+    /// and reject links/reparse points rather than following them.
     fn secure_data_dir(&self, path: &Path) -> Result<(), PlatformError>;
     fn default_data_dir(&self) -> Result<PathBuf, PlatformError>;
     fn default_config_path(&self) -> Result<PathBuf, PlatformError>;

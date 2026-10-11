@@ -23,8 +23,6 @@
 //! or no start time without a gap. `start_at` plus `poll_once` keep both.
 
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(target_os = "linux")]
-use std::fs;
 use std::io;
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -54,15 +52,6 @@ const SAMPLE_EVERY: Duration = Duration::from_millis(250);
 /// Bound on events kept from one tick. A full sink becomes a gap inside the
 /// collector; this process does not drop the rest quietly.
 const SINK_CAPACITY: usize = 8_192;
-
-/// Linux `CLK_TCK`. `sysconf(_SC_CLK_TCK)` needs `unsafe`, which this crate
-/// forbids. 100 is the value `sysinfo` uses when `sysconf` fails, and it is
-/// the value Linux ships. A kernel built with a different tick rate would
-/// hash a different uid; the attach would then not resolve and the collector
-/// would not keep scanning. That failure is visible (no process rows), not a
-/// guessed pid.
-#[cfg(target_os = "linux")]
-const LINUX_CLK_TCK: u64 = 100;
 
 /// `snapshot` walks this pid and its descendants. Pid 1 is init.
 const SAMPLE_ROOT_PID: u32 = 1;
@@ -803,44 +792,27 @@ fn store_reason(err: &aw_store::StoreError) -> String {
 /// `None` when the boot id or the start time cannot be read. Not a zero hash.
 /// Live processes under pid 1, keyed the same way the poll collector keys them.
 fn proc_table() -> Vec<ProcFact> {
-    #[cfg(target_os = "linux")]
-    {
-        let Some(boot) = read_boot_id() else {
-            return Vec::new();
-        };
-        let mut rows = Vec::new();
-        let Ok(entries) = fs::read_dir("/proc") else {
-            return Vec::new();
-        };
-        for entry in entries.flatten() {
-            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-                continue;
-            };
-            let Some(start_ns) = read_pid_start_ns(pid) else {
-                continue;
-            };
-            let Some(ppid) = read_ppid(pid) else {
-                continue;
-            };
-            let start_secs = start_ns / 1_000_000_000;
-            let Some(identity) =
-                ProcessIdentity::from_parts(&boot, pid, start_secs, StartTimeUnit::Seconds)
-            else {
-                continue;
-            };
-            rows.push(ProcFact {
-                pid,
-                ppid,
-                start_ns,
+    aw_platform::platform()
+        .sampling_process_table()
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|process| {
+            let start_secs = process.start_ns / 1_000_000_000;
+            let identity = ProcessIdentity::from_parts(
+                &process.boot_id,
+                process.key.pid,
+                start_secs,
+                StartTimeUnit::Seconds,
+            )?;
+            Some(ProcFact {
+                pid: process.key.pid,
+                ppid: process.ppid,
+                start_ns: process.start_ns,
                 uid: identity.uid,
-            });
-        }
-        rows
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Vec::new()
-    }
+            })
+        })
+        .collect()
 }
 
 /// `table` rows that are `root` or descend from it.
@@ -877,117 +849,40 @@ fn find_proc<'a>(
     })
 }
 
-#[cfg(target_os = "linux")]
-fn read_ppid(pid: u32) -> Option<u32> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let rest = stat.rsplit_once(')')?.1.trim_start();
-    // Field 4 is ppid, the second token after `)`.
-    rest.split_whitespace().nth(1)?.parse().ok()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn read_ppid(_pid: u32) -> Option<u32> {
-    None
-}
-
 /// [`ProcUid`] of `pid`, hashed the way the poll collector hashes a row.
 /// `None` when the process is gone or its identity cannot be read.
 pub(crate) fn proc_uid_of(pid: u32) -> Option<ProcUid> {
-    let start_ns = read_pid_start_ns(pid)?;
-    proc_uid_from_start_ns(pid, start_ns)
+    let process = aw_platform::platform().sampling_process(pid).ok()??;
+    proc_uid_from_sampling(&process)
 }
 
-/// Build the poll collector's identity from a precise `/proc` start time.
+/// Build the poll collector's identity from a precise platform start time.
 ///
 /// The value retained in the row stays precise, but the uid uses seconds:
 /// that is the only start-time granularity the poll collector exposes.
-fn proc_uid_from_start_ns(pid: u32, start_ns: u64) -> Option<ProcUid> {
-    let boot = read_boot_id()?;
-    let start_secs = start_ns / 1_000_000_000;
-    ProcessIdentity::from_parts(&boot, pid, start_secs, StartTimeUnit::Seconds).map(|id| id.uid)
+fn proc_uid_from_sampling(process: &aw_platform::SamplingProcess) -> Option<ProcUid> {
+    let start_secs = process.start_ns / 1_000_000_000;
+    ProcessIdentity::from_parts(
+        &process.boot_id,
+        process.key.pid,
+        start_secs,
+        StartTimeUnit::Seconds,
+    )
+    .map(|id| id.uid)
 }
 
 /// Capture the adopted root while the caller still holds it behind the pipe
 /// gate. `None` means one required `/proc` fact was unavailable; callers keep
 /// the adoption valid, but cannot later claim a root snapshot they lack.
 pub(crate) fn root_hint(pid: u32, name: Option<String>) -> Option<RootHint> {
-    let start_ns = read_pid_start_ns(pid)?;
+    let process = aw_platform::platform().sampling_process(pid).ok()??;
     Some(RootHint {
         pid,
-        ppid: read_ppid(pid)?,
-        start_ns,
-        uid: proc_uid_from_start_ns(pid, start_ns)?,
+        ppid: process.ppid,
+        start_ns: process.start_ns,
+        uid: proc_uid_from_sampling(&process)?,
         name,
     })
-}
-
-fn read_boot_id() -> Option<Vec<u8>> {
-    // Same file the poll collector reads on Linux (`host.rs`). Other targets
-    // take the boot id from `sysinfo`, which this crate does not link. A
-    // made-up boot id would not match the collector's hash, so the attach
-    // would never resolve. Refuse instead.
-    #[cfg(target_os = "linux")]
-    {
-        let text = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.as_bytes().to_vec())
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
-}
-
-/// Unix start nanoseconds of `pid`: `/proc/stat` `btime` plus
-/// `/proc/<pid>/stat` field 22 converted from ticks without first truncating
-/// to seconds.
-fn read_pid_start_ns(pid: u32) -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let ticks = stat_start_ticks(&stat)?;
-        start_ns_from_ticks(read_btime()?, ticks)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn start_ns_from_ticks(btime_secs: u64, ticks: u64) -> Option<u64> {
-    let btime_ns = btime_secs.checked_mul(1_000_000_000)?;
-    let elapsed_ns = ticks.checked_mul(1_000_000_000)? / LINUX_CLK_TCK;
-    btime_ns.checked_add(elapsed_ns)
-}
-
-/// Field 22 (`starttime`) of `/proc/pid/stat`.
-///
-/// The command is wrapped in parentheses and may contain spaces and
-/// parentheses, so the fields after it begin at the last `)`.
-#[cfg(target_os = "linux")]
-fn stat_start_ticks(stat: &str) -> Option<u64> {
-    let rest = stat.rsplit_once(')')?.1.trim_start();
-    // Field 3 is the state, the first token after `)`. starttime is field 22,
-    // which is index 19 of what remains.
-    let field = rest.split_whitespace().nth(19)?;
-    field.parse().ok()
-}
-
-#[cfg(target_os = "linux")]
-fn read_btime() -> Option<u64> {
-    let text = fs::read_to_string("/proc/stat").ok()?;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("btime ") {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
 }
 
 fn session_row(started_ns: i64) -> SessionRow {
@@ -1021,28 +916,33 @@ fn session_row(started_ns: i64) -> SessionRow {
 /// User id the daemon-wide sample session is recorded under. The preview UI
 /// ticket binds to the same id so a preview browser can see that session.
 pub(crate) fn current_user_id() -> String {
-    #[cfg(unix)]
-    {
-        unix_uid_string()
-    }
-    #[cfg(not(unix))]
-    {
-        // Not a user name. The column is `NOT NULL`.
-        "daemon".to_owned()
-    }
+    aw_platform::platform()
+        .current_user_id()
+        // The column is NOT NULL. This is a daemon label, never a guessed
+        // caller identity used for launch-as.
+        .unwrap_or_else(|| "daemon".to_owned())
 }
 
-#[cfg(unix)]
-fn unix_uid_string() -> String {
-    // Numeric uid of this process, from the owner of `/proc/self`. Not a name.
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(meta) = fs::metadata("/proc/self") {
-            use std::os::unix::fs::MetadataExt;
-            return meta.uid().to_string();
-        }
-    }
-    "daemon".to_owned()
+// Kept for the existing formula-level sampler tests. Production process
+// identity reads live exclusively behind `aw_platform::Platform` above.
+#[cfg(test)]
+const LINUX_CLK_TCK: u64 = 100;
+
+#[cfg(test)]
+fn start_ns_from_ticks(btime_secs: u64, ticks: u64) -> Option<u64> {
+    let btime_ns = btime_secs.checked_mul(1_000_000_000)?;
+    let elapsed_ns = ticks.checked_mul(1_000_000_000)? / LINUX_CLK_TCK;
+    btime_ns.checked_add(elapsed_ns)
+}
+
+#[cfg(test)]
+fn read_boot_id() -> Option<Vec<u8>> {
+    Some(
+        aw_platform::platform()
+            .sampling_process(std::process::id())
+            .ok()??
+            .boot_id,
+    )
 }
 
 /// One `processes` row per `ProcessStart` / `ProcessExit` that carried a [`ProcRef`].

@@ -2,8 +2,7 @@
 //!
 //! Cross-session search. The live route is `GET /api/v1/search?q&kind&since`.
 //! [`super::query::search_request`] builds that call. This command does not
-//! open the database. `--since -10m` needs a clock this production path does
-//! not have, so that form is refused rather than treated as the epoch.
+//! open the database. `--since` accepts RFC 3339 and relative-to-now forms.
 //! A sensitive hit is highlighted only when `color` is set.
 
 use std::io;
@@ -85,18 +84,13 @@ pub(crate) fn run(args: SearchArgs<'_>, source: &dyn QuerySource) -> io::Result<
     }
 }
 
-/// RFC 3339 and `+30s` resolve. `-10m` does not: there is no clock on this path.
+/// RFC 3339 and relative-to-now forms resolve against the caller's clock.
 fn resolve_since(text: &str) -> Result<i64, String> {
-    if text.trim().starts_with('-') || looks_bare_duration(text) {
-        return Err(
-            "`search --since` 的相对当前时间（-10m）需要此构建没有的时钟；请传入 RFC 3339"
-                .to_owned(),
-        );
-    }
-    super::query::resolve_time(text, None, 0)
-}
-
-fn looks_bare_duration(text: &str) -> bool {
-    let text = text.trim();
-    !text.is_empty() && text.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or_default();
+    super::query::resolve_time(text, None, now_ns).map_err(|_| {
+        format!("`search --since` 的值 `{text}` 无效；请输入 `10m` 或 `2026-10-11T09:00:00+08:00`")
+    })
 }

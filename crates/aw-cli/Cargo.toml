@@ -21,6 +21,7 @@ path = "src/lib.rs"
 
 [dependencies]
 aw-core = { workspace = true }
+aw-platform = { workspace = true }
 # Internal channel: path order, dial, error classes (shared with the app).
 aw-channel = { workspace = true }
 aw-store = { workspace = true }
@@ -48,25 +49,22 @@ serde_json = { version = "1.0.151", default-features = false, features = ["std"]
 # has acknowledged `/adopt`. nix is MIT and keeps this fd work safe under the
 # binary's `#![forbid(unsafe_code)]` policy.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", default-features = false, features = ["fs"] }
-
-[target.'cfg(windows)'.dependencies]
-# P1-CLI-02 / P1-WIN-04. Used only to hold a caller-created target at
-# CREATE_SUSPENDED until the daemon accepts `/adopt`, then resume its primary
-# thread. This pin matches aw-collector-windows and the existing lockfile.
-windows = { version = "=0.57.0", features = [
-    "Win32_Foundation",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_Threading",
-] }
+nix = { version = "0.30", default-features = false, features = ["fs", "process", "signal"] }
+# MIT. Installs safe process-local signal flags; `aw run --no-daemon` relays
+# SIGINT/SIGTERM to the target's process group without local unsafe handlers.
+signal-hook = { version = "=0.3.18", default-features = false }
 
 [dev-dependencies]
 # insta is MIT OR Apache-2.0. Same pin as aw-core. Snapshots record `aw --help`.
 insta = { version = "1.49.0", default-features = false }
 
-# Unsafe code is denied crate-wide. Two scoped, documented exceptions in
-# `cmd::run`: the Unix `pre_exec` that keeps the pipe gate out of the target,
-# and the Windows FFI that resumes a CREATE_SUSPENDED child after `/adopt`.
+[target.'cfg(windows)'.dev-dependencies]
+# The Windows integration test hosts a real temporary named pipe and spawns
+# the built `aw` binary through its normal aw-channel client path.
+tokio = { workspace = true }
+
+# Unsafe code is denied crate-wide. The Unix `pre_exec` gate is the sole
+# documented exception; Windows FFI is confined to `aw-platform`.
 [lints.rust]
 unsafe_code = "deny"
 

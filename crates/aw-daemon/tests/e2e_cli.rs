@@ -143,10 +143,31 @@ impl Daemon {
         };
         command
             .env_remove("AW_TOKEN")
+            .env("AW_DAEMON_CONFIG", self.root.join("config.toml"))
             .args(args)
             .stdin(Stdio::null())
             .output()
             .expect("spawn aw")
+    }
+
+    /// Run the CLI as root for administrator-only daemon operations. This is
+    /// used only with an isolated root daemon and its temporary socket.
+    fn aw_as_root(&self, args: &[&str]) -> Output {
+        let mut command = Command::new("sudo");
+        command.arg("-n").arg("env");
+        for (key, value) in env_for(&self.root) {
+            command.arg(format!("{key}={}", value.display()));
+        }
+        command
+            .arg(format!(
+                "AW_DAEMON_CONFIG={}",
+                self.root.join("config.toml").display()
+            ))
+            .arg(aw_bin())
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn root aw")
     }
 
     /// One HTTP/1.1 request over the socket; the peer credential is the caller.
@@ -251,6 +272,95 @@ impl Daemon {
             sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// Restart must not start a replacement while the old foreground loop still
+/// owns the data-dir and IPC locks. This is deliberately a real process test:
+/// the race only exists between the CLI's health polling and daemon teardown.
+#[test]
+fn daemon_restart_releases_locks_before_every_replacement() {
+    let daemon = Daemon::start(As::Me);
+    for round in 0..31 {
+        let out = daemon.aw(&["daemon", "restart"]);
+        assert!(
+            out.status.success(),
+            "restart {round} failed: {} / {}",
+            String::from_utf8_lossy(&out.stderr),
+            daemon.log()
+        );
+        let status = daemon.aw(&["daemon", "status"]);
+        assert!(
+            status.status.success(),
+            "daemon was not up after restart {round}: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+    let out = daemon.aw(&["daemon", "stop"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let started = Instant::now();
+    while UnixStream::connect(daemon.socket()).is_ok() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "replacement did not stop"
+        );
+        sleep(Duration::from_millis(50));
+    }
+}
+
+/// A config update patches one schema key in the source TOML; it must neither
+/// replace unrelated sections nor accept a typo as an inert setting.
+#[test]
+#[ignore = "needs passwordless sudo for an isolated root daemon"]
+fn config_set_merges_validates_and_shows_effective_defaults() {
+    let daemon = Daemon::start(As::Root);
+    let config = daemon.root.join("config.toml");
+    let source = std::fs::read_to_string(&config).expect("config");
+    std::fs::write(
+        &config,
+        format!("# keep this comment\n{source}\n[debug]\npreview_ui = false # keep too\n"),
+    )
+    .expect("rewrite config before set");
+
+    let out = daemon.aw_as_root(&["config", "set", "collectors.linux.tls_uprobe", "false"]);
+    assert!(
+        out.status.success(),
+        "config set: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(&config).expect("merged config");
+    assert!(text.contains("# keep this comment"));
+    assert!(text.contains("[storage]"));
+    assert!(text.contains("[api]"));
+
+    let get = daemon.aw_as_root(&["config", "get", "api.http_port"]);
+    assert!(
+        get.status.success(),
+        "{}",
+        String::from_utf8_lossy(&get.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "0");
+
+    let show = daemon.aw_as_root(&["config", "show"]);
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let shown = String::from_utf8_lossy(&show.stdout);
+    assert!(shown.contains("[storage]"), "{shown}");
+    assert!(shown.contains("[api]"), "{shown}");
+
+    let unknown = daemon.aw_as_root(&["config", "set", "nope.key", "1"]);
+    assert_eq!(unknown.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("未知配置键 \u{0060}nope.key\u{0060}"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
 }
 
 impl Drop for Daemon {
@@ -533,6 +643,100 @@ fn a_session_created_right_after_start_stays_recording() {
     let _ = sleeper.wait();
 }
 
+/// `timeline --follow` uses the daemon's bounded `/live` SSE snapshots rather
+/// than the old unavailable stub.  The foreground CLI is interrupted like a
+/// person pressing Ctrl-C: it finishes its current snapshot and exits cleanly.
+/// This uses the same isolated foreground daemon as the other end-to-end
+/// tests, never the installed daemon.
+#[test]
+fn timeline_follow_uses_temp_daemon_and_stops_cleanly_on_sigint() {
+    let mut sleeper = Command::new("sleep").arg("30").spawn().expect("sleep");
+    let daemon = Daemon::start(As::Me);
+    let (status, body) = daemon.http(
+        "POST",
+        "/api/v1/sessions",
+        &format!(r#"{{"mode":"attach","pid":{}}}"#, sleeper.id()),
+    );
+    assert_eq!(status, 201, "{body} / {}", daemon.log());
+    let sid = body["id"].as_str().expect("id").to_owned();
+
+    let follow = Command::new(aw_bin())
+        .envs(env_for(&daemon.root))
+        .env_remove("AW_TOKEN")
+        .env("AW_DAEMON_CONFIG", daemon.root.join("config.toml"))
+        .args(["timeline", &sid, "--follow", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn timeline follow");
+
+    // Give the CLI enough time to make one bounded `/live` request and install
+    // its Unix signal waiter before emulating Ctrl-C.
+    sleep(Duration::from_millis(1_300));
+    let signal = Command::new("kill")
+        .args(["-INT", &follow.id().to_string()])
+        .status()
+        .expect("send SIGINT to timeline follow");
+    assert!(signal.success(), "could not signal timeline follow");
+    let output = follow.wait_with_output().expect("wait for timeline follow");
+    assert!(
+        output.status.success(),
+        "timeline --follow: {} / daemon: {}",
+        String::from_utf8_lossy(&output.stderr),
+        daemon.log()
+    );
+    // The old implementation refused before dialing `/live`; a successful
+    // clean exit is the contract here because this foreground runtime has no
+    // live pipeline publisher yet and its snapshot may correctly be empty.
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("真实订阅未接通"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+}
+
+/// The local runner owns no daemon state.  It must still relay a terminal
+/// termination to the target process group and report the target's resulting
+/// status, rather than dying first and leaving the shell behind.
+#[test]
+fn no_daemon_run_relays_sigterm_to_the_target_process_group() {
+    let child = Command::new(aw_bin())
+        .args([
+            "run",
+            "--no-daemon",
+            "-q",
+            "--",
+            "sh",
+            "-c",
+            "trap 'exit 23' TERM; while :; do sleep 0.1; done",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn local aw run");
+
+    // Allow the child group and the relay thread to be established before
+    // emulating a supervisor's SIGTERM to the foreground `aw` process.
+    sleep(Duration::from_millis(1_000));
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM to aw");
+    assert!(signal.success(), "could not signal local aw run");
+    let output = child.wait_with_output().expect("wait for local aw run");
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "--no-daemon should return the target code: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Root daemon (via `sudo -n`), this test's account as the caller: the
 /// launched program's uid is the caller's and its group list is exactly the
 /// caller's login groups (`id -G`), supplementary groups included. Needs
@@ -569,4 +773,49 @@ fn root_daemon_launch_carries_the_callers_login_groups() {
     have.dedup();
     assert_eq!(have, want, "Groups of the launched program = id -G {name}");
     let _ = Command::new("kill").arg(pid.to_string()).status();
+}
+
+/// A root daemon samples a long-running program it launches for its caller.
+/// This is root-only because the daemon's launch-as-caller path is the case
+/// that previously only had coverage for credentials, not poll sampling.
+#[test]
+#[ignore = "needs root"]
+fn root_daemon_samples_long_running_program() {
+    let daemon = Daemon::start(As::Root);
+    let (status, body) = daemon.http_as_caller(
+        "POST",
+        "/api/v1/sessions",
+        r#"{"mode":"launch","argv":["sleep","20"]}"#,
+    );
+    assert_eq!(status, 201, "{body} / {}", daemon.log());
+    let pid = body["root_pid"].as_u64().expect("root_pid");
+    let sid = body["id"].as_str().expect("id");
+
+    let started = Instant::now();
+    let mut sampled = false;
+    let mut last = Value::Null;
+    while started.elapsed() < Duration::from_secs(10) {
+        let (status, body) =
+            daemon.http_as_caller("GET", &format!("/api/v1/sessions/{sid}/processes"), "");
+        if status == 200 && process_tree_contains_pid(&body["processes"], pid) {
+            sampled = true;
+            break;
+        }
+        last = serde_json::json!({ "status": status, "body": body });
+        sleep(Duration::from_millis(100));
+    }
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    assert!(
+        sampled,
+        "root daemon did not store a sampled row for pid {pid}: {last}; log: {}",
+        daemon.log()
+    );
+}
+
+fn process_tree_contains_pid(nodes: &Value, pid: u64) -> bool {
+    nodes.as_array().is_some_and(|nodes| {
+        nodes
+            .iter()
+            .any(|node| node["pid"] == pid || process_tree_contains_pid(&node["children"], pid))
+    })
 }

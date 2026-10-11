@@ -50,7 +50,7 @@ preview_ui = true       # 仅本机预览：打开 http://127.0.0.1:<端口>/ �
 ## 用法（命令树；部分子命令仍在接入）
 
 ```bash
-aw run --proxy -- claude                 # 启动并监控一个 Agent（--proxy 获取完整 URL）
+aw run -- claude                         # 启动并记录一个程序
 aw attach --pid 4412                     # 附着到正在运行的进程
 aw sessions list
 aw timeline @last --filter 'kind:file path:~/.ssh/**'

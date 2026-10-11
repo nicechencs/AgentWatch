@@ -9,8 +9,9 @@
 - **数据库**：单个 SQLite 文件 `agentwatch.db`，使用 `rusqlite`，并开启 bundled 特性以自带固定版本的 SQLite。
 - **PRAGMA**：
   - `journal_mode=WAL`、`synchronous=NORMAL`、`foreign_keys=ON`、`temp_store=MEMORY`、`mmap_size=268435456`；
-  - `auto_vacuum=INCREMENTAL`，在建库时设置。
-- **连接**：一个写连接，由 Batcher 线程独占；另有 N 个只读连接（默认 4 个）供 API 查询使用。
+  - `auto_vacuum=INCREMENTAL`，在建库时设置。`journal_mode` 与 `auto_vacuum` 都是持久设置：已有数据库不在每次打开时重写；若旧库仍是 rollback journal，daemon 只尝试一次转换为 WAL，转换失败则拒绝启动并提示先备份原库后重建，以免在不符合并发假设的格式上继续记录。
+- **连接**：所有连接在执行其他 SQL 前先设置 8 秒 `busy_timeout`。一个写连接，由 Batcher 线程独占；另有 N 个只读连接（默认 4 个）供 API 查询使用。
+- **写入**：写事务以 `BEGIN IMMEDIATE` 开始；批量写按最多 500 行提交，避免长事务阻塞 attach、查询和采样快照。每个待写行都有只由已脱敏的行内容派生的重放键（不含写入时刻或随机数）；事务提交后重试同一批次会跳过已确认的行，既不重复计数也不把缺口重复入库。
 - **文件权限**：见 security-privacy §4。
 - **为什么不按会话分库**：跨会话查询（历史搜索）是刚需。会话级删除改用 `DELETE ... WHERE session_id = ?` 加增量 vacuum。【待验证】大会话删除的耗时见 [SPIKE-06](../06-research/SPIKE-06-sqlite-throughput.md)。如果不可接受，就改为按月分库，用 `ATTACH` 联合查询。
 
@@ -446,7 +447,7 @@ loop every check_interval:
 - daemon 启动时的处理：
   1. 若版本低于当前版本：先备份为 `agentwatch.db.bak-v<old>`（使用 SQLite 在线备份 API），再在一个事务内依次执行迁移。
   2. 失败则回滚并拒绝启动，提示用户。
-  3. 若版本高于当前版本（降级安装）：以只读模式启动，并提示升级。
+  3. 若版本高于当前版本（降级安装）：以只读模式启动，并提示升级。查询继续可用；所有新建或修改请求返回 `db_read_only_newer`，不会尝试可选表回填或其他写入。
 - 离线迁移命令：`aw db migrate --dry-run`。
 - 测试：每个迁移都配一个旧版本的样例库夹具，放在 `fixtures/db/v<N>.db`，用来验证升级后的查询结果。
 

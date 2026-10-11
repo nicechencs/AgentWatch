@@ -18,7 +18,7 @@ fn main() -> ExitCode {
         eprintln!("usage: init_empty <path.db>");
         return ExitCode::from(2);
     }
-    match Store::open(PathBuf::from(path)) {
+    match Store::open_runtime(PathBuf::from(path)) {
         Ok(store) => match store.schema_version() {
             Ok(version) => {
                 println!("schema_version={version}");

@@ -21,7 +21,7 @@ const DNS_HEADER: &str =
 const GAP_HEADER: &str = "id,session_id,collector,kind,affects,from_ns,to_ns,count,detail,evidence";
 
 fn open_db() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = aw_store::open_in_memory_connection().unwrap();
     conn.execute_batch(SCHEMA).unwrap();
     ensure_timeline(&conn).unwrap();
     conn

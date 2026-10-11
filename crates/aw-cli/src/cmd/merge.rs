@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use aw_store::{merge_exports, MergeRequest};
+use aw_store::{merge_exports, MergeError, MergeRequest};
 
 use crate::exit;
 
@@ -94,7 +94,18 @@ pub(crate) fn run(args: MergeArgs<'_>) -> Outcome {
                 stderr: Vec::new(),
             }
         }
-        Err(err) => super::error_outcome(exit::GENERAL, "merge", &err.to_string(), args.json),
+        Err(err) => {
+            super::error_outcome(exit::GENERAL, "merge", &merge_error_text(&err), args.json)
+        }
+    }
+}
+
+fn merge_error_text(error: &MergeError) -> String {
+    match error {
+        MergeError::Io { path, source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+            format!("找不到文件：{}", path.display())
+        }
+        _ => error.to_string(),
     }
 }
 

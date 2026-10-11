@@ -27,9 +27,9 @@
 //! read [`ApplyReport::db_bytes`] (logical pages) rather than the file length.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::error::StoreError;
 use crate::migrate::Store;
@@ -60,6 +60,12 @@ const NS_PER_DAY: i64 = 24 * 60 * 60 * 1_000_000_000;
 /// (the bucket table references `net_flows.id`). `sessions` is deleted last,
 /// one row at a time, after its children are gone.
 const CHILD_TABLES: &[ChildTable] = &[
+    // Replay markers hold no event text, but they are per-session state and
+    // must not grow after the protected session is purged.
+    ChildTable {
+        name: "replay_writes",
+        key: "table_name, row_key",
+    },
     // Present only after migrations 0003–0005. `delete_children_in_batches`
     // skips a name that is not in sqlite_master, so a P1 database still purges.
     // The FTS rows for these ids are removed by the BEFORE DELETE triggers in
@@ -292,7 +298,8 @@ impl<'a> Retention<'a> {
 
     /// Size, per-table row counts, oldest session.
     pub fn stats(&self) -> Result<Stats, StoreError> {
-        read_stats(self.conn, &self.db_path)
+        let started = Instant::now();
+        read_stats(self.conn, &self.db_path).map_err(|err| err.with_busy_elapsed(started))
     }
 
     /// Run storage.md §5 steps 1–4 once.
@@ -305,6 +312,16 @@ impl<'a> Retention<'a> {
     /// "只写元数据和缺口" mode is about *new* detail, reported as
     /// [`WriteMode::MetadataAndGapsOnly`].
     pub fn apply(
+        &mut self,
+        now_ns: i64,
+        free_bytes: Option<u64>,
+    ) -> Result<ApplyReport, StoreError> {
+        let started = Instant::now();
+        self.apply_inner(now_ns, free_bytes)
+            .map_err(|err| err.with_busy_elapsed(started))
+    }
+
+    fn apply_inner(
         &mut self,
         now_ns: i64,
         free_bytes: Option<u64>,
@@ -377,6 +394,12 @@ impl<'a> Retention<'a> {
     /// Same protection as [`Self::apply`]: an active or pinned session is left
     /// in place, and each deletion writes `purged:<public_id>`.
     pub fn purge(&mut self, scope: PurgeScope) -> Result<Vec<PurgeReport>, StoreError> {
+        let started = Instant::now();
+        self.purge_inner(scope)
+            .map_err(|err| err.with_busy_elapsed(started))
+    }
+
+    fn purge_inner(&mut self, scope: PurgeScope) -> Result<Vec<PurgeReport>, StoreError> {
         let reason = match scope {
             PurgeScope::OlderThan { .. } => PurgeReason::OlderThan,
             PurgeScope::All => PurgeReason::All,
@@ -402,6 +425,12 @@ impl<'a> Retention<'a> {
     /// caller shows before asking for confirmation. Same rule as `purge`:
     /// pinned and still-active sessions are never candidates.
     pub fn purge_candidates(&self, scope: PurgeScope) -> Result<Vec<(i64, String)>, StoreError> {
+        let started = Instant::now();
+        self.purge_candidates_inner(scope)
+            .map_err(|err| err.with_busy_elapsed(started))
+    }
+
+    fn purge_candidates_inner(&self, scope: PurgeScope) -> Result<Vec<(i64, String)>, StoreError> {
         match scope {
             PurgeScope::OlderThan { ended_before_ns } => select_ended_unpinned(
                 self.conn,
@@ -426,8 +455,12 @@ impl<'a> Retention<'a> {
     /// so on a database with no purged sessions this changes nothing and still
     /// succeeds.
     pub fn vacuum(&mut self) -> Result<(), StoreError> {
-        incremental_vacuum(self.conn)?;
-        checkpoint_truncate(self.conn)
+        let started = Instant::now();
+        (|| {
+            incremental_vacuum(self.conn)?;
+            checkpoint_truncate(self.conn)
+        })()
+        .map_err(|err| err.with_busy_elapsed(started))
     }
 }
 
@@ -494,7 +527,7 @@ fn purge_session(
     }
     // The session row is one row. Children are already gone, so CASCADE is a no-op.
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| StoreError::sqlite("begin_purge_session", err))?;
     tx.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
         .map_err(|err| StoreError::sqlite("delete_session", err))?;
@@ -521,7 +554,7 @@ fn delete_children_in_batches(
     );
     loop {
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| StoreError::sqlite("begin_purge_batch", err))?;
         let n = tx
             .execute(&sql, params![session_id])
@@ -668,7 +701,7 @@ const TABLE_NAMES: &[&str] = &[
 ];
 
 /// Tables counted only when the migration that creates them has run.
-const OPTIONAL_TABLES: &[&str] = &["file_access"];
+const OPTIONAL_TABLES: &[&str] = &["file_access", "replay_writes"];
 
 fn count_named(conn: &Connection, table: &'static str) -> Result<TableCount, StoreError> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
@@ -1063,9 +1096,7 @@ mod tests {
         let path_writer = path.clone();
         let barrier_writer = Arc::clone(&barrier);
         let writer = thread::spawn(move || {
-            let conn = Connection::open(&path_writer).expect("writer open");
-            conn.busy_timeout(std::time::Duration::from_secs(5))
-                .expect("busy");
+            let conn = crate::open_connection(&path_writer).expect("writer open");
             conn.execute_batch("PRAGMA foreign_keys = ON").expect("fk");
             barrier_writer.wait();
             conn.execute(
@@ -1085,10 +1116,6 @@ mod tests {
             .expect("concurrent insert");
         });
 
-        store
-            .connection()
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .expect("busy");
         barrier.wait();
         let purged = Retention::new(&mut store, &path, RetentionConfig::default())
             .purge(PurgeScope::All)
@@ -1112,7 +1139,7 @@ mod tests {
         {
             let conn = store.connection();
             insert_session(conn, 1, "wide", 10, Some(20), 0, "[]");
-            let tx = conn.unchecked_transaction().expect("tx");
+            let tx = crate::migrate::immediate_transaction(conn).expect("tx");
             for i in 0..(BATCH_ROWS + 10) {
                 tx.execute(
                     "INSERT INTO dns (id, session_id, proc_uid, ts_ns, qname, qtype, rcode, answers, ttl_min, server, evidence, source)

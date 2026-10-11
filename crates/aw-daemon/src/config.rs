@@ -363,6 +363,205 @@ pub fn load_selected(
     Ok((config, warnings, Some(default_path)))
 }
 
+/// The complete effective configuration exposed by the local API.  This is
+/// deliberately built from [`DaemonConfig`] rather than the source document:
+/// omitted keys must still be visible with their defaults.
+#[must_use]
+pub fn effective_json(config: &DaemonConfig) -> Value {
+    json!({
+        "storage": { "data_dir": config.storage.data_dir },
+        "retention": {
+            "max_db_size_mb": config.retention.max_db_size_mb,
+            "max_age_days": config.retention.max_age_days,
+        },
+        "redaction": {},
+        "sensitive_paths": { "extra": config.sensitive_paths.extra },
+        "proxy": {
+            "on_tls_reject": match config.proxy.on_tls_reject {
+                TlsReject::Fail => "fail",
+                TlsReject::Tunnel => "tunnel",
+            },
+            "max_hash_body": config.proxy.max_hash_body,
+        },
+        "collectors": {
+            "windows": { "sni": config.collectors.windows.sni },
+            "linux": {
+                "tls_uprobe": config.collectors.linux.tls_uprobe,
+                "ipc_payload_peek": config.collectors.linux.ipc_payload_peek,
+            },
+        },
+        "limits": {},
+        "correlation": { "max_hash_file_size": config.correlation.max_hash_file_size },
+        "api": { "http_port": config.api.http_port },
+        "debug": {
+            "keep_raw_events": config.debug.keep_raw_events,
+            "preview_ui": config.debug.preview_ui,
+        },
+    })
+}
+
+/// Apply one schema-registered dotted key.  Unlike file parsing, an operator's
+/// `config set` typo is rejected rather than downgraded to an unknown-key
+/// warning, because accepting it would claim a setting took effect when it did
+/// not.
+pub fn set_dotted(config: &mut DaemonConfig, key: &str, value: &Value) -> Result<(), String> {
+    let bool_value = |value: &Value| {
+        value
+            .as_bool()
+            .ok_or_else(|| "需要 true 或 false".to_owned())
+    };
+    let positive = |value: &Value| match value.as_u64() {
+        Some(0) | None => Err("需要大于 0 的整数".to_owned()),
+        Some(value) => Ok(value),
+    };
+    match key {
+        "storage.data_dir" => {
+            let value = value.as_str().ok_or_else(|| "需要字符串路径".to_owned())?;
+            config.storage.data_dir = Some(PathBuf::from(value));
+        }
+        "retention.max_db_size_mb" => config.retention.max_db_size_mb = positive(value)?,
+        "retention.max_age_days" => config.retention.max_age_days = positive(value)?,
+        "sensitive_paths.extra" => {
+            let array = value
+                .as_array()
+                .ok_or_else(|| "需要字符串数组".to_owned())?;
+            let mut extra = Vec::with_capacity(array.len());
+            for item in array {
+                extra.push(
+                    item.as_str()
+                        .ok_or_else(|| "需要字符串数组".to_owned())?
+                        .to_owned(),
+                );
+            }
+            config.sensitive_paths.extra = extra;
+        }
+        "proxy.on_tls_reject" => {
+            let value = value
+                .as_str()
+                .ok_or_else(|| "需要字符串 fail 或 tunnel".to_owned())?;
+            config.proxy.on_tls_reject =
+                TlsReject::parse(value).ok_or_else(|| "只能是 fail 或 tunnel".to_owned())?;
+        }
+        "proxy.max_hash_body" => config.proxy.max_hash_body = positive(value)?,
+        "collectors.windows.sni" => config.collectors.windows.sni = bool_value(value)?,
+        "collectors.linux.tls_uprobe" => config.collectors.linux.tls_uprobe = bool_value(value)?,
+        "collectors.linux.ipc_payload_peek" => {
+            config.collectors.linux.ipc_payload_peek = bool_value(value)?;
+        }
+        "correlation.max_hash_file_size" => {
+            config.correlation.max_hash_file_size = positive(value)?
+        }
+        "api.http_port" => {
+            let port = value
+                .as_u64()
+                .ok_or_else(|| "需要 0 到 65535 的整数".to_owned())?;
+            config.api.http_port =
+                u16::try_from(port).map_err(|_| "需要 0 到 65535 的整数".to_owned())?;
+        }
+        "debug.keep_raw_events" => config.debug.keep_raw_events = bool_value(value)?,
+        "debug.preview_ui" => config.debug.preview_ui = bool_value(value)?,
+        _ => return Err(format!("未知配置键 `{key}`")),
+    }
+    Ok(())
+}
+
+/// Merge one setting into `path` without reserialising unrelated TOML.  The
+/// common table/key form is patched in place so comments and untouched sections
+/// survive; a missing key is inserted into (or creates) its table.
+pub fn merge_set_path(path: &Path, key: &str, value: &Value) -> Result<DaemonConfig, ConfigError> {
+    let source = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let (mut config, _) = parse_toml(&source)?;
+    set_dotted(&mut config, key, value).map_err(|detail| ConfigError::Invalid {
+        key: key.to_owned(),
+        detail,
+    })?;
+    let rendered = toml_value(value).map_err(|detail| ConfigError::Invalid {
+        key: key.to_owned(),
+        detail,
+    })?;
+    let merged = merge_toml_line(&source, key, &rendered);
+    // Parse exactly what will be persisted, so a line-oriented merge cannot
+    // produce an invalid configuration document.
+    let (parsed, _) = parse_toml(&merged)?;
+    atomic_write(path, merged.as_bytes()).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(parsed)
+}
+
+fn toml_value(value: &Value) -> Result<String, String> {
+    match value {
+        Value::Bool(value) => Ok(value.to_string()),
+        Value::Number(value) => Ok(value.to_string()),
+        Value::String(value) => Ok(format!("{:?}", value)),
+        Value::Array(values) => values
+            .iter()
+            .map(toml_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| format!("[{}]", values.join(", "))),
+        Value::Null | Value::Object(_) => Err("该配置值不能写为 TOML".to_owned()),
+    }
+}
+
+fn merge_toml_line(source: &str, dotted: &str, value: &str) -> String {
+    let (section, key) = dotted.rsplit_once('.').unwrap_or(("", dotted));
+    let mut lines: Vec<String> = source.lines().map(str::to_owned).collect();
+    let mut active = "";
+    let mut section_start = None;
+    let mut section_end = lines.len();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            if active == section && section_end == lines.len() {
+                section_end = index;
+            }
+            active = name.trim();
+            if active == section {
+                section_start = Some(index);
+                section_end = lines.len();
+            }
+            continue;
+        }
+        if active == section {
+            let without_comment = trimmed.split('#').next().unwrap_or(trimmed).trim();
+            if let Some((found, _)) = without_comment.split_once('=') {
+                if found.trim() == key {
+                    let indent = &line[..line.len() - line.trim_start().len()];
+                    let comment = line.find('#').map(|pos| &line[pos..]).unwrap_or("");
+                    lines[index] = if comment.is_empty() {
+                        format!("{indent}{key} = {value}")
+                    } else {
+                        format!("{indent}{key} = {value} {comment}")
+                    };
+                    return format!("{}\n", lines.join("\n"));
+                }
+            }
+        }
+    }
+    if section_start.is_some() {
+        lines.insert(section_end, format!("{key} = {value}"));
+    } else {
+        if !lines.is_empty() && !lines.last().is_some_and(String::is_empty) {
+            lines.push(String::new());
+        }
+        lines.push(format!("[{section}]"));
+        lines.push(format!("{key} = {value}"));
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    let permissions = fs::metadata(path)?.permissions();
+    fs::write(&temp, bytes)?;
+    fs::set_permissions(&temp, permissions)?;
+    fs::rename(temp, path)
+}
+
 /// JSON Schema document whose `properties` match [`DaemonConfig`] 1:1.
 pub fn config_schema_json() -> Value {
     json!({

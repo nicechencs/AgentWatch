@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use aw_store::ExportOptions;
 
 use crate::api::share::{
-    error_response, flag_on, open_owned, query_pairs, ApiResponse, ApiState, Caller,
+    error_response, flag_on, open_visible, query_pairs, ApiResponse, ApiState, Caller,
 };
 
 /// Export formats this module answers. Markdown is [`super::markdown`].
@@ -56,7 +56,7 @@ pub(crate) fn export_data(
     format: DataFormat,
 ) -> ApiResponse {
     let pairs = query_pairs(raw_query);
-    let (store, session_id) = match open_owned(state, &caller.user_id, sid) {
+    let (store, session_id, owner) = match open_visible(state, caller, sid) {
         Ok(Some(pair)) => pair,
         Ok(None) => return error_response(404, "not_found", "session not found"),
         Err(response) => return response,
@@ -66,7 +66,7 @@ pub(crate) fn export_data(
         .ok()
         .and_then(|d| i64::try_from(d.as_nanos()).ok());
     let options = ExportOptions {
-        user_id: &caller.user_id,
+        user_id: &owner,
         session_id,
         filter: pairs
             .get("filter")

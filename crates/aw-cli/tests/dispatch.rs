@@ -26,7 +26,7 @@ fn help_exits_0_and_lists_subcommands() {
         String::from_utf8_lossy(&out.stderr)
     );
     let help = String::from_utf8(out.stdout).expect("utf8");
-    for name in ["run", "ps", "sessions", "daemon", "version", "mcp-tap"] {
+    for name in ["run", "ps", "sessions", "daemon", "version"] {
         assert!(
             help.lines()
                 .any(|line| line.split_whitespace().next() == Some(name)),
@@ -48,11 +48,11 @@ fn version_exits_0() {
 }
 
 #[test]
-fn version_check_exits_1_and_does_not_claim_a_network_call() {
+fn version_check_exits_5_as_not_in_this_build() {
     let out = output(&["version", "--check"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(5));
     let err = String::from_utf8(out.stderr).expect("utf8");
-    assert!(err.contains("不会访问网络"), "{err}");
+    assert!(err.contains("本版本未接入"), "{err}");
 }
 
 #[test]

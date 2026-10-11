@@ -54,7 +54,11 @@ pub(crate) fn test(
         Ok(lang) => lang,
         Err(detail) => return super::error_outcome(exit::USAGE, "usage", &detail, json_mode),
     };
-    let loaded = match load_one(Path::new(rule_path)) {
+    let rule_path = Path::new(rule_path);
+    if let Err(detail) = require_file(rule_path) {
+        return super::error_outcome(exit::GENERAL, "rule", &detail, json_mode);
+    }
+    let loaded = match load_one(rule_path) {
         Ok(loaded) => loaded,
         Err(err) => return load_outcome(err, json_mode),
     };
@@ -228,8 +232,7 @@ struct FixtureRecord {
 }
 
 fn read_fixture(path: &Path) -> Result<Vec<FixtureRecord>, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|err| format!("读取 fixture {} 失败：{err}", path.display()))?;
+    let text = fs::read_to_string(path).map_err(|err| file_read_error(path, "fixture", err))?;
     let mut records = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let line_no = index + 1;
@@ -385,9 +388,22 @@ fn optional_u64(object: &Map<String, Value>, key: &str) -> Result<Option<u64>, S
 }
 
 fn read_expect(path: &Path) -> Result<Value, String> {
-    let text = fs::read_to_string(path)
-        .map_err(|err| format!("读取 expect {} 失败：{err}", path.display()))?;
+    let text = fs::read_to_string(path).map_err(|err| file_read_error(path, "expect", err))?;
     serde_json::from_str(&text).map_err(|_| format!("{} 不是 JSON", path.display()))
+}
+
+fn require_file(path: &Path) -> Result<(), String> {
+    fs::metadata(path)
+        .map(|_| ())
+        .map_err(|err| file_read_error(path, "规则", err))
+}
+
+fn file_read_error(path: &Path, what: &str, err: std::io::Error) -> String {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        format!("找不到文件：{}", path.display())
+    } else {
+        format!("读取 {what} {} 失败：{err}", path.display())
+    }
 }
 
 /// Compare objects independent of key order. Arrays keep their order.

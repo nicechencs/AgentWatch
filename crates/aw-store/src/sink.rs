@@ -1,4 +1,4 @@
-//! [`RecordSink`]: one transaction per batch of already-aggregated rows.
+//! [`RecordSink`]: bounded transactions for already-aggregated rows.
 //!
 //! P1-PIPE-05 should depend on this trait. It must not declare a second one.
 //! `aw-pipeline` cannot depend on `rusqlite`; the trait and the row types live
@@ -18,26 +18,42 @@
 //! Rows are not `Debug`: `sessions.argv` and `process_images.argv` / `env` are
 //! sensitive. Do not print them.
 
+use std::time::Instant;
+
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
 use crate::error::StoreError;
 use crate::file_access::{self, FileAccessRow};
 use crate::fts::{self, FtsMode, FtsSource};
 use crate::http::{self, HttpRow};
-use crate::migrate::{self, Store};
+use crate::migrate::{self, immediate_transaction, Store};
+use crate::replay::{self, KeyBuilder};
 use crate::retention::WriteMode;
 
 /// Accepts one batch and commits it, or rolls it back.
 ///
 /// P1-PIPE-05 owns retry and gap reporting. This trait only returns the error.
 pub trait RecordSink {
-    /// Write `batch` in one `BEGIN IMMEDIATE` transaction.
+    /// Write `batch` in bounded `BEGIN IMMEDIATE` transactions.
     ///
     /// Order inside the transaction: `sessions`, `processes`, `process_images`,
     /// `file_access`, `net_flows`, `net_flow_buckets`, `dns`, `gaps`. Processes
-    /// are written before flows and file rows. A failure rolls the whole batch back.
+    /// are written before flows and file rows. Each transaction has at most
+    /// [`MAX_ROWS_PER_TRANSACTION`] rows, so a host attach or sampler snapshot
+    /// cannot keep the write lock for one unbounded transaction. A failure
+    /// reports the first uncommitted chunk; already committed chunks remain
+    /// durable and can be safely replayed. A deterministic marker for every
+    /// already-redacted row is committed with that row, so replaying an
+    /// identical batch never applies counters or inserts a duplicate twice.
     fn write_batch(&mut self, batch: &WriteBatch) -> Result<(), StoreError>;
 }
+
+/// Maximum rows held by one writer transaction.
+///
+/// This is intentionally lower than the pipeline's normal delivery batch: a
+/// full-host attach can have thousands of processes even when normal event
+/// batches are small.
+pub const MAX_ROWS_PER_TRANSACTION: usize = 500;
 
 /// Rows for one commit. Empty vectors are skipped. Nothing is dropped silently:
 /// a constraint failure fails the batch.
@@ -161,7 +177,8 @@ pub struct ProcessRow {
 /// One `process_images` row.
 #[derive(Clone)]
 pub struct ProcessImageRow {
-    /// Row id. `None` lets SQLite assign one.
+    /// Row id. `None` derives a deterministic negative id from this row's
+    /// content, so replaying a committed chunk cannot duplicate it.
     pub id: Option<i64>,
     /// Owning session.
     pub session_id: i64,
@@ -270,7 +287,8 @@ pub struct NetFlowBucketRow {
 /// One `dns` row.
 #[derive(Clone)]
 pub struct DnsRow {
-    /// Row id. `None` lets SQLite assign one.
+    /// Row id. `None` derives a deterministic negative id from this row's
+    /// content, so replaying a committed chunk cannot duplicate it.
     pub id: Option<i64>,
     /// Owning session.
     pub session_id: i64,
@@ -331,6 +349,11 @@ pub struct SqliteSink<'a> {
 impl<'a> SqliteSink<'a> {
     /// Wrap the store's write connection. The store must not be read-only.
     pub fn new(store: &'a mut Store) -> Result<Self, StoreError> {
+        let started = Instant::now();
+        Self::new_inner(store).map_err(|err| err.with_busy_elapsed(started))
+    }
+
+    fn new_inner(store: &'a mut Store) -> Result<Self, StoreError> {
         if store.is_read_only() {
             return Err(StoreError::ReadOnly);
         }
@@ -339,6 +362,7 @@ impl<'a> SqliteSink<'a> {
         // database already at version 5 would never gain `http` or `findings`.
         apply_file_schema(store)?;
         crate::migrate::apply_http_schema(store)?;
+        crate::migrate::apply_replay_schema(store)?;
         Ok(Self {
             store,
             write_mode: WriteMode::Normal,
@@ -355,6 +379,14 @@ impl<'a> SqliteSink<'a> {
 
 impl RecordSink for SqliteSink<'_> {
     fn write_batch(&mut self, batch: &WriteBatch) -> Result<(), StoreError> {
+        let started = Instant::now();
+        self.write_batch_inner(batch)
+            .map_err(|err| err.with_busy_elapsed(started))
+    }
+}
+
+impl SqliteSink<'_> {
+    fn write_batch_inner(&mut self, batch: &WriteBatch) -> Result<(), StoreError> {
         if !batch.file_access.is_empty() || image_has_argv(&batch.process_images) {
             // 0003–0005. A P1 database stays at SCHEMA_VERSION until the first
             // file row or indexed argv, which is what the P1 reopen test asserts.
@@ -390,22 +422,68 @@ impl RecordSink for SqliteSink<'_> {
                 ),
             ));
         }
-        let tx = self
-            .store
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|err| StoreError::sqlite("begin_batch", err))?;
-        let result = write_all(&tx, batch, fts);
-        match result {
-            Ok(()) => tx
-                .commit()
-                .map_err(|err| StoreError::sqlite("commit_batch", err)),
-            Err(err) => {
-                drop(tx);
-                Err(err)
+        for chunk in bounded_batches(batch) {
+            let tx = self
+                .store
+                .connection_mut()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|err| StoreError::sqlite("begin_batch", err))?;
+            let result = write_all(&tx, &chunk, fts);
+            match result {
+                Ok(()) => tx
+                    .commit()
+                    .map_err(|err| StoreError::sqlite("commit_batch", err))?,
+                Err(err) => {
+                    drop(tx);
+                    return Err(err);
+                }
             }
         }
+        Ok(())
     }
+}
+
+/// Split a large delivery into write-order-preserving chunks. Each vector is
+/// emitted independently so the transaction boundary never exceeds the row
+/// cap and foreign-key parents are committed before their children.
+fn bounded_batches(batch: &WriteBatch) -> Vec<WriteBatch> {
+    // Preserve the existing all-or-nothing contract for normal deliveries.
+    // The lock bound only changes a delivery that is actually larger than it.
+    if batch_row_count(batch) <= MAX_ROWS_PER_TRANSACTION {
+        return vec![batch.clone()];
+    }
+    let mut out = Vec::new();
+    macro_rules! push_chunks {
+        ($field:ident) => {
+            for rows in batch.$field.chunks(MAX_ROWS_PER_TRANSACTION) {
+                let mut chunk = WriteBatch::default();
+                chunk.$field = rows.to_vec();
+                out.push(chunk);
+            }
+        };
+    }
+    push_chunks!(sessions);
+    push_chunks!(processes);
+    push_chunks!(process_images);
+    push_chunks!(file_access);
+    push_chunks!(net_flows);
+    push_chunks!(net_flow_buckets);
+    push_chunks!(dns);
+    push_chunks!(http);
+    push_chunks!(gaps);
+    out
+}
+
+fn batch_row_count(batch: &WriteBatch) -> usize {
+    batch.sessions.len()
+        + batch.processes.len()
+        + batch.process_images.len()
+        + batch.file_access.len()
+        + batch.net_flows.len()
+        + batch.net_flow_buckets.len()
+        + batch.dns.len()
+        + batch.http.len()
+        + batch.gaps.len()
 }
 
 fn batch_has_detail(batch: &WriteBatch) -> bool {
@@ -448,10 +526,14 @@ pub fn apply_file_schema(store: &mut Store) -> Result<(), StoreError> {
         return Ok(());
     }
     let conn = store.connection();
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|err| StoreError::sqlite("begin_file_schema", err))?;
+    let tx =
+        immediate_transaction(conn).map_err(|err| StoreError::sqlite("begin_file_schema", err))?;
     let applied = (|| {
+        // Recheck after acquiring the write lock. Two concurrent runtime
+        // openers may both have observed the missing table above.
+        if file_schema_present(&tx)? {
+            return Ok(());
+        }
         for (version, sql) in migrate::file_schema_scripts() {
             tx.execute_batch(sql)
                 .map_err(|err| StoreError::sqlite("migrate_file_schema", err))?;
@@ -510,10 +592,13 @@ fn write_sessions(tx: &Transaction<'_>, rows: &[SessionRow]) -> Result<(), Store
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
                 ?10, ?11, ?12, ?13, ?14, ?15,
                 ?16, ?17, ?18, ?19, ?20, ?21, ?22
-             )",
+             ) ON CONFLICT(id) DO NOTHING",
         )
         .map_err(|err| StoreError::sqlite("prepare_sessions", err))?;
     for row in rows {
+        if !replay::claim(tx, "sessions", &session_key(row), Some(row.id))? {
+            continue;
+        }
         stmt.execute(params![
             row.id,
             row.public_id,
@@ -578,6 +663,9 @@ fn write_processes(tx: &Transaction<'_>, rows: &[ProcessRow]) -> Result<(), Stor
         )
         .map_err(|err| StoreError::sqlite("prepare_processes", err))?;
     for row in rows {
+        if !replay::claim(tx, "processes", &process_key(row), Some(row.session_id))? {
+            continue;
+        }
         stmt.execute(params![
             row.session_id,
             row.proc_uid,
@@ -626,6 +714,9 @@ fn write_images(
         )
         .map_err(|err| StoreError::sqlite("prepare_images", err))?;
     for row in rows {
+        if !replay::claim(tx, "process_images", &image_key(row), Some(row.session_id))? {
+            continue;
+        }
         let inserted = stmt
             .execute(params![
                 row.id,
@@ -655,7 +746,8 @@ fn write_images(
         // searchable text; neither known means nothing is indexed (not "").
         let text = row.argv.as_deref().or(row.exe.as_deref());
         if file_schema_present(tx)? {
-            fts::upsert(tx, fts, FtsSource::ProcessImage, id, text)?;
+            // Freshly inserted above (`inserted != 0`): no FTS row can exist.
+            fts::insert_new(tx, fts, FtsSource::ProcessImage, id, text)?;
         }
     }
     Ok(())
@@ -711,6 +803,9 @@ fn write_flows(tx: &Transaction<'_>, rows: &[NetFlowRow]) -> Result<(), StoreErr
         .prepare_cached(&sql)
         .map_err(|err| StoreError::sqlite("prepare_flows", err))?;
     for row in rows {
+        if !replay::claim(tx, "net_flows", &flow_key(row), Some(row.session_id))? {
+            continue;
+        }
         stmt.execute(params![
             row.id,
             row.session_id,
@@ -762,6 +857,14 @@ fn write_buckets(tx: &Transaction<'_>, rows: &[NetFlowBucketRow]) -> Result<(), 
         )
         .map_err(|err| StoreError::sqlite("prepare_buckets", err))?;
     for row in rows {
+        if !replay::claim(
+            tx,
+            "net_flow_buckets",
+            &bucket_key(row),
+            Some(row.session_id),
+        )? {
+            continue;
+        }
         stmt.execute(params![
             row.flow_id,
             row.session_id,
@@ -787,12 +890,16 @@ fn write_dns(tx: &Transaction<'_>, rows: &[DnsRow]) -> Result<(), StoreError> {
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                 ?8, ?9, ?10, ?11, ?12
-             )",
+             ) ON CONFLICT(id) DO NOTHING",
         )
         .map_err(|err| StoreError::sqlite("prepare_dns", err))?;
     for row in rows {
+        let key = dns_key(row);
+        if !replay::claim(tx, "dns", &key, Some(row.session_id))? {
+            continue;
+        }
         stmt.execute(params![
-            row.id,
+            row.id.unwrap_or_else(|| replay::deterministic_id(&key)),
             row.session_id,
             row.proc_uid,
             row.ts_ns,
@@ -818,12 +925,17 @@ fn write_gaps(tx: &Transaction<'_>, rows: &[GapRow]) -> Result<(), StoreError> {
         .prepare_cached(
             "INSERT INTO gaps (
                 id, session_id, collector, kind, affects, from_ns, to_ns, count, detail
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO NOTHING",
         )
         .map_err(|err| StoreError::sqlite("prepare_gaps", err))?;
     for row in rows {
+        let key = gap_key(row);
+        if !replay::claim(tx, "gaps", &key, row.session_id)? {
+            continue;
+        }
         stmt.execute(params![
-            row.id,
+            row.id.unwrap_or_else(|| replay::deterministic_id(&key)),
             row.session_id,
             row.collector,
             row.kind,
@@ -838,13 +950,153 @@ fn write_gaps(tx: &Transaction<'_>, rows: &[GapRow]) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn session_key(row: &SessionRow) -> String {
+    let mut key = KeyBuilder::new("sessions");
+    key.i64(row.id);
+    key.text(&row.public_id);
+    key.opt_text(row.name.as_deref());
+    key.text(&row.mode);
+    key.opt_text(row.agent.as_deref());
+    key.opt_i64(row.root_proc_uid);
+    key.opt_text(row.argv.as_deref());
+    key.opt_text(row.cwd.as_deref());
+    key.text(&row.user_id);
+    key.i64(row.started_ns);
+    key.opt_i64(row.ended_ns);
+    key.opt_text(row.end_reason.as_deref());
+    key.opt_i64(row.exit_code);
+    key.i64(row.proxy_enabled);
+    key.opt_i64(row.proxy_port);
+    key.text(&row.platform);
+    key.opt_text(row.os_version.as_deref());
+    key.text(&row.collectors);
+    key.opt_text(row.collector_profile.as_deref());
+    key.opt_text(row.config_digest.as_deref());
+    key.i64(row.pinned);
+    key.opt_text(row.stats.as_deref());
+    key.finish()
+}
+
+fn process_key(row: &ProcessRow) -> String {
+    let mut key = KeyBuilder::new("processes");
+    key.i64(row.session_id);
+    key.i64(row.proc_uid);
+    key.i64(row.pid);
+    key.opt_i64(row.parent_uid);
+    key.opt_i64(row.ppid);
+    key.i64(row.depth);
+    key.i64(row.start_ns);
+    key.opt_i64(row.exit_ns);
+    key.opt_i64(row.exit_code);
+    key.opt_i64(row.exit_signal);
+    key.text(&row.how);
+    key.opt_text(row.user_id.as_deref());
+    key.opt_text(row.signer.as_deref());
+    key.text(&row.evidence);
+    key.opt_text(row.field_evidence.as_deref());
+    key.text(&row.source);
+    key.opt_text(row.agent.as_deref());
+    key.finish()
+}
+
+fn image_key(row: &ProcessImageRow) -> String {
+    let mut key = KeyBuilder::new("process_images");
+    key.opt_i64(row.id);
+    key.i64(row.session_id);
+    key.i64(row.proc_uid);
+    key.i64(row.seq);
+    key.i64(row.ts_ns);
+    key.opt_text(row.exe.as_deref());
+    key.opt_text(row.argv.as_deref());
+    key.opt_text(row.cwd.as_deref());
+    key.opt_text(row.env.as_deref());
+    key.text(&row.evidence);
+    key.opt_text(row.field_evidence.as_deref());
+    key.text(&row.source);
+    key.finish()
+}
+
+fn flow_key(row: &NetFlowRow) -> String {
+    let mut key = KeyBuilder::new("net_flows");
+    key.i64(row.id);
+    key.i64(row.session_id);
+    key.i64(row.proc_uid);
+    key.text(&row.proto);
+    key.text(&row.direction);
+    key.text(&row.local_ip);
+    key.i64(row.local_port);
+    key.text(&row.remote_ip);
+    key.i64(row.remote_port);
+    key.opt_text(row.domain.as_deref());
+    key.opt_text(row.domain_source.as_deref());
+    key.opt_text(row.domain_alts.as_deref());
+    key.opt_text(row.sni.as_deref());
+    key.opt_text(row.alpn.as_deref());
+    key.i64(row.start_ns);
+    key.opt_i64(row.end_ns);
+    key.opt_i64(row.bytes_up);
+    key.opt_i64(row.bytes_down);
+    key.i64(row.via_proxy);
+    key.i64(row.direct);
+    key.i64(row.preexisting);
+    key.i64(row.is_loopback);
+    key.opt_i64(row.result);
+    key.opt_i64(row.platform_total_up);
+    key.opt_i64(row.platform_total_down);
+    key.text(&row.evidence);
+    key.opt_text(row.na_reason.as_deref());
+    key.opt_text(row.field_evidence.as_deref());
+    key.text(&row.source);
+    key.finish()
+}
+
+fn bucket_key(row: &NetFlowBucketRow) -> String {
+    let mut key = KeyBuilder::new("net_flow_buckets");
+    key.i64(row.flow_id);
+    key.i64(row.session_id);
+    key.i64(row.bucket_ns);
+    key.i64(row.bytes_up);
+    key.i64(row.bytes_down);
+    key.text(&row.evidence);
+    key.finish()
+}
+
+fn dns_key(row: &DnsRow) -> String {
+    let mut key = KeyBuilder::new("dns");
+    key.i64(row.session_id);
+    key.opt_i64(row.proc_uid);
+    key.i64(row.ts_ns);
+    key.text(&row.qname);
+    key.i64(row.qtype);
+    key.opt_i64(row.rcode);
+    key.opt_text(row.answers.as_deref());
+    key.opt_i64(row.ttl_min);
+    key.opt_text(row.server.as_deref());
+    key.text(&row.evidence);
+    key.text(&row.source);
+    key.finish()
+}
+
+fn gap_key(row: &GapRow) -> String {
+    let mut key = KeyBuilder::new("gaps");
+    key.opt_i64(row.session_id);
+    key.text(&row.collector);
+    key.text(&row.kind);
+    key.text(&row.affects);
+    key.i64(row.from_ns);
+    key.i64(row.to_ns);
+    key.opt_i64(row.count);
+    key.opt_text(row.detail.as_deref());
+    key.finish()
+}
+
 /// Count rows in `table`. Test-only; not a query API.
 #[cfg(test)]
 pub(crate) fn count_rows(conn: &Connection, table: &str) -> Result<i64, StoreError> {
     // `table` is a fixed identifier from this crate, not user input.
     match table {
-        "sessions" | "processes" | "process_images" | "net_flows" | "net_flow_buckets" | "dns"
-        | "gaps" => {}
+        "sessions" | "processes" | "process_images" | "file_access" | "net_flows"
+        | "net_flow_buckets" | "dns" | "http" | "gaps" | "fts_text" => {}
         _ => {
             return Err(StoreError::sqlite(
                 "count_rows",
@@ -876,6 +1128,44 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::migrate::OpenStatus;
+
+    #[test]
+    fn large_batches_are_partitioned_at_the_write_lock_bound() {
+        let batch = WriteBatch {
+            gaps: (0..(MAX_ROWS_PER_TRANSACTION + 1))
+                .map(|index| GapRow {
+                    id: Some(i64::try_from(index).expect("gap id")),
+                    session_id: None,
+                    collector: "test".to_owned(),
+                    kind: "test".to_owned(),
+                    affects: "[]".to_owned(),
+                    from_ns: 1,
+                    to_ns: 1,
+                    count: None,
+                    detail: None,
+                })
+                .collect(),
+            ..WriteBatch::default()
+        };
+        let chunks = bounded_batches(&batch);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| {
+            chunk.sessions.len()
+                + chunk.processes.len()
+                + chunk.process_images.len()
+                + chunk.file_access.len()
+                + chunk.net_flows.len()
+                + chunk.net_flow_buckets.len()
+                + chunk.dns.len()
+                + chunk.http.len()
+                + chunk.gaps.len()
+                <= MAX_ROWS_PER_TRANSACTION
+        }));
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.gaps.len()).sum::<usize>(),
+            501
+        );
+    }
 
     fn temp_db(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -1125,6 +1415,207 @@ mod tests {
             count_rows(store.connection(), "net_flows").expect("after flows"),
             before_flow
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A delivery can commit several bounded transactions before a later row
+    /// fails. Retrying the repaired delivery must be exactly-once for every
+    /// batch table, including accumulators and rows whose old callers left the
+    /// integer id to SQLite.
+    #[test]
+    fn replay_after_a_later_chunk_failure_is_exactly_once_for_every_batch_table() {
+        let path = temp_db("replay-after-chunk-failure");
+        let _ = std::fs::remove_file(&path);
+        let mut store = Store::open(&path).expect("open");
+        let mut batch = WriteBatch::default();
+        batch.sessions.push(session(1));
+        batch.processes = (0..(MAX_ROWS_PER_TRANSACTION + 1))
+            .map(|proc_uid| process(1, i64::try_from(proc_uid).expect("proc uid")))
+            .collect();
+        batch.process_images.push(ProcessImageRow {
+            id: None,
+            session_id: 1,
+            proc_uid: 0,
+            seq: 0,
+            ts_ns: 2,
+            exe: Some("agentwatch-test".to_owned()),
+            argv: None,
+            cwd: None,
+            env: None,
+            evidence: "E1".to_owned(),
+            field_evidence: None,
+            source: "test".to_owned(),
+        });
+        batch.file_access.push(FileAccessRow {
+            id: 4,
+            session_id: 1,
+            proc_uid: 0,
+            op: "access".to_owned(),
+            path: "/redacted/test".to_owned(),
+            path_to: None,
+            access: Some("read".to_owned()),
+            first_ns: 2,
+            last_ns: 2,
+            opens: 1,
+            reads: Some(1),
+            bytes_read: Some(2),
+            writes: None,
+            bytes_written: None,
+            created: None,
+            truncated: None,
+            modified: None,
+            result: Some(0),
+            partial: 0,
+            sensitive_rule: None,
+            evidence: "E1".to_owned(),
+            na_reason: None,
+            field_evidence: None,
+            source: "test".to_owned(),
+        });
+        batch.net_flows.push(flow(3, 1, 0, Some(10)));
+        batch.net_flow_buckets.push(NetFlowBucketRow {
+            flow_id: 3,
+            session_id: 1,
+            bucket_ns: 0,
+            bytes_up: 4,
+            bytes_down: 1,
+            evidence: "E1".to_owned(),
+        });
+        batch.dns.push(DnsRow {
+            id: None,
+            session_id: 1,
+            proc_uid: Some(0),
+            ts_ns: 3,
+            qname: "example.test".to_owned(),
+            qtype: 1,
+            rcode: Some(0),
+            answers: Some("[]".to_owned()),
+            ttl_min: None,
+            server: None,
+            evidence: "E1".to_owned(),
+            source: "test/dns".to_owned(),
+        });
+        batch.http.push(HttpRow {
+            id: None,
+            session_id: 1,
+            proc_uid: Some(0),
+            flow_id: Some(3),
+            ts_ns: 4,
+            method: "GET".to_owned(),
+            url: "https://example.test/redacted".to_owned(),
+            host: "example.test".to_owned(),
+            http_version: None,
+            status: Some(200),
+            req_headers: None,
+            resp_headers: None,
+            req_body_bytes: None,
+            resp_body_bytes: None,
+            content_type: None,
+            duration_ms: None,
+            error: None,
+            evidence: "E2".to_owned(),
+            field_evidence: None,
+            na_reason: None,
+            source: "proxy/test".to_owned(),
+        });
+        batch.gaps = (0..(MAX_ROWS_PER_TRANSACTION + 1))
+            .map(|index| GapRow {
+                id: None,
+                session_id: Some(if index == MAX_ROWS_PER_TRANSACTION {
+                    99
+                } else {
+                    1
+                }),
+                collector: "test/collector".to_owned(),
+                kind: "unknown".to_owned(),
+                affects: "[\"net\"]".to_owned(),
+                from_ns: i64::try_from(index).expect("gap time"),
+                to_ns: i64::try_from(index).expect("gap time"),
+                count: None,
+                detail: None,
+            })
+            .collect();
+
+        let initial_err;
+        {
+            let mut sink = SqliteSink::new(&mut store).expect("sink");
+            initial_err = sink.write_batch(&batch).expect_err("last gap must fail");
+            assert!(
+                matches!(initial_err, StoreError::Sqlite { .. }),
+                "{initial_err}"
+            );
+        }
+        assert_eq!(
+            count_rows(store.connection(), "sessions").expect("sessions"),
+            1
+        );
+        assert_eq!(
+            count_rows(store.connection(), "gaps").expect("gaps"),
+            500,
+            "{initial_err}"
+        );
+
+        batch.gaps.last_mut().expect("last gap").session_id = Some(1);
+        {
+            let mut sink = SqliteSink::new(&mut store).expect("sink");
+            sink.write_batch(&batch).expect("repaired replay");
+        }
+        let expected = [
+            ("sessions", 1),
+            ("processes", 501),
+            ("process_images", 1),
+            ("file_access", 1),
+            ("net_flows", 1),
+            ("net_flow_buckets", 1),
+            ("dns", 1),
+            ("http", 1),
+            ("gaps", 501),
+            // One search row per indexed source row (image exe, file path,
+            // http url): a replay must not add duplicate search hits.
+            ("fts_text", 3),
+        ];
+        for (table, rows) in expected {
+            assert_eq!(
+                count_rows(store.connection(), table).expect(table),
+                rows,
+                "{table}"
+            );
+        }
+        let flow_up = flow_bytes_up(store.connection(), 3).expect("flow bytes");
+        let bucket_up: i64 = store
+            .connection()
+            .query_row(
+                "SELECT bytes_up FROM net_flow_buckets WHERE flow_id = 3 AND bucket_ns = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("bucket bytes");
+
+        {
+            let mut sink = SqliteSink::new(&mut store).expect("sink");
+            sink.write_batch(&batch).expect("identical replay");
+        }
+        for (table, rows) in expected {
+            assert_eq!(
+                count_rows(store.connection(), table).expect(table),
+                rows,
+                "{table}"
+            );
+        }
+        assert_eq!(
+            flow_bytes_up(store.connection(), 3).expect("flow bytes"),
+            flow_up
+        );
+        let replayed_bucket_up: i64 = store
+            .connection()
+            .query_row(
+                "SELECT bytes_up FROM net_flow_buckets WHERE flow_id = 3 AND bucket_ns = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("bucket bytes");
+        assert_eq!(replayed_bucket_up, bucket_up);
+        drop(store);
         let _ = std::fs::remove_file(&path);
     }
 }

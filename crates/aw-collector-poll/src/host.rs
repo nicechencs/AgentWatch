@@ -220,9 +220,9 @@ fn read_netstat() -> Result<ConnectionSnapshot, SourceError> {
 ///
 /// * Linux: `/proc/sys/kernel/random/boot_id` (ADR-0007). Not `sysinfo`'s
 ///   `boot_time`, which is `/proc/stat` `btime` or an uptime fallback.
-/// * Windows: `System::boot_time()`, which is `GetTickCount64` subtracted from
-///   the wall clock and rounded down to seconds. `0` and `u64::MAX` mean the
-///   helper failed.
+/// * Windows: the System process (pid 4) creation time from `aw-platform`.
+///   This is the same cached source used by the launch/adopt path, so two
+///   reads cannot differ when wall time is synchronized or rounded differently.
 /// * macOS: `System::boot_time()` is `sysctl(KERN_BOOTTIME)` (`kern.boottime`).
 ///   process-tracking names that value; ADR-0007 names `kern.bootsessionuuid`.
 ///   This crate does not add the sysctl FFI for the UUID. A non-zero value is
@@ -233,7 +233,11 @@ fn read_boot_id() -> Option<Vec<u8>> {
     {
         read_linux_boot_id()
     }
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        aw_platform::windows_system_boot_id()
+    }
+    #[cfg(target_os = "macos")]
     {
         read_sysinfo_boot_seconds()
     }
@@ -255,7 +259,7 @@ fn read_linux_boot_id() -> Option<Vec<u8>> {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn read_sysinfo_boot_seconds() -> Option<Vec<u8>> {
     let secs = System::boot_time();
     if secs == 0 || secs == u64::MAX {

@@ -18,6 +18,7 @@ import { sessionTitle } from "@/lib/session-title";
 import { sessionStatus } from "@/lib/session-status";
 import { useI18n } from "@/lib/i18n";
 import { useExport } from "@/lib/use-export";
+import { useAuth } from "@/lib/auth";
 
 /** Wait for a pause before the list query follows the search box. */
 const SEARCH_DEBOUNCE_MS = 250;
@@ -26,6 +27,8 @@ const RANGES = ["7d", "30d", "all"] as const;
 
 export function SessionsPage() {
   const { t } = useI18n();
+  const { me } = useAuth();
+  const admin = Boolean(me?.admin);
   const navigate = useNavigate();
   const client = useQueryClient();
   // The box reports its current text on input; this state only drives the query.
@@ -161,6 +164,7 @@ export function SessionsPage() {
                   <th key={col} className="px-2 py-1 font-normal">{t(`sessions.col.${col}`)}</th>
                 ),
               )}
+              {admin ? <th className="px-2 py-1 font-normal">{t("sessions.col.user")}</th> : null}
               <th />
             </tr>
           </thead>
@@ -169,6 +173,8 @@ export function SessionsPage() {
               <SessionRow
                 key={session.public_id}
                 session={session}
+                ownerActions={!admin || session.user_id === me?.user_id}
+                showUser={admin}
                 checked={picked.has(session.public_id)}
                 renaming={renaming === session.public_id}
                 onToggle={() => toggle(session.public_id)}
@@ -275,11 +281,13 @@ function Disk({ stats }: { stats: DbStats }) {
 }
 
 function SessionRow({
-  session, checked, renaming, onToggle, onOpen, onRenameStart, onRename, onPin, onStop, stopping, stopNotice, onDelete,
+  session, checked, renaming, ownerActions, showUser, onToggle, onOpen, onRenameStart, onRename, onPin, onStop, stopping, stopNotice, onDelete,
 }: {
   session: Session;
   checked: boolean;
   renaming: boolean;
+  ownerActions: boolean;
+  showUser: boolean;
   onToggle: () => void;
   onOpen: () => void;
   onRenameStart: () => void;
@@ -350,13 +358,14 @@ function SessionRow({
         {session.stats?.gap_count ? <span className="text-gap">{session.stats.gap_count}</span> : <Count value={session.stats?.gap_count ?? 0} />}
       </td>
       <td className="px-2 py-1"><Bytes value={session.stats?.bytes} /></td>
+      {showUser ? <td className="px-2 py-1">{session.user_id || "–"}</td> : null}
       <td className="px-2 py-1 text-right">
         {purged ? null : (
           <span className="inline-flex gap-2 text-ink-faint">
-            <button type="button" onClick={onRenameStart}>{t("sessions.rename")}</button>
-            <button type="button" onClick={onPin}>{session.pinned ? t("sessions.unpin") : t("sessions.pin")}</button>
-            {active ? <button type="button" disabled={stopping} onClick={onStop}>{stopping ? t("session.stopping") : t("session.stop")}</button> : null}
-            <button type="button" onClick={onDelete}>{t("sessions.delete")}</button>
+            <button type="button" disabled={!ownerActions} title={!ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onRenameStart}>{t("sessions.rename")}</button>
+            <button type="button" disabled={!ownerActions} title={!ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onPin}>{session.pinned ? t("sessions.unpin") : t("sessions.pin")}</button>
+            {active ? <button type="button" disabled={!ownerActions || stopping} title={!ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onStop}>{stopping ? t("session.stopping") : t("session.stop")}</button> : null}
+            <button type="button" disabled={!ownerActions} title={!ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onDelete}>{t("sessions.delete")}</button>
             <button
               type="button"
               disabled={exporter.pending !== null}

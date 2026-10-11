@@ -21,6 +21,7 @@ use super::Outcome;
 /// A failure to format the outcome.
 pub(crate) fn run(
     session: &str,
+    filter: Option<&str>,
     group_by: Option<&str>,
     sort: Option<&str>,
     json: bool,
@@ -35,7 +36,7 @@ pub(crate) fn run(
         ));
     }
     let mode = OutputMode::from_json_flag(json);
-    match source.flows(session, group_by, sort) {
+    match source.flows(session, filter, group_by, sort) {
         Ok(rows) => {
             let table = render::flows_table(&rows);
             let doc = render::flows_json(&rows);

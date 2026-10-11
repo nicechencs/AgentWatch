@@ -207,7 +207,7 @@ fn open_fresh(path: &std::path::Path) -> Result<Connection, String> {
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(wal_path(path));
     let _ = std::fs::remove_file(shm_path(path));
-    let conn = Connection::open(path).map_err(|err| format!("open {path:?}: {err}"))?;
+    let conn = aw_store::open_connection(path).map_err(|err| format!("open {path:?}: {err}"))?;
     // auto_vacuum must be set before any table exists.
     conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
         .map_err(|err| format!("auto_vacuum: {err}"))?;
@@ -274,7 +274,7 @@ fn seed_dict(conn: &mut Connection, layout: Layout) -> Result<(), String> {
         return Ok(());
     }
     let tx = conn
-        .unchecked_transaction()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| format!("dict tx: {err}"))?;
     {
         let mut stmt = tx

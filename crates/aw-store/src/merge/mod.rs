@@ -153,8 +153,8 @@ impl From<crate::StoreError> for MergeError {
 
 /// Import two JSONL exports into a new database and write `remote` edges.
 ///
-/// `output` is opened with [`Store::open`], which applies migration 0001 only.
-/// Inter-agent tables are created afterwards by an explicit
+/// `output` is opened with [`Store::open_runtime`], which includes the shared
+/// file-search schema. Inter-agent tables are created afterwards by an explicit
 /// [`apply_inter_agent_schema`] call. Migration 0010 is not applied inside
 /// `Store::open`.
 ///
@@ -195,7 +195,7 @@ pub fn merge_exports(request: &MergeRequest<'_>) -> Result<MergeReport, MergeErr
     }
     let paired = pair_flows(&side_a.flows, &side_b.flows, &nat);
 
-    let mut store = Store::open(request.output)?;
+    let mut store = Store::open_runtime(request.output)?;
     // 0010 is not part of Store::open. Remote edges need agent_links.
     apply_inter_agent_schema(&mut store)?;
     write_side(&store, &side_a, Side::A)?;

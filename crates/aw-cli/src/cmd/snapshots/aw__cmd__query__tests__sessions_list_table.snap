@@ -2,5 +2,5 @@
 source: crates/aw-cli/src/cmd/query.rs
 expression: rendered
 ---
-id      name  mode    agent          started_ns           ended_ns             pinned  evidence
-s-7k2m  demo  launch  example-agent  1700000000000000000  1700000060000000000  no      E1 系统
+id      name  mode    agent          started_ns           ended_ns             end_reason  pinned  evidence
+s-7k2m  demo  launch  example-agent  1700000000000000000  1700000060000000000  程序已退出  no      E1 系统

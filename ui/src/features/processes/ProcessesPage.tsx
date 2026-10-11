@@ -37,6 +37,9 @@ export function ProcessesPage() {
   if (tree.isError || !tree.data) {
     return <ErrorNote error={tree.error} onRetry={() => void tree.refetch()} />;
   }
+  if (tree.data.scan_pending) {
+    return <EmptyNote>正在读取进程…</EmptyNote>;
+  }
 
   // While filtering, search the whole loaded tree: a match under a folded
   // parent must still show up.

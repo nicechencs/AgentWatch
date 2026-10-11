@@ -8,6 +8,7 @@ mode        launch                                                         E1 �
 agent       example-agent                                                  E1 系统
 started_ns  1700000000000000000                                            E1 系统
 ended_ns    1700000060000000000                                            E1 系统
+end_reason  程序已退出                                                     E1 系统
 pinned      no                                                             E1 系统
 exit_code   没采                                                           E1 系统
 processes   2                                                              E1 系统

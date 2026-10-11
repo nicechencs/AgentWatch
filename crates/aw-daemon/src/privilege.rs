@@ -12,22 +12,7 @@
 
 /// Privilege of the current process, or `None` when it could not be read.
 pub(crate) fn current() -> Option<bool> {
-    #[cfg(target_os = "linux")]
-    {
-        aw_collector_linux::privilege::is_privileged()
-    }
-    #[cfg(target_os = "macos")]
-    {
-        aw_collector_macos::privilege::is_privileged()
-    }
-    #[cfg(target_os = "windows")]
-    {
-        aw_collector_windows::privilege::is_privileged()
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        None
-    }
+    aw_platform::platform().is_privileged()
 }
 
 #[cfg(test)]

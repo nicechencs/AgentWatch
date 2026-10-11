@@ -368,6 +368,7 @@ mod tests {
         let owner = Caller {
             user_id: my_user_id(),
             admin: false,
+            peer: None,
         };
         let doc = wait_for(&owner, pid);
         let stranger = body(&system_processes(
@@ -375,6 +376,7 @@ mod tests {
             &Caller {
                 user_id: "no-such-account".to_owned(),
                 admin: false,
+                peer: None,
             },
             "",
         ));
@@ -382,6 +384,7 @@ mod tests {
             &Caller {
                 user_id: "0".to_owned(),
                 admin: true,
+                peer: None,
             },
             pid,
         );
@@ -434,6 +437,7 @@ mod tests {
             &Caller {
                 user_id: "1000".to_owned(),
                 admin: false,
+                peer: None,
             },
             "q=sleep",
         ));
@@ -471,6 +475,7 @@ mod tests {
         let caller = Caller {
             user_id: "1000".to_owned(),
             admin: false,
+            peer: None,
         };
         let doc = body(&system_processes(fixed, &caller, "q=SLEEP"));
         assert_eq!(pids(&doc), vec![11], "own sleep only: {doc}");

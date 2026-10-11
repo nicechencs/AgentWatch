@@ -17,6 +17,7 @@ use rusqlite::{params, Connection};
 
 use crate::error::StoreError;
 use crate::fts::{self, FtsMode, FtsSource};
+use crate::replay::{self, KeyBuilder};
 
 /// One `file_access` row. Not `Debug`: `path` may be a sensitive filesystem path.
 #[derive(Clone)]
@@ -89,6 +90,9 @@ pub fn write_rows(
         .prepare_cached(&upsert_sql())
         .map_err(|err| StoreError::sqlite("prepare_file_access", err))?;
     for row in rows {
+        if !replay::claim(conn, "file_access", &replay_key(row), Some(row.session_id))? {
+            continue;
+        }
         stmt.execute(params![
             row.id,
             row.session_id,
@@ -125,6 +129,35 @@ pub fn write_rows(
         )?;
     }
     Ok(())
+}
+
+fn replay_key(row: &FileAccessRow) -> String {
+    let mut key = KeyBuilder::new("file_access");
+    key.i64(row.id);
+    key.i64(row.session_id);
+    key.i64(row.proc_uid);
+    key.text(&row.op);
+    key.text(&row.path);
+    key.opt_text(row.path_to.as_deref());
+    key.opt_text(row.access.as_deref());
+    key.i64(row.first_ns);
+    key.i64(row.last_ns);
+    key.i64(row.opens);
+    key.opt_i64(row.reads);
+    key.opt_i64(row.bytes_read);
+    key.opt_i64(row.writes);
+    key.opt_i64(row.bytes_written);
+    key.opt_i64(row.created);
+    key.opt_i64(row.truncated);
+    key.opt_i64(row.modified);
+    key.opt_i64(row.result);
+    key.i64(row.partial);
+    key.opt_text(row.sensitive_rule.as_deref());
+    key.text(&row.evidence);
+    key.opt_text(row.na_reason.as_deref());
+    key.opt_text(row.field_evidence.as_deref());
+    key.text(&row.source);
+    key.finish()
 }
 
 /// Text stored in `fts_text.body` for this row.

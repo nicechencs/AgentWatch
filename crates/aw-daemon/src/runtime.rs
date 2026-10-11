@@ -61,6 +61,11 @@ pub const LOG_KEEP: usize = 5;
 /// How often the foreground loop looks for the stop file.
 const POLL: Duration = Duration::from_millis(50);
 
+/// A restart can observe the IPC socket disappear before the old foreground
+/// loop has dropped the instance lock.  Keep a just-started replacement from
+/// failing spuriously during that short, orderly shutdown window.
+const INSTANCE_LOCK_WAIT: Duration = Duration::from_secs(2);
+
 /// How often that loop also takes a poll sample. A divisor of the wait so a
 /// sample is not late by more than one stop-file poll.
 const SAMPLE_EVERY_POLLS: u32 = 5;
@@ -83,7 +88,7 @@ pub enum RuntimeError {
     Config(String),
 
     /// The data directory could not be created. No other directory was used.
-    #[error("failed to create data directory `{}`: {source}", path.display())]
+    #[error("无法安全使用数据目录「{}」：{source}", path.display())]
     DataDir {
         /// Directory we tried to create.
         path: PathBuf,
@@ -129,6 +134,13 @@ pub enum RuntimeError {
         /// Underlying I/O error.
         #[source]
         source: io::Error,
+    },
+
+    /// The session database could not be opened safely at daemon startup.
+    #[error("{message}")]
+    Database {
+        /// Localized operator-facing explanation.
+        message: String,
     },
 }
 
@@ -182,6 +194,24 @@ impl InstanceLock {
         })?;
         let _ = file.flush();
         Ok(Self { file, path })
+    }
+
+    /// Acquire the instance lock, allowing an orderly predecessor a brief
+    /// bounded interval to finish its shutdown.  This is intentionally only a
+    /// retry for lock contention: permission and I/O failures remain immediate.
+    pub fn acquire_after_restart(data_dir: &Path) -> Result<Self, RuntimeError> {
+        let mut waited = Duration::ZERO;
+        loop {
+            match Self::acquire(data_dir) {
+                Ok(lock) => return Ok(lock),
+                Err(err @ RuntimeError::AlreadyRunning { .. }) if waited < INSTANCE_LOCK_WAIT => {
+                    thread::sleep(POLL);
+                    waited += POLL;
+                    drop(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     /// Lock file path. No caller in this card; a later status command prints it.
@@ -524,6 +554,7 @@ impl Batcher {
 pub fn run_foreground(
     config: &DaemonConfig,
     warnings: &[ConfigWarning],
+    config_path: Option<&Path>,
 ) -> Result<(), RuntimeError> {
     let data_dir = resolve_data_dir(config).map_err(|err| RuntimeError::Config(err.to_string()))?;
     ensure_data_dir(&data_dir).map_err(|source| RuntimeError::DataDir {
@@ -534,7 +565,7 @@ pub fn run_foreground(
     let stop_path = data_dir.join(STOP_FILE_NAME);
     let _ = fs::remove_file(&stop_path);
 
-    let lock = InstanceLock::acquire(&data_dir)?;
+    let lock = InstanceLock::acquire_after_restart(&data_dir)?;
     init_logging(&data_dir)?;
 
     // The directory is recorded, but not as a field named `path`: the subscriber
@@ -547,6 +578,12 @@ pub fn run_foreground(
     for warning in warnings {
         tracing::warn!("{}", warning.message());
     }
+
+    // Open before any listener or collector can claim that recording is live.
+    // In particular, an old rollback-journal database must become WAL here or
+    // the daemon refuses to start with an actionable, localized instruction.
+    let session_db = data_dir.join("agentwatch.db");
+    aw_store::Store::open_runtime(&session_db).map_err(database_startup_error)?;
 
     let stop = StopFlag::new();
     // Stop the batcher only after collectors have stopped. Sharing the runtime
@@ -566,7 +603,7 @@ pub fn run_foreground(
     let http_port = config.api.http_port;
     // One state for both listeners: a ticket issued on the internal channel
     // (`aw ui`, the desktop app) must be redeemable on loopback HTTP.
-    let shared = Arc::new(Mutex::new(foreground_api(config, &data_dir)));
+    let shared = Arc::new(Mutex::new(foreground_api(config, &data_dir, config_path)));
     // Sessions started from the API (`crate::watch`): one sampler per root.
     // Close the last run's unfinished sessions before any listener opens, so
     // a session created by the first request is never swept up as stale.
@@ -645,6 +682,21 @@ pub fn run_foreground(
     Ok(())
 }
 
+fn database_startup_error(err: aw_store::StoreError) -> RuntimeError {
+    if let Some((path, reason)) = err.legacy_wal_conversion() {
+        RuntimeError::Database {
+            message: format!(
+                "没法转换旧版的会话数据库，后台没有启动。原因：{reason}。可以先备份「{}」再删掉它，后台会新建一份。",
+                path.display()
+            ),
+        }
+    } else {
+        RuntimeError::Database {
+            message: format!("无法打开会话数据库：{err}"),
+        }
+    }
+}
+
 /// Publish what the samplers are doing for `GET /doctor` (Settings, new
 /// session page). Read from the samplers themselves, not from the config.
 fn report_collectors(
@@ -715,44 +767,21 @@ fn start_ipc(
 
 /// API state for the foreground listener: the data-dir database, the loaded
 /// config, and no in-memory sessions.
-fn foreground_api(config: &DaemonConfig, data_dir: &Path) -> ApiState {
+fn foreground_api(config: &DaemonConfig, data_dir: &Path, config_path: Option<&Path>) -> ApiState {
     let mut state = ApiState::default();
     state.sessions.clear();
     state.query = StoreQuery::open_path(data_dir.join("agentwatch.db"));
     state.config_json = config_snapshot(config);
+    state.config_path = config_path.map(Path::to_path_buf);
     // Off unless the config asks for it. The flag only changes `GET /`.
     state.preview_ui = config.debug.preview_ui;
     state
 }
 
-/// Non-secret view of the loaded config. No paths: the data directory can
-/// contain a user name, and the startup log already recorded it.
+/// Complete effective view of the loaded config for the local, authenticated
+/// configuration API.
 fn config_snapshot(config: &DaemonConfig) -> serde_json::Value {
-    serde_json::json!({
-        "retention": {
-            "max_db_size_mb": config.retention.max_db_size_mb,
-            "max_age_days": config.retention.max_age_days,
-        },
-        "proxy": {
-            "on_tls_reject": match config.proxy.on_tls_reject {
-                crate::config::TlsReject::Fail => "fail",
-                crate::config::TlsReject::Tunnel => "tunnel",
-            },
-            "max_hash_body": config.proxy.max_hash_body,
-        },
-        "collectors": {
-            "windows": { "sni": config.collectors.windows.sni },
-            "linux": {
-                "tls_uprobe": config.collectors.linux.tls_uprobe,
-                "ipc_payload_peek": config.collectors.linux.ipc_payload_peek,
-            },
-        },
-        "correlation": { "max_hash_file_size": config.correlation.max_hash_file_size },
-        "debug": {
-            "keep_raw_events": config.debug.keep_raw_events,
-            "preview_ui": config.debug.preview_ui,
-        },
-    })
+    crate::config::effective_json(config)
 }
 
 /// Install the process-wide file subscriber. Call once per process.
@@ -804,9 +833,21 @@ pub fn signal_stop(data_dir: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        core_dump_guard_status, is_sensitive_field, rfc3339_utc, InstanceLock, RollingFile,
-        RuntimeError, LOG_MAX_BYTES,
+        core_dump_guard_status, database_startup_error, is_sensitive_field, rfc3339_utc,
+        InstanceLock, RollingFile, RuntimeError, LOG_MAX_BYTES,
     };
+
+    #[test]
+    fn legacy_wal_conversion_startup_error_is_actionable_and_localized() {
+        let err = database_startup_error(aw_store::StoreError::LegacyWalConversion {
+            path: std::path::PathBuf::from("/tmp/agentwatch.db"),
+            reason: "database is locked".to_owned(),
+        });
+        assert_eq!(
+            err.to_string(),
+            "没法转换旧版的会话数据库，后台没有启动。原因：database is locked。可以先备份「/tmp/agentwatch.db」再删掉它，后台会新建一份。"
+        );
+    }
 
     #[test]
     fn log_timestamp_is_rfc3339_utc() {

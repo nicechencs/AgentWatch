@@ -31,7 +31,7 @@ fn run() -> Result<(), String> {
     }
     let _ = std::fs::remove_file(&path);
 
-    let mut store = Store::open(&path).map_err(|err| format!("open: {err}"))?;
+    let mut store = Store::open_runtime(&path).map_err(|err| format!("open: {err}"))?;
     let batch = sample_batch();
     let mut sink = SqliteSink::new(&mut store).map_err(|err| format!("sink: {err}"))?;
 

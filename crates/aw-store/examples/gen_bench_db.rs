@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use aw_store::{ensure_timeline, Store};
-use rusqlite::params;
+use rusqlite::{params, TransactionBehavior};
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -41,7 +41,7 @@ fn main() -> ExitCode {
     }
 
     let started = Instant::now();
-    let mut store = match Store::open(PathBuf::from(&path)) {
+    let mut store = match Store::open_runtime(PathBuf::from(&path)) {
         Ok(store) => store,
         Err(err) => {
             eprintln!("open: {err}");
@@ -53,7 +53,7 @@ fn main() -> ExitCode {
         eprintln!("timeline view: {err}");
         return ExitCode::from(1);
     }
-    let tx = match conn.transaction() {
+    let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
         Ok(tx) => tx,
         Err(err) => {
             eprintln!("begin: {err}");

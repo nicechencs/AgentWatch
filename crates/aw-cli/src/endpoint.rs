@@ -73,7 +73,7 @@ impl std::error::Error for EndpointError {}
 /// A resolved daemon address plus the credential the transport should present.
 ///
 /// Not `Debug`: `token` is a bearer secret. [`fmt::Display`] prints the address
-/// and, for HTTP, the token length and last four characters.
+/// and never prints credential metadata.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Endpoint {
     /// Unix socket. Authenticated by peer uid, not a bearer token.
@@ -112,9 +112,7 @@ impl fmt::Display for Endpoint {
         match self {
             Self::Unix { path } => write!(f, "Unix socket {}", path.display()),
             Self::Pipe { path } => write!(f, "命名管道 {}", path.display()),
-            Self::Http { base, token } => {
-                write!(f, "HTTP {}（token {}）", base.origin(), token_hint(token))
-            }
+            Self::Http { base, .. } => write!(f, "HTTP {}", base.origin()),
         }
     }
 }
@@ -355,8 +353,7 @@ mod tests {
         assert!(shown.contains("http://localhost:7456"), "{shown}");
         assert!(!shown.contains("flag-secret-value"), "{shown}");
         assert!(!shown.contains("env-secret-value"), "{shown}");
-        assert!(shown.contains("len=17"), "{shown}");
-        assert!(shown.contains("alue"), "{shown}");
+        assert!(!shown.contains("token"), "{shown}");
         match endpoint {
             Endpoint::Http { token, .. } => assert_eq!(token, "flag-secret-value"),
             other => panic!("expected http, got {other}"),

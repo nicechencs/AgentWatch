@@ -24,7 +24,7 @@ use aw_pipeline::wording::{lint, lint_allowing, Lang, RuleId, Violation};
 use aw_store::{redact_host_field, redact_user_paths, session_summary, SessionSummary, Store};
 
 use crate::api::share::{
-    error_response, findings_for_report, flag_on, json_response, open_owned, parse_lang,
+    error_response, findings_for_report, flag_on, json_response, open_visible, parse_lang,
     query_pairs, ApiResponse, ApiState, Caller, FindingView,
 };
 
@@ -48,16 +48,16 @@ pub(crate) fn export_markdown(
     // times read in their own clock. Absent or invalid: UTC, labelled so.
     let tz = parse_tz(pairs.get("tz").map(String::as_str));
 
-    let opened = match open_owned(state, &caller.user_id, sid) {
+    let opened = match open_visible(state, caller, sid) {
         Ok(Some(pair)) => pair,
         Ok(None) => return error_response(404, "not_found", "session not found"),
         Err(response) => return response,
     };
-    let (store, session_id) = opened;
+    let (store, session_id, owner) = opened;
     match build_report(
         &store,
         session_id,
-        &caller.user_id,
+        &owner,
         Reader { lang, tz },
         redact_paths,
         redact_hosts,

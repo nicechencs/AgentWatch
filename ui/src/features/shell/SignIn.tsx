@@ -16,6 +16,9 @@ export function SignIn() {
         status === "busy" ||
         status === "timeout" ||
         status === "broken" ||
+        status === "unidentified_peer" ||
+        status === "untrusted_server" ||
+        status === "server_unverified" ||
         status === "failed" ? (
           <>
             {status === "unreachable" ? (
@@ -34,6 +37,8 @@ export function SignIn() {
               <p className="mt-3 text-sm">{t("auth.timeout")}</p>
             ) : status === "broken" ? (
               <p className="mt-3 text-sm">{t("auth.broken", { reason: error ?? "" })}</p>
+            ) : status === "unidentified_peer" || status === "untrusted_server" || status === "server_unverified" ? (
+              <p className="mt-3 text-sm">{error ?? t("error.unknown")}</p>
             ) : (
               <p className="mt-3 text-sm">{t("auth.daemonError", { reason: error ?? "" })}</p>
             )}

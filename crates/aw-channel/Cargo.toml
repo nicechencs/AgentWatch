@@ -7,9 +7,15 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "Internal-channel client shared by aw and the desktop app: socket/pipe path order, dial with error classes, one HTTP/1.1 exchange. std only."
+description = "Internal-channel client shared by aw and the desktop app: socket/pipe path order, dial with error classes, one HTTP/1.1 exchange."
 
 [dependencies]
+
+# The Windows client asks the platform boundary to validate the connected
+# named-pipe server's token before it writes a request.  Keep Win32 FFI out of
+# this std-only transport crate.
+[target.'cfg(windows)'.dependencies]
+aw-platform = { path = "../aw-platform" }
 
 [lints.rust]
 unsafe_code = "forbid"

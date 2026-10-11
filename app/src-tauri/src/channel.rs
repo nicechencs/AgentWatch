@@ -3,7 +3,9 @@
 //! The app runs unprivileged and talks to `agentwatchd` over the Unix socket
 //! (Linux/macOS) or the named pipe (Windows) through `aw-channel`, the same
 //! client `aw` uses: same path order (system path, then the per-user path an
-//! unprivileged daemon binds), same error classes, pipe-busy retry, timeout.
+//! unprivileged daemon binds), same error classes, pipe-busy retry, timeout,
+//! and, on Windows, identification QoS plus server-token verification before
+//! request bytes are sent.
 //! No `Authorization` is sent; the daemon identifies the peer by its OS
 //! credential. Nothing here opens a TCP port.
 //!
@@ -37,8 +39,8 @@ pub struct Reply {
 }
 
 /// Error object the page receives when a command fails. `code` is one of
-/// `daemon_unreachable`, `daemon_forbidden`, `daemon_busy`, `daemon_timeout`,
-/// `channel_broken`, `refused`.
+/// `daemon_unreachable`, `daemon_forbidden`, `daemon_untrusted_server`,
+/// `daemon_busy`, `daemon_timeout`, `channel_broken`, `refused`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Failure {
     /// Stable machine code.
@@ -66,7 +68,7 @@ impl Failure {
     pub fn broken(detail: &str) -> Self {
         Self {
             code: "channel_broken".to_owned(),
-            message: "与 AgentWatch 服务的连接中断了，请重试。".to_owned(),
+            message: "跟后台的连接断了，请再试一次。".to_owned(),
             detail: detail.to_owned(),
         }
     }

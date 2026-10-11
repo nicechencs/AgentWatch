@@ -115,6 +115,26 @@ describe("desktop app entry", () => {
     expect(screen.queryByText("The AgentWatch service is not running")).toBeNull();
   });
 
+  it("puts a squatted Windows pipe's agreed warning at the app top", async () => {
+    const invoke = vi.fn().mockRejectedValue({
+      code: "daemon_untrusted_server",
+      message: "developer detail",
+    });
+    (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = { invoke };
+    render(
+      <I18nProvider lang="zh">
+        <AuthProvider>
+          <Status />
+          <SignIn />
+        </AuthProvider>
+      </I18nProvider>,
+    );
+    await waitFor(() => expect(screen.getByText("untrusted_server")).toBeInTheDocument());
+    expect(
+      screen.getByText("连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为防内容被它拿到，这次没有发送任何内容。"),
+    ).toBeInTheDocument();
+  });
+
   it("busy / timeout / broken channel are errors, not 'not running'", async () => {
     for (const [code, status] of [
       ["daemon_busy", "busy"],

@@ -11,8 +11,9 @@
 //!   dropped to the caller's uid, gid and login group list when the daemon
 //!   runs as root ([`super::launch_as`]). The account comes only from the OS peer
 //!   credential; an unknown one is refused, never run as root.
-//! - Only Linux reads process identity for the poll sampler today; elsewhere
-//!   these routes answer 503 `collector_unavailable` and create nothing.
+//! - A route is available only when `aw-platform` exposes both process identity
+//!   and a process table to the sampler; otherwise it answers 503
+//!   `collector_unavailable` and creates nothing.
 
 use serde_json::{json, Value};
 
@@ -20,6 +21,25 @@ use super::auth::{random_secret, Caller};
 use super::routes::{error_response, ApiResponse, ApiState};
 use crate::sample::SampleTarget;
 use crate::watch::{now_ns, PendingLaunch, WatchRequest, ADOPT_TIMEOUT_NS};
+
+/// macOS launch result, before the watcher takes ownership. A platform launch
+/// is already a released handle; a same-account spawn is still a `Child`.
+/// Either becomes the one handle the watcher reaps.
+#[cfg(target_os = "macos")]
+enum ChildHandoff {
+    Released(Box<dyn aw_platform::ReleasedChild>),
+    Process(std::process::Child),
+}
+
+#[cfg(target_os = "macos")]
+impl ChildHandoff {
+    fn into_released(self) -> Box<dyn aw_platform::ReleasedChild> {
+        match self {
+            Self::Released(child) => child,
+            Self::Process(child) => crate::watch::released_child(child),
+        }
+    }
+}
 
 fn parse(body: &[u8]) -> Result<Value, ApiResponse> {
     if body.is_empty() {
@@ -105,34 +125,35 @@ fn daemon_uid() -> u32 {
 }
 
 fn collector_available() -> Result<(), ApiResponse> {
-    if cfg!(target_os = "linux") {
+    let available = |capability| {
+        aw_platform::platform().capability(capability) == aw_platform::CapabilityStatus::Available
+    };
+    if available(aw_platform::Capability::ProcessIdentity)
+        && available(aw_platform::Capability::ProcessTable)
+    {
         Ok(())
     } else {
         Err(error_response(
             503,
             "collector_unavailable",
-            "the poll sampler reads process identity only on Linux in this build",
+            "the poll sampler process identity is not available in this build",
         ))
     }
 }
 
-/// Real, effective, and saved uids of `pid` from `/proc/<pid>/status`.
-/// `/proc/<pid>` itself is root-owned, so its directory owner is not useful.
-/// `None` means the three identity fields could not be read.
-fn pid_owner(pid: u32) -> Option<[u32; 3]> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        let line = status.lines().find(|line| line.starts_with("Uid:"))?;
-        let mut uids = line[4..]
-            .split_whitespace()
-            .map(|uid| uid.parse::<u32>().ok());
-        Some([uids.next()??, uids.next()??, uids.next()??])
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
+/// Whether the process identity the platform just read belongs to this
+/// authenticated peer.  A failure to read an owner is never treated as a
+/// match, and Windows compares a SID rather than a daemon account or pid.
+fn caller_owns_process(caller: &Caller, process: &aw_platform::ProcessEntry) -> bool {
+    match process.owner.as_ref() {
+        Some(aw_platform::Owner::Unix {
+            ruid, euid, suid, ..
+        }) => caller
+            .user_id
+            .parse::<u32>()
+            .is_ok_and(|uid| [ruid, euid, suid].iter().all(|actual| **actual == uid)),
+        Some(aw_platform::Owner::Windows { sid, .. }) => sid == &caller.user_id,
+        None => false,
     }
 }
 
@@ -153,9 +174,13 @@ fn check_pid_owner(
             "pid is not running (or its identity cannot be read)",
         )
     })?;
-    let caller_uid = caller.user_id.parse::<u32>().ok();
-    let owner = pid_owner(pid);
+    let process = aw_platform::platform().process_identity(pid).ok().flatten();
     let after = crate::sample::proc_uid_of(pid);
+    let after_key = aw_platform::platform()
+        .sampling_process(pid)
+        .ok()
+        .flatten()
+        .map(|sample| sample.key);
     if after != Some(before) {
         return Err(error_response(
             400,
@@ -163,8 +188,9 @@ fn check_pid_owner(
             "pid changed while its identity was being checked",
         ));
     }
-    let owned_by_caller = owner
-        .is_some_and(|uids| caller_uid.is_some_and(|uid| uids.iter().all(|actual| *actual == uid)));
+    let owned_by_caller = process.is_some_and(|process| {
+        after_key == Some(process.key) && caller_owns_process(caller, &process)
+    });
     if owned_by_caller || (allow_admin && caller.admin) {
         return Ok(before);
     }
@@ -187,25 +213,39 @@ fn db_path(state: &ApiState) -> Result<std::path::PathBuf, ApiResponse> {
     })
 }
 
+fn require_writable_database(path: &std::path::Path) -> Result<(), ApiResponse> {
+    let store = aw_store::Store::open_runtime(path)
+        .map_err(|err| super::routes::database_store_response(&err, "cannot open the database"))?;
+    if store.is_read_only() {
+        Err(super::routes::database_read_only_newer_response())
+    } else {
+        Ok(())
+    }
+}
+
 /// Allocate `sessions.id` and insert the row. Id 1 stays the daemon sample's.
 fn insert_session(path: &std::path::Path, target: &mut SampleTarget) -> Result<(), ApiResponse> {
-    let store_error = |what: &str| error_response(500, "store", what);
-    let mut store =
-        aw_store::Store::open(path).map_err(|_| store_error("cannot open the database"))?;
+    let store_error =
+        |err: &aw_store::StoreError, what: &str| super::routes::database_store_response(err, what);
+    let mut store = aw_store::Store::open_runtime(path)
+        .map_err(|err| store_error(&err, "cannot open the database"))?;
+    if store.is_read_only() {
+        return Err(super::routes::database_read_only_newer_response());
+    }
     let max: i64 = store
         .connection()
         .query_row("SELECT COALESCE(MAX(id), 1) FROM sessions", [], |row| {
             row.get(0)
         })
-        .map_err(|_| store_error("cannot read session ids"))?;
+        .map_err(|_| error_response(500, "store", "cannot read session ids"))?;
     target.db_id = max.max(1).saturating_add(1);
     let mut batch = aw_store::WriteBatch::default();
     batch.sessions.push(target.session_row(now_ns()));
-    let mut sink =
-        aw_store::SqliteSink::new(&mut store).map_err(|_| store_error("cannot open the writer"))?;
+    let mut sink = aw_store::SqliteSink::new(&mut store)
+        .map_err(|err| store_error(&err, "cannot open the writer"))?;
     use aw_store::RecordSink;
     sink.write_batch(&batch)
-        .map_err(|_| store_error("cannot write the session row"))?;
+        .map_err(|err| store_error(&err, "cannot write the session row"))?;
     target.write_session_row = false;
     Ok(())
 }
@@ -245,32 +285,6 @@ fn label_from_argv(argv: &[String]) -> String {
     }
 }
 
-/// The display label for an attach target: its executable base name, or the
-/// base name of `argv[0]` when the executable path is unavailable.
-fn attach_target_name(exe: Option<&str>, argv: Option<&[String]>) -> Option<String> {
-    fn base_name(path: &str) -> Option<&str> {
-        path.rsplit(['/', '\\'])
-            .find(|part| !part.trim().is_empty())
-    }
-
-    let name = exe.and_then(base_name).or_else(|| {
-        argv.and_then(|items| items.first())
-            .and_then(|arg0| base_name(arg0))
-    })?;
-    let redactor = aw_pipeline::Redactor::new(&aw_pipeline::config::RedactionConfig::default());
-    Some(redactor.scrub_text(name))
-}
-
-/// Read the target from the same process table used by the attach picker.
-/// The table is live, so a target that exits during creation may not have a
-/// label to retain.
-fn attach_target_name_for_pid(pid: u32) -> Option<String> {
-    let process = aw_collector_poll::host_process_table()?
-        .into_iter()
-        .find(|process| process.row.pid == pid)?;
-    attach_target_name(process.row.exe.as_deref(), process.row.argv.as_deref())
-}
-
 fn target_for(
     caller: &Caller,
     body: &Value,
@@ -278,13 +292,11 @@ fn target_for(
     root_pid: u32,
     argv: Option<&[String]>,
 ) -> Result<SampleTarget, ApiResponse> {
-    let name = opt_text(body, "name")
-        .or_else(|| argv.map(label_from_argv))
-        .or_else(|| {
-            (mode == "attach")
-                .then(|| attach_target_name_for_pid(root_pid))
-                .flatten()
-        });
+    // Attach used to read the entire host process table here merely to derive
+    // a display label.  That made the HTTP 201 wait for the initial scan
+    // (notably several seconds on a busy host).  The watcher performs that
+    // scan after this response; callers can supply a name if one is needed.
+    let name = opt_text(body, "name").or_else(|| argv.map(label_from_argv));
     Ok(SampleTarget {
         db_id: 0,
         public_id: new_public_id()?,
@@ -296,7 +308,31 @@ fn target_for(
         agent: opt_text(body, "agent"),
         write_session_row: true,
         root_hint: None,
+        root_identity: None,
     })
+}
+
+/// Convert the optional public duration into a daemon-owned absolute
+/// deadline.  The daemon, rather than the CLI connection, owns session end.
+fn duration_deadline(value: &Value) -> Result<Option<i64>, ApiResponse> {
+    let Some(milliseconds) = value.get("duration_ms") else {
+        return Ok(None);
+    };
+    let milliseconds = milliseconds
+        .as_u64()
+        .filter(|milliseconds| *milliseconds > 0)
+        .ok_or_else(|| {
+            error_response(
+                400,
+                "bad_argument",
+                "duration_ms: expected a positive integer",
+            )
+        })?;
+    let nanos = milliseconds
+        .checked_mul(1_000_000)
+        .and_then(|nanos| i64::try_from(nanos).ok())
+        .ok_or_else(|| error_response(400, "bad_argument", "duration_ms is too large"))?;
+    Ok(Some(now_ns().saturating_add(nanos)))
 }
 
 fn created(target: &SampleTarget, extra: Value) -> ApiResponse {
@@ -329,92 +365,152 @@ fn create_inner(
     match value.get("mode").and_then(Value::as_str) {
         Some("attach") => {
             let pid = pid_field(&value)?;
-            let _ = check_pid_owner(caller, pid, true)?;
+            let root_identity = check_pid_owner(caller, pid, true)?;
+            let deadline_ns = duration_deadline(&value)?;
             let mut target = target_for(caller, &value, "attach", pid, None)?;
+            // This is a single identity read, not the full process-table scan.
+            // It is retained so the session always identifies the root the
+            // daemon actually authorized, even if that root exits before the
+            // asynchronous sampler gets its first turn.
+            target.root_identity = Some(root_identity);
+            target.root_hint =
+                crate::sample::root_hint(pid, None).filter(|hint| hint.uid == root_identity);
             insert_session(&path, &mut target)?;
-            let response = created(&target, json!({}));
+            let response = created(&target, json!({ "scan_pending": true }));
+            state.pending_scans.insert(target.public_id.clone());
             state.watch_requests.push(WatchRequest::Start {
                 target: Box::new(target),
                 child: None,
+                deadline_ns,
             });
             Ok(response)
         }
         Some("launch") => {
-            let argv = argv_field(&value)?;
-            collector_available()?;
-            // Whose account: only the OS-verified caller (see `launch_as`).
-            // A `uid` / `user` in the body is never read.
-            let who = super::launch_as::identity_for(&caller.user_id, daemon_uid())?;
-            let cwd = opt_text(&value, "cwd");
-            let env: Vec<(String, String)> = value
-                .get("env")
-                .and_then(Value::as_object)
-                .map(|env| {
-                    env.iter()
-                        .filter_map(|(key, val)| val.as_str().map(|v| (key.clone(), v.to_owned())))
-                        .collect()
-                })
-                .unwrap_or_default();
-            #[allow(unused_mut)]
-            let mut child = match &who {
+            // App/API launch creation has no Windows token-to-user launch path
+            // yet. `aw run` is different: its CLI creates a held child as the
+            // current user and this daemon only adopts it through `/adopt`.
+            #[cfg(windows)]
+            {
+                Err(error_response(
+                    503,
+                    "launch_not_in_this_build",
+                    "Windows 上从 App 新建会话本版本未接入，请在终端里用 aw run 启动。",
+                ))
+            }
+            #[cfg(not(windows))]
+            {
+                let argv = argv_field(&value)?;
+                collector_available()?;
+                // Whose account: only the OS-verified caller (see `launch_as`).
+                // A `uid` / `user` in the body is never read.
+                let who = super::launch_as::identity_for(&caller.user_id, daemon_uid())?;
+                let cwd = opt_text(&value, "cwd");
+                let env: Vec<(String, String)> = value
+                    .get("env")
+                    .and_then(Value::as_object)
+                    .map(|env| {
+                        env.iter()
+                            .filter_map(|(key, val)| {
+                                val.as_str().map(|v| (key.clone(), v.to_owned()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // Linux and macOS both map `SpawnAsError::Drop` here. Windows never
+                // reaches it: a different account is refused before spawn.
                 #[cfg(unix)]
-                Some(who) => super::launch_as::spawn_as(who, &argv, cwd.as_deref(), &env)
-                    .map_err(|err| match err {
-                        super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
-                        super::launch_as::SpawnAsError::Drop(step) => {
-                            tracing::error!(uid = who.uid, step, "account switch failed");
-                            error_response(
-                                500,
-                                "drop_failed",
-                                "the program did not switch to the caller's account and was stopped",
-                            )
-                        }
-                    })?,
-                // No account switch here: never start it as the service account.
-                #[cfg(not(unix))]
-                Some(_) => return Err(super::launch_as::no_account_switch()),
-                None => {
-                    let mut command = std::process::Command::new(&argv[0]);
-                    command
-                        .args(&argv[1..])
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null());
-                    if let Some(cwd) = &cwd {
-                        command.current_dir(cwd);
-                    }
-                    command.envs(env.iter().map(|(k, v)| (k, v)));
-                    command.spawn().map_err(|err| spawn_error(&err))?
-                }
-            };
-            let pid = child.id();
-            #[cfg(target_os = "linux")]
-            if let Some(who) = &who {
-                if !super::launch_as::verify_dropped(pid, who) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    tracing::error!(
-                        pid,
-                        uid = who.uid,
-                        "launched child did not drop to the caller; killed"
-                    );
-                    return Err(error_response(
+                let drop_failed = |uid: u32, step: &str| {
+                    tracing::error!(uid, step, "account switch failed");
+                    error_response(
                         500,
                         "drop_failed",
                         "the program did not switch to the caller's account and was stopped",
-                    ));
+                    )
+                };
+                // macOS: both accounts go through the hold stage. It blocks on a
+                // pipe, switches (when the caller is someone else) and only then
+                // uses the caller's cwd and env. The watcher reaps this handle.
+                #[cfg(target_os = "macos")]
+                let (pid, child) = {
+                    let Some(peer) = caller.peer.clone() else {
+                        return Err(error_response(
+                            403,
+                            "caller_unidentified",
+                            "the caller's account could not be identified",
+                        ));
+                    };
+                    let released = super::launch_as::spawn_as(
+                        peer,
+                        &account_of(who.as_ref(), &caller.user_id)?,
+                        &argv,
+                        cwd.as_deref(),
+                        &env,
+                    )
+                    .map_err(|err| match err {
+                        super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
+                        super::launch_as::SpawnAsError::Drop(step) => {
+                            drop_failed(caller.user_id.parse().unwrap_or(0), &step)
+                        }
+                    })?;
+                    (released.pid(), ChildHandoff::Released(released))
+                };
+                #[cfg(not(target_os = "macos"))]
+                #[allow(unused_mut)]
+                let (pid, mut child) = match &who {
+                    #[cfg(unix)]
+                    Some(who) => {
+                        let child = super::launch_as::spawn_as(who, &argv, cwd.as_deref(), &env)
+                            .map_err(|err| match err {
+                                super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
+                                super::launch_as::SpawnAsError::Drop(step) => {
+                                    drop_failed(who.uid, &step)
+                                }
+                            })?;
+                        (child.id(), child)
+                    }
+                    // No account switch here: never start it as the service account.
+                    #[cfg(not(unix))]
+                    Some(_) => return Err(super::launch_as::no_account_switch()),
+                    None => {
+                        let child = spawn_as_self(&argv, cwd.as_deref(), &env)?;
+                        (child.id(), child)
+                    }
+                };
+                #[cfg(target_os = "linux")]
+                if let Some(who) = &who {
+                    if !super::launch_as::verify_dropped(pid, who) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        tracing::error!(
+                            pid,
+                            uid = who.uid,
+                            "launched child did not drop to the caller; killed"
+                        );
+                        return Err(error_response(
+                            500,
+                            "drop_failed",
+                            "the program did not switch to the caller's account and was stopped",
+                        ));
+                    }
                 }
+                let mut target = target_for(caller, &value, "launch", pid, Some(&argv))?;
+                target.root_hint =
+                    crate::sample::root_hint(pid, argv0_basename(target.argv_json.as_deref()));
+                target.root_identity = target.root_hint.as_ref().map(|hint| hint.uid);
+                insert_session(&path, &mut target)?;
+                let response = created(&target, json!({}));
+                state.watch_requests.push(WatchRequest::Start {
+                    target: Box::new(target),
+                    // Both the platform launch and a same-account spawn hand over a
+                    // released handle. The watcher reaps it; nothing is left as a pid.
+                    #[cfg(target_os = "macos")]
+                    child: Some(child.into_released()),
+                    #[cfg(not(target_os = "macos"))]
+                    child: Some(crate::watch::released_child(child)),
+                    deadline_ns: None,
+                });
+                Ok(response)
             }
-            let mut target = target_for(caller, &value, "launch", pid, Some(&argv))?;
-            target.root_hint =
-                crate::sample::root_hint(pid, argv0_basename(target.argv_json.as_deref()));
-            insert_session(&path, &mut target)?;
-            let response = created(&target, json!({}));
-            state.watch_requests.push(WatchRequest::Start {
-                target: Box::new(target),
-                child: Some(child),
-            });
-            Ok(response)
         }
         _ => Err(error_response(
             400,
@@ -422,6 +518,40 @@ fn create_inner(
             "mode: expected \"attach\" or \"launch\"",
         )),
     }
+}
+
+/// The account a macOS launch starts as. `who` is `Some` when the daemon must
+/// drop to another account; `None` means the caller is the daemon's own
+/// account, looked up so the program still gets that account's home and shell.
+#[cfg(target_os = "macos")]
+fn account_of(
+    who: Option<&super::launch_as::Identity>,
+    user_id: &str,
+) -> Result<super::launch_as::Identity, ApiResponse> {
+    match who {
+        Some(who) => Ok(who.clone()),
+        None => super::launch_as::own_account(user_id),
+    }
+}
+
+/// Start `argv` as the daemon's own account. Used only when the caller is that
+/// same account, so there is nothing to switch.
+fn spawn_as_self(
+    argv: &[String],
+    cwd: Option<&str>,
+    env: &[(String, String)],
+) -> Result<std::process::Child, ApiResponse> {
+    let mut command = std::process::Command::new(&argv[0]);
+    command
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command.envs(env.iter().map(|(k, v)| (k, v)));
+    command.spawn().map_err(|err| spawn_error(&err))
 }
 
 /// `POST /sessions/run`: record the session and hand back an adopt ticket.
@@ -494,8 +624,9 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
                     )
                 })?;
         let path = db_path(state)?;
+        require_writable_database(&path)?;
         let root_proc_uid = i64::from_ne_bytes(root_hint.uid.0.to_ne_bytes());
-        rusqlite::Connection::open(&path)
+        aw_store::open_connection(&path)
             .and_then(|conn| {
                 conn.execute(
                     "UPDATE sessions SET root_proc_uid = ?1 WHERE id = ?2",
@@ -511,6 +642,7 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
         };
         pending.target.root_pid = pid;
         pending.target.root_hint = Some(root_hint);
+        pending.target.root_identity = pending.target.root_hint.as_ref().map(|hint| hint.uid);
         // Write the root's row now, while `aw run` still holds it at the gate:
         // the foreground loop starts the sampler up to a poll later, and a
         // root that exits (and posts `/exit`) before then would otherwise be
@@ -527,6 +659,7 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
         state.watch_requests.push(WatchRequest::Start {
             target: Box::new(pending.target),
             child: None,
+            deadline_ns: None,
         });
         Ok(response)
     };
@@ -554,7 +687,8 @@ pub(super) fn record_exit(
                 error_response(400, "bad_argument", "exit_code: expected a signed integer")
             })?;
         let path = db_path(state)?;
-        let conn = rusqlite::Connection::open(&path)
+        require_writable_database(&path)?;
+        let conn = aw_store::open_connection(&path)
             .map_err(|_| error_response(500, "store", "cannot open the database"))?;
         let row: Option<(i64, String, Option<i64>)> = conn
             .query_row(
@@ -613,11 +747,9 @@ pub(super) fn attach(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u
         let value = parse(body)?;
         let path = db_path(state)?;
         let pid = pid_field(&value)?;
-        let conn = rusqlite::Connection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .map_err(|_| error_response(500, "store", "cannot open the database"))?;
+        let conn =
+            aw_store::open_connection_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|_| error_response(500, "store", "cannot open the database"))?;
         type Row = (
             i64,
             String,
@@ -655,7 +787,9 @@ pub(super) fn attach(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u
                 "session is not open for attach",
             ));
         }
-        let _ = check_pid_owner(caller, pid, true)?;
+        let root_identity = check_pid_owner(caller, pid, true)?;
+        let root_hint =
+            crate::sample::root_hint(pid, None).filter(|hint| hint.uid == root_identity);
         let target = SampleTarget {
             db_id,
             public_id: sid.to_owned(),
@@ -666,11 +800,13 @@ pub(super) fn attach(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u
             argv_json: None,
             agent,
             write_session_row: false,
-            root_hint: None,
+            root_hint,
+            root_identity: Some(root_identity),
         };
         state.watch_requests.push(WatchRequest::Start {
             target: Box::new(target),
             child: None,
+            deadline_ns: None,
         });
         Ok(ApiResponse::json(
             200,
@@ -689,7 +825,7 @@ pub(super) fn stopped(state: &mut ApiState, sid: &str) {
         return;
     };
     let Ok(conn) =
-        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        aw_store::open_connection_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {
         return;
     };
@@ -700,6 +836,87 @@ pub(super) fn stopped(state: &mut ApiState, sid: &str) {
     ) {
         state.watch_requests.push(WatchRequest::Stop { db_id });
     }
+}
+
+/// The route created a session but its success response could not reach the
+/// peer (for example, the CLI was killed while SQLite was busy).  Do not leave
+/// that unacknowledged recording session open: mark it as an attach failure,
+/// remove its pending work, and stop an already-started sampler if necessary.
+///
+/// This is called only by transport writers after a failed write of a 201.
+pub(super) fn reply_delivery_failed(
+    state: &mut ApiState,
+    request: &super::routes::HttpRequest,
+    response: &ApiResponse,
+) {
+    if request.method != "POST"
+        || !matches!(
+            request.path.as_str(),
+            "/api/v1/sessions" | "/api/v1/sessions/run"
+        )
+        || response.status != 201
+    {
+        return;
+    }
+    let Some(public_id) = serde_json::from_slice::<Value>(&response.body)
+        .ok()
+        .and_then(|body| body.get("id").and_then(Value::as_str).map(str::to_owned))
+    else {
+        return;
+    };
+    state.pending_scans.remove(&public_id);
+    state.pending_launches.remove(&public_id);
+    // Prevent a queued scan from starting after the client has gone away.
+    state.watch_requests.retain(|pending| {
+        !matches!(pending, WatchRequest::Start { target, .. } if target.public_id == public_id)
+    });
+    state.undelivered_sessions.insert(public_id.clone());
+    close_undelivered_session(state, &public_id);
+}
+
+/// Retry every failed-delivery close that a temporary database lock delayed.
+/// The foreground watcher calls this every tick; daemon restart recovery is a
+/// final backstop if the daemon stops before a retry can succeed.
+pub(crate) fn retry_undelivered_sessions(state: &mut ApiState) {
+    let pending: Vec<String> = state.undelivered_sessions.iter().cloned().collect();
+    for public_id in pending {
+        close_undelivered_session(state, &public_id);
+    }
+}
+
+fn close_undelivered_session(state: &mut ApiState, public_id: &str) {
+    let Some(path) = state.query.db_path.clone() else {
+        return;
+    };
+    let Ok(conn) = aw_store::open_connection(&path) else {
+        tracing::error!("could not open database to close undelivered session reply");
+        return;
+    };
+    let db_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM sessions WHERE public_id = ?1",
+            [public_id],
+            |row| row.get(0),
+        )
+        .ok();
+    let Ok(updated) = conn.execute(
+        "UPDATE sessions SET ended_ns = ?1, end_reason = 'attach_failed' \
+         WHERE public_id = ?2 AND ended_ns IS NULL",
+        rusqlite::params![now_ns(), public_id],
+    ) else {
+        tracing::error!("could not close undelivered session reply");
+        return;
+    };
+    if updated == 1 {
+        if let Some(db_id) = db_id {
+            state.watch_requests.push(WatchRequest::Stop { db_id });
+        }
+        tracing::warn!(
+            "session creation reply was not delivered; recording ended as attach_failed"
+        );
+    }
+    // A row already ended is also resolved: do not retry it forever.
+    state.undelivered_sessions.remove(public_id);
 }
 
 /// A failed `spawn` as an error the UI can word. The code says what went
@@ -751,21 +968,127 @@ mod spawn_error_tests {
 }
 
 #[cfg(test)]
-mod attach_target_name_tests {
-    use super::attach_target_name;
+#[allow(clippy::expect_used)]
+mod database_busy_tests {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use rusqlite::{Transaction, TransactionBehavior};
+
+    use super::{insert_session, reply_delivery_failed, ApiResponse, ApiState, SampleTarget};
 
     #[test]
-    fn attach_name_prefers_the_executable_then_argv_zero() {
-        let argv = vec!["/usr/local/bin/from-argv".to_owned()];
+    fn lock_past_busy_timeout_returns_db_busy_with_measured_wait() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aw-db-busy-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let path = dir.join("agentwatch.db");
+        drop(aw_store::Store::open_runtime(&path).expect("runtime store"));
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || {
+            let conn = aw_store::open_connection(&writer_path).expect("writer connection");
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)
+                .expect("begin immediate");
+            tx.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('busy-test', '1')",
+                [],
+            )
+            .expect("writer row");
+            ready_tx.send(()).expect("signal writer");
+            // Keep the lock well beyond the connection's busy timeout.  A
+            // one-second margin raced on macOS, where setup before the write
+            // can take long enough for the writer to release first.
+            thread::sleep(aw_store::BUSY_TIMEOUT + Duration::from_secs(3));
+            tx.commit().expect("writer commit");
+        });
+        ready_rx.recv().expect("writer ready");
+
+        let mut target = SampleTarget {
+            db_id: 0,
+            public_id: "s-busy".to_owned(),
+            name: None,
+            mode: "attach",
+            root_pid: 1,
+            user_id: "test".to_owned(),
+            argv_json: None,
+            agent: None,
+            write_session_row: true,
+            root_hint: None,
+            root_identity: None,
+        };
+        let response = insert_session(&path, &mut target).expect_err("busy response");
+        assert_eq!(response.status, 503);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).expect("busy JSON");
+        assert_eq!(body["error"]["code"], "db_busy");
+        let waited = body["error"]["waited_seconds"]
+            .as_u64()
+            .expect("measured seconds");
+        assert!(waited >= aw_store::BUSY_TIMEOUT.as_secs());
         assert_eq!(
-            attach_target_name(Some("/opt/tools/from-exe"), Some(&argv)),
-            Some("from-exe".to_owned())
+            body["error"]["message"],
+            format!("会话数据库正忙（后台在写入），等了 {waited} 秒还是没轮到，请稍后再试。")
         );
-        assert_eq!(
-            attach_target_name(None, Some(&argv)),
-            Some("from-argv".to_owned())
-        );
-        assert_eq!(attach_target_name(None, None), None);
+        assert!(body["error"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("database is locked")
+                || detail.contains("database is busy")));
+        writer.join().expect("writer thread");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn undelivered_creation_reply_ends_the_new_session_as_attach_failed() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aw-undelivered-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let path = dir.join("agentwatch.db");
+        let mut state = ApiState::default();
+        state.query = super::super::StoreQuery::open_path(path.clone());
+        let mut target = SampleTarget {
+            db_id: 0,
+            public_id: "s-undelivered".to_owned(),
+            name: None,
+            mode: "attach",
+            root_pid: 1,
+            user_id: "test".to_owned(),
+            argv_json: None,
+            agent: None,
+            write_session_row: true,
+            root_hint: None,
+            root_identity: None,
+        };
+        insert_session(&path, &mut target).expect("session row");
+        state.pending_scans.insert(target.public_id.clone());
+        let request = super::super::routes::HttpRequest {
+            method: "POST".to_owned(),
+            path: "/api/v1/sessions".to_owned(),
+            ..super::super::routes::HttpRequest::default()
+        };
+        let response = ApiResponse::json(201, &serde_json::json!({ "id": target.public_id }));
+        reply_delivery_failed(&mut state, &request, &response);
+
+        let conn = aw_store::open_connection(&path).expect("connection");
+        let ended: (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT ended_ns, end_reason FROM sessions WHERE public_id = 's-undelivered'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("ended session");
+        assert!(ended.0.is_some());
+        assert_eq!(ended.1.as_deref(), Some("attach_failed"));
+        assert!(state.pending_scans.is_empty());
+        assert!(state.undelivered_sessions.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -780,6 +1103,7 @@ mod ownership_tests {
         let caller = Caller {
             user_id: crate::sample::current_user_id(),
             admin: false,
+            peer: None,
         };
         let mut child = std::process::Command::new("sleep")
             .arg("5")

@@ -11,6 +11,7 @@ name = "agentwatchd"
 path = "src/main.rs"
 
 [dependencies]
+aw-platform = { workspace = true }
 aw-core = { workspace = true }
 aw-pipeline = { workspace = true }
 aw-store = { workspace = true }

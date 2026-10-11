@@ -3,19 +3,11 @@
 //! `cfg(target_os)` is allowed only in this module. Business logic must call
 //! [`default_data_dir`] / [`default_config_path`] and must not branch on the OS.
 //!
-//! The task card names these data directories (no extra `data/` segment):
-//! Linux `/var/lib/agentwatch`, macOS `/Library/Application Support/AgentWatch`,
-//! Windows `%ProgramData%\AgentWatch`. architecture.md §7 puts Windows and macOS
-//! data under a `data` subdirectory of the same root. This card follows the
-//! task card. Config files still live where §7 says they do.
-//!
 //! Creating a directory that fails is an error. There is no fallback to the
 //! user home directory. This module never creates the three system directories
 //! by itself; callers pass a configured path (tests and `--foreground` use a
 //! temp directory via `storage.data_dir`).
 
-#[cfg(target_os = "windows")]
-use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -26,31 +18,9 @@ use std::path::{Path, PathBuf};
 /// On Windows, returns an error when `ProgramData` is unset. It does not invent
 /// a path under the user profile.
 pub fn default_data_dir() -> io::Result<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        Ok(PathBuf::from("/var/lib/agentwatch"))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Ok(PathBuf::from("/Library/Application Support/AgentWatch"))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let root = env::var_os("ProgramData").ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "ProgramData is unset; refusing to fall back to the user home directory",
-            )
-        })?;
-        Ok(PathBuf::from(root).join("AgentWatch"))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "no default AgentWatch data directory for this operating system",
-        ))
-    }
+    aw_platform::platform()
+        .default_data_dir()
+        .map_err(platform_error)
 }
 
 /// Default daemon config file for this platform (§7 locations).
@@ -59,36 +29,54 @@ pub fn default_data_dir() -> io::Result<PathBuf> {
 ///
 /// On Windows, returns an error when `ProgramData` is unset.
 pub fn default_config_path() -> io::Result<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        Ok(PathBuf::from("/etc/agentwatch/config.toml"))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Ok(PathBuf::from(
-            "/Library/Application Support/AgentWatch/config.toml",
-        ))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Ok(default_data_dir()?.join("config.toml"))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "no default AgentWatch config path for this operating system",
-        ))
-    }
+    aw_platform::platform()
+        .default_config_path()
+        .map_err(platform_error)
 }
 
-/// Create `dir` (and parents). Failure is returned as-is; nothing is written elsewhere.
+/// Create and secure `dir` (and parents) before anything is written below it.
 ///
 /// # Errors
 ///
-/// Returns the `create_dir_all` error. Does not fall back to another directory.
+/// Returns the platform permission/ownership error. Does not fall back to
+/// another directory and never follows a symlink/reparse point.
 pub fn ensure_data_dir(dir: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(dir)
+    aw_platform::platform()
+        .secure_data_dir(dir)
+        .map_err(|error| secure_data_dir_error(dir, error))
+}
+
+fn secure_data_dir_error(dir: &Path, error: aw_platform::PlatformError) -> io::Error {
+    if matches!(
+        error,
+        aw_platform::PlatformError::Invalid {
+            capability: "secure_data_dir",
+            detail: "data directory owner is not trusted"
+                | "data directory owner is not the daemon user"
+                | "data directory owner changed while it was being secured",
+        }
+    ) {
+        let message = format!(
+            "数据目录「{}」不归管理员所有，可能被别人改过。为防万一，后台没有启动。请删掉这个目录后再启动后台。",
+            dir.display()
+        );
+        return io::Error::new(io::ErrorKind::PermissionDenied, message);
+    }
+    platform_error(error)
+}
+
+fn platform_error(error: aw_platform::PlatformError) -> io::Error {
+    match error {
+        aw_platform::PlatformError::Io(error) => error,
+        aw_platform::PlatformError::Unsupported { .. } => {
+            io::Error::new(io::ErrorKind::Unsupported, error)
+        }
+        aw_platform::PlatformError::Invalid { .. }
+        | aw_platform::PlatformError::PeerNotIdentified { .. }
+        | aw_platform::PlatformError::PipePeerNotIdentified { .. } => {
+            io::Error::new(io::ErrorKind::InvalidInput, error)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +100,33 @@ mod tests {
             Ok(())
         } else {
             Err(std::io::Error::other("temp data dir was not created"))
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_data_dir_rejects_a_symlink() -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "agentwatchd-paths-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::create_dir_all(&target)?;
+        symlink(&target, &link)?;
+        let Err(error) = ensure_data_dir(&link) else {
+            return Err(std::io::Error::other("a data-dir symlink must be refused"));
+        };
+        let _ = std::fs::remove_dir_all(&root);
+        if error.kind() == std::io::ErrorKind::InvalidInput {
+            Ok(())
+        } else {
+            Err(error)
         }
     }
 }

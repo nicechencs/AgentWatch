@@ -24,12 +24,13 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use aw_store::{
-    around, delete_session, dns_events, files, flow_buckets, flows, gaps, list_sessions,
-    newest_session_for_user, patch_session, process_detail, process_tree, public_id_by_session_id,
-    search, session_by_public_id, session_summary, stop_session, timeline, timeline_histogram,
-    traffic, CompileCtx, Cursor, FileGroupBy, FileQuery, FlowQuery, FtsMode, ProcessNode,
-    PurgeScope, QueryError, Retention, RetentionConfig, SessionFilter, SessionListItem,
-    SessionSummary, Store, StoreError, StoreExpr, TimelinePage, TimelineQuery,
+    around, delete_session, dns_events, files, flow_buckets, flows, gaps, list_all_sessions,
+    list_sessions, newest_session_for_user, patch_session, process_detail, process_tree,
+    process_tree_filtered, public_id_by_session_id, search, session_by_public_id, session_summary,
+    stop_session, timeline, timeline_histogram, traffic, CompileCtx, Cursor, FileGroupBy,
+    FileQuery, FlowQuery, FtsMode, ProcessNode, PurgeScope, QueryError, Retention, RetentionConfig,
+    SessionFilter, SessionListItem, SessionSummary, Store, StoreError, StoreExpr, TimelinePage,
+    TimelineQuery,
 };
 
 // Every method calls a function `aw-store` exports. A filter string is parsed
@@ -73,6 +74,27 @@ pub enum QueryBackendError {
         /// Short name, for the 501 body. Not a SQL statement.
         what: &'static str,
     },
+    /// SQLite waited for a writer for the measured interval and did not obtain
+    /// the lock. The diagnostic is retained for structured detail/logging only.
+    Busy {
+        /// Real elapsed whole seconds reported by the store.
+        waited_seconds: u64,
+        /// SQLite's English diagnostic.
+        detail: String,
+    },
+    /// A database made by a newer AgentWatch is intentionally queryable but
+    /// this operation would modify it.
+    ReadOnlyNewer,
+    /// A legacy rollback-journal database could not be converted to WAL.
+    /// This is distinct from an ordinary store error because the daemon must
+    /// tell the operator how to preserve the original database.
+    LegacyWalConversion {
+        /// Local database path, supplied separately rather than parsed from a
+        /// display string.
+        path: PathBuf,
+        /// SQLite's diagnostic.
+        reason: String,
+    },
     /// SQLite or the store rejected the call. Display text only.
     Store(String),
 }
@@ -90,6 +112,14 @@ impl std::fmt::Display for QueryBackendError {
             Self::NotFound => write!(f, "session not found"),
             Self::NoSessions => write!(f, "this account has no sessions"),
             Self::Unimplemented { what } => write!(f, "{what} is not available"),
+            Self::Busy { waited_seconds, .. } => write!(
+                f,
+                "session database remained busy after {waited_seconds} seconds"
+            ),
+            Self::ReadOnlyNewer => write!(f, "database was opened read-only because it is newer"),
+            Self::LegacyWalConversion { path, reason } => {
+                write!(f, "could not convert {} to WAL: {reason}", path.display())
+            }
             Self::Store(msg) => write!(f, "{msg}"),
         }
     }
@@ -419,7 +449,7 @@ impl StoreQuery {
         if !path.exists() {
             return Ok(None);
         }
-        Store::open(path).map(Some).map_err(map_store)
+        Store::open_runtime(path).map(Some).map_err(map_store)
     }
 
     /// Integer id already remembered for `sid`. A numeric `sid` is the id itself.
@@ -476,6 +506,86 @@ impl StoreQuery {
             self.remember(sid, id);
         }
         Ok(found)
+    }
+
+    /// Owner of a session visible to this OS-identified caller.  `@last`
+    /// deliberately resolves through the caller's own user id even for root.
+    pub(crate) fn owner_for_viewer(
+        &self,
+        caller: &crate::api::auth::Caller,
+        sid: &str,
+    ) -> Result<Option<String>, QueryBackendError> {
+        let Some(store) = self.open()? else {
+            return Ok(None);
+        };
+        if !caller.admin || sid == "@last" {
+            let Some(id) = self.resolve_id(&store, &caller.user_id, sid)? else {
+                return Ok(None);
+            };
+            return store
+                .connection()
+                .query_row("SELECT user_id FROM sessions WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .map_err(|err| QueryBackendError::Store(format!("session owner: {err}")));
+        }
+        let sql = if sid.parse::<i64>().is_ok() {
+            "SELECT user_id FROM sessions WHERE id = ?1"
+        } else {
+            "SELECT user_id FROM sessions WHERE public_id = ?1"
+        };
+        store
+            .connection()
+            .query_row(sql, [sid], |row| row.get(0))
+            .optional()
+            .map_err(|err| QueryBackendError::Store(format!("session owner: {err}")))
+    }
+
+    /// List sessions using only the transport-established administrator bit.
+    pub(crate) fn list_sessions_for_viewer(
+        &self,
+        caller: &crate::api::auth::Caller,
+        query: &ListQuery,
+    ) -> Result<Page<SessionListItem>, QueryBackendError> {
+        let Some(store) = self.open()? else {
+            return Ok(Page {
+                rows: Vec::new(),
+                next_cursor: None,
+            });
+        };
+        let cursor = parse_cursor(query.cursor.as_deref())?;
+        let filter = SessionFilter {
+            q: query.q.clone(),
+            agent: query.agent.clone(),
+            active_only: query.active_only,
+            since_ns: query.since_ns,
+            until_ns: query.until_ns,
+            expr: query.filter.clone(),
+            limit: Some(query.limit.saturating_add(1)),
+            cursor,
+        };
+        let mut rows = if caller.admin {
+            list_all_sessions(store.connection(), &filter)
+        } else {
+            list_sessions(store.connection(), &caller.user_id, &filter)
+        }
+        .map_err(map_query)?;
+        let next_cursor = if rows.len() as i64 > query.limit {
+            rows.truncate(query.limit as usize);
+            rows.last()
+                .map(|row| format!("{},{}", row.started_ns, row.id))
+        } else {
+            None
+        };
+        let mut guard = self
+            .ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for row in &rows {
+            guard.insert(&row.public_id, row.id);
+        }
+        Ok(Page { rows, next_cursor })
     }
 }
 
@@ -538,6 +648,7 @@ impl SessionQuery for StoreQuery {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
+        require_writable(&store)?;
         let Some(id) = self.resolve_id(&store, user_id, sid)? else {
             return Ok(None);
         };
@@ -554,6 +665,7 @@ impl SessionQuery for StoreQuery {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
+        require_writable(&store)?;
         let Some(id) = self.resolve_id(&store, user_id, sid)? else {
             return Ok(None);
         };
@@ -564,6 +676,7 @@ impl SessionQuery for StoreQuery {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
+        require_writable(&store)?;
         let Some(id) = self.resolve_id(&store, user_id, sid)? else {
             return Ok(None);
         };
@@ -651,7 +764,7 @@ impl SessionQuery for StoreQuery {
         &self,
         user_id: &str,
         sid: &str,
-        _query: &ListQuery,
+        query: &ListQuery,
     ) -> Result<Option<serde_json::Value>, QueryBackendError> {
         let Some(store) = self.open()? else {
             return Ok(None);
@@ -659,7 +772,9 @@ impl SessionQuery for StoreQuery {
         let Some(id) = self.resolve_id(&store, user_id, sid)? else {
             return Ok(None);
         };
-        let tree = process_tree(store.connection(), user_id, id).map_err(map_query)?;
+        let expr = store_expr(query.filter.as_deref())?;
+        let tree = process_tree_filtered(store.connection(), user_id, id, expr.as_ref())
+            .map_err(map_query)?;
         Ok(tree.map(|nodes| serde_json::json!({ "processes": nodes_json(&nodes) })))
     }
 
@@ -979,7 +1094,7 @@ impl SessionQuery for StoreQuery {
                 "reason": "per-user db stats is not exported by aw-store",
             }));
         }
-        let mut store = Store::open(&path).map_err(map_store)?;
+        let mut store = Store::open_runtime(&path).map_err(map_store)?;
         let retention = Retention::new(&mut store, &path, RetentionConfig::default());
         let stats = retention.stats().map_err(map_store)?;
         Ok(serde_json::json!({
@@ -1158,7 +1273,32 @@ impl StoreQuery {
     /// unlike [`StoreQuery::open`], which treats absence as "no database".
     fn open_mut(&self) -> Result<Store, QueryBackendError> {
         let path = self.db_path.as_ref().ok_or_else(missing_db)?;
-        Store::open(path).map_err(map_store)
+        let store = Store::open_runtime(path).map_err(map_store)?;
+        require_writable(&store)?;
+        Ok(store)
+    }
+
+    /// `None` means this daemon has not created a session database yet. The
+    /// flag is intentionally available independently of a write endpoint so
+    /// API clients can disable mutating controls before submitting a request.
+    pub(crate) fn database_read_only(&self) -> Result<Option<bool>, QueryBackendError> {
+        let Some(path) = &self.db_path else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        Store::open_runtime(path)
+            .map(|store| Some(store.is_read_only()))
+            .map_err(map_store)
+    }
+}
+
+fn require_writable(store: &Store) -> Result<(), QueryBackendError> {
+    if store.is_read_only() {
+        Err(QueryBackendError::ReadOnlyNewer)
+    } else {
+        Ok(())
     }
 }
 
@@ -1215,7 +1355,17 @@ fn map_query(err: QueryError) -> QueryBackendError {
 }
 
 fn map_store(err: StoreError) -> QueryBackendError {
-    QueryBackendError::Store(err.to_string())
+    match err {
+        StoreError::Busy { waited, op, source } => QueryBackendError::Busy {
+            waited_seconds: waited.as_secs().max(1),
+            detail: format!("{op}: {source}"),
+        },
+        StoreError::ReadOnly => QueryBackendError::ReadOnlyNewer,
+        StoreError::LegacyWalConversion { path, reason } => {
+            QueryBackendError::LegacyWalConversion { path, reason }
+        }
+        err => QueryBackendError::Store(err.to_string()),
+    }
 }
 
 /// `step` uses the same `<n>`, `<n>s`, `<n>ms`, `<n>ns` forms as `window`.
@@ -1689,7 +1839,7 @@ fn gap_json(row: &aw_store::GapItem) -> serde_json::Value {
 
 #[cfg(test)]
 mod label_tests {
-    use super::{argv_value, session_label};
+    use super::{argv_value, session_label, QueryBackendError, StoreQuery};
 
     /// UI re-review #144 new-5: a session started with 「启动程序」 was listed
     /// as `s-31988513fa4a`; with no name, the command is the label.
@@ -1710,5 +1860,41 @@ mod label_tests {
             serde_json::json!(["sleep", "90"])
         );
         assert!(argv_value(None).is_null());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn newer_database_is_reported_read_only_and_rejects_mutations() {
+        let dir = std::env::temp_dir().join(format!(
+            "aw-query-newer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let path = dir.join("agentwatch.db");
+        let store = aw_store::Store::open(&path).expect("seed store");
+        store
+            .connection()
+            .execute(
+                "UPDATE schema_meta SET value = '12' WHERE key = 'schema_version'",
+                [],
+            )
+            .expect("future version");
+        drop(store);
+
+        let query = StoreQuery::open_path(path);
+        assert_eq!(
+            query.database_read_only().expect("read-only flag"),
+            Some(true)
+        );
+        assert!(matches!(
+            query.open_mut(),
+            Err(QueryBackendError::ReadOnlyNewer)
+        ));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

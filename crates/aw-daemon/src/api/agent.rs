@@ -738,7 +738,7 @@ pub(crate) fn list_agent_events(
     sid: &str,
     raw_query: &str,
 ) -> super::routes::ApiResponse {
-    use super::http_events::{json_response, open_owned, page_limit, query_pairs};
+    use super::http_events::{json_response, open_visible, page_limit, query_pairs};
     use super::routes::error_response;
 
     let pairs = query_pairs(raw_query);
@@ -753,7 +753,7 @@ pub(crate) fn list_agent_events(
             Err(_) => return error_response(400, "bad_argument", "cursor: expected an integer"),
         },
     };
-    let (store, session_id) = match open_owned(state, &caller.user_id, sid) {
+    let (store, session_id, _owner) = match open_visible(state, caller, sid) {
         Ok(Some(pair)) => pair,
         Ok(None) => return error_response(404, "not_found", "session not found"),
         Err(response) => return response,

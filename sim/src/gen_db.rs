@@ -2,9 +2,8 @@
 //! database for use as a query-performance benchmark (P2-STORE-03).
 //!
 //! The generated database contains `file_access` and `processes` rows in
-//! the schema defined by `crates/aw-store/migrations/`.  `sim` does not
-//! depend on `aw-store`, so the schema is replicated here as a minimal
-//! subset sufficient for benchmark queries.
+//! the schema defined by `crates/aw-store/migrations/`. The schema is
+//! replicated here as a minimal subset sufficient for benchmark queries.
 //!
 //! # Schema (subset)
 //!
@@ -78,18 +77,14 @@ pub(crate) struct Opts {
 }
 
 // ---------------------------------------------------------------------------
-// Generator — pure Rust using SQLite through raw rusqlite calls.
-// rusqlite is already a dev-dependency of sim (via serve integration tests);
-// here it is used directly since sim/Cargo.toml already carries it at
-// version 0.32.1.
+// Generator — raw SQL through rusqlite, with aw-store's shared connection
+// opener so every SQLite connection has the product busy-timeout contract.
 // ---------------------------------------------------------------------------
 
 /// Generate the database.  This is also callable from unit tests.
 pub(crate) fn generate(opts: &Opts) -> Result<(), String> {
-    use rusqlite::Connection;
-
-    let conn =
-        Connection::open(&opts.out).map_err(|e| format!("open {}: {e}", opts.out.display()))?;
+    let conn = aw_store::open_connection(&opts.out)
+        .map_err(|e| format!("open {}: {e}", opts.out.display()))?;
 
     conn.execute_batch(SCHEMA)
         .map_err(|e| format!("create schema: {e}"))?;
@@ -136,8 +131,7 @@ pub(crate) fn generate(opts: &Opts) -> Result<(), String> {
     let ops = OPS;
     let evidences = EVIDENCES;
 
-    let tx = conn
-        .unchecked_transaction()
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| format!("begin tx: {e}"))?;
 
     for sid in 1..=sessions {
@@ -289,7 +283,6 @@ const EVIDENCES: &[&str] = &["E1", "E2", "E1", "E1", "E3"];
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
 
     fn temp_path(suffix: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
@@ -314,7 +307,7 @@ mod tests {
         };
         generate(&opts).unwrap();
 
-        let conn = Connection::open(&path).unwrap();
+        let conn = aw_store::open_connection(&path).unwrap();
         let count: i64 = conn
             .query_row("SELECT count(*) FROM file_access", [], |r| r.get(0))
             .unwrap();
@@ -336,7 +329,7 @@ mod tests {
             sessions: 1,
         })
         .unwrap();
-        let conn = Connection::open(&path).unwrap();
+        let conn = aw_store::open_connection(&path).unwrap();
         let v: String = conn
             .query_row(
                 "SELECT value FROM schema_meta WHERE key='schema_version'",
@@ -377,7 +370,7 @@ mod tests {
             sessions: 1,
         })
         .unwrap();
-        let conn = Connection::open(&path).unwrap();
+        let conn = aw_store::open_connection(&path).unwrap();
         let mut stmt = conn
             .prepare("SELECT DISTINCT op FROM file_access ORDER BY op")
             .unwrap();

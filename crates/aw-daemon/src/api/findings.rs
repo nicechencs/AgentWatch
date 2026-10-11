@@ -16,7 +16,7 @@ use aw_pipeline::wording::{render, Lang, WordingError};
 
 use super::auth::Caller;
 use super::http_events::{
-    json_response, open_owned, page_limit, parse_cursor, parse_lang, query_pairs,
+    json_response, open_owned, open_visible, page_limit, parse_cursor, parse_lang, query_pairs,
 };
 use super::routes::{error_response, ApiResponse, ApiState};
 
@@ -25,7 +25,7 @@ use super::routes::{error_response, ApiResponse, ApiState};
 pub(crate) mod share {
     pub(crate) use super::super::auth::Caller;
     pub(crate) use super::super::http_events::{
-        flag_on, json_response, open_owned, parse_lang, query_pairs,
+        flag_on, json_response, open_visible, parse_lang, query_pairs,
     };
     pub(crate) use super::super::routes::{error_response, ApiResponse, ApiState};
     pub(crate) use super::{findings_for_report, FindingView};
@@ -84,16 +84,16 @@ pub(crate) fn get_findings(
         }
     }
 
-    let opened = match open_owned(state, &caller.user_id, sid) {
+    let opened = match open_visible(state, caller, sid) {
         Ok(Some(pair)) => pair,
         Ok(None) => return error_response(404, "not_found", "session not found"),
         Err(response) => return response,
     };
-    let (store, session_id) = opened;
+    let (store, session_id, owner) = opened;
     match list_findings(
         store.connection(),
         session_id,
-        &caller.user_id,
+        &owner,
         lang,
         min_severity,
         &evidence,
@@ -144,6 +144,9 @@ pub(crate) fn patch_finding(
         Err(response) => return response,
     };
     let (store, session_id) = opened;
+    if store.is_read_only() {
+        return super::routes::database_read_only_newer_response();
+    }
     let now_ns = unix_ns();
     // A null body clears the mark and who/when. A set records this caller.
     let (mark, by, at): (Option<&str>, Option<&str>, Option<i64>) = match user_state.as_deref() {

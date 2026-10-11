@@ -119,12 +119,22 @@ fn send_blocking(endpoint: &Endpoint, body: &[u8]) -> io::Result<()> {
 
 /// Length-prefixed frame: 4 byte big-endian length, then the JSON body.
 ///
-/// Unix sockets and Windows named pipes are both opened through `File`. On
-/// Windows a pipe path (`\\.\pipe\...`) opens that way; on Unix a socket path
-/// does not, and the write fails. That failure is a drop. This card does not
-/// add `uds` or a Win32 pipe client — neither is in the lockfile.
+/// On Unix, opening a socket through `File` fails and the hook is dropped.
+/// Windows must use aw-channel's protected named-pipe open: a hook can carry
+/// agent input, so no byte may go to a pipe before identification SQOS and the
+/// daemon-owner check succeed.
+#[cfg(not(windows))]
 fn write_frame(path: &Path, body: &[u8]) -> io::Result<()> {
     let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
+    file.write_all(&len.to_be_bytes())?;
+    file.write_all(body)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_frame(path: &Path, body: &[u8]) -> io::Result<()> {
+    let mut file = aw_channel::open_pipe_client(path).map_err(io::Error::other)?;
     let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
     file.write_all(&len.to_be_bytes())?;
     file.write_all(body)?;

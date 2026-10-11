@@ -136,3 +136,58 @@ fn ps_reads_the_daemon_table_over_the_socket() {
         "{stdout}"
     );
 }
+
+/// Reverse test for the test-only purge target (review 14:40): a build without
+/// `test-purge-data-dir` (the release configuration) has no `--data-dir` on
+/// `daemon uninstall`. Pointing it at an ordinary directory is refused and the
+/// directory and its contents are still there afterwards.
+#[cfg(not(feature = "test-purge-data-dir"))]
+#[test]
+fn uninstall_purge_data_dir_is_rejected_and_deletes_nothing() {
+    let dir = std::env::temp_dir().join(format!("aw-purge-reverse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("nested")).unwrap();
+    std::fs::write(dir.join("nested/keep"), b"keep").unwrap();
+    let out = aw()
+        .args(["daemon", "uninstall", "--purge", "--data-dir"])
+        .arg(&dir)
+        .output()
+        .expect("spawn aw");
+    let kept = dir.join("nested/keep").exists();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !out.status.success(),
+        "release-style build accepted --data-dir; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(kept, "the ordinary directory was deleted");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "没有「--data-dir」这个参数，用 `aw daemon uninstall --help` 可以看全部参数。"
+        ),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("unexpected argument"), "stderr: {stderr}");
+}
+
+/// Any unknown flag gets the Chinese sentence naming the flag and the help
+/// command of the subcommand it was given to, not clap's English error.
+#[test]
+fn unknown_argument_is_reported_in_chinese_with_subcommand_help() {
+    let out = output(&["sessions", "--no-such-flag=1"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("没有「--no-such-flag」这个参数，用 `aw sessions --help` 可以看全部参数。"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("unexpected argument"), "stderr: {stderr}");
+    let out = output(&["--bogus", "version"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("没有「--bogus」这个参数，用 `aw version --help` 可以看全部参数。"),
+        "stderr: {stderr}"
+    );
+}

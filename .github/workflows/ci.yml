@@ -43,6 +43,22 @@ jobs:
         run: scripts/check-daemon-current-user.sh
       - name: cargo test
         run: cargo test --workspace --no-fail-fast
+      # Review 14:40: `aw daemon uninstall --purge --data-dir` exists only in
+      # test builds (feature test-purge-data-dir). Run its own tests with the
+      # feature, then prove the RELEASE binary rejects the flag and leaves an
+      # ordinary directory in place.
+      - name: purge --data-dir is test-build only
+        shell: bash
+        run: |
+          cargo test -p aw-cli --features test-purge-data-dir --bin aw uninstall_
+          cargo build --release -p aw-cli --bin aw
+          dir="$RUNNER_TEMP/aw-purge-release-check"
+          mkdir -p "$dir/nested" && echo keep > "$dir/nested/keep"
+          if target/release/aw daemon uninstall --purge --data-dir "$dir"; then
+            echo "release aw accepted --data-dir"; exit 1
+          fi
+          test -f "$dir/nested/keep" || { echo "release aw deleted the directory"; exit 1; }
+          echo "release aw rejected --data-dir; directory kept"
       # macOS: these two crates' tests must actually run. `cargo test
       # --workspace` above includes them; this step prints their names so a
       # green log shows macos::launch::tests, macos::tests and macos::spawn::tests

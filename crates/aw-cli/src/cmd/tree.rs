@@ -402,6 +402,7 @@ pub(crate) enum DaemonCmd {
         #[arg(long)]
         check: bool,
         /// 仅用于测试：`--purge` 时删除这个指定的数据目录，不触碰系统后台的数据
+        #[cfg(feature = "test-purge-data-dir")]
         #[arg(long, value_name = "DIR")]
         data_dir: Option<std::path::PathBuf>,
     },

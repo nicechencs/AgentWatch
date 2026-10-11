@@ -19,6 +19,13 @@ path = "src/main.rs"
 name = "aw_cli"
 path = "src/lib.rs"
 
+[features]
+# Test builds only (like aw-platform's `test-hold-delay`): enables
+# `aw daemon uninstall --purge --data-dir <DIR>`, which deletes the named
+# directory. Release builds do not have the flag, so clap rejects it and no
+# deletion code is compiled in. CI runs the release binary to prove that.
+test-purge-data-dir = []
+
 [dependencies]
 aw-core = { workspace = true }
 aw-platform = { workspace = true }

@@ -101,7 +101,7 @@ pub(crate) fn execute_args(args: &[String]) -> io::Result<Outcome> {
     let env_token = EndpointInput::from_args(None, None, None).token_env;
     match Cli::try_parse_from(std::iter::once("aw".to_owned()).chain(args.iter().cloned())) {
         Ok(cli) => dispatch_live(cli, env_token),
-        Err(err) => Ok(usage_outcome(err)),
+        Err(err) => Ok(usage_outcome(err, args)),
     }
 }
 
@@ -514,16 +514,19 @@ pub(crate) fn execute_args_with_control(
 ) -> io::Result<Outcome> {
     match Cli::try_parse_from(std::iter::once("aw".to_owned()).chain(args.iter().cloned())) {
         Ok(cli) => dispatch(cli, env_token, http, source, control),
-        Err(err) => Ok(usage_outcome(err)),
+        Err(err) => Ok(usage_outcome(err, args)),
     }
 }
 
-fn usage_outcome(err: clap::Error) -> Outcome {
+fn usage_outcome(err: clap::Error, args: &[String]) -> Outcome {
     let code = match err.kind() {
         ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => exit::OK,
         _ => exit::USAGE,
     };
-    let message = err.render().to_string();
+    let message = match unknown_argument_message(&err, args) {
+        Some(message) => message,
+        None => err.render().to_string(),
+    };
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     if code == exit::OK {
@@ -536,6 +539,48 @@ fn usage_outcome(err: clap::Error) -> Outcome {
         stdout,
         stderr,
     }
+}
+
+/// clap's own text for an unknown flag is English ("error: unexpected
+/// argument ..."). Show the reviewed Chinese sentence instead, naming the flag
+/// and the help command of the subcommand it was given to.
+fn unknown_argument_message(err: &clap::Error, args: &[String]) -> Option<String> {
+    use clap::error::{ContextKind, ContextValue};
+    if err.kind() != ErrorKind::UnknownArgument {
+        return None;
+    }
+    let arg = match err.get(ContextKind::InvalidArg)? {
+        ContextValue::String(value) => value.clone(),
+        _ => return None,
+    };
+    let arg = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
+    Some(format!(
+        "没有「{arg}」这个参数，用 `{} --help` 可以看全部参数。\n",
+        subcommand_path(args)
+    ))
+}
+
+/// `aw daemon uninstall` for `["daemon", "uninstall", "--purge", ...]`:
+/// follow the arguments down the command tree as far as they name
+/// subcommands. Flags and their values are skipped.
+fn subcommand_path(args: &[String]) -> String {
+    use clap::CommandFactory;
+    let mut command = Cli::command();
+    let mut path = vec!["aw".to_owned()];
+    for arg in args {
+        if arg == "--" {
+            break;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        let Some(sub) = command.find_subcommand(arg).cloned() else {
+            continue;
+        };
+        path.push(sub.get_name().to_owned());
+        command = sub;
+    }
+    path.join(" ")
 }
 
 fn dispatch(
@@ -1016,6 +1061,7 @@ fn ops_command(
                 | tree::DaemonCmd::Restart
                 | tree::DaemonCmd::Logs { .. } => return None,
                 tree::DaemonCmd::Install { yes } => daemon::DaemonOp::Install { confirm: *yes },
+                #[cfg(feature = "test-purge-data-dir")]
                 tree::DaemonCmd::Uninstall {
                     purge,
                     check,
@@ -1024,6 +1070,14 @@ fn ops_command(
                     purge: *purge,
                     check: *check,
                     data_dir: data_dir.clone(),
+                },
+                // Release builds have no `--data-dir`: the op never names a
+                // directory to delete.
+                #[cfg(not(feature = "test-purge-data-dir"))]
+                tree::DaemonCmd::Uninstall { purge, check } => daemon::DaemonOp::Uninstall {
+                    purge: *purge,
+                    check: *check,
+                    data_dir: None,
                 },
             };
             Some(daemon::run(

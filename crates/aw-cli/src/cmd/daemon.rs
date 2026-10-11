@@ -6,7 +6,9 @@
 //! and exit 4 when it says the caller is not an administrator.
 
 use serde_json::json;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "test-purge-data-dir")]
+use std::path::Path;
+use std::path::PathBuf;
 
 use crate::exit;
 
@@ -134,11 +136,18 @@ impl DaemonControl for PlannedControl {
                 if *check {
                     ("checked", "此构建的 uninstall --check 没有发现可移除内容")
                 } else if *purge {
-                    if let Some(path) = data_dir.as_deref() {
-                        remove_test_data_dir(path)?;
-                        ("removed", "已删除指定的测试数据目录；没有移除系统服务")
-                    } else {
-                        ("planned", "已记录 uninstall --purge；没有删除数据库")
+                    match data_dir.as_deref() {
+                        #[cfg(feature = "test-purge-data-dir")]
+                        Some(path) => {
+                            remove_test_data_dir(path)?;
+                            ("removed", "已删除指定的测试数据目录；没有移除系统服务")
+                        }
+                        #[cfg(feature = "test-purge-data-dir")]
+                        None => ("planned", "已记录 uninstall --purge；没有删除数据库"),
+                        // Release builds never delete a directory, even if a
+                        // future caller builds the op with a path.
+                        #[cfg(not(feature = "test-purge-data-dir"))]
+                        _ => ("planned", "已记录 uninstall --purge；没有删除数据库"),
                     }
                 } else {
                     ("planned", "已记录 uninstall；没有移除服务")
@@ -155,7 +164,8 @@ impl DaemonControl for PlannedControl {
 /// Remove only an explicit test target.  The normal daemon data directory is
 /// deliberately not inferred here, so this command cannot accidentally affect
 /// an installed service.  A filesystem root and a path without a final name
-/// are never valid removal targets.
+/// are never valid removal targets.  Compiled into test builds only.
+#[cfg(feature = "test-purge-data-dir")]
 fn remove_test_data_dir(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() || path.file_name().is_none() {
         return Err("测试数据目录无效，拒绝删除".to_owned());
@@ -585,6 +595,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-purge-data-dir")]
     #[test]
     fn uninstall_can_remove_only_an_explicit_test_data_directory() {
         let path =
@@ -604,6 +615,32 @@ mod tests {
         );
         assert_eq!(outcome.code, exit::OK);
         assert!(!path.exists(), "only the supplied test target is removed");
+    }
+
+    /// Release configuration: even an op that names a directory never
+    /// deletes it (the CLI cannot build one, this guards future callers).
+    #[cfg(not(feature = "test-purge-data-dir"))]
+    #[test]
+    fn release_uninstall_purge_never_deletes_a_named_directory() {
+        let path =
+            std::env::temp_dir().join(format!("aw-cli-uninstall-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("temp dir");
+        std::fs::write(path.join("keep"), b"keep").expect("temp file");
+        let outcome = run(
+            DaemonOp::Uninstall {
+                purge: true,
+                check: false,
+                data_dir: Some(path.clone()),
+            },
+            false,
+            &Admin(true),
+            &mut PlannedControl,
+        );
+        let kept = path.join("keep").exists();
+        let _ = std::fs::remove_dir_all(&path);
+        assert_eq!(outcome.code, exit::OK);
+        assert!(kept, "release build must not delete the named directory");
     }
 
     #[test]

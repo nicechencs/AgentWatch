@@ -674,8 +674,10 @@ mod pipe {
 
     /// Finish this one-request pipe instance. Flushing is blocking on Windows
     /// (it waits until the client reads the buffered reply), so keep it off the
-    /// current-thread accept runtime. Always disconnect afterwards; a dropped
-    /// handle alone made later clients intermittently see a broken pipe.
+    /// current-thread accept runtime. Never `DisconnectNamedPipe` after a
+    /// reply: it makes the client's next read fail (ERROR_PIPE_NOT_CONNECTED)
+    /// instead of ending cleanly. The instance is closed when `pipe` drops; the
+    /// client stops at the reply's Content-Length.
     async fn finish(pipe: &NamedPipeServer) -> io::Result<()> {
         let raw = pipe.as_raw_handle() as usize;
         let flushed = tokio::task::spawn_blocking(move || {
@@ -685,8 +687,7 @@ mod pipe {
         })
         .await
         .map_err(|_| io::Error::other("named-pipe flush task failed"))?;
-        let disconnected = pipe.disconnect();
-        flushed.and(disconnected)
+        flushed
     }
 }
 

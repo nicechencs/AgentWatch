@@ -502,11 +502,46 @@ fn roundtrip<S: Read + Write>(stream: &mut S, bytes: &[u8]) -> Result<Vec<u8>, D
     stream
         .write_all(bytes)
         .map_err(|err| io_broken("write", &err))?;
+    read_framed(stream)
+}
+
+/// Read one HTTP/1.1 reply and stop at its declared end: the head, then
+/// exactly `Content-Length` body bytes. Without a length, read to EOF. The
+/// server closes its end after replying; on a Windows named pipe that close
+/// can surface as an error rather than EOF, so once the declared reply is
+/// complete nothing more is read.
+fn read_framed<S: Read>(stream: &mut S) -> Result<Vec<u8>, DialError> {
     let mut out = Vec::new();
-    stream
-        .read_to_end(&mut out)
-        .map_err(|err| io_broken("read", &err))?;
-    Ok(out)
+    let mut buf = [0_u8; 8 * 1024];
+    loop {
+        if let Some(total) = framed_len(&out) {
+            if out.len() >= total {
+                out.truncate(total);
+                return Ok(out);
+            }
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => return Ok(out),
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(io_broken("read", &err)),
+        }
+    }
+}
+
+/// Total reply length (head + body) once the head is complete and carries a
+/// `Content-Length`; `None` while the head is incomplete or has no length.
+fn framed_len(bytes: &[u8]) -> Option<usize> {
+    let end = bytes.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let head = std::str::from_utf8(&bytes[..end]).ok()?;
+    let length = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    })?;
+    end.checked_add(length)
 }
 
 fn io_broken(what: &str, err: &io::Error) -> DialError {
@@ -517,6 +552,46 @@ fn io_broken(what: &str, err: &io::Error) -> DialError {
         DialError::Timeout(format!("{what}: {}", err.kind()))
     } else {
         DialError::Broken(format!("{what}: {}", err.kind()))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod framing_tests {
+    use super::read_framed;
+    use std::io::{self, Read};
+
+    /// Yields its bytes, then an error instead of EOF (a Windows pipe whose
+    /// server closed after replying).
+    struct ThenError(io::Cursor<Vec<u8>>);
+    impl Read for ThenError {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.read(buf)? {
+                0 => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+                n => Ok(n),
+            }
+        }
+    }
+
+    #[test]
+    fn stops_at_content_length_and_never_reads_past_the_reply() {
+        let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec();
+        let got =
+            read_framed(&mut ThenError(io::Cursor::new(reply.clone()))).expect("framed reply");
+        assert_eq!(got, reply);
+    }
+
+    #[test]
+    fn without_a_length_reads_to_eof() {
+        let reply = b"HTTP/1.1 204 No Content\r\n\r\n".to_vec();
+        let got = read_framed(&mut io::Cursor::new(reply.clone())).expect("framed reply");
+        assert_eq!(got, reply);
+    }
+
+    #[test]
+    fn a_truncated_body_is_an_error_not_a_short_reply() {
+        let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nok".to_vec();
+        assert!(read_framed(&mut ThenError(io::Cursor::new(reply))).is_err());
     }
 }
 

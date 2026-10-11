@@ -1206,7 +1206,8 @@ mod tests {
     #[ignore = "needs root and a normal account"]
     fn root_hold_does_not_distinguish_a_program_in_a_private_directory() {
         use crate::{
-            EnvSource, IdentifiedCaller, Owner, PeerIdentity, PlatformError, SpawnRequest,
+            EnvSource, IdentifiedCaller, Owner, PeerIdentity, PlatformError, SpawnFailure,
+            SpawnRequest,
         };
         use std::os::unix::fs::PermissionsExt;
 
@@ -1250,16 +1251,16 @@ mod tests {
                 Err(error) => error,
                 Ok(_) => panic!("inaccessible program must fail"),
             };
-            let PlatformError::Io(error) = error else {
-                panic!("expected child exec error");
+            let PlatformError::Spawn(kind) = error else {
+                panic!("expected a typed child exec failure, got {error:?}");
             };
-            (error.kind(), error.to_string())
+            kind
         };
 
         let present = attempt(&program);
         std::fs::remove_file(&program).expect("remove hidden program");
         let absent = attempt(&program);
-        assert_eq!(present.0, std::io::ErrorKind::PermissionDenied);
+        assert_eq!(present, SpawnFailure::ProgramNotPermitted);
         assert_eq!(present, absent, "presence below 0700 changed the result");
         let _ = std::fs::remove_dir_all(&dir);
     }

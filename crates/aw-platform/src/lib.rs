@@ -458,6 +458,51 @@ pub fn note_pipe_peer_identification() {
     windows::note_pipe_peer_identification();
 }
 
+/// Build the minimal environment for a program launched by the Windows daemon.
+///
+/// On Windows this is built from the current account's profile, not from the
+/// daemon process environment. Other systems have their own account-environment
+/// builders, so asking for the Windows form is explicit unsupported there.
+#[cfg(windows)]
+pub fn account_base_env() -> Result<Vec<(String, String)>, PlatformError> {
+    windows::account_base_env()
+}
+
+/// Windows account-profile environments are not available on this OS.
+#[cfg(not(windows))]
+pub fn account_base_env() -> Result<Vec<(String, String)>, PlatformError> {
+    Err(PlatformError::Unsupported {
+        capability: "account_base_env",
+        os: std::env::consts::OS,
+        kind: UnsupportedKind::NotSupportedOnThisOs,
+    })
+}
+
+/// Whether a caller may replace a base environment variable.
+///
+/// Unix names are case-sensitive, while Windows names are not. Keeping that
+/// choice with the platform avoids a target-OS branch in shared launch code.
+#[must_use]
+pub fn is_reserved_env_name(name: &str, case_insensitive: bool) -> bool {
+    const RESERVED: [&str; 5] = ["HOME", "USER", "LOGNAME", "SHELL", "PATH"];
+
+    RESERVED.iter().any(|reserved| {
+        if case_insensitive {
+            name.eq_ignore_ascii_case(reserved)
+        } else {
+            name == *reserved
+        }
+    })
+}
+
+/// Windows environment names are case-insensitive, including the reserved
+/// names that requests may not replace.
+#[cfg(windows)]
+#[must_use]
+pub fn windows_reserved_env_name(name: &str) -> bool {
+    windows::windows_reserved_env_name(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +521,31 @@ mod tests {
         assert_eq!(Capability::SpawnAsCaller.as_str(), "spawn_as_caller");
         assert_eq!(Capability::SpawnAsCaller.zh(), "以连接方身份启动");
         assert_eq!(Capability::ExitCode.zh(), "退出码");
+    }
+
+    #[test]
+    fn reserved_environment_names_follow_the_platform_case_rule() {
+        for name in ["Path", "path", "PATH", "Home"] {
+            assert!(is_reserved_env_name(name, true), "{name} must be reserved");
+        }
+        for name in ["LANG", "TZ", "LC_ALL"] {
+            assert!(!is_reserved_env_name(name, true), "{name} is not reserved");
+        }
+        assert!(is_reserved_env_name("PATH", false));
+        assert!(!is_reserved_env_name("Path", false));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_account_environment_is_explicitly_unsupported_off_windows() {
+        assert!(matches!(
+            account_base_env(),
+            Err(PlatformError::Unsupported {
+                capability: "account_base_env",
+                kind: UnsupportedKind::NotSupportedOnThisOs,
+                ..
+            })
+        ));
     }
 
     #[cfg(target_os = "linux")]

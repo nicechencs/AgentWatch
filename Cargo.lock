@@ -79,6 +79,7 @@ dependencies = [
  "aw-collector-windows",
  "aw-core",
  "aw-pipeline",
+ "aw-platform",
  "aw-proxy",
  "aw-store",
  "clap",
@@ -188,6 +189,7 @@ dependencies = [
  "aw-collector-macos",
  "aw-collector-windows",
  "nix",
+ "windows 0.57.0",
 ]
 
 [[package]]

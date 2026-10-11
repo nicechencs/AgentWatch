@@ -52,8 +52,13 @@ fn is_sid_text(text: &str) -> bool {
 /// Who is on the other end of a pipe connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipeClient {
+    /// PID returned by `GetNamedPipeClientProcessId`; it is advisory until the
+    /// token query below succeeds, at which point both facts identify one peer.
+    pub pid: u32,
     /// String SID of the client process token (`S-1-5-21-…`).
     pub sid: String,
+    /// `TokenElevation` from that client's token.
+    pub elevated: bool,
     /// Elevated token or LocalSystem.
     pub admin: bool,
 }
@@ -185,6 +190,10 @@ mod imp {
         };
         let mut options = ServerOptions::new();
         options.first_pipe_instance(first);
+        // Be explicit even though Tokio's current default is true: this pipe
+        // is local-only by contract and must retain PIPE_REJECT_REMOTE_CLIENTS
+        // if Tokio's default ever changes.
+        options.reject_remote_clients(true);
         // SAFETY: `attributes` is a valid SECURITY_ATTRIBUTES whose descriptor
         // stays allocated until after this call; the kernel copies it into the
         // pipe object, so freeing it afterwards is allowed.
@@ -219,13 +228,13 @@ mod imp {
         // SAFETY: `process` is owned here and not used again.
         let _ = unsafe { CloseHandle(process) };
         opened.map_err(os_err)?;
-        let result = token_identity(token);
+        let result = token_identity(token, pid);
         // SAFETY: `token` was opened above and is not used again.
         let _ = unsafe { CloseHandle(token) };
         result
     }
 
-    fn token_identity(token: HANDLE) -> io::Result<PipeClient> {
+    fn token_identity(token: HANDLE, pid: u32) -> io::Result<PipeClient> {
         let mut needed = 0_u32;
         // SAFETY: size query with no buffer.
         let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
@@ -265,6 +274,8 @@ mod imp {
         .map_err(os_err)?;
         let elevated = elevation.TokenIsElevated != 0;
         Ok(PipeClient {
+            pid,
+            elevated,
             admin: is_admin(&sid, elevated),
             sid,
         })

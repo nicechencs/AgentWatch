@@ -585,10 +585,31 @@ mod pipe {
         control: Arc<Control>,
     ) -> io::Result<()> {
         let caller = match client_identity(&pipe) {
-            Ok(client) => Caller {
-                user_id: client.sid,
-                admin: client.admin,
-            },
+            Ok(client) => {
+                // Keep the transport result in the platform identity shape
+                // before deriving route authorization.  There is no daemon
+                // identity fallback: a failed token query took the 403 branch.
+                let peer = aw_platform::PeerIdentity::Identified {
+                    owner: aw_platform::Owner::Windows {
+                        sid: client.sid.clone(),
+                        elevated: client.elevated,
+                    },
+                    pid: Some(client.pid),
+                };
+                if aw_platform::IdentifiedCaller::from_peer(peer).is_err() {
+                    let response = error_response(
+                        403,
+                        "unidentified_peer",
+                        "pipe client could not be identified",
+                    );
+                    write_all(&pipe, &response_bytes(&response)).await?;
+                    return Ok(());
+                }
+                Caller {
+                    user_id: client.sid,
+                    admin: client.admin,
+                }
+            }
             Err(err) => {
                 tracing::warn!(target: "aw_daemon::ipc", error = %err, "pipe client not identified");
                 let response = error_response(

@@ -19,6 +19,23 @@ aw-collector-macos = { path = "../aw-collector-macos" }
 
 [target.'cfg(windows)'.dependencies]
 aw-collector-windows = { path = "../aw-collector-windows" }
+# This is the already locked `windows` 0.57 package.  The platform boundary is
+# the only shared-code crate that calls the Windows process APIs.
+windows = { version = "=0.57.0", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
-[lints]
-workspace = true
+# `windows/mod.rs` is the narrowly-scoped FFI boundary; the module documents
+# each call and opts in locally.  Inheriting the workspace `forbid` would make
+# that scoped opt-in impossible (as in aw-collector-windows).
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

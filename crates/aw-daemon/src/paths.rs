@@ -46,9 +46,16 @@ pub fn default_config_path() -> io::Result<PathBuf> {
 ///
 /// Returns the `create_dir_all` error. Does not fall back to another directory.
 pub fn ensure_data_dir(dir: &Path) -> io::Result<()> {
-    aw_platform::platform()
-        .secure_data_dir(dir)
-        .map_err(platform_error)
+    let platform = aw_platform::platform();
+    // Only the privileged daemon's default system location receives the
+    // platform ACL. Configured and test directories remain caller-owned.
+    let protect = platform.is_privileged() == Some(true)
+        && platform.default_data_dir().ok().as_deref() == Some(dir);
+    if protect {
+        platform.secure_data_dir(dir).map_err(platform_error)
+    } else {
+        std::fs::create_dir_all(dir)
+    }
 }
 
 fn platform_error(error: aw_platform::PlatformError) -> io::Error {

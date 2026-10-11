@@ -1,5 +1,7 @@
 //! Explicit operating-system boundary for AgentWatch shared code.
-#![forbid(unsafe_code)]
+// Windows FFI is deliberately confined to `windows/`, where each call is
+// documented with its safety invariant.  The shared boundary stays unsafe-free.
+#![deny(unsafe_code)]
 use std::fmt;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
@@ -107,6 +109,9 @@ pub struct ProcessEntry {
     pub ppid: Option<u32>,
     pub exe: Option<PathBuf>,
     pub argv: Option<Vec<String>>,
+    /// `NA(reason)` when arguments are not available.  Windows deliberately
+    /// does not scrape another process's PEB as part of a cheap table scan.
+    pub argv_na_reason: Option<&'static str>,
     pub owner: Option<Owner>,
 }
 impl fmt::Debug for ProcessEntry {
@@ -116,6 +121,7 @@ impl fmt::Debug for ProcessEntry {
             .field("ppid", &self.ppid)
             .field("exe", &self.exe)
             .field("argv_len", &self.argv.as_ref().map(Vec::len))
+            .field("argv_na_reason", &self.argv_na_reason)
             .field("owner", &self.owner)
             .finish()
     }
@@ -138,6 +144,8 @@ impl fmt::Debug for SpawnRequest {
 /// HELD: daemon death also kills the target (Linux gate EOF/PDEATHSIG; Windows suspended Job `KILL_ON_JOB_CLOSE`; macOS `POSIX_SPAWN_START_SUSPENDED` watchdog). RELEASED: target survives daemon restart. `abort`/Drop before release kill and reap.
 pub trait HeldChild: Send {
     fn pid(&self) -> u32;
+    /// Anti-reuse identity retained with the daemon-owned child handle.
+    fn key(&self) -> ProcessKey;
     fn release(&mut self) -> Result<(), PlatformError>;
     fn abort(&mut self) -> Result<(), PlatformError>;
 }
@@ -157,11 +165,12 @@ pub enum PeerIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentifiedCaller {
     owner: Owner,
+    pid: Option<u32>,
 }
 impl IdentifiedCaller {
     pub fn from_peer(peer: PeerIdentity) -> Result<Self, PlatformError> {
         match peer {
-            PeerIdentity::Identified { owner, .. } => Ok(Self { owner }),
+            PeerIdentity::Identified { owner, pid } => Ok(Self { owner, pid }),
             PeerIdentity::NotIdentified { .. } => Err(PlatformError::Invalid {
                 capability: "caller_identity",
                 detail: "caller was not identified",
@@ -172,6 +181,29 @@ impl IdentifiedCaller {
     pub(crate) fn owner(&self) -> &Owner {
         &self.owner
     }
+    #[allow(dead_code)]
+    pub(crate) const fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+}
+/// Identify this process through the active platform implementation.  This is
+/// for direct local launches (`aw run --no-daemon`); pipe callers must still be
+/// identified by their transport before constructing an [`IdentifiedCaller`].
+pub fn current_caller() -> Result<IdentifiedCaller, PlatformError> {
+    let entry = platform()
+        .process_identity(std::process::id())?
+        .ok_or(PlatformError::Invalid {
+            capability: "caller_identity",
+            detail: "current process identity unavailable",
+        })?;
+    let owner = entry.owner.ok_or(PlatformError::Invalid {
+        capability: "caller_identity",
+        detail: "current process owner unavailable",
+    })?;
+    IdentifiedCaller::from_peer(PeerIdentity::Identified {
+        owner,
+        pid: Some(entry.key.pid),
+    })
 }
 pub trait Platform: Send + Sync {
     fn os(&self) -> &'static str;

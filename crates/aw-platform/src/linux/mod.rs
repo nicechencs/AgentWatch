@@ -71,6 +71,7 @@ fn entry(pid: u32) -> Result<Option<ProcessEntry>, PlatformError> {
         ppid,
         exe: fs::read_link(root.join("exe")).ok(),
         argv,
+        argv_na_reason: None,
         owner,
     }))
 }

@@ -309,14 +309,14 @@ fn os_code(error: &std::io::Error) -> String {
 #[derive(Debug, Default)]
 pub(crate) struct CommandSpawner;
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 struct ProcessChild {
     child: Child,
     #[cfg(windows)]
     suspended: bool,
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 impl SpawnedChild for ProcessChild {
     fn pid(&self) -> u32 {
         self.child.id()
@@ -358,6 +358,7 @@ impl SpawnedChild for ProcessChild {
 /// the primary thread to resume.
 #[cfg(windows)]
 #[allow(unsafe_code)]
+#[allow(dead_code)] // retained test-only compatibility helper; production uses aw-platform.
 mod windows_release {
     use std::mem::size_of;
 
@@ -551,6 +552,44 @@ impl SpawnedChild for GatedChild {
     }
 }
 
+#[cfg(windows)]
+struct WindowsPlatformChild {
+    child: Box<dyn aw_platform::HeldChild>,
+    key: aw_platform::ProcessKey,
+}
+
+#[cfg(windows)]
+impl SpawnedChild for WindowsPlatformChild {
+    fn pid(&self) -> u32 {
+        self.child.pid()
+    }
+
+    fn wait(&mut self) -> Result<i32, String> {
+        loop {
+            match aw_platform::platform()
+                .reap_child(self.key)
+                .map_err(|error| error.to_string())?
+            {
+                aw_platform::ReapOutcome::Exited(code) => return Ok(code),
+                aw_platform::ReapOutcome::StillRunning => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                aw_platform::ReapOutcome::Signaled(_) | aw_platform::ReapOutcome::NotOurChild => {
+                    return Err("Windows 子进程不再由当前启动器持有".to_owned());
+                }
+            }
+        }
+    }
+
+    fn release(&mut self) -> Result<(), String> {
+        self.child.release().map_err(|error| error.to_string())
+    }
+
+    fn kill_and_reap(&mut self) {
+        let _ = self.child.abort();
+    }
+}
+
 impl Spawner for CommandSpawner {
     fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, String> {
         let Some((program, args)) = spec.command.split_first() else {
@@ -588,22 +627,29 @@ impl Spawner for CommandSpawner {
                 release_fd: Some(write_fd),
             }))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let _ = (program, args);
+            let caller = aw_platform::current_caller().map_err(|error| error.to_string())?;
+            let request = aw_platform::SpawnRequest {
+                command: spec.command.clone(),
+                cwd: spec.cwd.clone().map(Into::into),
+                env: spec.env.clone(),
+            };
+            let child = aw_platform::platform()
+                .spawn_suspended(&caller, &request)
+                .map_err(|error| error.to_string())?;
+            let key = child.key();
+            Ok(Box::new(WindowsPlatformChild { child, key }))
+        }
+        #[cfg(all(not(unix), not(windows)))]
         {
             let mut command = Command::new(program);
             command.args(args);
             configure_command(&mut command, spec);
-            #[cfg(windows)]
-            command.creation_flags(0x0000_0004); // CREATE_SUSPENDED
             command
                 .spawn()
-                .map(|child| {
-                    Box::new(ProcessChild {
-                        child,
-                        #[cfg(windows)]
-                        suspended: true,
-                    }) as Box<dyn SpawnedChild>
-                })
+                .map(|child| Box::new(ProcessChild { child }) as Box<dyn SpawnedChild>)
                 .map_err(|error| spawn_error_text(&error))
         }
     }
@@ -680,13 +726,8 @@ fn nix_spawn_error_text(error: nix::errno::Errno) -> String {
     spawn_error_text(&std::io::Error::from_raw_os_error(error as i32))
 }
 
-/// Windows production launcher.
-///
-/// Uses [`launch::production`]. Job assignment is unavailable in this crate
-/// (`forbid(unsafe_code)`, no `windows` dependency), so no process is created.
-/// The error is [`crate::launch::LaunchError::JobFailed`] and does not claim a
-/// Job. A real suspended `CreateProcess` needs the `windows` crate, which is
-/// out of scope for `aw-cli`.
+/// Windows production launcher.  The platform boundary retains the primary
+/// thread and process handles, so this crate never re-discovers a thread by PID.
 #[cfg(target_os = "windows")]
 #[derive(Debug, Default)]
 pub(crate) struct PlatformLauncher;
@@ -694,8 +735,51 @@ pub(crate) struct PlatformLauncher;
 #[cfg(target_os = "windows")]
 impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
-        let mut api = launch::production();
-        launch::dispatch_windows(&mut api, spec)
+        let caller =
+            aw_platform::current_caller().map_err(|error| LaunchDispatchError::NotImplemented {
+                detail: format!("Windows 调用方身份不可用：{error}"),
+            })?;
+        let request = aw_platform::SpawnRequest {
+            command: spec.command.clone(),
+            cwd: spec.cwd.clone().map(Into::into),
+            env: spec.env.clone(),
+        };
+        let mut child = aw_platform::platform()
+            .spawn_suspended(&caller, &request)
+            .map_err(|error| LaunchDispatchError::NotImplemented {
+                detail: format!("Windows 挂起启动不可用：{error}"),
+            })?;
+        let key = child.key();
+        let pid = child.pid();
+        child
+            .release()
+            .map_err(|error| LaunchDispatchError::NotImplemented {
+                detail: format!("Windows 放行失败：{error}"),
+            })?;
+        loop {
+            match aw_platform::platform().reap_child(key).map_err(|error| {
+                LaunchDispatchError::NotImplemented {
+                    detail: format!("Windows 回收子进程失败：{error}"),
+                }
+            })? {
+                aw_platform::ReapOutcome::Exited(code) => {
+                    return Ok(Launched {
+                        code,
+                        pid,
+                        note: None,
+                        sampling: spec.no_daemon,
+                    });
+                }
+                aw_platform::ReapOutcome::StillRunning => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                aw_platform::ReapOutcome::Signaled(_) | aw_platform::ReapOutcome::NotOurChild => {
+                    return Err(LaunchDispatchError::NotImplemented {
+                        detail: "Windows 子进程不再由当前启动器持有".to_owned(),
+                    });
+                }
+            }
+        }
     }
 
     fn forward_interrupt(&mut self, _pid: u32) -> Result<(), LaunchDispatchError> {

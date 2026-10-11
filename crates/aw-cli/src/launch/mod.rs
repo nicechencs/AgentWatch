@@ -210,6 +210,7 @@ impl UnixLauncher for UnsupportedUnixLauncher {
 ///
 /// [`LaunchDispatchError::Windows`] when the state machine stops.
 #[cfg(target_os = "windows")]
+#[allow(dead_code)] // legacy state-machine unit-test seam; production uses aw-platform.
 pub fn dispatch_windows<A: JobApi>(
     api: &mut A,
     spec: &RunSpec,

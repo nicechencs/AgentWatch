@@ -1,7 +1,7 @@
 # Windows 采集器
 
 > 状态：草案
-> 最后更新：2026-10-07
+> 最后更新：2026-10-11
 > 关联：REQ-01~04、REQ-11、ADR-0008、ADR-0013、SPIKE-02、SPIKE-05、SPIKE-09、[capability-matrix](capability-matrix.md)、[inter-agent-communication](../01-architecture/inter-agent-communication.md)
 
 涉及 crate：`aw-collector-windows`，依赖 `ferrisetw` 和 `windows` crate。
@@ -126,6 +126,24 @@ P3-WIN-01（2026-10-08）没有在本机或 CI 上订阅 `Microsoft-Windows-PktM
 
 ### 4.1 启动模式
 
+`aw-platform` 已实现进程身份与表：`ProcessKey` 使用
+`GetProcessTimes` 的创建 `FILETIME`，镜像路径来自
+`QueryFullProcessImageNameW`，父 pid 来自 Toolhelp 快照，属主为令牌 SID
+加 `TokenElevation`。进程参数不读取 PEB，明确为
+`NA(collector_unavailable)`，不会以空数组冒充未知。`reap_child` 只接受本
+daemon 保留的进程句柄，先等待、读退出码再关闭句柄；任意外来 pid 都是
+`NotOurChild`。
+
+`aw run --no-daemon -- cmd /c exit 7` 已改由该接口的
+`CreateProcessW(CREATE_SUSPENDED)` → kill-on-close Job → 清除限制 →
+`ResumeThread` → `reap_child` 路径执行，目标退出码原样返回。尚未在 Windows
+真机或 Windows CI 跑过该路径，以下 Job 嵌套与服务交接结论仍为【待验证】。
+挂起阶段若 CLI 异常退出，最后一个 Job 句柄关闭会结束目标；已放行时先清除
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，因此后续 daemon/CLI 停止不结束目标。
+在服务路径，平台层只接受已识别的命名管道客户端：它会重新核验客户端 PID
+的令牌 SID/提权状态，复制为主令牌并使用 `CreateProcessAsUserW`；不能核验时
+失败，绝不改以 LocalSystem 启动。服务 API 的实际交接与 IOCP 范围更新尚未接通。
+
 1. CLI（普通权限）用 `CREATE_SUSPENDED` 创建目标进程，这样继承用户桌面、令牌和控制台。
 2. CLI 创建 Job Object，调用 `AssignProcessToJobObject`，然后把 Job 句柄的副本交给 daemon：可以通过 `DuplicateHandle` 到 daemon 进程，或者给 Job 命名【待验证 SPIKE-05】。
 3. 用 `JobObjectAssociateCompletionPortInformation` 关联一个 IOCP，接收 `JOB_OBJECT_MSG_NEW_PROCESS` 和 `JOB_OBJECT_MSG_EXIT_PROCESS`，并更新范围集合。
@@ -147,6 +165,7 @@ P3-WIN-01（2026-10-08）没有在本机或 CI 上订阅 `Microsoft-Windows-PktM
 - 安装包：MSI（WiX），或用 `dist` 生成的安装器。代码签名用 OV/EV 证书，也可以用 Azure Trusted Signing，可以减少 SmartScreen 警告。
 - 服务崩溃自动重启：`sc failure` 配置 3 次重启。
 - ETW 会话在进程异常退出后会残留。启动时先按名字 `ControlTrace(STOP)` 停掉旧会话。
+- 默认的特权数据目录 `%ProgramData%\AgentWatch` 创建后应用受保护 DACL：关掉继承，只留 `SYSTEM` 和 `BUILTIN\Administrators` 完全控制。仅当 daemon 以特权运行且路径正是默认系统目录时启用；`AW_SOCKET`、`HOME`、`XDG_RUNTIME_DIR` 指向的临时测试目录不会被改 ACL。【待验证：未在真机检查生成的 ACL】
 
 ## 6. 已知坑
 

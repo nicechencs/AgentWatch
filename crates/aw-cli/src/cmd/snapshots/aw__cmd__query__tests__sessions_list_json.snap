@@ -6,6 +6,8 @@ expression: body
   "sessions": [
     {
       "agent": "example-agent",
+      "end_reason": "exited",
+      "end_reason_label": "程序已退出",
       "ended_ns": 1700000060000000000,
       "evidence": {
         "level": "E1"

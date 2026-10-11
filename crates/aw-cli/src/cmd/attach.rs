@@ -569,9 +569,9 @@ fn prepare(args: &AttachArgs<'_>) -> Result<AttachRequest, Outcome> {
     };
     if args.group.is_some() {
         return Err(super::error_outcome(
-            exit::GENERAL,
-            "not_available",
-            "此构建的 attach 不支持 --group（P3/P5 提供）",
+            exit::NOT_IN_BUILD,
+            "not_in_build",
+            "`--group` 本版本未接入",
             args.json,
         ));
     }

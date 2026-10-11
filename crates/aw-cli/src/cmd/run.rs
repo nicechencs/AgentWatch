@@ -423,7 +423,17 @@ impl SpawnedChild for PlatformGatedChild {
             .ok_or_else(|| "无法等待尚未放行的程序".to_owned())?;
         match child.wait().map_err(platform_child_error)? {
             ReapOutcome::Exited(code) => Ok(code),
-            ReapOutcome::Signaled(_) | ReapOutcome::StillRunning => Ok(exit::GENERAL),
+            ReapOutcome::Signaled(signo) => {
+                #[cfg(windows)]
+                {
+                    Ok(signo)
+                }
+                #[cfg(not(windows))]
+                {
+                    Ok(128 + signo)
+                }
+            }
+            ReapOutcome::StillRunning => Ok(exit::GENERAL),
         }
     }
 
@@ -687,10 +697,8 @@ impl Launcher for PlatformLauncher {
         })
     }
 
-    fn forward_interrupt(&mut self, _pid: u32) -> Result<(), LaunchDispatchError> {
-        Err(LaunchDispatchError::NotImplemented {
-            detail: "中断转发尚未接通；将等待子进程结束，不转发信号".to_owned(),
-        })
+    fn forward_interrupt(&mut self, pid: u32) -> Result<(), LaunchDispatchError> {
+        forward_unix_signal(pid, nix::sys::signal::Signal::SIGINT)
     }
 }
 
@@ -857,13 +865,27 @@ impl Launcher for PlatformLauncher {
         })
     }
 
-    fn forward_interrupt(&mut self, _pid: u32) -> Result<(), LaunchDispatchError> {
-        // No process group was created. A signal would need libc, which this
-        // crate does not link. Do not claim the interrupt was forwarded.
-        Err(LaunchDispatchError::NotImplemented {
-            detail: "中断转发不可用；没有创建进程组，且未链接 libc".to_owned(),
-        })
+    fn forward_interrupt(&mut self, pid: u32) -> Result<(), LaunchDispatchError> {
+        forward_unix_signal(pid, nix::sys::signal::Signal::SIGINT)
     }
+}
+
+/// Forward one terminal signal to a directly spawned Unix child. This is kept
+/// at the CLI boundary; it does not change collector scope or process-group
+/// ownership. The signal number is never formatted from user input.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn forward_unix_signal(
+    pid: u32,
+    signal: nix::sys::signal::Signal,
+) -> Result<(), LaunchDispatchError> {
+    let pid = i32::try_from(pid).map_err(|_| LaunchDispatchError::NotImplemented {
+        detail: "子进程号超出 Unix pid 范围".to_owned(),
+    })?;
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), signal).map_err(|error| {
+        LaunchDispatchError::NotImplemented {
+            detail: format!("无法转发中断给子进程：{error}"),
+        }
+    })
 }
 
 /// Run `aw run`.
@@ -955,6 +977,14 @@ fn prepare(
     args: &RunArgs<'_>,
     deferred: DeferredFlags,
 ) -> Result<(SummaryLevel, RunSpec), Outcome> {
+    if args.raw.is_some() {
+        return Err(super::error_outcome(
+            exit::NOT_IN_BUILD,
+            "not_in_build",
+            "`--raw` 本版本未接入",
+            args.json,
+        ));
+    }
     let planned = match proxy_plan(args, deferred) {
         Ok(planned) => planned,
         Err(detail) => {
@@ -987,8 +1017,8 @@ fn prepare(
     }
     if let Some(detail) = deferred_reason(deferred) {
         return Err(super::error_outcome(
-            exit::GENERAL,
-            "not_available",
+            exit::NOT_IN_BUILD,
+            "not_in_build",
             &detail,
             args.json,
         ));
@@ -1282,10 +1312,7 @@ fn deferred_reason(flags: DeferredFlags) -> Option<String> {
     // verified per-agent MCP config injection, so this process must not rewrite
     // a config and must not launch. The wrapper itself is `aw mcp-tap`.
     if flags.mcp_tap {
-        return Some(
-            "`aw run` 不支持 --mcp-tap：尚未实现每个 Agent 的 MCP 配置注入（SPIKE-09）；请手动使用 `aw mcp-tap -- <cmd>`。没有启动程序"
-                .to_owned(),
-        );
+        return Some("`--mcp-tap` 本版本未接入".to_owned());
     }
     let mut which = Vec::new();
     if flags.self_report {
@@ -1303,10 +1330,7 @@ fn deferred_reason(flags: DeferredFlags) -> Option<String> {
     if which.is_empty() {
         return None;
     }
-    Some(format!(
-        "此构建不支持 {}（P3/P5 提供）；没有启动程序",
-        which.join(", ")
-    ))
+    Some(format!("`{}` 本版本未接入", which.join(", ")))
 }
 
 fn parse_summary(text: Option<&str>) -> Result<SummaryLevel, String> {
@@ -1949,7 +1973,7 @@ mod tests {
             for summary in sources {
                 let mut launcher = fake_exit_7();
                 let outcome = run(&ran, none(), &mut UnixAdapter(&mut launcher), summary);
-                assert_eq!(outcome.code, 7);
+                assert_eq!(outcome.code, exit::NOT_IN_BUILD);
                 assert!(outcome.stdout.is_empty());
                 let err = text(&outcome.stderr);
                 for marker in [
@@ -1962,7 +1986,8 @@ mod tests {
                 ] {
                     assert!(!err.contains(marker), "input marker appeared: {marker}");
                 }
-                assert_eq!(launcher.env_len, Some(1));
+                assert!(err.contains("`--raw` 本版本未接入"), "{err}");
+                assert_eq!(launcher.env_len, None);
             }
         }
     }

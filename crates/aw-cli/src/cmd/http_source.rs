@@ -159,7 +159,11 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
 
     fn set_pinned(&mut self, key: &str, pinned: bool) -> Result<SessionItem, QueryError> {
         let _ = self.patch(key, &serde_json::json!({ "pinned": pinned }))?;
-        Ok(self.show_session(key)?.item)
+        // The summary route predates the `pinned` field. The successful PATCH
+        // is authoritative for this mutation, so do not turn it into "没采".
+        let mut item = self.show_session(key)?.item;
+        item.pinned = Some(pinned);
+        Ok(item)
     }
 
     fn delete_sessions(&mut self, keys: &[String]) -> Result<u64, QueryError> {
@@ -172,7 +176,7 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
                 query: String::new(),
                 body: Vec::new(),
             };
-            let body = self.call(&request)?;
+            let body = self.call_session(&request, Some(key))?;
             // A 200 that does not name a deletion is not a success.
             match body.get("deleted") {
                 Some(Value::String(_)) => removed = removed.saturating_add(1),
@@ -203,7 +207,7 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
             pairs.push(("limit".to_owned(), limit.to_string()));
         }
         let path = format!("/api/v1/sessions/{}/timeline", encode_path_segment(key));
-        let body = self.call(&get_pairs(&path, &pairs))?;
+        let body = self.call_session(&get_pairs(&path, &pairs), Some(key))?;
         let rows = array_field(&body, "rows")?;
         let items = rows
             .iter()
@@ -230,12 +234,20 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
         })
     }
 
-    fn procs(&self, key: &str, tree: bool) -> Result<Vec<ProcItem>, QueryError> {
-        let pairs: Vec<(String, String)> = if tree {
+    fn procs(
+        &self,
+        key: &str,
+        tree: bool,
+        filter: Option<&str>,
+    ) -> Result<Vec<ProcItem>, QueryError> {
+        let mut pairs: Vec<(String, String)> = if tree {
             vec![("tree".to_owned(), "1".to_owned())]
         } else {
             Vec::new()
         };
+        if let Some(filter) = filter {
+            pairs.push(("filter".to_owned(), filter.to_owned()));
+        }
         let path = format!("/api/v1/sessions/{}/processes", encode_path_segment(key));
         // `key` is what the user typed. A 404 must name it; dropping it prints
         // 「找不到会话 ``」.
@@ -247,10 +259,14 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
     fn flows(
         &self,
         key: &str,
+        filter: Option<&str>,
         group_by: Option<&str>,
         sort: Option<&str>,
     ) -> Result<Vec<FlowItem>, QueryError> {
         let mut pairs: Vec<(String, String)> = Vec::new();
+        if let Some(filter) = filter {
+            pairs.push(("filter".to_owned(), filter.to_owned()));
+        }
         if let Some(group_by) = group_by {
             pairs.push(("group_by".to_owned(), group_by.to_owned()));
         }
@@ -258,21 +274,21 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
             pairs.push(("sort".to_owned(), sort.to_owned()));
         }
         let path = format!("/api/v1/sessions/{}/flows", encode_path_segment(key));
-        let body = self.call(&get_pairs(&path, &pairs))?;
+        let body = self.call_session(&get_pairs(&path, &pairs), Some(key))?;
         let rows = array_field(&body, "flows")?;
         rows.iter().map(flow_item).collect()
     }
 
     fn gaps(&self, key: &str) -> Result<Vec<GapItem>, QueryError> {
         let path = format!("/api/v1/sessions/{}/gaps", encode_path_segment(key));
-        let body = self.call(&ApiRequest::get(&path))?;
+        let body = self.call_session(&ApiRequest::get(&path), Some(key))?;
         let rows = array_field(&body, "gaps")?;
         rows.iter().map(gap_item).collect()
     }
 
     fn files(&self, key: &str, query: &FileQuery) -> Result<Vec<FileItem>, QueryError> {
         let request = super::query::files_request(key, query);
-        let body = self.call(&request)?;
+        let body = self.call_session(&request, Some(key))?;
         // `group_by=dir` answers `{ "roots": [...] }`, which is not a file row.
         // Mapping a root onto FileItem would invent `op` and `first_ns`.
         if body.get("files").is_none() && body.get("roots").is_some() {
@@ -287,7 +303,7 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
     fn around(&self, key: &str, query: &AroundQuery) -> Result<AroundPage, QueryError> {
         let window = ns_to_window(query.window_ns);
         let request = super::query::around_request(key, &query.reference, &window);
-        let body = self.call(&request)?;
+        let body = self.call_session(&request, Some(key))?;
         let rows = array_field(&body, "rows")?;
         let items = rows
             .iter()
@@ -306,7 +322,7 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
 
     fn http(&self, key: &str, query: &HttpQuery) -> Result<HttpPage, QueryError> {
         let request = super::query::http_request(key, query);
-        let body = self.call(&request)?;
+        let body = self.call_session(&request, Some(key))?;
         let rows = array_field(&body, "http")?;
         let items = rows.iter().map(http_item).collect::<Result<Vec<_>, _>>()?;
         let reason = match body.get("reason") {
@@ -327,7 +343,7 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
 
     fn findings(&self, key: &str, query: &FindingQuery) -> Result<Vec<FindingItem>, QueryError> {
         let request = super::query::findings_request(key, query);
-        let body = self.call(&request)?;
+        let body = self.call_session(&request, Some(key))?;
         let rows = array_field(&body, "findings")?;
         rows.iter().map(finding_item).collect()
     }
@@ -374,7 +390,10 @@ impl<T: Transport> HttpQuerySource<T> {
 
     fn patch(&self, key: &str, body: &Value) -> Result<Value, QueryError> {
         let path = format!("/api/v1/sessions/{}", encode_path_segment(key));
-        self.call(&ApiRequest::json_method_public("PATCH", &path, body))
+        self.call_session(
+            &ApiRequest::json_method_public("PATCH", &path, body),
+            Some(key),
+        )
     }
 }
 
@@ -427,7 +446,7 @@ fn client_to_query_for(err: &ClientError, key: Option<&str>) -> QueryError {
         ClientError::Forbidden { .. }
         | ClientError::Status {
             status: 401 | 403, ..
-        } => QueryError::Unavailable {
+        } => QueryError::Permission {
             detail: clip(&format!("认证失败：{err}")),
         },
         ClientError::Unreachable { .. }
@@ -488,6 +507,7 @@ fn session_from_fields(
         // start stays unknown rather than failing the whole list.
         started_ns: opt_i64_field(value, "started_ns")?,
         ended_ns: opt_i64_field(value, "ended_ns")?,
+        end_reason: opt_string(value, "end_reason")?,
         pinned,
         // The list and summary documents do not carry an evidence level.
         // A session the daemon returned was observed by the tool.

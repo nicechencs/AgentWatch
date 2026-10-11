@@ -87,13 +87,6 @@ pub(crate) trait ConfigApi {
     /// [`ConfigError::Forbidden`] when the caller is not an administrator.
     fn set(&mut self, key: &str, value: &Value) -> Result<ConfigDoc, ConfigError>;
 
-    /// `GET /api/v1/config/schema`.
-    ///
-    /// # Errors
-    ///
-    /// A daemon or transport failure.
-    fn schema(&mut self) -> Result<Value, ConfigError>;
-
     /// `GET /api/v1/rules`.
     ///
     /// # Errors
@@ -136,12 +129,6 @@ impl ConfigApi for UnwiredConfig {
         })
     }
 
-    fn schema(&mut self) -> Result<Value, ConfigError> {
-        Err(ConfigError::Unreachable {
-            detail: UNWIRED.to_owned(),
-        })
-    }
-
     fn rules(&mut self) -> Result<Vec<RuleInfo>, ConfigError> {
         Err(ConfigError::Unreachable {
             detail: UNWIRED.to_owned(),
@@ -151,9 +138,8 @@ impl ConfigApi for UnwiredConfig {
 
 /// Production client for `GET`/`PUT /api/v1/config`.
 ///
-/// [`UnwiredConfig`] stays for tests. `schema` and `rules` have no daemon
-/// route; those methods return [`ConfigError::Failed`] naming the missing
-/// route instead of an empty document.
+/// [`UnwiredConfig`] stays for tests. Rules have no daemon route and are
+/// loaded from their local files instead.
 pub(crate) struct HttpConfigApi {
     endpoint: crate::endpoint::Endpoint,
 }
@@ -203,13 +189,6 @@ impl ConfigApi for HttpConfigApi {
         // `{ "applied": "memory" }`. That is not the new document. Re-read it.
         let _ = body;
         self.show(false)
-    }
-
-    fn schema(&mut self) -> Result<Value, ConfigError> {
-        // `GET /api/v1/config/schema` is not a route. Do not print `{}`.
-        Err(ConfigError::Failed {
-            detail: "未提供 GET /api/v1/config/schema；此命令不会编造 schema".to_owned(),
-        })
     }
 
     fn rules(&mut self) -> Result<Vec<RuleInfo>, ConfigError> {
@@ -285,12 +264,6 @@ pub(crate) fn set_request(key: &str, value: &Value) -> crate::client::ApiRequest
     crate::client::ApiRequest::put_json("/api/v1/config", &json!({ "key": key, "value": value }))
 }
 
-/// `GET /api/v1/config/schema`.
-#[must_use]
-pub(crate) fn schema_request() -> crate::client::ApiRequest {
-    crate::client::ApiRequest::get("/api/v1/config/schema")
-}
-
 /// `GET /api/v1/rules`.
 #[must_use]
 pub(crate) fn rules_request() -> crate::client::ApiRequest {
@@ -360,18 +333,17 @@ pub(crate) fn run(cmd: &ConfigCmd, json: bool, api: &mut dyn ConfigApi) -> Outco
             }
         }
         ConfigCmd::Edit => super::error_outcome(
-            exit::GENERAL,
-            "not_implemented",
-            "此构建的 `config edit` 不会启动编辑器；请使用 `aw config set <key> <value>`（尚未实现）",
+            exit::NOT_IN_BUILD,
+            "not_in_build",
+            "`config edit` 本版本未接入",
             json,
         ),
-        ConfigCmd::Schema => {
-            let _request = schema_request();
-            match api.schema() {
-                Ok(schema) => value_outcome("schema", &schema, json),
-                Err(err) => config_error(err, json),
-            }
-        }
+        ConfigCmd::Schema => super::error_outcome(
+            exit::NOT_IN_BUILD,
+            "not_in_build",
+            "`config schema` 本版本未接入",
+            json,
+        ),
         ConfigCmd::Rules(RulesCmd::List) => {
             let _request = rules_request();
             match api.rules() {
@@ -492,6 +464,14 @@ fn rules_outcome(rules: &[RuleInfo], json_mode: bool) -> Outcome {
 }
 
 fn config_error(err: ConfigError, json_mode: bool) -> Outcome {
+    if matches!(err, ConfigError::Forbidden { .. }) {
+        return super::error_outcome(
+            exit::PERMISSION,
+            "permission",
+            "需要管理员权限才能修改配置",
+            json_mode,
+        );
+    }
     let (code, machine) = match &err {
         ConfigError::Unreachable { .. } => (exit::UNREACHABLE, "unreachable"),
         ConfigError::Forbidden { .. } => (exit::PERMISSION, "permission"),

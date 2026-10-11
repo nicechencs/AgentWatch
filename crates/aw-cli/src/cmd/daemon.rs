@@ -178,36 +178,73 @@ pub(crate) fn run(
 }
 
 /// Plan text only. Exit [`exit::USAGE`] so a missing `--yes` is not a success.
+#[allow(clippy::needless_return)]
 fn unconfirmed_install(json: bool) -> Outcome {
-    let plan = windows_install_plan();
-    let acls = windows_acl_lines();
-    if json {
-        let body = json!({
-            "state": "planned",
-            "confirmed": false,
-            "service": {
-                "name": plan.name,
-                "display_name": plan.display_name,
-                "start_mode": plan.start_mode,
-                "account": plan.account,
-                "sid_type": plan.sid_type,
-                "bin_path": plan.bin_path,
-                "recovery": {
-                    "first_delay_ms": plan.first_delay_ms,
-                    "second_delay_ms": plan.second_delay_ms,
-                    "third_delay_ms": plan.third_delay_ms,
-                },
-            },
-            "acls": acls,
-            "hint": "请重新运行 `aw daemon install --yes` 以打印 sc.exe 文本；此进程不会执行它",
-        });
-        return Outcome {
-            code: exit::USAGE,
-            stdout: format!("{body}\n").into_bytes(),
-            stderr: Vec::new(),
+    #[cfg(not(target_os = "windows"))]
+    {
+        let platform = if cfg!(target_os = "macos") {
+            "launchd"
+        } else {
+            "systemd"
+        };
+        let detail = format!(
+            "planned: {platform} 安装计划；此命令不注册服务。实际安装由安装包提供\n提示: 请使用 AgentWatch 安装包完成安装\n"
+        );
+        return if json {
+            Outcome {
+                code: exit::USAGE,
+                stdout: format!(
+                    "{}\n",
+                    json!({
+                        "state": "planned",
+                        "confirmed": false,
+                        "platform": platform,
+                        "executed": false,
+                        "hint": "实际安装由安装包提供",
+                    })
+                )
+                .into_bytes(),
+                stderr: Vec::new(),
+            }
+        } else {
+            Outcome {
+                code: exit::USAGE,
+                stdout: detail.into_bytes(),
+                stderr: Vec::new(),
+            }
         };
     }
-    let text = format!(
+    #[cfg(target_os = "windows")]
+    {
+        let plan = windows_install_plan();
+        let acls = windows_acl_lines();
+        if json {
+            let body = json!({
+                "state": "planned",
+                "confirmed": false,
+                "service": {
+                    "name": plan.name,
+                    "display_name": plan.display_name,
+                    "start_mode": plan.start_mode,
+                    "account": plan.account,
+                    "sid_type": plan.sid_type,
+                    "bin_path": plan.bin_path,
+                    "recovery": {
+                        "first_delay_ms": plan.first_delay_ms,
+                        "second_delay_ms": plan.second_delay_ms,
+                        "third_delay_ms": plan.third_delay_ms,
+                    },
+                },
+                "acls": acls,
+                "hint": "请重新运行 `aw daemon install --yes` 以打印 sc.exe 文本；此进程不会执行它",
+            });
+            return Outcome {
+                code: exit::USAGE,
+                stdout: format!("{body}\n").into_bytes(),
+                stderr: Vec::new(),
+            };
+        }
+        let text = format!(
         "\
 planned: install plan was rendered; nothing was registered
 service_name={name}
@@ -231,10 +268,11 @@ hint: re-run `aw daemon install --yes` to print sc.exe text for an administrator
         third = plan.third_delay_ms,
         acls = acls.join(""),
     );
-    Outcome {
-        code: exit::USAGE,
-        stdout: text.into_bytes(),
-        stderr: Vec::new(),
+        Outcome {
+            code: exit::USAGE,
+            stdout: text.into_bytes(),
+            stderr: Vec::new(),
+        }
     }
 }
 
@@ -248,37 +286,78 @@ fn finish(op: &DaemonOp, effect: &DaemonEffect, json: bool) -> Outcome {
 }
 
 /// `--yes` still does not register a service. It prints the `sc.exe` text.
+#[allow(clippy::needless_return)]
 fn confirmed_install(effect: &DaemonEffect, json: bool) -> Outcome {
-    let commands = windows_sc_text();
-    if json {
-        let body = json!({
-            "state": effect.state,
-            "detail": effect.detail,
-            "confirmed": true,
-            "executed": false,
-            "sc_commands": commands,
-        });
-        return Outcome {
-            code: exit::OK,
-            stdout: format!("{body}\n").into_bytes(),
-            stderr: Vec::new(),
+    #[cfg(not(target_os = "windows"))]
+    {
+        let platform = if cfg!(target_os = "macos") {
+            "launchd"
+        } else {
+            "systemd"
+        };
+        let detail = format!(
+            "{}: {}\nexecuted=false\n{platform} 服务由 AgentWatch 安装包安装；此命令没有注册服务\n",
+            effect.state, effect.detail
+        );
+        return if json {
+            Outcome {
+                code: exit::OK,
+                stdout: format!(
+                    "{}\n",
+                    json!({
+                        "state": effect.state,
+                        "detail": effect.detail,
+                        "confirmed": true,
+                        "executed": false,
+                        "platform": platform,
+                        "hint": "实际安装由安装包提供",
+                    })
+                )
+                .into_bytes(),
+                stderr: Vec::new(),
+            }
+        } else {
+            Outcome {
+                code: exit::OK,
+                stdout: detail.into_bytes(),
+                stderr: Vec::new(),
+            }
         };
     }
-    let text = format!(
-        "\
+    #[cfg(target_os = "windows")]
+    {
+        let commands = windows_sc_text();
+        if json {
+            let body = json!({
+                "state": effect.state,
+                "detail": effect.detail,
+                "confirmed": true,
+                "executed": false,
+                "sc_commands": commands,
+            });
+            return Outcome {
+                code: exit::OK,
+                stdout: format!("{body}\n").into_bytes(),
+                stderr: Vec::new(),
+            };
+        }
+        let text = format!(
+            "\
 {state}: {detail}
 executed=false
 {commands}",
-        state = effect.state,
-        detail = effect.detail,
-    );
-    Outcome {
-        code: exit::OK,
-        stdout: text.into_bytes(),
-        stderr: Vec::new(),
+            state = effect.state,
+            detail = effect.detail,
+        );
+        Outcome {
+            code: exit::OK,
+            stdout: text.into_bytes(),
+            stderr: Vec::new(),
+        }
     }
 }
 
+#[cfg(target_os = "windows")]
 struct WindowsPlanView {
     name: &'static str,
     display_name: &'static str,
@@ -293,6 +372,7 @@ struct WindowsPlanView {
 
 /// Mirrors `aw_daemon::service::windows::install_plan`. This crate does not
 /// link the daemon, and it does not query the Service Control Manager.
+#[cfg(target_os = "windows")]
 fn windows_install_plan() -> WindowsPlanView {
     WindowsPlanView {
         name: "AgentWatch",
@@ -307,6 +387,7 @@ fn windows_install_plan() -> WindowsPlanView {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn windows_acl_lines() -> Vec<String> {
     vec![
         "acl path=\\\\.\\pipe\\agentwatch trustee=NT AUTHORITY\\SYSTEM rights=full trustee=BUILTIN\\Administrators rights=full trustee=INTERACTIVE rights=read-write\n".to_owned(),
@@ -314,6 +395,7 @@ fn windows_acl_lines() -> Vec<String> {
     ]
 }
 
+#[cfg(target_os = "windows")]
 fn windows_sc_text() -> String {
     "\
 sc.exe create AgentWatch binPath= \"C:\\Program Files\\AgentWatch\\agentwatchd.exe --foreground\" start= delayed-auto obj= LocalSystem DisplayName= \"AgentWatch Daemon\"
@@ -409,10 +491,13 @@ mod tests {
         assert_eq!(outcome.code, exit::USAGE);
         let text = String::from_utf8(outcome.stdout).expect("utf8");
         assert!(text.contains("AgentWatch"), "{text}");
-        assert!(text.contains("--yes"), "{text}");
-        // The hint may name `sc.exe` as the command an administrator would run.
-        // Naming it is not running it: the control was not asked to apply anything.
-        assert!(text.contains("does not run it"), "{text}");
+        assert!(text.contains("安装计划"), "{text}");
+        // Non-Windows plans describe only this platform's installer pack.
+        assert!(!text.contains("sc.exe"), "{text}");
+        assert!(
+            text.contains("安装包") || text.contains("安装计划"),
+            "{text}"
+        );
         assert!(control.seen.is_empty());
     }
 

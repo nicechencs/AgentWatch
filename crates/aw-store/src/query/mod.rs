@@ -19,7 +19,7 @@ mod sql;
 
 use std::collections::BTreeMap;
 
-use rusqlite::{params_from_iter, Connection, OptionalExtension, Row};
+use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, OptionalExtension, Row};
 
 use crate::query::filter::{parse, Expr};
 // `pub(crate)` so `export` can compile a filter without copying the SQL builder.
@@ -556,27 +556,62 @@ pub fn process_tree(
     user_id: &str,
     session_id: i64,
 ) -> Result<Option<Vec<ProcessNode>>, QueryError> {
+    process_tree_filtered(conn, user_id, session_id, None)
+}
+
+/// Process tree narrowed by the shared filter compiler.
+///
+/// A matching child whose parent was filtered out becomes a root. This makes
+/// the result truthful: the missing parent was not returned, rather than
+/// inventing an ancestor that did not match.
+pub fn process_tree_filtered(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+    filter: Option<&StoreExpr>,
+) -> Result<Option<Vec<ProcessNode>>, QueryError> {
     if !session_visible(conn, user_id, session_id)? {
         return Ok(None);
     }
+    let pred = match filter {
+        Some(expr) => compile_predicate(
+            expr,
+            StoreTarget::Procs,
+            &CompileCtx {
+                session_start_ns: session_started(conn, session_id)?,
+                ..CompileCtx::default()
+            },
+        )?,
+        None => Compiled {
+            sql: "1".to_owned(),
+            params: Vec::new(),
+            target: StoreTarget::Procs,
+            warnings: Vec::new(),
+        },
+    };
+    let mut sql = String::from(
+        "SELECT processes.proc_uid, processes.pid, processes.parent_uid, processes.depth, \
+                processes.start_ns, processes.exit_ns, processes.exit_code, processes.evidence, \
+                (SELECT CASE \
+                    WHEN exe IS NULL THEN NULL \
+                    ELSE replace(exe, rtrim(exe, replace(replace(exe, char(92), char(47)), char(47), '')), '') \
+                 END FROM process_images i \
+                 WHERE i.session_id = processes.session_id AND i.proc_uid = processes.proc_uid \
+                 ORDER BY i.ts_ns DESC LIMIT 1) \
+         FROM processes WHERE processes.session_id = ? AND (",
+    );
+    sql.push_str(&pred.sql);
+    sql.push_str(") ORDER BY processes.start_ns, processes.proc_uid");
+    let mut bind = vec![SqlValue::Integer(session_id)];
+    bind.extend(pred.params.into_iter().map(|param| match param {
+        StoreParam::Text(text) => SqlValue::Text(text),
+        StoreParam::Int(value) => SqlValue::Integer(value),
+    }));
     let mut stmt = conn
-        .prepare(
-            "SELECT p.proc_uid, p.pid, p.parent_uid, p.depth, p.start_ns, p.exit_ns, p.exit_code, \
-                    p.evidence, \
-                    (SELECT CASE \
-                        WHEN exe IS NULL THEN NULL \
-                        ELSE replace(exe, rtrim(exe, replace(replace(exe, char(92), char(47)), char(47), '')), '') \
-                     END \
-                     FROM process_images i \
-                     WHERE i.session_id = p.session_id AND i.proc_uid = p.proc_uid \
-                     ORDER BY i.ts_ns DESC LIMIT 1) \
-             FROM processes p \
-             WHERE p.session_id = ? \
-             ORDER BY p.start_ns, p.proc_uid",
-        )
+        .prepare(&sql)
         .map_err(|err| QueryError::sqlite("process_tree", err))?;
     let flat = stmt
-        .query_map(rusqlite::params![session_id], |row| {
+        .query_map(params_from_iter(bind.iter()), |row| {
             Ok(FlatProc {
                 proc_uid: row.get(0)?,
                 pid: row.get(1)?,

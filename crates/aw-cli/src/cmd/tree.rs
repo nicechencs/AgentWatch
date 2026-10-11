@@ -13,7 +13,9 @@ use clap::{Parser, Subcommand};
     version,
     about = "AgentWatch 命令行客户端",
     subcommand_required = true,
-    disable_help_subcommand = true
+    disable_help_subcommand = true,
+    disable_help_flag = true,
+    help_template = "{about-with-newline}\n用法: {usage}\n\n命令：\n{subcommands}\n\n选项：\n{options}\n"
 )]
 pub(crate) struct Cli {
     /// 机器可读的 JSON 输出
@@ -29,7 +31,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) token: Option<String>,
     /// 语言：zh 或 en
-    #[arg(long, global = true, value_parser = ["zh", "en"])]
+    #[arg(long, global = true, value_parser = ["zh", "en"], hide_possible_values = true)]
     pub(crate) lang: Option<String>,
     /// 安静模式
     #[arg(short, long, global = true)]
@@ -37,76 +39,82 @@ pub(crate) struct Cli {
     /// 更详细的日志，可重复
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub(crate) verbose: u8,
+    /// 显示帮助
+    #[arg(short = 'h', long, global = true, action = clap::ArgAction::Help, required = false)]
+    pub(crate) help: Option<bool>,
     #[command(subcommand)]
     pub(crate) command: Command,
 }
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
-    /// 启动模式
+    /// 启动程序并记录
     Run {
-        #[arg(long)]
+        #[arg(long, help = "智能体类型")]
         agent: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "会话名称")]
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "注入显式代理（本版本未接入）")]
         proxy: bool,
-        #[arg(long)]
+        #[arg(long, help = "代理被拒绝时的处理方式（本版本未接入）")]
         proxy_on_reject: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "不跟随子进程")]
         no_follow_children: bool,
-        #[arg(long)]
+        #[arg(long, help = "纳入额外进程（本版本未接入）")]
         include_proc: Vec<String>,
-        #[arg(long)]
+        #[arg(long, help = "智能体自报告来源（本版本未接入）")]
         self_report: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "被启动程序的工作目录")]
         cwd: Option<String>,
-        #[arg(long = "env")]
+        #[arg(long = "env", help = "只交给被启动的程序，不发给后台")]
         env_vars: Vec<String>,
-        #[arg(long)]
+        #[arg(long, help = "结束时摘要：none、short 或 full")]
         summary: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "固定会话，不参与自动清理")]
         pin: bool,
-        #[arg(long)]
+        #[arg(long, help = "监控组（本版本未接入）")]
         group: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "MCP 调用记录（本版本未接入）")]
         mcp_tap: bool,
-        #[arg(long)]
+        #[arg(long, help = "不使用后台，在当前进程记录")]
         no_daemon: bool,
-        #[arg(long)]
+        #[arg(long, help = "原始事件文件（本版本未接入）")]
         raw: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "关闭脱敏（本版本未接入）")]
         unsafe_no_redact: bool,
-        /// 目标命令
+        /// 要启动的程序及其参数
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
     /// 附着到已有进程
     Attach {
-        #[arg(long)]
+        #[arg(long, help = "要附着的进程号")]
         pid: Option<u32>,
         /// 进程名 pattern
-        #[arg(long)]
+        #[arg(long, help = "不跟随子进程")]
         name: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "不纳入已有子进程")]
         no_follow_children: bool,
-        #[arg(long)]
+        #[arg(long, help = "移入 cgroup")]
         no_existing_children: bool,
-        #[arg(long)]
+        #[arg(long, help = "智能体类型")]
         move_to_cgroup: bool,
-        #[arg(long)]
+        #[arg(long, help = "固定会话，不参与自动清理")]
         agent: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "监控组（本版本未接入）")]
         pin: bool,
-        #[arg(long)]
+        #[arg(long, help = "直到目标进程退出")]
         group: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "记录时长，例如 10m")]
         until_exit: bool,
         #[arg(long)]
         duration: Option<String>,
     },
-    /// 停止监控，不结束进程
-    Stop { session: String },
+    /// 停止记录（程序继续运行）
+    Stop {
+        /// 会话号或 @last
+        session: String,
+    },
     /// 列出可附着的进程
     Ps {
         #[arg(long)]
@@ -114,11 +122,12 @@ pub(crate) enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// 会话
+    /// 查看和管理会话
     #[command(subcommand)]
     Sessions(SessionsCmd),
-    /// 时间线
+    /// 查看会话时间线
     Timeline {
+        /// 会话号或 @last
         session: String,
         #[arg(long)]
         filter: Option<String>,
@@ -131,8 +140,9 @@ pub(crate) enum Command {
         #[arg(long)]
         limit: Option<u64>,
     },
-    /// 进程
+    /// 会话里的进程（含退出码）
     Procs {
+        /// 会话号或 @last
         session: String,
         #[arg(long)]
         tree: bool,
@@ -149,8 +159,9 @@ pub(crate) enum Command {
         #[arg(long)]
         sort: Option<String>,
     },
-    /// 网络流
+    /// 会话里的网络流
     Flows {
+        /// 会话号或 @last
         session: String,
         #[arg(long)]
         filter: Option<String>,
@@ -165,8 +176,9 @@ pub(crate) enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// 发现
+    /// 查看发现
     Findings {
+        /// 会话号或 @last
         session: String,
         #[arg(long, value_parser = ["info", "notice", "warn"])]
         min_severity: Option<String>,
@@ -178,9 +190,13 @@ pub(crate) enum Command {
         lang: Option<String>,
     },
     /// 采集缺口
-    Gaps { session: String },
+    Gaps {
+        /// 会话号或 @last
+        session: String,
+    },
     /// 查看某条记录前后的事件
     Around {
+        /// 会话号或 @last
         session: String,
         reference: String,
         #[arg(long)]
@@ -188,66 +204,70 @@ pub(crate) enum Command {
     },
     /// 跨会话搜索
     Search {
+        /// 搜索词或筛选表达式
         text: String,
         #[arg(long)]
         since: Option<String>,
         #[arg(long)]
         kind: Option<String>,
     },
-    /// 导出
+    /// 导出会话记录
     Export {
+        /// 会话号或 @last
         session: String,
         /// 导出格式：jsonl、csv、md（markdown 也可）
         #[arg(long)]
         format: Option<String>,
-        #[arg(short, long)]
+        #[arg(short, long, help = "写入文件；省略则输出到标准输出")]
         output: Option<String>,
         #[arg(long)]
         filter: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "导出智能体、链路或 RPC（本版本未接入）")]
         include: Option<String>,
         #[arg(long)]
         redact_paths: bool,
         #[arg(long)]
         redact_hosts: bool,
     },
-    /// 打开本地 Web UI
+    /// 打开 AgentWatch 界面
     Ui {
         #[arg(long)]
         no_open: bool,
         #[arg(long)]
         port: Option<u16>,
     },
-    /// 自检
+    /// 检查本机能力
     Doctor {
-        #[arg(long)]
+        #[arg(long, help = "性能与降级信息（本版本未接入）")]
         perf: bool,
     },
-    /// 管理 daemon
+    /// 管理后台
     #[command(subcommand)]
     Daemon(DaemonCmd),
     /// 配置
     #[command(subcommand)]
     Config(ConfigCmd),
-    /// 代理 CA
-    #[command(subcommand)]
+    /// 代理 CA（本版本未接入）
+    #[command(subcommand, hide = true)]
     Proxy(ProxyCmd),
     /// 数据库
     #[command(subcommand)]
     Db(DbCmd),
-    /// 开发用夹具
-    #[command(subcommand)]
+    /// 开发用夹具（本版本未接入）
+    #[command(subcommand, hide = true)]
     Fixtures(FixturesCmd),
-    /// 监控组
-    #[command(subcommand)]
+    /// 监控组（本版本未接入）
+    #[command(subcommand, hide = true)]
     Group(GroupCmd),
-    /// Agent 实例
+    /// 智能体实例（本版本未接入）
+    #[command(hide = true)]
     Agents {
         session: Option<String>,
         #[arg(long)]
         group: Option<String>,
     },
-    /// Agent 间链路
+    /// 智能体间链路（本版本未接入）
+    #[command(hide = true)]
     Links {
         session: Option<String>,
         #[arg(long)]
@@ -257,7 +277,8 @@ pub(crate) enum Command {
         #[arg(long)]
         min_evidence: Option<String>,
     },
-    /// MCP 或 A2A 调用
+    /// MCP 或 A2A 调用（本版本未接入）
+    #[command(hide = true)]
     Rpc {
         session: String,
         #[arg(long)]
@@ -265,7 +286,8 @@ pub(crate) enum Command {
         #[arg(long)]
         target: Option<String>,
     },
-    /// 委托链路
+    /// 委托链路（本版本未接入）
+    #[command(hide = true)]
     Chain { session: String, reference: String },
     /// 跨主机离线合并
     Merge {
@@ -277,25 +299,27 @@ pub(crate) enum Command {
         #[arg(long)]
         nat: Option<String>,
     },
-    /// 接收 Agent hook 事件
+    /// 由智能体自动调用，一般不用手动运行
     Hook {
         agent: String,
         #[arg(long)]
         session: Option<String>,
     },
-    /// stdio 透明包装器
+    /// stdio 透明包装器（本版本未接入）
+    #[command(hide = true)]
     McpTap {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
-    /// 单进程模式
+    /// 单进程模式（本版本未接入）
+    #[command(hide = true)]
     Dev {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// 版本
     Version {
-        #[arg(long)]
+        #[arg(long, help = "检查新版本（本版本未接入）")]
         check: bool,
     },
 }
@@ -325,14 +349,14 @@ pub(crate) enum SessionsCmd {
     Delete {
         #[arg(required = true)]
         sessions: Vec<String>,
-        #[arg(long)]
+        #[arg(long, help = "不再确认，直接删除（无法恢复）")]
         yes: bool,
     },
 }
 
 #[derive(Subcommand)]
 pub(crate) enum DaemonCmd {
-    /// 状态
+    /// 查看后台是否运行
     Status,
     /// 启动
     Start,
@@ -346,7 +370,7 @@ pub(crate) enum DaemonCmd {
         #[arg(long)]
         yes: bool,
     },
-    /// 卸载系统服务
+    /// 卸载系统服务（安装包提供实际安装与卸载）
     Uninstall {
         #[arg(long)]
         purge: bool,
@@ -395,7 +419,7 @@ pub(crate) enum ConfigCmd {
     },
     /// 编辑配置
     Edit,
-    /// 输出配置 JSON Schema
+    /// 输出配置 JSON Schema（本版本未接入）
     Schema,
     /// 规则
     #[command(subcommand)]
@@ -415,9 +439,16 @@ pub(crate) enum ProxyCmd {
     Trust {
         #[arg(long)]
         user: bool,
+        /// 不再确认，直接继续
+        #[arg(long)]
+        yes: bool,
     },
     /// 从用户证书库移除
-    Untrust,
+    Untrust {
+        /// 不再确认，直接继续
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -425,19 +456,23 @@ pub(crate) enum DbCmd {
     /// 体积与各表行数
     Stats,
     /// 压缩数据库
-    Vacuum,
-    /// 迁移
+    Vacuum {
+        /// 不再确认，直接执行（无法恢复）
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 更新数据库结构
     Migrate {
         #[arg(long)]
         dry_run: bool,
     },
-    /// 清理
+    /// 删除旧会话（不可恢复）
     Purge {
         #[arg(long)]
         older_than: Option<String>,
-        #[arg(long)]
+        #[arg(long, help = "删除全部可删除的会话")]
         all: bool,
-        #[arg(long)]
+        #[arg(long, help = "不再确认，直接删除（无法恢复）")]
         yes: bool,
     },
 }
@@ -532,11 +567,11 @@ pub(crate) fn command_label(command: &Command) -> &'static str {
             ProxyCmd::CaInfo => "proxy ca-info",
             ProxyCmd::RotateCa { .. } => "proxy rotate-ca",
             ProxyCmd::Trust { .. } => "proxy trust",
-            ProxyCmd::Untrust => "proxy untrust",
+            ProxyCmd::Untrust { .. } => "proxy untrust",
         },
         Command::Db(cmd) => match cmd {
             DbCmd::Stats => "db stats",
-            DbCmd::Vacuum => "db vacuum",
+            DbCmd::Vacuum { .. } => "db vacuum",
             DbCmd::Migrate { .. } => "db migrate",
             DbCmd::Purge { .. } => "db purge",
         },

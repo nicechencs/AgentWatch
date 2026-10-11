@@ -513,9 +513,9 @@ const fn capability_status_text(status: CapabilityStatus) -> &'static str {
 pub(crate) fn run(perf: bool, json: bool, source: &mut dyn DoctorSource) -> Outcome {
     if perf {
         return super::error_outcome(
-            exit::USAGE,
-            "not_implemented",
-            "`aw doctor --perf` 尚未实现（P2）",
+            exit::NOT_IN_BUILD,
+            "not_in_build",
+            "`--perf` 本版本未接入",
             json,
         );
     }
@@ -693,9 +693,9 @@ mod tests {
     #[test]
     fn perf_is_refused_as_p2() {
         let outcome = run(true, false, &mut Fixed);
-        assert_eq!(outcome.code, exit::USAGE);
+        assert_eq!(outcome.code, exit::NOT_IN_BUILD);
         let err = String::from_utf8(outcome.stderr).expect("utf8");
-        assert!(err.contains("P2"), "{err}");
+        assert!(err.contains("本版本未接入"), "{err}");
         assert!(outcome.stdout.is_empty());
     }
 

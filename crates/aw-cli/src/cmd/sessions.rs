@@ -2,7 +2,7 @@
 //!
 //! Records come from a [`QuerySource`]. Production passes the daemon client.
 
-use std::io;
+use std::io::{self, IsTerminal, Write};
 
 use serde_json::json;
 
@@ -156,11 +156,11 @@ fn delete(
     mode: OutputMode,
     source: &mut dyn QuerySource,
 ) -> io::Result<Outcome> {
-    if !yes {
+    if !yes && !confirm_delete(sessions.len()) {
         return Ok(super::error_outcome(
             exit::USAGE,
             "usage",
-            "`sessions delete` 需要 --yes，否则拒绝执行",
+            "现在不在终端里，没法确认删除。确定要删的话，请加上 `--yes`（删除后无法恢复）",
             mode == OutputMode::Json,
         ));
     }
@@ -180,6 +180,24 @@ fn delete(
     }
 }
 
+/// Ask only on an interactive terminal; redirected input must never block.
+fn confirm_delete(count: usize) -> bool {
+    if !io::stdin().is_terminal() {
+        return false;
+    }
+    let _ = write!(
+        io::stderr(),
+        "将删除 {count} 个会话，删除后无法恢复。确定吗？[是/否]"
+    );
+    let _ = io::stderr().flush();
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).is_ok()
+        && matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "是" | "y" | "yes"
+        )
+}
+
 pub(crate) fn write_ok(
     mode: OutputMode,
     table: &crate::output::Table,
@@ -196,8 +214,9 @@ pub(crate) fn write_ok(
 
 pub(crate) fn query_outcome(err: QueryError, json: bool) -> Outcome {
     let (code, machine) = match &err {
-        QueryError::NotFound { .. } => (exit::GENERAL, "not_found"),
-        QueryError::NoSessions => (exit::GENERAL, "no_sessions"),
+        QueryError::NotFound { .. } => (exit::NOT_FOUND, "not_found"),
+        QueryError::NoSessions => (exit::NOT_FOUND, "no_sessions"),
+        QueryError::Permission { .. } => (exit::PERMISSION, "permission_denied"),
         QueryError::BadArgument { .. } => (exit::USAGE, "usage"),
         QueryError::Unavailable { .. } => (exit::GENERAL, "not_connected"),
     };
@@ -311,7 +330,7 @@ mod tests {
             &mut source,
         )
         .expect("show");
-        assert_eq!(outcome.code, exit::GENERAL);
+        assert_eq!(outcome.code, exit::NOT_FOUND);
         assert_eq!(
             paths.borrow().clone(),
             vec![
@@ -321,7 +340,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(outcome.stderr).expect("utf8"),
-            "aw: 找不到会话 `no-such-name`\n"
+            "aw: 找不到会话「no-such-name」\n"
         );
     }
 

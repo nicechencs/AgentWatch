@@ -68,6 +68,14 @@ pub(crate) fn daemon_stop(
     }
     let mut client = Client::new(endpoint.clone(), open());
     if let Err(err) = client.call(&ApiRequest::post_json("/api/v1/daemon/stop", &json!({}))) {
+        if is_permission_error(&err) {
+            return error_outcome(
+                exit::PERMISSION,
+                "permission",
+                "需要管理员权限才能停止后台",
+                json,
+            );
+        }
         return client_error(&err, endpoint, json);
     }
     let mut waited = Duration::ZERO;
@@ -102,6 +110,14 @@ pub(crate) fn daemon_restart(
 ) -> Outcome {
     let stopped = daemon_stop(endpoint, open, stop_wait, json);
     if stopped.code != exit::OK {
+        if stopped.code == exit::PERMISSION {
+            return error_outcome(
+                exit::PERMISSION,
+                "permission",
+                "需要管理员权限才能重启后台",
+                json,
+            );
+        }
         return stopped;
     }
     if let Err(detail) = wait_for_shutdown_release(endpoint, stop_wait) {
@@ -190,7 +206,18 @@ fn fetch(
     let mut client = Client::new(endpoint.clone(), open());
     let reply = client
         .call(&ApiRequest::get_query("/api/v1/daemon/logs", query))
-        .map_err(|err| client_error(&err, endpoint, json))?;
+        .map_err(|err| {
+            if is_permission_error(&err) {
+                error_outcome(
+                    exit::PERMISSION,
+                    "permission",
+                    "需要管理员权限才能查看后台日志",
+                    json,
+                )
+            } else {
+                client_error(&err, endpoint, json)
+            }
+        })?;
     let body = reply.json().unwrap_or(Value::Null);
     let text = body
         .get("text")
@@ -199,6 +226,17 @@ fn fetch(
         .to_owned();
     let offset = body.get("offset").and_then(Value::as_u64).unwrap_or(0);
     Ok((body, text, offset))
+}
+
+fn is_permission_error(error: &crate::client::ClientError) -> bool {
+    matches!(
+        error,
+        crate::client::ClientError::Forbidden { .. }
+            | crate::client::ClientError::Status {
+                status: 401 | 403,
+                ..
+            }
+    )
 }
 
 /// `-f` loop settings.

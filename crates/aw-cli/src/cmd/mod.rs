@@ -116,6 +116,9 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
     if let Command::Version { check } = &cli.command {
         return Ok(version_outcome(*check, json));
     }
+    if let Some(outcome) = not_in_build_command(&cli.command, json) {
+        return Ok(outcome);
+    }
     if let Some(outcome) = hook_command(&cli, env_token.as_deref()) {
         return Ok(outcome);
     }
@@ -171,12 +174,7 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
     if let Some(outcome) = ops_command(&cli.command, json, lang, Some(&endpoint)) {
         return Ok(outcome);
     }
-    Ok(error_outcome(
-        exit::GENERAL,
-        "not_implemented",
-        &format!("`{}` 尚未实现", command_label(&cli.command)),
-        json,
-    ))
+    Ok(not_in_build(command_label(&cli.command), json))
 }
 
 /// `aw ui`, `aw daemon start|status|stop|restart|logs`, and `aw ps`: the commands that need
@@ -547,6 +545,9 @@ fn dispatch(
     if let Command::Version { check } = &cli.command {
         return Ok(version_outcome(*check, json));
     }
+    if let Some(outcome) = not_in_build_command(&cli.command, json) {
+        return Ok(outcome);
+    }
     if let Some(outcome) = hook_command(&cli, env_token.as_deref()) {
         return Ok(outcome);
     }
@@ -588,12 +589,7 @@ fn dispatch(
 
     let label = command_label(&cli.command);
     match probe(&endpoint, http) {
-        Ok(()) => Ok(error_outcome(
-            exit::GENERAL,
-            "not_implemented",
-            &format!("`{label}` 尚未实现"),
-            json,
-        )),
+        Ok(()) => Ok(not_in_build(label, json)),
         Err(err) => Ok(client_outcome(err, &endpoint, json)),
     }
 }
@@ -650,14 +646,49 @@ fn mcp_tap_command(cli: &Cli) -> Option<Outcome> {
     Some(mcp_tap::run(cmd))
 }
 
+/// Commands deliberately compiled into the command tree for compatibility but
+/// not connected in this release. Keep this before endpoint resolution: a
+/// missing daemon must never disguise an unavailable feature.
+fn not_in_build_command(command: &Command, json: bool) -> Option<Outcome> {
+    let label = match command {
+        Command::Agents { .. }
+        | Command::Links { .. }
+        | Command::Rpc { .. }
+        | Command::Chain { .. }
+        | Command::Fixtures(_)
+        | Command::Group(_)
+        | Command::Dev { .. }
+        | Command::McpTap { .. } => command_label(command),
+        _ => return None,
+    };
+    Some(not_in_build(label, json))
+}
+
+pub(crate) fn not_in_build(label: &str, json: bool) -> Outcome {
+    error_outcome(
+        exit::NOT_IN_BUILD,
+        "not_in_build",
+        &format!("`{label}` 本版本未接入"),
+        json,
+    )
+}
+
 /// `aw proxy` (P3-PROXY-01). Does not read `ca.key` and does not probe `/health`.
 fn proxy_command(command: &Command, json: bool) -> Option<Outcome> {
     let Command::Proxy(cmd) = command else {
         return None;
     };
-    // `--confirm` is not on the shared clap tree. Without it, `trust` / `untrust`
-    // stop at the prompt and do not call a certificate tool.
-    Some(proxy::run(cmd, json, false, &mut proxy::UnwiredProxy))
+    let yes = matches!(
+        cmd,
+        tree::ProxyCmd::Trust { yes: true, .. } | tree::ProxyCmd::Untrust { yes: true }
+    );
+    Some(proxy::run(
+        cmd,
+        json,
+        yes,
+        &mut proxy::UnwiredProxy,
+        &mut proxy::StdinConfirm,
+    ))
 }
 
 /// `run`, `attach`, `stop`, and `ps` (P1-CLI-02).
@@ -794,14 +825,26 @@ fn query_command(
             },
             source,
         )?)),
-        Command::Procs { session, tree, .. } => Ok(Some(procs::run(session, *tree, json, source)?)),
+        Command::Procs {
+            session,
+            tree,
+            filter,
+        } => Ok(Some(procs::run(
+            session,
+            *tree,
+            filter.as_deref(),
+            json,
+            source,
+        )?)),
         Command::Flows {
             session,
+            filter,
             group_by,
             sort,
             ..
         } => Ok(Some(flows::run(
             session,
+            filter.as_deref(),
             group_by.as_deref(),
             sort.as_deref(),
             json,
@@ -917,21 +960,26 @@ fn ops_command(
             format,
             output,
             filter,
+            include,
             redact_paths,
             redact_hosts,
-            ..
-        } => Some(export_command(
-            export::ExportArgs {
-                session,
-                format: format.as_deref(),
-                output: output.as_deref(),
-                filter: filter.as_deref(),
-                redact_paths: *redact_paths,
-                redact_hosts: *redact_hosts,
-                json,
-            },
-            endpoint,
-        )),
+        } => {
+            if include.is_some() {
+                return Some(not_in_build("--include", json));
+            }
+            Some(export_command(
+                export::ExportArgs {
+                    session,
+                    format: format.as_deref(),
+                    output: output.as_deref(),
+                    filter: filter.as_deref(),
+                    redact_paths: *redact_paths,
+                    redact_hosts: *redact_hosts,
+                    json,
+                },
+                endpoint,
+            ))
+        }
         Command::Doctor { perf } => {
             if let Some(endpoint) = endpoint {
                 Some(doctor::run(
@@ -968,7 +1016,7 @@ fn ops_command(
         Command::Db(cmd) => {
             let op = match cmd {
                 tree::DbCmd::Stats => db::DbOp::Stats,
-                tree::DbCmd::Vacuum => db::DbOp::Vacuum,
+                tree::DbCmd::Vacuum { yes } => db::DbOp::Vacuum { yes: *yes },
                 tree::DbCmd::Migrate { dry_run } => db::DbOp::Migrate { dry_run: *dry_run },
                 tree::DbCmd::Purge {
                     older_than,
@@ -980,8 +1028,6 @@ fn ops_command(
                     yes: *yes,
                 },
             };
-            // No TTY on this path. `vacuum` and `purge` refuse unless the caller
-            // already passed `--yes` (purge) or a test injects [`db::Confirmed`].
             if let Some(endpoint) = endpoint {
                 Some(db::run(
                     op,
@@ -989,7 +1035,7 @@ fn ops_command(
                     privilege,
                     &db::FixedClock(0),
                     &mut db::HttpDbApi::new(endpoint.clone()),
-                    &mut db::NotInteractive,
+                    &mut db::StdinConfirm,
                 ))
             } else {
                 Some(db::run(
@@ -1054,12 +1100,7 @@ fn usage_gap(command: &Command) -> Option<String> {
 
 fn version_outcome(check: bool, json: bool) -> Outcome {
     if check {
-        return error_outcome(
-            exit::GENERAL,
-            "not_implemented",
-            "`aw version --check` 不会访问网络，尚未实现",
-            json,
-        );
+        return not_in_build("--check", json);
     }
     let text = if json {
         "{\"version\":\"0.1.0\"}\n".to_owned()
@@ -1248,10 +1289,9 @@ mod tests {
             None,
             &mut http,
         );
-        assert_eq!(outcome.code, exit::GENERAL);
+        assert_eq!(outcome.code, exit::NOT_IN_BUILD);
         let err = text(&outcome.stderr);
-        assert!(err.contains("尚未实现"), "{err}");
-        assert!(err.contains("尚未实现"), "{err}");
+        assert!(err.contains("本版本未接入"), "{err}");
         assert!(!err.contains(TOKEN), "{err}");
         assert_eq!(http.opened, 1);
         assert_eq!(paths(&http), vec!["/health".to_owned()]);
@@ -1271,8 +1311,8 @@ mod tests {
         assert_eq!(outcome.code, exit::PERMISSION);
         let err = text(&outcome.stderr);
         assert!(err.contains("没有通过后台的身份验证"), "{err}");
-        assert!(err.contains("len=19"), "{err}");
-        assert!(err.contains("WXYZ"), "{err}");
+        assert!(!err.contains("len="), "{err}");
+        assert!(!err.contains("WXYZ"), "{err}");
         assert!(!err.contains(TOKEN), "{err}");
         assert_eq!(paths(&http), vec!["/health".to_owned()]);
     }
@@ -1337,10 +1377,9 @@ mod tests {
         assert_eq!(http.opened, 0);
 
         let check = run(&["version", "--check"], None, &mut http);
-        assert_eq!(check.code, exit::GENERAL);
+        assert_eq!(check.code, exit::NOT_IN_BUILD);
         let err = text(&check.stderr);
-        assert!(err.contains("不会访问网络"), "{err}");
-        assert!(err.contains("尚未实现"), "{err}");
+        assert!(err.contains("`--check` 本版本未接入"), "{err}");
         assert_eq!(http.opened, 0);
     }
 
@@ -1390,9 +1429,9 @@ mod tests {
             None,
             &mut http,
         );
-        assert_eq!(outcome.code, exit::GENERAL);
+        assert_eq!(outcome.code, exit::NOT_IN_BUILD);
         let err = text(&outcome.stderr);
-        assert!(err.contains("\"not_implemented\""), "{err}");
+        assert!(err.contains("\"not_in_build\""), "{err}");
         assert!(!err.contains(TOKEN), "{err}");
         assert_eq!(output_mode(true), OutputMode::Json);
     }
@@ -1408,8 +1447,7 @@ mod tests {
         for name in [
             "run", "attach", "stop", "ps", "sessions", "timeline", "procs", "files", "flows",
             "http", "findings", "gaps", "around", "search", "export", "ui", "doctor", "daemon",
-            "config", "proxy", "db", "fixtures", "group", "agents", "links", "rpc", "chain",
-            "merge", "hook", "mcp-tap", "dev", "version",
+            "config", "db", "merge", "hook", "version",
         ] {
             assert!(
                 help.lines()
@@ -1417,7 +1455,41 @@ mod tests {
                 "missing subcommand `{name}` in:\n{help}"
             );
         }
+        for name in [
+            "proxy", "fixtures", "group", "agents", "links", "rpc", "chain", "mcp-tap", "dev",
+        ] {
+            assert!(
+                !help
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(name)),
+                "placeholder `{name}` must be hidden in:\n{help}"
+            );
+        }
         insta::assert_snapshot!(help);
+    }
+
+    #[test]
+    fn zh_help_names_key_arguments_and_hides_placeholders() {
+        let mut http = script(200, "{}");
+        let root = run(&["--lang", "zh", "--help"], None, &mut http);
+        let root_help = text(&root.stdout);
+        assert!(root_help.contains("用法:"), "{root_help}");
+        assert!(!root_help.contains("agents"), "{root_help}");
+        assert!(!root_help.contains("mcp-tap"), "{root_help}");
+        assert!(!root_help.contains("proxy"), "{root_help}");
+
+        let stop = run(&["stop", "--help"], None, &mut http);
+        assert!(text(&stop.stdout).contains("会话号或 @last"));
+        let run_help = run(&["run", "--help"], None, &mut http);
+        let run_text = text(&run_help.stdout);
+        assert!(run_text.contains("只交给被启动的程序，不发给后台"));
+        assert!(run_text.contains("关闭脱敏（本版本未接入）"));
+        let purge = run(&["db", "purge", "--help"], None, &mut http);
+        assert!(text(&purge.stdout).contains("不再确认，直接删除（无法恢复）"));
+
+        let placeholder = run(&["agents"], None, &mut http);
+        assert_eq!(placeholder.code, exit::NOT_IN_BUILD);
+        assert_eq!(text(&placeholder.stderr), "aw: `agents` 本版本未接入\n");
     }
 
     #[test]

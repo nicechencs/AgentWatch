@@ -125,11 +125,11 @@ pub(crate) fn ui(
         )
     } else {
         match &opened {
-            Some(Ok(())) => format!("opened {url}\nthe ticket is valid once, for 60 s\n"),
+            Some(Ok(())) => format!("已打开 {url}\n这个登录链接只能用一次，60 秒内有效\n"),
             Some(Err(reason)) => {
-                format!("could not open a browser ({reason}); open this URL within 60 s:\n{url}\n")
+                format!("无法打开浏览器（{reason}）；请在 60 秒内打开：\n{url}\n")
             }
-            None => format!("{url}\nthe ticket is valid once, for 60 s\n"),
+            None => format!("{url}\n这个登录链接只能用一次，60 秒内有效\n"),
         }
     };
     Outcome {

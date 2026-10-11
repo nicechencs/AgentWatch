@@ -49,7 +49,7 @@ serde_json = { version = "1.0.151", default-features = false, features = ["std"]
 # has acknowledged `/adopt`. nix is MIT and keeps this fd work safe under the
 # binary's `#![forbid(unsafe_code)]` policy.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", default-features = false, features = ["fs"] }
+nix = { version = "0.30", default-features = false, features = ["fs", "process", "signal"] }
 
 [dev-dependencies]
 # insta is MIT OR Apache-2.0. Same pin as aw-core. Snapshots record `aw --help`.

@@ -172,7 +172,7 @@ mod tests {
         }
 
         let outcome = run("s-missing", false, &mut Missing);
-        assert_eq!(outcome.code, exit::USAGE);
+        assert_eq!(outcome.code, exit::NOT_FOUND);
         assert_eq!(
             String::from_utf8(outcome.stderr).expect("utf8"),
             "aw: 找不到会话 `s-missing`\n"

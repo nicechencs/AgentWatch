@@ -22,6 +22,7 @@ use super::Outcome;
 pub(crate) fn run(
     session: &str,
     tree: bool,
+    filter: Option<&str>,
     json: bool,
     source: &dyn QuerySource,
 ) -> io::Result<Outcome> {
@@ -34,7 +35,7 @@ pub(crate) fn run(
         ));
     }
     let mode = OutputMode::from_json_flag(json);
-    match source.procs(session, tree) {
+    match source.procs(session, tree, filter) {
         Ok(nodes) => {
             let table = render::procs_table(&nodes, tree);
             let doc = render::procs_json(&nodes, tree);
@@ -95,15 +96,15 @@ mod tests {
             )]),
         };
         let source = HttpQuerySource::with_transport(endpoint(), script);
-        let outcome = run("s-someone-else", false, false, &source).expect("procs");
-        assert_eq!(outcome.code, exit::GENERAL);
+        let outcome = run("s-someone-else", false, None, false, &source).expect("procs");
+        assert_eq!(outcome.code, exit::NOT_FOUND);
         assert_eq!(
             paths.borrow().clone(),
             vec!["/api/v1/sessions/s-someone-else/processes".to_owned()]
         );
         assert_eq!(
             String::from_utf8(outcome.stderr).expect("utf8"),
-            "aw: 找不到会话 `s-someone-else`\n"
+            "aw: 找不到会话「s-someone-else」\n"
         );
     }
 }

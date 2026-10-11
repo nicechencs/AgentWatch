@@ -25,11 +25,11 @@ use std::sync::Mutex;
 
 use aw_store::{
     around, delete_session, dns_events, files, flow_buckets, flows, gaps, list_sessions,
-    newest_session_for_user, patch_session, process_detail, process_tree, public_id_by_session_id,
-    search, session_by_public_id, session_summary, stop_session, timeline, timeline_histogram,
-    traffic, CompileCtx, Cursor, FileGroupBy, FileQuery, FlowQuery, FtsMode, ProcessNode,
-    PurgeScope, QueryError, Retention, RetentionConfig, SessionFilter, SessionListItem,
-    SessionSummary, Store, StoreError, StoreExpr, TimelinePage, TimelineQuery,
+    newest_session_for_user, patch_session, process_detail, process_tree, process_tree_filtered,
+    public_id_by_session_id, search, session_by_public_id, session_summary, stop_session, timeline,
+    timeline_histogram, traffic, CompileCtx, Cursor, FileGroupBy, FileQuery, FlowQuery, FtsMode,
+    ProcessNode, PurgeScope, QueryError, Retention, RetentionConfig, SessionFilter,
+    SessionListItem, SessionSummary, Store, StoreError, StoreExpr, TimelinePage, TimelineQuery,
 };
 
 // Every method calls a function `aw-store` exports. A filter string is parsed
@@ -651,7 +651,7 @@ impl SessionQuery for StoreQuery {
         &self,
         user_id: &str,
         sid: &str,
-        _query: &ListQuery,
+        query: &ListQuery,
     ) -> Result<Option<serde_json::Value>, QueryBackendError> {
         let Some(store) = self.open()? else {
             return Ok(None);
@@ -659,7 +659,9 @@ impl SessionQuery for StoreQuery {
         let Some(id) = self.resolve_id(&store, user_id, sid)? else {
             return Ok(None);
         };
-        let tree = process_tree(store.connection(), user_id, id).map_err(map_query)?;
+        let expr = store_expr(query.filter.as_deref())?;
+        let tree = process_tree_filtered(store.connection(), user_id, id, expr.as_ref())
+            .map_err(map_query)?;
         Ok(tree.map(|nodes| serde_json::json!({ "processes": nodes_json(&nodes) })))
     }
 

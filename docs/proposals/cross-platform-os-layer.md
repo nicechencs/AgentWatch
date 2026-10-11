@@ -29,7 +29,7 @@ App 新建会话，后台按系统认出连接方，再按那个身份启动：
 | 系统 | 怎么认、怎么启动 |
 |---|---|
 | Windows | 从命名管道取出客户端令牌，认出调用方。按**这个身份**以挂起方式创建，绝不用服务账户。Job Object 由后台拿着 |
-| macOS | 本地套接字上用 `getpeereid` / `LOCAL_PEERPID` 取出对端 uid，切到这个身份再启动 |
+| macOS | 本地套接字上用 `getpeereid` / `LOCAL_PEERPID` 取出对端 uid，切到这个身份再启动；接口不提供附加组，字段为 `None` |
 | Linux | `SO_PEERCRED` 认出 uid，按这个 uid 启动（现有的 launch-as） |
 
 `aw run` 在 Windows 上：`aw` 自己拿着「关闭即杀」的 Job，放行或移交之前先清掉这个限制。
@@ -109,6 +109,8 @@ macOS 崩溃兜底用看门狗管道，不用「另起一个小看门狗发 `SIG
 ### 能力查询
 
 能力是一个固定枚举 `Capability`，查询结果三选一：`Available` / `NotInThisBuild` / `NotSupportedOnThisOs`。`aw doctor` 逐项通过这个接口问，不自己猜。两种「还不支持」一律带上 `os` 和 `capability` 返回，绝不静默给空结果：
+
+每个枚举值只有一个稳定英文 `as_str()` 名称，供 JSON 使用；人读的中文名称由 `zh()` 提供。当前名称依次是 `spawn_suspended`（挂起启动）、`spawn_as_caller`（以连接方身份启动）、`process_identity`（进程身份）、`process_table`（进程表）、`peer_identity`（认出连接方）、`secure_data_dir`（数据目录权限）、`exit_code`（退出码）。Linux 的 `spawn_suspended` 仅代表同一后台用户；`spawn_as_caller` 在 `aw-platform` 接入 launch-as 前报告 `NotInThisBuild`。
 
 - `NotInThisBuild`：界面显示「本版本未接入」
 - `NotSupportedOnThisOs`：界面显示「这个系统不支持」

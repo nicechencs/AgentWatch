@@ -12,9 +12,34 @@ fn no(capability: &'static str) -> PlatformError {
     }
 }
 pub fn identify_unix_peer(
-    _: &std::os::unix::net::UnixStream,
+    stream: &std::os::unix::net::UnixStream,
 ) -> Result<PeerIdentity, PlatformError> {
-    Err(no("peer_identity"))
+    let (uid, gid) =
+        nix::unistd::getpeereid(stream).map_err(|_| PlatformError::PeerNotIdentified {
+            reason: "getpeereid unavailable",
+        })?;
+    // LOCAL_PEERPID is not available on every socket configuration. The uid
+    // and gid above are enough to authenticate the caller, so preserve that
+    // identity when the optional pid cannot be obtained. Darwin's peer API
+    // does not provide supplementary groups; represent that absence as none.
+    let pid = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerPid)
+        .ok()
+        .and_then(|pid| u32::try_from(pid).ok());
+    let uid = uid.as_raw();
+    let gid = gid.as_raw();
+    Ok(PeerIdentity::new(
+        Owner::Unix {
+            ruid: uid,
+            euid: uid,
+            suid: uid,
+            rgid: gid,
+            egid: gid,
+            sgid: gid,
+            // getpeereid/LOCAL_PEERPID cannot report supplementary groups.
+            groups: None,
+        },
+        pid,
+    ))
 }
 impl Platform for CurrentPlatform {
     fn os(&self) -> &'static str {
@@ -23,6 +48,7 @@ impl Platform for CurrentPlatform {
     fn capability(&self, capability: Capability) -> CapabilityStatus {
         match capability {
             Capability::SpawnSuspended
+            | Capability::SpawnAsCaller
             | Capability::ProcessIdentity
             | Capability::ProcessTable
             | Capability::PeerIdentity

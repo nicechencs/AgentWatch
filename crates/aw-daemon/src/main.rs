@@ -10,6 +10,7 @@
 //! Collector assembly stays in `collectors.rs`. This file does not name a platform.
 
 #![forbid(unsafe_code)]
+#![deny(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
 use std::process::ExitCode;

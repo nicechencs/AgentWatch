@@ -113,7 +113,9 @@ pub enum Owner {
         rgid: u32,
         egid: u32,
         sgid: u32,
-        groups: Vec<u32>,
+        /// Supplementary groups when the platform can authenticate them.
+        /// `None` means the platform peer API does not expose them.
+        groups: Option<Vec<u32>>,
     },
     Windows {
         sid: String,
@@ -221,11 +223,39 @@ impl IdentifiedCaller {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {
     SpawnSuspended,
+    SpawnAsCaller,
     ProcessIdentity,
     ProcessTable,
     PeerIdentity,
     SecureDataDir,
     ExitCode,
+}
+impl Capability {
+    /// Stable machine-readable capability name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SpawnSuspended => "spawn_suspended",
+            Self::SpawnAsCaller => "spawn_as_caller",
+            Self::ProcessIdentity => "process_identity",
+            Self::ProcessTable => "process_table",
+            Self::PeerIdentity => "peer_identity",
+            Self::SecureDataDir => "secure_data_dir",
+            Self::ExitCode => "exit_code",
+        }
+    }
+
+    /// Chinese display name used by human-facing `aw doctor` output.
+    pub const fn zh(self) -> &'static str {
+        match self {
+            Self::SpawnSuspended => "挂起启动",
+            Self::SpawnAsCaller => "以连接方身份启动",
+            Self::ProcessIdentity => "进程身份",
+            Self::ProcessTable => "进程表",
+            Self::PeerIdentity => "认出连接方",
+            Self::SecureDataDir => "数据目录权限",
+            Self::ExitCode => "退出码",
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityStatus {
@@ -290,5 +320,28 @@ mod tests {
             "not_in_this_build"
         );
         assert_eq!(UnsupportedKind::NotSupportedOnThisOs.zh(), "这个系统不支持");
+    }
+
+    #[test]
+    fn capability_names_are_stable() {
+        assert_eq!(Capability::SpawnSuspended.as_str(), "spawn_suspended");
+        assert_eq!(Capability::SpawnAsCaller.zh(), "以连接方身份启动");
+        assert_eq!(Capability::ExitCode.zh(), "退出码");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_peer_identity_reports_current_uid() -> Result<(), PlatformError> {
+        use std::os::unix::net::UnixStream;
+
+        let (server, _client) = UnixStream::pair()?;
+        let peer = identify_unix_peer(&server)?;
+        let Owner::Unix { euid, .. } = peer.owner() else {
+            return Err(PlatformError::PeerNotIdentified {
+                reason: "Unix stream peer did not have a Unix owner",
+            });
+        };
+        assert_eq!(*euid, nix::unistd::geteuid().as_raw());
+        Ok(())
     }
 }

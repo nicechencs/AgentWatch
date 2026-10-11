@@ -33,13 +33,46 @@ pub fn identify_unix_peer(
     let pid = u32::try_from(credentials.pid()).map_err(|_| PlatformError::PeerNotIdentified {
         reason: "SO_PEERCRED returned an invalid pid",
     })?;
-    let owner =
-        entry(pid)?
-            .and_then(|process| process.owner)
-            .ok_or(PlatformError::PeerNotIdentified {
-                reason: "peer process ownership is unavailable",
-            })?;
+    // SO_PEERCRED is captured by the kernel for this connection. Do not use
+    // /proc for its uid/gid: the pid can exit and be reused between the two
+    // reads. `/proc/<pid>/status` is only a best-effort source of groups.
+    let uid = credentials.uid();
+    let gid = credentials.gid();
+    let groups = peer_groups(pid, uid)?;
+    let owner = Owner::Unix {
+        ruid: uid,
+        euid: uid,
+        suid: uid,
+        rgid: gid,
+        egid: gid,
+        sgid: gid,
+        groups,
+    };
     Ok(PeerIdentity::new(owner, Some(pid)))
+}
+
+/// Return groups only when `/proc` still describes the peer authenticated by
+/// `SO_PEERCRED`. A missing or unreadable proc entry leaves groups unavailable;
+/// it must not turn an otherwise authenticated peer into an unknown caller.
+fn peer_groups(pid: u32, peer_uid: u32) -> Result<Option<Vec<u32>>, PlatformError> {
+    let status = match fs::read_to_string(format!("/proc/{pid}/status")) {
+        Ok(status) => status,
+        Err(_) => return Ok(None),
+    };
+    let Some(Owner::Unix {
+        ruid,
+        groups: Some(groups),
+        ..
+    }) = owner_from_status(&status)
+    else {
+        return Ok(None);
+    };
+    if ruid != peer_uid {
+        return Err(PlatformError::PeerNotIdentified {
+            reason: "peer pid ownership changed while reading proc status",
+        });
+    }
+    Ok(Some(groups))
 }
 
 fn owner_from_status(status: &str) -> Option<Owner> {
@@ -63,7 +96,7 @@ fn owner_from_status(status: &str) -> Option<Owner> {
         rgid: *gid.first()?,
         egid: *gid.get(1)?,
         sgid: *gid.get(2)?,
-        groups: numbers("Groups:").unwrap_or_default(),
+        groups: Some(numbers("Groups:").unwrap_or_default()),
     })
 }
 
@@ -338,7 +371,9 @@ impl Platform for CurrentPlatform {
             | Capability::ProcessTable
             | Capability::PeerIdentity
             | Capability::ExitCode => CapabilityStatus::Available,
-            Capability::SecureDataDir => CapabilityStatus::NotInThisBuild,
+            Capability::SpawnAsCaller | Capability::SecureDataDir => {
+                CapabilityStatus::NotInThisBuild
+            }
         }
     }
     fn spawn_suspended(

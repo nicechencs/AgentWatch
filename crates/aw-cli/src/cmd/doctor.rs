@@ -371,7 +371,9 @@ pub(crate) fn report_json(report: &DoctorReport) -> Value {
         .collect();
     let platform_capabilities: Vec<Value> = platform_capabilities()
         .into_iter()
-        .map(|(status, name)| json!({ "capability": name, "status": capability_text(status) }))
+        .map(|(capability, status)| {
+            json!({ "capability": capability.as_str(), "status": capability_text(status) })
+        })
         .collect();
     json!({
         "os": report.host.os,
@@ -442,40 +444,48 @@ fn report_text(report: &DoctorReport) -> String {
         ));
     }
     out.push_str("platform capability  status\n");
-    for (capability, name) in platform_capabilities() {
-        out.push_str(&format!("{name}  {}\n", capability_text(capability)));
+    for (capability, status) in platform_capabilities() {
+        out.push_str(&format!(
+            "{}  {}\n",
+            capability.zh(),
+            capability_text(status)
+        ));
     }
     out
 }
 
 /// Fixed interface-v2 capabilities are deliberately shown separately from
 /// collector matrix rows, whose existing wording and test contract stay intact.
-fn platform_capabilities() -> [(CapabilityStatus, &'static str); 6] {
+fn platform_capabilities() -> [(PlatformCapability, CapabilityStatus); 7] {
     let platform = aw_platform::platform();
     [
         (
+            PlatformCapability::SpawnSuspended,
             platform.capability(PlatformCapability::SpawnSuspended),
-            "spawn_suspended",
         ),
         (
+            PlatformCapability::SpawnAsCaller,
+            platform.capability(PlatformCapability::SpawnAsCaller),
+        ),
+        (
+            PlatformCapability::ProcessIdentity,
             platform.capability(PlatformCapability::ProcessIdentity),
-            "process_identity",
         ),
         (
+            PlatformCapability::ProcessTable,
             platform.capability(PlatformCapability::ProcessTable),
-            "process_table",
         ),
         (
+            PlatformCapability::PeerIdentity,
             platform.capability(PlatformCapability::PeerIdentity),
-            "peer_identity",
         ),
         (
+            PlatformCapability::SecureDataDir,
             platform.capability(PlatformCapability::SecureDataDir),
-            "secure_data_dir",
         ),
         (
+            PlatformCapability::ExitCode,
             platform.capability(PlatformCapability::ExitCode),
-            "exit_code",
         ),
     ]
 }
@@ -637,6 +647,25 @@ mod tests {
         assert_eq!(value["privileged"], false);
         let again = report_json(&Fixed.report());
         assert_eq!(again["categories"].as_array().unwrap().len(), 7);
+    }
+
+    #[test]
+    fn platform_capability_names_are_localized_only_in_text() {
+        let report = Fixed.report();
+        let text = super::report_text(&report);
+        assert!(text.contains("挂起启动"), "{text}");
+        assert!(text.contains("以连接方身份启动"), "{text}");
+        assert!(!text.contains("spawn_suspended"), "{text}");
+
+        let json = report_json(&report);
+        let names: Vec<&str> = json["platform_capabilities"]
+            .as_array()
+            .expect("platform capabilities")
+            .iter()
+            .filter_map(|row| row["capability"].as_str())
+            .collect();
+        assert!(names.contains(&"spawn_suspended"), "{names:?}");
+        assert!(names.contains(&"spawn_as_caller"), "{names:?}");
     }
 
     #[test]

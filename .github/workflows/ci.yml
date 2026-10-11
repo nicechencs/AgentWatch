@@ -34,6 +34,10 @@ jobs:
         run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: daemon cannot use its own identity
+        if: runner.os == 'Linux'
+        shell: bash
+        run: scripts/check-daemon-current-user.sh
       - name: cargo test
         run: cargo test --workspace
       - name: root daemon tests

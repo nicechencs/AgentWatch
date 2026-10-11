@@ -187,6 +187,13 @@ impl Watches {
                     },
                 );
             }
+            // A sampler can observe the process as gone before `try_reap`
+            // reports its status (or while that nonblocking call errors). The
+            // daemon still owns this handle, so always hand it to the waiter
+            // instead of dropping a possible zombie at session end.
+            if let Some(child) = running.child.take() {
+                reap_launched_child(child);
+            }
         }
     }
 

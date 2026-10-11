@@ -72,7 +72,7 @@ export function NewSessionPage() {
  * Collected kinds as chips with their evidence; the rest in one plain
  * sentence per reason, worded like the Settings page (「没采」). A kind whose
  * collector does not run in this mode (`collector_unavailable`) says exactly
- * that, not 「不可得：当前运行模式不支持采集此信息」. List separator and colon
+ * that, not 「不可得：这个模式下没有对应采集器」. List separator and colon
  * come from the locale, never a hard-coded full-width 「：」.
  */
 export function CapabilityList({ capabilities }: { capabilities: DoctorCapability[] }) {

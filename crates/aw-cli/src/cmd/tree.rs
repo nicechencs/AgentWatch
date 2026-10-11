@@ -12,10 +12,11 @@ use clap::{Parser, Subcommand};
     name = "aw",
     version,
     about = "AgentWatch 命令行客户端",
+    override_usage = "aw [选项] <命令>",
     subcommand_required = true,
     disable_help_subcommand = true,
     disable_help_flag = true,
-    help_template = "{about-with-newline}\n用法: {usage}\n\n命令：\n{subcommands}\n\n选项：\n{options}\n"
+    help_template = "{about-with-newline}\n用法：{usage}\n\n命令：\n{subcommands}\n\n选项：\n{options}\n"
 )]
 pub(crate) struct Cli {
     /// 机器可读的 JSON 输出
@@ -78,7 +79,7 @@ pub(crate) enum Command {
         mcp_tap: bool,
         #[arg(
             long,
-            help = "不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序都会跟着结束。"
+            help = aw_platform::NO_DAEMON_HELP
         )]
         no_daemon: bool,
         #[arg(long, help = "原始事件文件（本版本未接入）")]
@@ -129,8 +130,10 @@ pub(crate) enum Command {
         filter: Option<String>,
     },
     /// 查看和管理会话
-    #[command(subcommand)]
-    Sessions(SessionsCmd),
+    Sessions {
+        #[command(subcommand)]
+        command: Option<SessionsCmd>,
+    },
     /// 查看会话时间线
     Timeline {
         /// 会话号或 @last
@@ -182,7 +185,7 @@ pub(crate) enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// 查看发现
+    /// 发现记录
     Findings {
         /// 会话号或 @last
         session: String,
@@ -354,6 +357,7 @@ pub(crate) enum SessionsCmd {
         owner: Option<String>,
     },
     /// 固定会话，不参与自动清理
+    #[command(about = "固定会话，不参与自动清理")]
     Pin {
         session: String,
         /// 管理员操作其他用户会话时，明确指定会话主人
@@ -552,7 +556,7 @@ pub(crate) fn command_label(command: &Command) -> &'static str {
         Command::Attach { .. } => "attach",
         Command::Stop { .. } => "stop",
         Command::Ps { .. } => "ps",
-        Command::Sessions(cmd) => match cmd {
+        Command::Sessions { command: Some(cmd) } => match cmd {
             SessionsCmd::List { .. } => "sessions list",
             SessionsCmd::Show { .. } => "sessions show",
             SessionsCmd::Rename { .. } => "sessions rename",
@@ -560,6 +564,7 @@ pub(crate) fn command_label(command: &Command) -> &'static str {
             SessionsCmd::Unpin { .. } => "sessions unpin",
             SessionsCmd::Delete { .. } => "sessions delete",
         },
+        Command::Sessions { command: None } => "sessions list",
         Command::Timeline { .. } => "timeline",
         Command::Procs { .. } => "procs",
         Command::Files { .. } => "files",

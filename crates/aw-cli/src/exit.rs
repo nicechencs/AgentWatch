@@ -19,6 +19,8 @@ pub const PERMISSION: i32 = 4;
 pub const NOT_IN_BUILD: i32 = 5;
 /// The daemon answered, but the requested resource does not exist.
 pub const NOT_FOUND: i32 = 6;
+/// The operator declined an interactive destructive confirmation.
+pub const CANCELLED: i32 = 7;
 
 /// Map an HTTP status from the daemon onto a CLI exit code.
 ///

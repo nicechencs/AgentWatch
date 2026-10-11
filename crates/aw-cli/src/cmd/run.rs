@@ -191,7 +191,7 @@ impl DaemonSummary {
 
 /// Fixed sentence for a daemon-recorded run. Not a claim about the target.
 const DAEMON_LEVEL_NOTE: &str =
-    "证据 S（后台轮询采样）· 数字为目标退出时后台已记录的部分，会话由后台在根进程退出后结束";
+    "后台定时查看进程表；数字为目标退出时后台已记录的部分，会话由后台在根进程退出后结束";
 
 impl SessionSummary for DaemonSummary {
     fn summarize(&mut self, session_hint: Option<&str>) -> Result<Option<Summary>, String> {
@@ -283,7 +283,7 @@ pub(crate) fn spawn_error_text(error: &std::io::Error) -> String {
     // The code and the OS number stay out of this sentence. The caller pairs
     // it with `spawn_error_code` for the log and, with `--json`, `error.code`.
     match error.kind() {
-        std::io::ErrorKind::NotFound => "无法启动程序：找不到这个程序或工作目录".to_owned(),
+        std::io::ErrorKind::NotFound => "找不到程序，请检查名字或路径".to_owned(),
         std::io::ErrorKind::PermissionDenied => {
             "无法启动程序：没有权限运行它或进入工作目录".to_owned()
         }
@@ -305,10 +305,12 @@ pub(crate) fn spawn_error_code(error: &std::io::Error) -> &'static str {
 /// Keep this wording identical on every platform, including Windows where
 /// CreateProcess performs the PATH lookup inside `aw-platform`.
 fn spawn_error_text_for(program: &str, error: &std::io::Error) -> String {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        format!("找不到程序「{program}」，请检查名字或路径")
-    } else {
-        spawn_error_text(error)
+    match error.kind() {
+        std::io::ErrorKind::NotFound => format!("找不到程序「{program}」，请检查名字或路径"),
+        std::io::ErrorKind::PermissionDenied => {
+            format!("程序「{program}」没有执行权限，请检查文件权限后再试。")
+        }
+        _ => spawn_error_text(error),
     }
 }
 
@@ -531,7 +533,7 @@ fn spawn_step_text(program: &str, cwd: Option<&str>, error: &std::io::Error) -> 
         };
     }
     if text.starts_with("exec:") || error.kind() == std::io::ErrorKind::NotFound {
-        return spawn_error_text_for(program, &std::io::Error::from(std::io::ErrorKind::NotFound));
+        return spawn_error_text_for(program, error);
     }
     spawn_error_text(error)
 }
@@ -554,7 +556,7 @@ fn spawn_step_code(error: &std::io::Error) -> &'static str {
 fn caller_identity_error() -> (&'static str, String) {
     (
         "identity_unavailable",
-        "认不出当前用户，已停止启动：无法确认当前用户".to_owned(),
+        "认不出当前用户，已停止启动：系统没有提供可确认的身份。".to_owned(),
     )
 }
 
@@ -1162,7 +1164,7 @@ fn daemon_prepare(
         return Err(super::error_outcome(
             exit::GENERAL,
             "not_available",
-            "后台记录会话时不支持 --no-follow-children（轮询采样器总是跟随子进程）；请移除此参数或使用 --no-daemon",
+            "后台记录会话时不支持 --no-follow-children；请移除此参数或使用 --no-daemon",
             args.json,
         ));
     }
@@ -1582,6 +1584,13 @@ fn write_summary(
         // target's own stdout stays untouched.
         return out.write_all(&bytes);
     }
+    if args.no_daemon {
+        writeln!(out, "[aw] 没连后台，这次只运行程序，不做记录，也没有摘要。")?;
+        if let Some(note) = launched.note {
+            writeln!(out, "[aw] {note}")?;
+        }
+        return Ok(());
+    }
     match figures {
         Ok(Some(summary)) => {
             let processes = if !args.no_daemon && summary.processes == Some(0) {
@@ -1626,12 +1635,6 @@ fn write_summary(
             }
             writeln!(out, "[aw] 摘要不可用 · {detail}")?;
         }
-    }
-    if args.no_daemon {
-        writeln!(
-            out,
-            "[aw] 已请求采样模式（--no-daemon）；实际采集状态不可得，未经采集器确认"
-        )?;
     }
     match (args.pin, pin_state) {
         (true, PinState::Unknown) => {
@@ -2041,7 +2044,7 @@ mod tests {
             bytes_down: Some(0),
             top_domains: Vec::new(),
             gaps: Some(0),
-            level_note: "证据 S".to_owned(),
+            level_note: "定时查看进程表".to_owned(),
         };
         let mut launcher = fake_exit_7();
         let outcome = run(
@@ -2220,13 +2223,12 @@ mod tests {
                 assert_eq!(body["top_domains"][0]["name"], "example.test");
                 assert_eq!(body["top_domains"][0]["flows"], 2);
             } else {
-                assert!(err.contains("已请求采样模式（--no-daemon）"), "{err}");
-                assert!(err.contains("实际采集状态不可得"), "{err}");
-                assert!(err.contains("已请求会话保留（--pin）"), "{err}");
-                assert!(err.contains("保留状态不可得"), "{err}");
-                assert!(err.contains(&sample_summary().level_note), "{err}");
-                assert!(!err.contains("等级 S"), "{err}");
-                assert!(!err.contains("会话已标记为保留"), "{err}");
+                assert!(
+                    err.contains("没连后台，这次只运行程序，不做记录，也没有摘要。"),
+                    "{err}"
+                );
+                assert!(!err.contains(&sample_summary().level_note), "{err}");
+                assert!(!err.contains("已请求会话保留"), "{err}");
             }
         }
     }
@@ -2258,10 +2260,16 @@ mod tests {
                         assert_unknown_json(&body, pin, no_daemon);
                         assert_unavailable_json(&body);
                         assert_eq!(body["reason"], "摘要不可用");
+                    } else if no_daemon {
+                        assert!(
+                            err.contains("没连后台，这次只运行程序，不做记录，也没有摘要。"),
+                            "{err}"
+                        );
+                        assert!(!err.contains("摘要不可用"), "{err}");
+                        assert!(!err.contains("已请求会话保留"), "{err}");
                     } else {
                         assert!(err.contains("摘要不可用"), "{err}");
                         assert_eq!(err.contains("已请求会话保留"), pin, "{err}");
-                        assert_eq!(err.contains("已请求采样模式"), no_daemon, "{err}");
                         assert!(!err.contains("会话已标记为保留"), "{err}");
                         assert!(!err.contains("等级 S"), "{err}");
                         assert!(!err.contains("进程 0"), "{err}");
@@ -2293,11 +2301,12 @@ mod tests {
                 assert_unavailable_json(&body);
                 assert_eq!(body["reason"], "摘要源不可用");
             } else {
-                assert!(err.contains("摘要不可用 · 摘要源不可用"), "{err}");
-                assert!(err.contains("保留状态不可得"), "{err}");
-                assert!(err.contains("实际采集状态不可得"), "{err}");
-                assert!(!err.contains("会话已标记为保留"), "{err}");
-                assert!(!err.contains("等级 S"), "{err}");
+                assert!(
+                    err.contains("没连后台，这次只运行程序，不做记录，也没有摘要。"),
+                    "{err}"
+                );
+                assert!(!err.contains("摘要源不可用"), "{err}");
+                assert!(!err.contains("已请求会话保留"), "{err}");
             }
         }
     }
@@ -2943,7 +2952,7 @@ mod tests {
             env: Vec::new(),
             no_follow_children: false,
             allow_breakaway: false,
-            no_daemon: false,
+            no_daemon: true,
         };
         let mut spawned = CommandSpawner
             .spawn(&spec)
@@ -3003,6 +3012,44 @@ mod tests {
     }
 
     #[test]
+    fn no_daemon_spawn_failures_name_the_program_or_working_directory() {
+        use std::io::{Error, ErrorKind};
+
+        assert_eq!(
+            super::spawn_step_text(
+                "missing-tool",
+                None,
+                &Error::new(ErrorKind::NotFound, "exec: missing")
+            ),
+            "找不到程序「missing-tool」，请检查名字或路径"
+        );
+        assert_eq!(
+            super::spawn_step_text(
+                "not-executable",
+                None,
+                &Error::new(ErrorKind::PermissionDenied, "exec: denied")
+            ),
+            "程序「not-executable」没有执行权限，请检查文件权限后再试。"
+        );
+        assert_eq!(
+            super::spawn_step_text(
+                "tool",
+                Some("/missing/cwd"),
+                &Error::new(ErrorKind::NotFound, "chdir: missing")
+            ),
+            "找不到工作目录「/missing/cwd」"
+        );
+        assert_eq!(
+            super::spawn_step_text(
+                "tool",
+                Some("/locked/cwd"),
+                &Error::new(ErrorKind::PermissionDenied, "chdir: denied")
+            ),
+            "没有权限进入工作目录「/locked/cwd」，请换一个目录或检查权限。"
+        );
+    }
+
+    #[test]
     fn spawn_failure_stops_the_pending_session_without_printing_argv() {
         let command = vec!["private-tool".to_owned(), "--secret".to_owned()];
         let log = Rc::new(RefCell::new(Vec::new()));
@@ -3045,7 +3092,7 @@ mod tests {
             code: 0,
             fail: Some((
                 "identity_unavailable",
-                "认不出当前用户，已停止启动：无法确认当前用户".to_owned(),
+                "认不出当前用户，已停止启动：系统没有提供可确认的身份。".to_owned(),
             )),
         };
         let mut parsed = args(&command);
@@ -3062,7 +3109,7 @@ mod tests {
         assert_eq!(body["error"]["code"], "identity_unavailable");
         assert_eq!(
             body["error"]["message"],
-            "认不出当前用户，已停止启动：无法确认当前用户"
+            "认不出当前用户，已停止启动：系统没有提供可确认的身份。"
         );
     }
 
@@ -3112,9 +3159,21 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_no_daemon_releases_the_held_child_and_keeps_exit_7() {
-        let spec = RunSpec::new(vec!["cmd".to_owned(), "/c".to_owned(), "exit 7".to_owned()])
+        let mut spec = RunSpec::new(vec!["cmd".to_owned(), "/c".to_owned(), "exit 7".to_owned()])
             .expect("spec");
+        spec.no_daemon = true;
         let launched = PlatformLauncher.launch(&spec).expect("Windows launch");
+        assert_eq!(launched.code, 7);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_no_daemon_releases_the_held_child_and_keeps_exit_7() {
+        use super::Launcher;
+        let mut spec = RunSpec::new(vec!["sh".to_owned(), "-c".to_owned(), "exit 7".to_owned()])
+            .expect("spec");
+        spec.no_daemon = true;
+        let launched = super::PlatformLauncher.launch(&spec).expect("macOS launch");
         assert_eq!(launched.code, 7);
     }
 

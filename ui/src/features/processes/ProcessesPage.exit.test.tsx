@@ -59,4 +59,37 @@ describe("process exit code", () => {
     );
     expect(container.textContent).toBe("正在读取进程…");
   });
+
+  it("shows the short-process notice only for a poll process collector with S evidence", async () => {
+    const { ProcessesPage } = await import("@/features/processes/ProcessesPage");
+    const polling = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    polling.setQueryData(["processes", "s-1"], { roots: [] });
+    polling.setQueryData(["session", "s-1"], {
+      public_id: "s-1",
+      collectors: [{ mode: "poll", capabilities: [{ kind: "proc", evidence: "S" }] }],
+      ended_ns: 1,
+    });
+    const pollPage = render(
+      <QueryClientProvider client={polling}>
+        <ProcessesPage />
+      </QueryClientProvider>,
+    );
+    expect(pollPage.container.querySelector("[data-fast-exit-may-be-missed]")?.textContent)
+      .toBe(ZH["procs.fastExitMayBeMissed"]);
+    pollPage.unmount();
+
+    const native = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    native.setQueryData(["processes", "s-1"], { roots: [] });
+    native.setQueryData(["session", "s-1"], {
+      public_id: "s-1",
+      collectors: [{ mode: "native", capabilities: [{ kind: "proc", evidence: "E1" }] }],
+      ended_ns: 1,
+    });
+    const nativePage = render(
+      <QueryClientProvider client={native}>
+        <ProcessesPage />
+      </QueryClientProvider>,
+    );
+    expect(nativePage.container.querySelector("[data-fast-exit-may-be-missed]")).toBeNull();
+  });
 });

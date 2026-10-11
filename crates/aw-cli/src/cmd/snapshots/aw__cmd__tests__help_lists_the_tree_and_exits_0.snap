@@ -4,7 +4,7 @@ expression: help
 ---
 AgentWatch 命令行客户端
 
-用法: aw [OPTIONS] <COMMAND>
+用法：aw [选项] <命令>
 
 命令：
   run       启动程序并记录
@@ -17,7 +17,7 @@ AgentWatch 命令行客户端
   files     文件访问
   flows     会话里的网络流
   http      HTTP 记录
-  findings  查看发现
+  findings  发现记录
   gaps      采集缺口
   around    查看某条记录前后的事件
   search    跨会话搜索

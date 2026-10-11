@@ -25,6 +25,10 @@ export function ProcessesPage() {
   const { sid } = useParams({ strict: false }) as { sid: string };
   const tree = useQuery({ queryKey: ["processes", sid], queryFn: () => api.processes(sid) });
   const session = useQuery(sessionQueryOptions(sid));
+  const fastExitMayBeMissed = session.data?.collectors.some(
+    (collector) => collector.mode === "poll"
+      && collector.capabilities.some((capability) => capability.kind === "proc" && capability.evidence === "S"),
+  ) === true;
   const files = coverage(session.data, "file");
   const net = coverage(session.data, "net");
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -63,6 +67,11 @@ export function ProcessesPage() {
 
   return (
     <div className="h-full overflow-auto" onClick={() => setMenu(null)}>
+      {fastExitMayBeMissed ? (
+        <p className="border-b border-line px-3 py-1.5 text-xs text-ink-faint" data-fast-exit-may-be-missed="">
+          {t("procs.fastExitMayBeMissed")}
+        </p>
+      ) : null}
       <div className="flex items-center gap-2 border-b border-line px-3 py-1.5 text-[11px]">
         <input
           value={nameFilter}

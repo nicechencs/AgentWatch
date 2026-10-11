@@ -14,6 +14,8 @@ use super::render;
 use super::sessions::{query_outcome, write_ok};
 use super::Outcome;
 
+const FAST_EXIT_NOTE: &str = "这个会话是定时查看进程表来记录的，运行时间很短的程序可能没记下来。";
+
 /// Render the process list or tree.
 ///
 /// # Errors
@@ -36,15 +38,42 @@ pub(crate) fn run(
     }
     let mode = OutputMode::from_json_flag(json);
     match source.procs(session, tree, filter) {
-        Ok(processes) if processes.scan_pending => Ok(Outcome {
-            code: exit::OK,
-            stdout: "正在读取进程…\n".as_bytes().to_vec(),
-            stderr: Vec::new(),
-        }),
+        Ok(processes) if processes.scan_pending => {
+            if mode == OutputMode::Json {
+                let doc = serde_json::json!({
+                    "scan_pending": true,
+                    "fast_exit_may_be_missed": processes.fast_exit_may_be_missed,
+                    "processes": [],
+                });
+                Ok(Outcome {
+                    code: exit::OK,
+                    stdout: format!("{doc}\n").into_bytes(),
+                    stderr: Vec::new(),
+                })
+            } else {
+                let mut stdout = "正在读取进程…\n".as_bytes().to_vec();
+                if processes.fast_exit_may_be_missed {
+                    stdout.extend_from_slice(format!("{FAST_EXIT_NOTE}\n").as_bytes());
+                }
+                Ok(Outcome {
+                    code: exit::OK,
+                    stdout,
+                    stderr: Vec::new(),
+                })
+            }
+        }
         Ok(processes) => {
             let table = render::procs_table(&processes.nodes, tree);
-            let doc = render::procs_json(&processes.nodes, tree);
-            write_ok(mode, &table, &doc)
+            let mut doc = render::procs_json(&processes.nodes, tree);
+            doc["fast_exit_may_be_missed"] =
+                serde_json::Value::Bool(processes.fast_exit_may_be_missed);
+            let mut outcome = write_ok(mode, &table, &doc)?;
+            if mode == OutputMode::Table && processes.fast_exit_may_be_missed {
+                outcome
+                    .stdout
+                    .extend_from_slice(format!("{FAST_EXIT_NOTE}\n").as_bytes());
+            }
+            Ok(outcome)
         }
         Err(err) => Ok(query_outcome(err, json)),
     }
@@ -130,5 +159,39 @@ mod tests {
             String::from_utf8(outcome.stdout).expect("utf8"),
             "正在读取进程…\n"
         );
+    }
+
+    #[test]
+    fn process_output_marks_fast_exits_only_when_the_daemon_says_so() {
+        let table_source = HttpQuerySource::with_transport(
+            endpoint(),
+            Script {
+                paths: Rc::new(RefCell::new(Vec::new())),
+                replies: RefCell::new(vec![(
+                    200,
+                    br#"{"processes":[],"fast_exit_may_be_missed":true}"#.to_vec(),
+                )]),
+            },
+        );
+        let table = run("s-poll", false, None, false, &table_source).expect("table");
+        assert_eq!(table.code, exit::OK);
+        assert!(String::from_utf8(table.stdout)
+            .expect("utf8")
+            .ends_with("这个会话是定时查看进程表来记录的，运行时间很短的程序可能没记下来。\n"));
+
+        let json_source = HttpQuerySource::with_transport(
+            endpoint(),
+            Script {
+                paths: Rc::new(RefCell::new(Vec::new())),
+                replies: RefCell::new(vec![(
+                    200,
+                    br#"{"processes":[],"fast_exit_may_be_missed":true}"#.to_vec(),
+                )]),
+            },
+        );
+        let json = run("s-poll", false, None, true, &json_source).expect("json");
+        assert_eq!(json.code, exit::OK);
+        let body: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json document");
+        assert_eq!(body["fast_exit_may_be_missed"], true);
     }
 }

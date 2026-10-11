@@ -143,11 +143,17 @@ impl DaemonControl for PlannedControl {
                             ("removed", "已删除指定的测试数据目录；没有移除系统服务")
                         }
                         #[cfg(feature = "test-purge-data-dir")]
-                        None => ("planned", "已记录 uninstall --purge；没有删除数据库"),
+                        None => (
+                            "planned",
+                            "这一版不会删除数据：会话数据库和数据目录都还在。",
+                        ),
                         // Release builds never delete a directory, even if a
                         // future caller builds the op with a path.
                         #[cfg(not(feature = "test-purge-data-dir"))]
-                        _ => ("planned", "已记录 uninstall --purge；没有删除数据库"),
+                        _ => (
+                            "planned",
+                            "这一版不会删除数据：会话数据库和数据目录都还在。",
+                        ),
                     }
                 } else {
                     ("planned", "已记录 uninstall；没有移除服务")
@@ -225,7 +231,7 @@ fn unconfirmed_install(json: bool) -> Outcome {
             "systemd"
         };
         let detail = format!(
-            "planned: {platform} 安装计划；此命令不注册服务。实际安装由安装包提供\n提示: 请使用 AgentWatch 安装包完成安装\n"
+            "{platform} 安装说明：此命令不注册服务。实际安装由安装包提供\n提示：请使用 AgentWatch 安装包完成安装\n"
         );
         return if json {
             Outcome {
@@ -282,29 +288,29 @@ fn unconfirmed_install(json: bool) -> Outcome {
             };
         }
         let text = format!(
-        "\
-planned: install plan was rendered; nothing was registered
-service_name={name}
-display_name={display}
-start_mode={start}
-account={account}
-sid_type={sid}
-bin_path={bin}
-recovery=restart/{first}/restart/{second}/restart/{third}
+            "\
+已生成安装说明；此命令没有注册服务
+服务名称：{name}
+显示名称：{display}
+启动方式：{start}
+账户：{account}
+服务 SID：{sid}
+程序路径：{bin}
+失败后重启：{first}/{second}/{third}
 {acls}\
-hint: re-run `aw daemon install --yes` to print sc.exe text for an administrator; this process does not run it
+提示：请重新运行 `aw daemon install --yes`，向管理员显示 sc.exe 命令；本进程不会执行它
 ",
-        name = plan.name,
-        display = plan.display_name,
-        start = plan.start_mode,
-        account = plan.account,
-        sid = plan.sid_type,
-        bin = plan.bin_path,
-        first = plan.first_delay_ms,
-        second = plan.second_delay_ms,
-        third = plan.third_delay_ms,
-        acls = acls.join(""),
-    );
+            name = plan.name,
+            display = plan.display_name,
+            start = plan.start_mode,
+            account = plan.account,
+            sid = plan.sid_type,
+            bin = plan.bin_path,
+            first = plan.first_delay_ms,
+            second = plan.second_delay_ms,
+            third = plan.third_delay_ms,
+            acls = acls.join(""),
+        );
         Outcome {
             code: exit::USAGE,
             stdout: text.into_bytes(),
@@ -333,8 +339,8 @@ fn confirmed_install(effect: &DaemonEffect, json: bool) -> Outcome {
             "systemd"
         };
         let detail = format!(
-            "{}: {}\nexecuted=false\n{platform} 服务由 AgentWatch 安装包安装；此命令没有注册服务\n",
-            effect.state, effect.detail
+            "{}\n{platform} 服务由 AgentWatch 安装包安装；此命令没有注册服务\n",
+            effect.detail
         );
         return if json {
             Outcome {
@@ -378,14 +384,7 @@ fn confirmed_install(effect: &DaemonEffect, json: bool) -> Outcome {
                 stderr: Vec::new(),
             };
         }
-        let text = format!(
-            "\
-{state}: {detail}
-executed=false
-{commands}",
-            state = effect.state,
-            detail = effect.detail,
-        );
+        let text = format!("{}\n{commands}", effect.detail);
         Outcome {
             code: exit::OK,
             stdout: text.into_bytes(),
@@ -461,7 +460,7 @@ fn ok_outcome(effect: &DaemonEffect, json: bool) -> Outcome {
             json!({ "state": effect.state, "detail": effect.detail })
         )
     } else {
-        format!("{}: {}\n", effect.state, effect.detail)
+        format!("{}\n", effect.detail)
     };
     Outcome {
         code: exit::OK,
@@ -536,11 +535,11 @@ mod tests {
         assert_eq!(outcome.code, exit::USAGE);
         let text = String::from_utf8(outcome.stdout).expect("utf8");
         assert!(text.contains("AgentWatch"), "{text}");
-        assert!(text.contains("安装计划"), "{text}");
+        assert!(text.contains("安装说明"), "{text}");
         // Non-Windows plans describe only this platform's installer pack.
         assert!(!text.contains("sc.exe"), "{text}");
         assert!(
-            text.contains("安装包") || text.contains("安装计划"),
+            text.contains("安装包") || text.contains("安装说明"),
             "{text}"
         );
         assert!(control.seen.is_empty());
@@ -571,7 +570,7 @@ mod tests {
     #[test]
     fn uninstall_purge_with_admin_is_planned_not_deleted() {
         let mut control = Recording { seen: Vec::new() };
-        let outcome = run(
+        let json_outcome = run(
             DaemonOp::Uninstall {
                 purge: true,
                 check: false,
@@ -581,17 +580,39 @@ mod tests {
             &Admin(true),
             &mut control,
         );
-        assert_eq!(outcome.code, exit::OK);
-        let text = String::from_utf8(outcome.stdout).expect("utf8");
-        assert!(text.contains("planned"), "{text}");
-        assert!(text.contains("没有删除数据库"), "{text}");
-        assert_eq!(
-            control.seen,
-            vec![DaemonOp::Uninstall {
+        assert_eq!(json_outcome.code, exit::OK);
+        let json_text = String::from_utf8(json_outcome.stdout).expect("utf8");
+        assert!(json_text.contains("\"state\":\"planned\""), "{json_text}");
+
+        let human_outcome = run(
+            DaemonOp::Uninstall {
                 purge: true,
                 check: false,
                 data_dir: None,
-            }]
+            },
+            false,
+            &Admin(true),
+            &mut control,
+        );
+        assert_eq!(human_outcome.code, exit::OK);
+        assert_eq!(
+            String::from_utf8(human_outcome.stdout).expect("utf8"),
+            "这一版不会删除数据：会话数据库和数据目录都还在。\n"
+        );
+        assert_eq!(
+            control.seen,
+            vec![
+                DaemonOp::Uninstall {
+                    purge: true,
+                    check: false,
+                    data_dir: None,
+                },
+                DaemonOp::Uninstall {
+                    purge: true,
+                    check: false,
+                    data_dir: None,
+                },
+            ]
         );
     }
 

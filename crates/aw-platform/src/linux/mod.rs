@@ -13,6 +13,8 @@ use std::{fs, io};
 
 pub(crate) struct CurrentPlatform;
 
+pub const NO_DAEMON_HELP: &str = "不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序会跟着结束。机器上没有可用的 cgroup v2 时，子程序要是自己脱离了进程组，不保证会跟着结束。";
+
 fn no(capability: &'static str) -> PlatformError {
     PlatformError::Unsupported {
         capability,

@@ -159,9 +159,8 @@ impl fmt::Display for ClientError {
                 if let Some(text) = aw_channel::human_socket_path_error(detail) {
                     return f.write_str(&text);
                 }
-                write!(
-                    f,
-                    "连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：{detail}"
+                f.write_str(
+                    "连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（只运行程序，不做记录）。",
                 )
             }
             Self::Forbidden { detail } => write!(
@@ -642,17 +641,17 @@ mod tests {
     }
 
     #[test]
-    fn unreachable_message_starts_with_the_daemon_instruction_and_keeps_detail() {
+    fn unreachable_message_is_the_reviewed_daemon_instruction() {
         let detail = "x.sock: connection refused";
         let text = ClientError::Unreachable {
             detail: detail.to_owned(),
         }
         .to_string();
-        assert!(
-            text.starts_with("连不上后台，请先运行 `aw daemon start`"),
-            "{text}"
+        assert_eq!(
+            text,
+            "连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（只运行程序，不做记录）。"
         );
-        assert!(text.contains(detail), "{text}");
+        assert!(!text.contains(detail), "{text}");
     }
 
     #[test]

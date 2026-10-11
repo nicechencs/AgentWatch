@@ -334,10 +334,10 @@ fn fix_for(category: &str, privileged: bool) -> &'static str {
     match category {
         "file" | "net" | "dns" if privileged => "本版本未接入",
         "proc" | "file" | "net" | "dns" => {
-            "请以管理员权限（Windows）或 root（Linux/macOS）运行后台，或使用 --no-daemon（证据 S）"
+            "请以管理员权限（Windows）或 root（Linux/macOS）运行后台，或使用 --no-daemon（只运行程序，不做记录）"
         }
         "url" => "URL 需要显式代理（P3）；否则字段为 NA(tls_no_proxy)",
-        "scope" => "启动模式需要 Job、cgroup 或进程树范围；附着点之前为证据 S",
+        "scope" => "启动模式需要 Job、cgroup 或进程树范围；附着点之前的范围可能不完整",
         "priv" => "install 和 uninstall 需要管理员终端或 sudo",
         _ => "此类别没有已知修复方法",
     }
@@ -435,12 +435,18 @@ fn report_text(report: &DoctorReport) -> String {
     for row in &report.categories {
         let source = row.source.as_deref().unwrap_or("-");
         let fix = row.fix.as_deref().unwrap_or("-");
+        let fast_exit_note = if row.category == "proc" && source == "poll" {
+            " · 定时查看进程表，运行时间很短的程序可能漏记"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "{}  {}  {}  {}\n",
+            "{}  {}  {}  {}{}\n",
             row.category,
             source,
             evidence_badge(&row.evidence),
-            fix
+            fix,
+            fast_exit_note,
         ));
     }
     out.push_str("platform capability  status\n");
@@ -736,6 +742,10 @@ mod tests {
             .to_owned();
         assert!(!line.contains("不可得"), "{line}");
         assert!(!line.contains("root"), "{line}");
+        assert!(
+            line.contains("定时查看进程表，运行时间很短的程序可能漏记"),
+            "{line}"
+        );
     }
 
     #[test]

@@ -49,6 +49,16 @@ use macos::CurrentPlatform;
 #[cfg(target_os = "windows")]
 use windows::CurrentPlatform;
 
+/// Platform-specific, reviewed `aw run --no-daemon` help text.
+#[cfg(target_os = "linux")]
+pub use linux::NO_DAEMON_HELP;
+/// Platform-specific, reviewed `aw run --no-daemon` help text.
+#[cfg(target_os = "macos")]
+pub use macos::NO_DAEMON_HELP;
+/// Platform-specific, reviewed `aw run --no-daemon` help text.
+#[cfg(target_os = "windows")]
+pub use windows::NO_DAEMON_HELP;
+
 /// Operating system version for `aw doctor`. `None` when this build cannot read
 /// it; the caller prints 「不可得」 and never an empty string.
 #[must_use]
@@ -153,7 +163,7 @@ impl fmt::Display for PlatformError {
                 f,
                 "named-pipe peer was not identified: {operation} failed (Win32 error {win32_error})"
             ),
-            Self::Io(error) => write!(f, "platform I/O error: {error}"),
+            Self::Io(error) => write!(f, "platform operation failed: {error}"),
             Self::Invalid { capability, detail } => write!(f, "{capability}: {detail}"),
         }
     }

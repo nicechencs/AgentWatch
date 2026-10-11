@@ -68,6 +68,9 @@ use windows::Win32::System::Threading::{
 
 pub(crate) struct CurrentPlatform;
 
+pub const NO_DAEMON_HELP: &str =
+    "不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序都会跟着结束。";
+
 /// `aw doctor` reports peer identification as available only after a real
 /// named-pipe exchange has successfully read a client token.  A compiled API
 /// alone is not evidence that the service can identify its callers.

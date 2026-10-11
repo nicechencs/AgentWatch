@@ -3,6 +3,7 @@ source: crates/aw-cli/src/cmd/query.rs
 expression: body
 ---
 {
+  "fast_exit_may_be_missed": false,
   "processes": [
     {
       "argv": "<redacted>",

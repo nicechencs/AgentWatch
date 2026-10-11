@@ -5,7 +5,7 @@ import { sessionStatus } from "@/lib/session-status";
 
 /**
  * How often an open session's header and overview are re-read while it is
- * recording. Without it the header kept 「录制中」 and the Stop button after
+ * recording. Without it the header kept 「记录中」 and the Stop button after
  * the program had exited, and the overview kept the 「0 进程」 it read in the
  * first second (before the first sample was written).
  */

@@ -607,7 +607,7 @@ pub(crate) fn resolve_program(
     }))
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(unix, windows)))]
 fn configure_command(command: &mut Command, spec: &RunSpec) {
     if let Some(cwd) = spec.cwd.as_deref() {
         command.current_dir(cwd);

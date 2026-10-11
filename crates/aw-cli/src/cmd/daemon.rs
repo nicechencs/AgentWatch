@@ -479,6 +479,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn install_without_yes_prints_the_plan_and_does_not_apply() {
         let mut control = Recording { seen: Vec::new() };
@@ -496,6 +497,28 @@ mod tests {
         assert!(!text.contains("sc.exe"), "{text}");
         assert!(
             text.contains("安装包") || text.contains("安装计划"),
+            "{text}"
+        );
+        assert!(control.seen.is_empty());
+    }
+
+    /// Windows plans name the `sc.exe` registration an administrator would
+    /// run; naming it is not running it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_without_yes_prints_the_sc_plan_and_does_not_apply() {
+        let mut control = Recording { seen: Vec::new() };
+        let outcome = run(
+            DaemonOp::Install { confirm: false },
+            false,
+            &Admin(false),
+            &mut control,
+        );
+        assert_eq!(outcome.code, exit::USAGE);
+        let text = String::from_utf8(outcome.stdout).expect("utf8");
+        assert!(text.contains("AgentWatch"), "{text}");
+        assert!(
+            text.contains("sc.exe") || text.contains("service_name=AgentWatch"),
             "{text}"
         );
         assert!(control.seen.is_empty());

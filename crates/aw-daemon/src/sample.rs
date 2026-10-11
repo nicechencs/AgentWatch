@@ -226,10 +226,17 @@ impl HostSampler {
             SampleSessionState::Absent => {}
         }
         let Some(uid) = proc_uid_of(self.target.root_pid) else {
-            tracing::warn!(
-                pid = self.target.root_pid,
-                "poll sampler not started: root process identity unavailable"
-            );
+            if process_is_gone(self.target.root_pid) {
+                tracing::debug!(
+                    pid = self.target.root_pid,
+                    "program already exited, skipping sampling"
+                );
+            } else {
+                tracing::warn!(
+                    pid = self.target.root_pid,
+                    "poll sampler not started: root process identity unavailable"
+                );
+            }
             return false;
         };
         if self
@@ -854,6 +861,15 @@ fn find_proc<'a>(
 pub(crate) fn proc_uid_of(pid: u32) -> Option<ProcUid> {
     let process = aw_platform::platform().sampling_process(pid).ok()??;
     proc_uid_from_sampling(&process)
+}
+
+/// Whether the platform can confirm that `pid` is no longer present.
+///
+/// This is deliberately separate from [`proc_uid_of`]: a missing sampling
+/// identity can also mean that a still-running process was unreadable. That
+/// case remains a warning rather than being mistaken for a normal exit.
+fn process_is_gone(pid: u32) -> bool {
+    matches!(aw_platform::platform().process_identity(pid), Ok(None))
 }
 
 /// Build the poll collector's identity from a precise platform start time.

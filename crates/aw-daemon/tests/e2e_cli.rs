@@ -570,3 +570,48 @@ fn root_daemon_launch_carries_the_callers_login_groups() {
     assert_eq!(have, want, "Groups of the launched program = id -G {name}");
     let _ = Command::new("kill").arg(pid.to_string()).status();
 }
+
+/// A root daemon samples a long-running program it launches for its caller.
+/// This is root-only because the daemon's launch-as-caller path is the case
+/// that previously only had coverage for credentials, not poll sampling.
+#[test]
+#[ignore = "needs root"]
+fn root_daemon_samples_long_running_program() {
+    let daemon = Daemon::start(As::Root);
+    let (status, body) = daemon.http_as_caller(
+        "POST",
+        "/api/v1/sessions",
+        r#"{"mode":"launch","argv":["sleep","20"]}"#,
+    );
+    assert_eq!(status, 201, "{body} / {}", daemon.log());
+    let pid = body["root_pid"].as_u64().expect("root_pid");
+    let sid = body["id"].as_str().expect("id");
+
+    let started = Instant::now();
+    let mut sampled = false;
+    let mut last = Value::Null;
+    while started.elapsed() < Duration::from_secs(10) {
+        let (status, body) =
+            daemon.http_as_caller("GET", &format!("/api/v1/sessions/{sid}/processes"), "");
+        if status == 200 && process_tree_contains_pid(&body["processes"], pid) {
+            sampled = true;
+            break;
+        }
+        last = serde_json::json!({ "status": status, "body": body });
+        sleep(Duration::from_millis(100));
+    }
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    assert!(
+        sampled,
+        "root daemon did not store a sampled row for pid {pid}: {last}; log: {}",
+        daemon.log()
+    );
+}
+
+fn process_tree_contains_pid(nodes: &Value, pid: u64) -> bool {
+    nodes.as_array().is_some_and(|nodes| {
+        nodes
+            .iter()
+            .any(|node| node["pid"] == pid || process_tree_contains_pid(&node["children"], pid))
+    })
+}

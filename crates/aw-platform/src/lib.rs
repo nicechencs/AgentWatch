@@ -3,6 +3,12 @@
 // remains unsafe-free.
 #![deny(unsafe_code)]
 
+/// OS-independent Windows Job launch state machine.
+///
+/// The Windows platform module supplies the FFI primitives; this module keeps
+/// the ordering and failure rules testable on every supported target.
+pub mod held_launch;
+
 use std::fmt;
 use std::path::{Path, PathBuf};
 

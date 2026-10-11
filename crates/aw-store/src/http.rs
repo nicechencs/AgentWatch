@@ -96,8 +96,9 @@ pub fn insert_http(conn: &Connection, row: &HttpRow) -> Result<(), StoreError> {
         return Ok(());
     }
     let id = row.id.unwrap_or_else(|| replay::deterministic_id(&key));
-    conn.execute(
-        "INSERT INTO http (
+    let inserted = conn
+        .execute(
+            "INSERT INTO http (
             id, session_id, proc_uid, flow_id, ts_ns, method, url, host,
             http_version, status, req_headers, resp_headers,
             req_body_bytes, resp_body_bytes, content_type, duration_ms, error,
@@ -108,36 +109,37 @@ pub fn insert_http(conn: &Connection, row: &HttpRow) -> Result<(), StoreError> {
             ?13, ?14, ?15, ?16, ?17,
             ?18, ?19, ?20, ?21
          ) ON CONFLICT(id) DO NOTHING",
-        params![
-            id,
-            row.session_id,
-            row.proc_uid,
-            row.flow_id,
-            row.ts_ns,
-            row.method,
-            row.url,
-            row.host,
-            row.http_version,
-            row.status,
-            row.req_headers,
-            row.resp_headers,
-            row.req_body_bytes,
-            row.resp_body_bytes,
-            row.content_type,
-            row.duration_ms,
-            row.error,
-            row.evidence,
-            row.field_evidence,
-            row.na_reason,
-            row.source,
-        ],
-    )
-    .map_err(|err| StoreError::sqlite("insert_http", err))?;
-    if fts_text_present(conn)? {
+            params![
+                id,
+                row.session_id,
+                row.proc_uid,
+                row.flow_id,
+                row.ts_ns,
+                row.method,
+                row.url,
+                row.host,
+                row.http_version,
+                row.status,
+                row.req_headers,
+                row.resp_headers,
+                row.req_body_bytes,
+                row.resp_body_bytes,
+                row.content_type,
+                row.duration_ms,
+                row.error,
+                row.evidence,
+                row.field_evidence,
+                row.na_reason,
+                row.source,
+            ],
+        )
+        .map_err(|err| StoreError::sqlite("insert_http", err))?;
+    if inserted != 0 && fts_text_present(conn)? {
         let src_id = id;
         let text = Some(row.url.as_str());
         let fts = fts::read_mode(conn)?;
-        fts::upsert(conn, fts, FtsSource::Http, src_id, text)?;
+        // The http row was just inserted above (`inserted != 0`).
+        fts::insert_new(conn, fts, FtsSource::Http, src_id, text)?;
     }
     Ok(())
 }

@@ -746,7 +746,8 @@ fn write_images(
         // searchable text; neither known means nothing is indexed (not "").
         let text = row.argv.as_deref().or(row.exe.as_deref());
         if file_schema_present(tx)? {
-            fts::upsert(tx, fts, FtsSource::ProcessImage, id, text)?;
+            // Freshly inserted above (`inserted != 0`): no FTS row can exist.
+            fts::insert_new(tx, fts, FtsSource::ProcessImage, id, text)?;
         }
     }
     Ok(())
@@ -1095,7 +1096,7 @@ pub(crate) fn count_rows(conn: &Connection, table: &str) -> Result<i64, StoreErr
     // `table` is a fixed identifier from this crate, not user input.
     match table {
         "sessions" | "processes" | "process_images" | "file_access" | "net_flows"
-        | "net_flow_buckets" | "dns" | "http" | "gaps" => {}
+        | "net_flow_buckets" | "dns" | "http" | "gaps" | "fts_text" => {}
         _ => {
             return Err(StoreError::sqlite(
                 "count_rows",
@@ -1569,6 +1570,9 @@ mod tests {
             ("dns", 1),
             ("http", 1),
             ("gaps", 501),
+            // One search row per indexed source row (image exe, file path,
+            // http url): a replay must not add duplicate search hits.
+            ("fts_text", 3),
         ];
         for (table, rows) in expected {
             assert_eq!(

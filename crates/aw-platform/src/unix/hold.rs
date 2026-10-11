@@ -113,7 +113,6 @@ pub(crate) fn spawn(
         Some(dir) => Some(ffi::c_string(dir.as_os_str(), "cwd is not valid text")?),
         None => None,
     };
-    let program = ffi::c_string(std::ffi::OsStr::new(program), "program is not valid text")?;
     let mut argv = Vec::with_capacity(request.command.len());
     for arg in &request.command {
         argv.push(ffi::c_string(
@@ -131,6 +130,16 @@ pub(crate) fn spawn(
         .filter(|(key, _)| !request.env.iter().any(|(name, _)| name == key))
         .collect();
     env_pairs.extend(request.env.iter().cloned());
+    // `execve` does not search PATH, and `execvp` is not async-signal-safe.
+    // Resolve a bare program name here, before fork, against the PATH the
+    // target will see.
+    let search_path = env_pairs
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "PATH")
+        .map(|(_, value)| value.as_str());
+    let resolved = resolve_program(program, search_path)?;
+    let program = ffi::c_string(resolved.as_os_str(), "program is not valid text")?;
     let mut env = Vec::with_capacity(env_pairs.len());
     for (key, value) in &env_pairs {
         let pair = format!("{key}={value}");
@@ -182,6 +191,38 @@ pub(crate) fn spawn(
 
 /// Process-wide: `pipe` and the `fork` that inherits the read end are one
 /// critical section. Poisoned is fine; the lock still excludes other forks.
+/// Default search path when the target environment has no `PATH`.
+const DEFAULT_SEARCH_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+/// Find `program` the way a shell would, before fork. A name containing `/`
+/// is used as given. Otherwise each absolute `PATH` entry is tried; relative
+/// entries (including empty ones, which mean ".") are skipped on purpose.
+/// Nothing found is `NotFound`, which callers render as 找不到程序「…」.
+fn resolve_program(
+    program: &str,
+    search_path: Option<&str>,
+) -> Result<std::path::PathBuf, PlatformError> {
+    use std::os::unix::fs::PermissionsExt;
+    if program.contains('/') {
+        return Ok(std::path::PathBuf::from(program));
+    }
+    for dir in search_path.unwrap_or(DEFAULT_SEARCH_PATH).split(':') {
+        if !dir.starts_with('/') {
+            continue;
+        }
+        let candidate = std::path::Path::new(dir).join(program);
+        if let Ok(meta) = std::fs::metadata(&candidate) {
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(PlatformError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("program not found on PATH: {program}"),
+    )))
+}
+
 static PIPE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct MacHeld {

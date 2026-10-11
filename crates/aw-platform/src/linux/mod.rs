@@ -14,7 +14,8 @@ use std::{fs, io};
 mod watchdog;
 
 pub use watchdog::{
-    cleanup_watchdog_descendants, prepare_watchdog, take_watchdog_control, WatchdogPrepareError,
+    cleanup_watchdog_descendants, prepare_watchdog, prepare_watchdog_fallback,
+    reap_watchdog_children, take_watchdog_control, WatchdogCleanup, WatchdogPrepareError,
 };
 
 pub(crate) struct CurrentPlatform;

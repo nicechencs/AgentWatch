@@ -63,7 +63,8 @@ use linux::CurrentPlatform;
 /// released programs must never be wrapped by this cleanup mechanism.
 #[cfg(target_os = "linux")]
 pub use linux::{
-    cleanup_watchdog_descendants, prepare_watchdog, take_watchdog_control, WatchdogPrepareError,
+    cleanup_watchdog_descendants, prepare_watchdog, prepare_watchdog_fallback,
+    reap_watchdog_children, take_watchdog_control, WatchdogCleanup, WatchdogPrepareError,
 };
 #[cfg(target_os = "macos")]
 use macos::CurrentPlatform;

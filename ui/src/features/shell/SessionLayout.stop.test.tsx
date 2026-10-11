@@ -44,6 +44,18 @@ describe("session header stop action", () => {
     expect(status).toHaveAttribute("title", "后台重启，记录已中断");
   });
 
+  it("shows the exact bounded-cleanup warning at the top of a session", () => {
+    view(toSession({
+      ...base,
+      ended_ns: 2,
+      end_reason: "exited",
+      cleanup_leftovers: { count: 6, pids: [1234, 5678, 9012, 3456, 7890], eperm_pid: null },
+    }));
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "程序已经结束，但它启动的 6 个子程序没能结束，可能还在运行（进程号：1234、5678、9012、3456、7890等）。可以用 `kill -9 进程号` 手动结束。",
+    );
+  });
+
   it("uses Stop recording wording and shows the success notice", async () => {
     const active = toSession({ ...base, ended_ns: null, end_reason: null });
     const stopped = toSession({ ...base, ended_ns: 2, end_reason: "user_stop" });

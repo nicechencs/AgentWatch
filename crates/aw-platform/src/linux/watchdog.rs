@@ -5,13 +5,26 @@
 //! held across the fork that created that process. The watchdog itself starts
 //! the target only after [`prepare_watchdog`] has made it a child subreaper.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 const LEFTOVER_GRACE: Duration = Duration::from_secs(2);
+const CLEANUP_LIMIT: Duration = Duration::from_secs(5);
+
+/// Bounded result of a watchdog cleanup.  The actual survivor count is the
+/// length of `survivors`; callers truncate only for display, never before the
+/// count is known. `eperm_survivors` is a subset retained for the truthful
+/// cross-account remediation wording.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchdogCleanup {
+    /// Descendant pids still observable when the deadline elapsed.
+    pub survivors: Vec<i32>,
+    /// Survivors for which a signal was refused with `EPERM`.
+    pub eperm_survivors: Vec<i32>,
+}
 
 /// A setup failure which means the watchdog must not start the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +35,24 @@ pub enum WatchdogPrepareError {
     SignalDisposition,
 }
 
+/// Make the CLI a fallback subreaper before it starts its watchdog child.  If
+/// that helper is killed unexpectedly, its target is reparented here and the
+/// CLI can run the same bounded descendant cleanup instead of reporting the
+/// watchdog's signal as if it were the program's result.
+#[allow(unsafe_code)]
+pub fn prepare_watchdog_fallback() -> io::Result<()> {
+    let result = unsafe {
+        // SAFETY: PR_SET_CHILD_SUBREAPER changes only this process's Linux
+        // child-reaping role and uses no caller pointers.
+        libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Move this re-exec'd process out of the terminal's session, make it a
 /// subreaper, and arm a parent-death notification.
 ///
@@ -30,20 +61,38 @@ pub enum WatchdogPrepareError {
 /// between the two syscalls. No identity switch occurs in this launcher; if
 /// one is introduced it must happen before this function is called.
 #[allow(unsafe_code)]
-pub fn prepare_watchdog(parent_pid: u32) -> Result<(), WatchdogPrepareError> {
+pub fn prepare_watchdog(
+    parent_pid: u32,
+    stays_in_terminal_session: bool,
+) -> Result<(), WatchdogPrepareError> {
     // SAFETY: `setsid`, `prctl`, and `getppid` take no Rust pointers. They run
     // in the dedicated re-exec'd watchdog before it starts any target.
     unsafe {
-        if libc::setsid() < 0 {
+        if stays_in_terminal_session {
+            // A foreground target must stay in aw's session: only a process
+            // group in that session can become the terminal foreground group.
+            // The re-exec'd helper is not a group leader yet, so this gives it
+            // an isolated group without stealing the terminal.
+            if libc::setpgid(0, 0) != 0 {
+                return Err(WatchdogPrepareError::Session);
+            }
+        } else if libc::setsid() < 0 {
             return Err(WatchdogPrepareError::Session);
         }
-        // A background shell may have started `aw` with these signals ignored.
-        // The watchdog relays signals from `aw` itself, so the newly created
-        // target must start with their ordinary default dispositions instead
-        // of inheriting a shell's ignored disposition.
-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // The watchdog must outlive the CLI long enough to clean descendants.
+        // Terminal and supervisor signals belong to the target group and are
+        // delivered over the private control socket, never to this helper.
+        for signal in [
+            libc::SIGINT,
+            libc::SIGTERM,
+            libc::SIGHUP,
+            libc::SIGQUIT,
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+        ] {
             let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = libc::SIG_DFL;
+            action.sa_sigaction = libc::SIG_IGN;
             if libc::sigemptyset(&mut action.sa_mask) != 0
                 || libc::sigaction(signal, &action, std::ptr::null_mut()) != 0
             {
@@ -97,16 +146,18 @@ struct ProcessIdentity {
 /// a reused pid. Every cleanup begins with SIGTERM and a two-second grace
 /// period; only survivors are frozen and killed. SIGHUP is never a cleanup
 /// signal: it belongs solely to an actual terminal disconnect path.
-pub fn cleanup_watchdog_descendants() {
+pub fn cleanup_watchdog_descendants() -> WatchdogCleanup {
     let self_pid = std::process::id() as libc::pid_t;
+    let cleanup_deadline = Instant::now() + CLEANUP_LIMIT;
+    let mut denied = BTreeSet::new();
     for target in descendants_of(self_pid, &process_snapshot()) {
-        signal_if_same(target, libc::SIGTERM);
+        signal_if_same(target, libc::SIGTERM, &mut denied);
     }
     let deadline = Instant::now() + LEFTOVER_GRACE;
     while Instant::now() < deadline {
         reap_children();
         if descendants_of(self_pid, &process_snapshot()).is_empty() {
-            return;
+            return WatchdogCleanup::default();
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -117,22 +168,35 @@ pub fn cleanup_watchdog_descendants() {
         if targets.is_empty() {
             reap_children();
             if descendants_of(self_pid, &process_snapshot()).is_empty() {
-                return;
+                return WatchdogCleanup::default();
+            }
+            if Instant::now() >= cleanup_deadline {
+                return remaining_cleanup(self_pid, &denied);
             }
             continue;
         }
 
         for target in &targets {
-            signal_if_same(*target, libc::SIGSTOP);
+            signal_if_same(*target, libc::SIGSTOP, &mut denied);
         }
         // A new scan is required after freezing: children already exiting can
         // be reparented to the subreaper during this interval.
         for target in descendants_of(self_pid, &process_snapshot()) {
-            signal_if_same(target, libc::SIGKILL);
+            signal_if_same(target, libc::SIGKILL, &mut denied);
         }
         reap_children();
+        if Instant::now() >= cleanup_deadline {
+            return remaining_cleanup(self_pid, &denied);
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Reap every exited direct/adopted child without waiting.  The watchdog calls
+/// this during normal execution so short-lived background programs cannot pile
+/// up as zombies until the root exits.
+pub fn reap_watchdog_children() {
+    reap_children();
 }
 
 fn process_snapshot() -> Vec<ProcessIdentity> {
@@ -197,7 +261,27 @@ fn descendants_of(root: libc::pid_t, snapshot: &[ProcessIdentity]) -> Vec<Proces
 }
 
 #[allow(unsafe_code)]
-fn signal_if_same(target: ProcessIdentity, signal: libc::c_int) {
+fn remaining_cleanup(root: libc::pid_t, denied: &BTreeSet<libc::pid_t>) -> WatchdogCleanup {
+    let survivors: Vec<i32> = descendants_of(root, &process_snapshot())
+        .into_iter()
+        .map(|target| target.pid)
+        .collect();
+    let eperm_survivors = survivors
+        .iter()
+        .copied()
+        .filter(|pid| denied.contains(pid))
+        .collect();
+    WatchdogCleanup {
+        survivors,
+        eperm_survivors,
+    }
+}
+
+fn signal_if_same(
+    target: ProcessIdentity,
+    signal: libc::c_int,
+    denied: &mut BTreeSet<libc::pid_t>,
+) {
     if target.state == b'Z'
         || read_identity(target.pid).is_none_or(|current| {
             current.ppid != target.ppid || current.start_time != target.start_time
@@ -208,7 +292,11 @@ fn signal_if_same(target: ProcessIdentity, signal: libc::c_int) {
     // SAFETY: the pid has just been verified against its parent and start
     // time. `kill` has no Rust pointers and the signal is a fixed constant.
     unsafe {
-        libc::kill(target.pid, signal);
+        if libc::kill(target.pid, signal) != 0
+            && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        {
+            denied.insert(target.pid);
+        }
     }
 }
 

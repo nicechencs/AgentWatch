@@ -109,6 +109,15 @@ export interface Session {
   collectors: CollectorInfo[];
   pinned: boolean;
   stats: SessionStats | null;
+  /** Descendants that remained after the launch supervisor's bounded cleanup. */
+  cleanup_leftovers?: {
+    /** Actual survivor count; this is never inferred from the displayed ids. */
+    count: number;
+    /** At most five ids, supplied by the supervisor. */
+    pids: number[];
+    /** A remaining pid that rejected cleanup with EPERM, when known. */
+    eperm_pid: number | null;
+  } | null;
   /** Present when the session was removed by the retention policy. */
   purged?: boolean | null;
   purged_reason?: string | null;

@@ -235,6 +235,10 @@ pub struct SessionSummary {
     pub finding_count: Option<i64>,
     /// `sessions.argv` as stored (JSON array, redacted).
     pub argv: Option<String>,
+    /// Opaque session metadata JSON.  Callers may expose only documented,
+    /// non-content fields from this value; an absent value is unknown, not an
+    /// empty object.
+    pub stats: Option<String>,
 }
 
 /// One process in a session tree.
@@ -502,7 +506,7 @@ pub fn session_summary(
     let head = conn
         .query_row(
             "SELECT s.id, s.public_id, s.name, s.agent, s.started_ns, s.ended_ns, s.end_reason, \
-                    s.exit_code, s.mode, s.platform, s.os_version, s.collectors, s.argv \
+                    s.exit_code, s.mode, s.platform, s.os_version, s.collectors, s.argv, s.stats \
              FROM sessions s WHERE s.id = ? AND s.user_id = ?",
             rusqlite::params![session_id, user_id],
             |row| {
@@ -520,6 +524,7 @@ pub fn session_summary(
                     row.get::<_, Option<String>>(10)?,
                     row.get::<_, String>(11)?,
                     row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             },
         )
@@ -539,6 +544,7 @@ pub fn session_summary(
         os_version,
         collectors,
         argv,
+        stats,
     )) = head
     else {
         return Ok(None);
@@ -566,6 +572,7 @@ pub fn session_summary(
         collectors,
         finding_count: counts.finding_count,
         argv,
+        stats,
     });
     Ok(summary)
 }

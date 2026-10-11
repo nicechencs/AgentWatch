@@ -1250,6 +1250,12 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
             if let Some(sid) = rest.strip_suffix("/adopt") {
                 return super::watch_routes::adopt(state, caller, sid, &req.body);
             }
+            if let Some(sid) = rest.strip_suffix("/commit") {
+                return super::watch_routes::commit(state, caller, sid);
+            }
+            if let Some(sid) = rest.strip_suffix("/leftovers") {
+                return super::watch_routes::record_leftovers(state, caller, sid, &req.body);
+            }
             if let Some(sid) = rest.strip_suffix("/attach") {
                 return super::watch_routes::attach(state, caller, sid, &req.body);
             }
@@ -1680,9 +1686,11 @@ fn mutation_owner(
 fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendError>) -> ApiResponse {
     match result {
         Ok(None) => not_found_session(),
-        Ok(Some(summary)) => ApiResponse::json(
-            200,
-            &json!({
+        Ok(Some(summary)) => {
+            let cleanup_leftovers = cleanup_leftovers_json(summary.stats.as_deref());
+            ApiResponse::json(
+                200,
+                &json!({
                 "id": summary.public_id,
                 "session_id": summary.id,
                 "name": summary.name,
@@ -1696,6 +1704,7 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
                 "os_version": summary.os_version,
                 "collectors": stored_collectors_json(&summary.collectors),
                 "argv": super::query::argv_value(summary.argv.as_deref()),
+                "cleanup_leftovers": cleanup_leftovers,
                 "stats": counts_json(&aw_store::SessionCounts {
                     process_count: summary.process_count,
                     flow_count: summary.flow_count,
@@ -1705,10 +1714,43 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
                     bytes_down: summary.bytes_down,
                     finding_count: summary.finding_count,
                 }),
-            }),
-        ),
+                }),
+            )
+        }
         Err(err) => from_backend(err),
     }
+}
+
+/// Return only the bounded, documented cleanup shape from `sessions.stats`.
+/// Older or unrelated stats cache entries stay absent rather than being
+/// guessed into a survivor count.
+fn cleanup_leftovers_json(stats: Option<&str>) -> Value {
+    let Some(value) = stats.and_then(|text| serde_json::from_str::<Value>(text).ok()) else {
+        return Value::Null;
+    };
+    let Some(leftovers) = value.get("cleanup_leftovers") else {
+        return Value::Null;
+    };
+    let Some(count) = leftovers.get("count").and_then(Value::as_u64) else {
+        return Value::Null;
+    };
+    let pids: Vec<u64> = leftovers
+        .get("pids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .filter(|pid| *pid > 0)
+        .take(5)
+        .collect();
+    if count == 0 || u64::try_from(pids.len()).unwrap_or(u64::MAX) > count {
+        return Value::Null;
+    }
+    let eperm_pid = leftovers
+        .get("eperm_pid")
+        .and_then(Value::as_u64)
+        .filter(|pid| *pid > 0);
+    json!({ "count": count, "pids": pids, "eperm_pid": eperm_pid })
 }
 
 /// Mark a session response while the watcher has not yet completed its first
@@ -3336,6 +3378,30 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_leftovers_are_owned_and_visible_only_in_session_detail() {
+        let (dir, db) = seeded_db(
+            "cleanup-leftovers",
+            "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors) VALUES (1, 's-cleanup', 'launch', 'alice', 1, 'linux', '[]');",
+        );
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db);
+        let alice = token_for(&mut state, "alice", false);
+        let bob = token_for(&mut state, "bob", false);
+        let path = "/api/v1/sessions/s-cleanup/leftovers";
+        let body = r#"{"count":6,"pids":[1234,5678,9012,3456,7890],"eperm_pid":5678}"#;
+        assert_eq!(post(&mut state, &bob, path, body).0, 404);
+        assert_eq!(post(&mut state, &alice, path, body).0, 200);
+        let (status, detail) = get_as(&mut state, "alice", "/api/v1/sessions/s-cleanup");
+        assert_eq!(status, 200, "{detail}");
+        assert_eq!(detail["cleanup_leftovers"]["count"], 6);
+        assert_eq!(detail["cleanup_leftovers"]["pids"][4], 7890);
+        assert_eq!(detail["cleanup_leftovers"]["eperm_pid"], 5678);
+        let (_, other) = get_as(&mut state, "bob", "/api/v1/sessions/s-cleanup");
+        assert_eq!(other["error"]["code"], "not_found");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn null_session_platform_falls_back_to_the_host_in_list_and_detail() {
         let (dir, db) = seeded_db("null-platform", "");
         // New rows require a platform, but a query must remain useful for an
@@ -3531,6 +3597,16 @@ mod tests {
             &format!(r#"{{"ticket":"{ticket}","pid":{pid}}}"#),
         );
         assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            post(
+                &mut state,
+                &token,
+                &format!("/api/v1/sessions/{sid}/commit"),
+                "",
+            )
+            .0,
+            200
+        );
         // A second adopt finds nothing waiting.
         assert_eq!(
             post(
@@ -3644,34 +3720,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A `/sessions/run` whose program the CLI could not start is an empty row.
-    /// Stopping it discards the row. A launch that fails to spawn writes none.
+    /// A `/sessions/run` is only an in-memory reservation until the held child
+    /// confirms exec. Repeating a missing-program launch cannot leave a
+    /// write-then-delete empty session behind.
     #[cfg(target_os = "linux")]
     #[test]
-    fn stopping_an_unadopted_run_discards_the_empty_session() {
+    fn two_hundred_uncommitted_runs_leave_zero_sessions() {
         let (dir, db) = seeded_db("discard", "");
         let mut state = ApiState::new(1_000);
         state.query = super::StoreQuery::open_path(db.clone());
         let token = token_for(&mut state, &crate::sample::current_user_id(), false);
         let before = session_count(&db);
-        let (status, body) = post(
-            &mut state,
-            &token,
-            "/api/v1/sessions/run",
-            r#"{"argv":["/nonexistent/prog"]}"#,
+        for _ in 0..200 {
+            let (status, body) = post(
+                &mut state,
+                &token,
+                "/api/v1/sessions/run",
+                r#"{"argv":["/nonexistent/prog"]}"#,
+            );
+            assert_eq!(status, 201, "{body}");
+            let sid = body["id"].as_str().unwrap_or_default();
+            let (status, body) = post(
+                &mut state,
+                &token,
+                &format!("/api/v1/sessions/{sid}/discard"),
+                "",
+            );
+            assert_eq!(status, 200, "{body}");
+        }
+        assert_eq!(
+            session_count(&db),
+            before,
+            "uncommitted launches wrote a session"
         );
-        assert_eq!(status, 201, "{body}");
-        assert_eq!(session_count(&db), before + 1);
-        let sid = body["id"].as_str().unwrap_or_default().to_owned();
-        let (status, body) = post(
-            &mut state,
-            &token,
-            &format!("/api/v1/sessions/{sid}/stop"),
-            "",
-        );
-        assert_eq!(status, 200, "{body}");
-        assert_eq!(body["discarded"], true);
-        assert_eq!(session_count(&db), before, "the empty row is gone");
 
         let (status, body) = post(
             &mut state,
@@ -3741,6 +3822,16 @@ mod tests {
             .0,
             200
         );
+        assert_eq!(
+            post(
+                &mut state,
+                &token,
+                &format!("/api/v1/sessions/{sid}/commit"),
+                "",
+            )
+            .0,
+            200
+        );
         assert_eq!(session_count(&db), before + 1);
         let root_rows: i64 = aw_store::open_connection(&db)
             .and_then(|c| {
@@ -3787,16 +3878,10 @@ mod tests {
             let (status, response) = post(state, &token, "/api/v1/sessions/run", body);
             assert_eq!(status, 201, "{response}");
             let sid = response["id"].as_str().unwrap_or_default().to_owned();
-            aw_store::open_connection(&db)
-                .and_then(|c| {
-                    c.query_row(
-                        "SELECT name FROM sessions WHERE public_id = ?1",
-                        [&sid],
-                        |r| r.get::<_, Option<String>>(0),
-                    )
-                })
-                .ok()
-                .flatten()
+            state
+                .pending_launches
+                .get(&sid)
+                .and_then(|pending| pending.target.name.clone())
                 .unwrap_or_default()
         };
         let derived = name_of(
@@ -3818,9 +3903,9 @@ mod tests {
     }
 
     /// `aw run` posts `/exit` as soon as the root exits, which can be before
-    /// the foreground loop's first poll starts a sampler. The root's row must
-    /// already exist (written at `/adopt`) so the code lands on it, and the
-    /// later poll keeps it: one row, exit code 7, never NULL.
+    /// the foreground loop's first poll starts a sampler. `/commit` writes
+    /// the root row only after the held child successfully execs; the later
+    /// poll keeps that same row: one row, exit code 7, never NULL.
     #[cfg(target_os = "linux")]
     #[test]
     #[allow(clippy::expect_used)]
@@ -3864,6 +3949,20 @@ mod tests {
         );
         assert_eq!(status, 200, "{body}");
 
+        nix::unistd::write(&write_fd, b"1\n").expect("release gate");
+        drop(write_fd);
+        assert_eq!(child.wait().expect("reap child").code(), Some(7));
+        assert_eq!(
+            post(
+                &mut state,
+                &token,
+                &format!("/api/v1/sessions/{sid}/commit"),
+                "",
+            )
+            .0,
+            200
+        );
+
         // A pid can be reused. Seed another depth-0 row with this pid but a
         // different identity; `/exit` must only update the adopted root row.
         let (db_id, root_proc_uid, start_ns): (i64, i64, i64) = aw_store::open_connection(&db)
@@ -3897,10 +3996,6 @@ mod tests {
                 )
             })
             .expect("reused pid row");
-
-        nix::unistd::write(&write_fd, b"1\n").expect("release gate");
-        drop(write_fd);
-        assert_eq!(child.wait().expect("reap child").code(), Some(7));
 
         let (status, body) = post(
             &mut state,
@@ -3991,6 +4086,16 @@ mod tests {
         nix::unistd::write(&write_fd, b"1\n").expect("release gate");
         drop(write_fd);
         assert_eq!(child.wait().expect("reap child").code(), Some(7));
+        assert_eq!(
+            post(
+                &mut state,
+                &token,
+                &format!("/api/v1/sessions/{sid}/commit"),
+                "",
+            )
+            .0,
+            200
+        );
 
         let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
         let mut watches = crate::watch::Watches::new(db.clone());

@@ -125,7 +125,7 @@ macOS 是三平台中**风险最高**的一个：原生能力依赖 Apple 审批
 
 macOS 没有与 cgroup 或 Job 等价的、能自动覆盖后代进程的公开机制。所以统一采用**进程树跟踪**：
 
-1. 启动模式：CLI 为目标程序做 `posix_spawn`，并设置 `POSIX_SPAWN_START_SUSPENDED`【待验证】。把 PID 报给 daemon，等 daemon 确认已将其加入范围后，再发 `SIGCONT` 让它继续。
+1. 启动模式：`aw run` 和后台新建会话都经 `aw-platform` 起一个闸门，闸门是本程序自己的一份副本。闸门用写死的环境启动（只有 `PATH=/usr/bin:/bin`），工作目录是 `/`，argv 只有 `aw-mac-gate`。程序、工作目录、环境变量都当数据写进一根管道，不放进闸门自己的环境、参数或工作目录。闸门堵住读这根管道：读到放行的一个字节才继续，读到 EOF（创建者已死，或还没放行就中止）则不 exec 直接退出。放行之后闸门先切身份（见下），再进入调用方的工作目录，再用调用方的环境 `execve` 目标。放行之后程序不再读这根管道，所以后台重启程序继续跑。不另起看门狗，也不按 pid 发 `SIGKILL`。【待验证】这根管道和身份切换都还没在真机 macOS 上跑过。`aw run` 这条路径上，`aw` 自己是创建者：它先挂住，等后台确认纳入范围后再放行；放行前任何失败都关掉管道（闸门读到 EOF 退出）并 `waitpid`。`--cwd` 两条路径都支持：闸门切完身份（或确认不用切）之后才 `chdir`。后台新建会话时，root 后台不直接以 root 运行程序：闸门在还是 root 时不碰调用方的任何东西，先 `initgroups` → `setgid` → `setuid`，确认真实/有效 uid 都已是调用方且 `setuid(0)` 失败，才 `chdir` 再 exec；调用方就是后台自己的账户时跳过切换，其余相同。每一步失败有自己的退出码，记在日志里，不显示给用户：读不到规格 121，`initgroups` 122，`setgid` 123，`setuid` 124，切换自检失败（uid 没切过去，或 `setuid(0)` 仍成功）125，`chdir` 126，`exec` 127。调用方身份只来自连接上的 `getpeereid`（uid、gid）和 `LOCAL_PEERPID`（pid），经 `IdentifiedCaller::from_peer` 传入；认不出就拒绝，不退回后台自己的身份。
 2. daemon 在 ES 的 `fork` 事件上：父进程在范围内，就把子进程加入。使用原生 ES 时，同时把它加入 inverse mute 的范围。
 3. 辅助判断：`responsible_audit_token` 可以识别那些由 launchd 代为启动、但“责任进程”仍是目标的进程，比如 XPC 服务。这类归属标为 I。
 4. 经 `launchctl` 或 `open` 命令拉起的程序，父进程是 launchd，按 CAP-SCOPE-03 记为“链路中断”。
@@ -150,8 +150,33 @@ macOS 没有与 cgroup 或 Job 等价的、能自动覆盖后代进程的公开�
 | 签名与授权配置错误的错误码不直观（如 `ES_NEW_CLIENT_RESULT_ERR_NOT_ENTITLED`） | `aw doctor` 把常见错误码翻译成可操作的提示 |
 | Apple Silicon 与 Intel | 发布 universal2 二进制 |
 | 容器与虚拟机（Docker Desktop、OrbStack） | 容器里的进程在 VM 内，宿主机上只能看到 VM 进程；标“链路中断” |
+| Unix 套接字路径超过 104 字节时报 `os error 22` | 见下。daemon 绑定和客户端连接前都先检查长度，超限给出中文说明（写明上限和实际长度），不再只剩一句 `invalid argument` |
+
+
+### 套接字路径过长（`os error 22`）
+
+macOS 的 `sockaddr_un` 是 `sun_len: u8`、`sun_family`、`sun_path: [c_char; 104]`。路径按字节算，**104 字节及以上就不能用**（还要留一个结尾的空字节）。默认路径都不超：`/var/run/agentwatch/api.sock` 是 28 字节，`$HOME/Library/Application Support/AgentWatch/api.sock` 在常见用户名下也在 80 字节以内。会超的是 `AW_SOCKET` 指到一个很长的临时目录下面。
+
+报错的来源要分清：
+
+- Rust 标准库在发起系统调用**之前**就自己检查长度，超限返回 `ErrorKind::InvalidInput`，错误文本是 `path must be shorter than SUN_LEN`。它的 `Display` 在某些路径上只显示 `invalid argument`。
+- 真正的 `EINVAL`（errno 22）只有路径穿过了这层检查、由内核拒绝时才会出现。两者看起来都像 `os error 22`，但多数时候根本没有系统调用。
+
+所以 daemon 的 `bind` 和客户端的 `connect` 都在调用前先量长度，超限直接给出「套接字路径太长：N 字节，这个系统的上限是 104 字节」。Linux 的上限是 108，同一段检查按系统取数。
+
+**还需要真机确认的：** 104 这个上限来自 `libc` 里 `sun_path` 的数组长度，没有在 macOS 上实际绑过一个 103 字节和一个 104 字节的路径来对照。标准库的提前拒绝也意味着过长路径到不了内核，真机上能验证的是「103 字节能绑定、104 字节被我们的检查拒绝」。
 
 ## 7. 测试方法
+
+> **未在真机验证。** 下面这些都只在 Linux 上交叉编译过（`aarch64-apple-darwin` 的 `aw-platform` 通过 clippy；`aw-cli` 与 `aw-daemon` 的 macOS 目标编不过，因为 `ring`、`aws-lc-sys`、`libsqlite3-sys` 的构建脚本需要 macOS SDK），没有在一台 Mac 上运行过：
+>
+> - 闸门管道：创建者被杀（写端关闭、闸门读到 EOF）后，程序是否还没 exec 就退出；放行（写入一个字节）之后程序是否跑起来，并且不再因为后台重启被杀掉。
+> - 闸门进程的 `initgroups` / `setgid` / `setuid` 是否把附加组也带上，以及 `setuid(0)` 的自检。切换发生在 `chdir` 和使用调用方环境之前；闸门自己的环境只有 `PATH=/usr/bin:/bin`。
+> - 长程序能被采样：后台启动 `sleep 20`，会话的进程列表里出现这个 pid。CI 上这条不需要 root。
+> - `proc_pidinfo(PROC_PIDTBSDINFO)` 读出的 uid/gid 与启动时间，和 `KERN_PROCARGS2` 的 argv 布局。
+> - `getpeereid` 与 `LOCAL_PEERPID` 是否对本地套接字给出对端 uid 和 pid。
+> - `kern.osproductversion` 的返回格式。
+> - 套接字路径 103 字节能绑定、104 字节被拒绝（见 §6）。
 
 - 单元测试：eslogger JSON、nettop CSV、pcapng 的 fixture 回放，可以在任意平台的 CI 上跑。
 - 端到端：GitHub 托管的 macOS runner 上无法通过交互方式授予完全磁盘访问【待验证：能否用 tccutil 或预置的 TCC 数据库绕过】。规划如下：

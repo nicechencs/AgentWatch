@@ -38,6 +38,9 @@ pub(crate) enum ConfigError {
     Failed { detail: String },
     /// Authenticated and refused. Exit 4.
     Forbidden { detail: String },
+    /// The local channel could not establish a trustworthy peer identity.
+    /// This preserves the fixed IPC failure wording. Exit 4.
+    IdentityFailure { detail: String, code: &'static str },
     /// The value does not match the schema. Exit 2.
     Invalid { detail: String },
 }
@@ -48,6 +51,7 @@ impl std::fmt::Display for ConfigError {
             Self::Unreachable { detail }
             | Self::Failed { detail }
             | Self::Forbidden { detail }
+            | Self::IdentityFailure { detail, .. }
             | Self::Invalid { detail } => write!(f, "{detail}"),
         }
     }
@@ -86,13 +90,6 @@ pub(crate) trait ConfigApi {
     /// [`ConfigError::Invalid`] when `value` fails schema validation.
     /// [`ConfigError::Forbidden`] when the caller is not an administrator.
     fn set(&mut self, key: &str, value: &Value) -> Result<ConfigDoc, ConfigError>;
-
-    /// `GET /api/v1/config/schema`.
-    ///
-    /// # Errors
-    ///
-    /// A daemon or transport failure.
-    fn schema(&mut self) -> Result<Value, ConfigError>;
 
     /// `GET /api/v1/rules`.
     ///
@@ -136,12 +133,6 @@ impl ConfigApi for UnwiredConfig {
         })
     }
 
-    fn schema(&mut self) -> Result<Value, ConfigError> {
-        Err(ConfigError::Unreachable {
-            detail: UNWIRED.to_owned(),
-        })
-    }
-
     fn rules(&mut self) -> Result<Vec<RuleInfo>, ConfigError> {
         Err(ConfigError::Unreachable {
             detail: UNWIRED.to_owned(),
@@ -151,9 +142,8 @@ impl ConfigApi for UnwiredConfig {
 
 /// Production client for `GET`/`PUT /api/v1/config`.
 ///
-/// [`UnwiredConfig`] stays for tests. `schema` and `rules` have no daemon
-/// route; those methods return [`ConfigError::Failed`] naming the missing
-/// route instead of an empty document.
+/// [`UnwiredConfig`] stays for tests. Rules have no daemon route and are
+/// loaded from their local files instead.
 pub(crate) struct HttpConfigApi {
     endpoint: crate::endpoint::Endpoint,
 }
@@ -188,9 +178,12 @@ impl ConfigApi for HttpConfigApi {
 
     fn get(&mut self, key: &str) -> Result<Value, ConfigError> {
         let body = self.call(&show_request(true, Some(key)))?;
-        // The daemon ignores `?key=` and returns the whole in-memory document.
-        // Walk it. A missing key is not `null` invented by this process.
+        // Newer daemons return the selected value for `?key=`; retain the
+        // whole-document walk for older daemons during a rolling upgrade.
         let root = body.get("config").unwrap_or(&body);
+        if !root.is_object() {
+            return Ok(root.clone());
+        }
         lookup_key(root, key)
     }
 
@@ -200,13 +193,6 @@ impl ConfigApi for HttpConfigApi {
         // `{ "applied": "memory" }`. That is not the new document. Re-read it.
         let _ = body;
         self.show(false)
-    }
-
-    fn schema(&mut self) -> Result<Value, ConfigError> {
-        // `GET /api/v1/config/schema` is not a route. Do not print `{}`.
-        Err(ConfigError::Failed {
-            detail: "未提供 GET /api/v1/config/schema；此命令不会编造 schema".to_owned(),
-        })
     }
 
     fn rules(&mut self) -> Result<Vec<RuleInfo>, ConfigError> {
@@ -235,11 +221,18 @@ fn lookup_key(root: &Value, key: &str) -> Result<Value, ConfigError> {
 }
 
 fn client_to_config(err: crate::client::ClientError) -> ConfigError {
+    if let Some(code) = err.identity_failure_code() {
+        return ConfigError::IdentityFailure {
+            detail: clip_config(&err.to_string()),
+            code,
+        };
+    }
     match &err {
         crate::client::ClientError::Unreachable { .. } => ConfigError::Unreachable {
             detail: clip_config(&err.to_string()),
         },
         crate::client::ClientError::Forbidden { .. }
+        | crate::client::ClientError::UntrustedServer { .. }
         | crate::client::ClientError::Status {
             status: 401 | 403, ..
         } => ConfigError::Forbidden {
@@ -280,12 +273,6 @@ pub(crate) fn show_request(effective: bool, key: Option<&str>) -> crate::client:
 #[must_use]
 pub(crate) fn set_request(key: &str, value: &Value) -> crate::client::ApiRequest {
     crate::client::ApiRequest::put_json("/api/v1/config", &json!({ "key": key, "value": value }))
-}
-
-/// `GET /api/v1/config/schema`.
-#[must_use]
-pub(crate) fn schema_request() -> crate::client::ApiRequest {
-    crate::client::ApiRequest::get("/api/v1/config/schema")
 }
 
 /// `GET /api/v1/rules`.
@@ -357,18 +344,17 @@ pub(crate) fn run(cmd: &ConfigCmd, json: bool, api: &mut dyn ConfigApi) -> Outco
             }
         }
         ConfigCmd::Edit => super::error_outcome(
-            exit::GENERAL,
-            "not_implemented",
-            "此构建的 `config edit` 不会启动编辑器；请使用 `aw config set <key> <value>`（尚未实现）",
+            exit::NOT_IN_BUILD,
+            "not_in_build",
+            "`config edit` 本版本未接入",
             json,
         ),
-        ConfigCmd::Schema => {
-            let _request = schema_request();
-            match api.schema() {
-                Ok(schema) => value_outcome("schema", &schema, json),
-                Err(err) => config_error(err, json),
-            }
-        }
+        ConfigCmd::Schema => super::error_outcome(
+            exit::NOT_IN_BUILD,
+            "not_in_build",
+            "`config schema` 本版本未接入",
+            json,
+        ),
         ConfigCmd::Rules(RulesCmd::List) => {
             let _request = rules_request();
             match api.rules() {
@@ -489,9 +475,18 @@ fn rules_outcome(rules: &[RuleInfo], json_mode: bool) -> Outcome {
 }
 
 fn config_error(err: ConfigError, json_mode: bool) -> Outcome {
+    if matches!(err, ConfigError::Forbidden { .. }) {
+        return super::error_outcome(
+            exit::PERMISSION,
+            "permission",
+            "需要管理员权限才能修改配置",
+            json_mode,
+        );
+    }
     let (code, machine) = match &err {
         ConfigError::Unreachable { .. } => (exit::UNREACHABLE, "unreachable"),
         ConfigError::Forbidden { .. } => (exit::PERMISSION, "permission"),
+        ConfigError::IdentityFailure { code, .. } => (exit::PERMISSION, *code),
         ConfigError::Invalid { .. } => (exit::USAGE, "usage"),
         ConfigError::Failed { .. } => (exit::GENERAL, "config"),
     };

@@ -32,4 +32,18 @@ describe("error text", () => {
       expect(said).not.toBe(ZH["error.forbidden"]);
     }
   });
+
+  it("uses the measured database-lock wait in the localized busy sentence", () => {
+    const err = new ApiError(
+      503,
+      {
+        error: {
+          code: "db_busy",
+          message: "The session database is busy (the service is writing). Waited 8 s and still couldn't get in; try again later.",
+        },
+      },
+      "x",
+    );
+    expect(describeError(err, t)).toBe("会话数据库正忙（后台在写入），等了 8 秒还是没轮到，请稍后再试。");
+  });
 });

@@ -15,7 +15,7 @@ use crate::client::{ApiRequest, Client, ClientError, LoopbackHttp, Transport};
 use crate::endpoint::Endpoint;
 use crate::exit;
 
-use super::query::encode_path_segment;
+use super::query::{encode_path_segment, encode_query};
 use super::Outcome;
 
 /// Parsed `aw attach` flags.
@@ -98,6 +98,9 @@ pub(crate) enum ControlError {
     Unreachable { detail: String },
     /// The local channel denied the caller before an HTTP response.
     Forbidden { detail: String },
+    /// A process other than LocalSystem or the current user owned the opened
+    /// Windows pipe. No request bytes were sent.
+    UntrustedServer { detail: String },
     /// The request or response transport failed.
     Transport { detail: String },
     /// The daemon returned a non-success HTTP status.
@@ -121,6 +124,9 @@ impl std::fmt::Display for ControlError {
                 f,
                 "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。详情：{detail}"
             ),
+            Self::UntrustedServer { .. } => {
+                f.write_str("连上的不是 AgentWatch 后台（管道被别的程序占用），已停止发送。")
+            }
             Self::Transport { detail } => write!(f, "向后台发请求失败：{detail}"),
             Self::Status {
                 status,
@@ -139,6 +145,7 @@ impl From<ClientError> for ControlError {
         match error {
             ClientError::Unreachable { detail } => Self::Unreachable { detail },
             ClientError::Forbidden { detail } => Self::Forbidden { detail },
+            ClientError::UntrustedServer { detail } => Self::UntrustedServer { detail },
             ClientError::Transport { detail } => Self::Transport { detail },
             ClientError::Status {
                 status,
@@ -159,7 +166,7 @@ impl ControlError {
     pub(crate) fn exit_code(&self) -> i32 {
         match self {
             Self::Unreachable { .. } => exit::UNREACHABLE,
-            Self::Forbidden { .. } => exit::PERMISSION,
+            Self::Forbidden { .. } | Self::UntrustedServer { .. } => exit::PERMISSION,
             Self::Transport { .. } | Self::BadReply { .. } => exit::GENERAL,
             Self::Status { status, .. } => exit::from_http_status(*status),
         }
@@ -175,6 +182,7 @@ impl ControlError {
         match self {
             Self::Unreachable { .. } => "unreachable",
             Self::Forbidden { .. } => "forbidden",
+            Self::UntrustedServer { .. } => "daemon_untrusted_server",
             Self::Status { code, status, .. } => code.as_deref().unwrap_or(match *status {
                 401 => "unauthorized",
                 403 => "forbidden",
@@ -231,7 +239,11 @@ pub(crate) trait DaemonSessions {
     /// Stop observation for a session. This never ends the target process.
     /// Returns the public id that was stopped. `@last` is resolved by the
     /// daemon; a name is resolved among the caller's own sessions.
-    fn stop_monitoring(&mut self, session: &str) -> Result<String, ControlError>;
+    fn stop_monitoring(
+        &mut self,
+        session: &str,
+        owner: Option<&str>,
+    ) -> Result<String, ControlError>;
 
     /// Set the session's pinned flag.
     fn pin(&mut self, session: &str) -> Result<(), ControlError>;
@@ -397,10 +409,22 @@ impl<T: Transport> DaemonSessions for HttpDaemonSessions<T> {
         })
     }
 
-    fn stop_monitoring(&mut self, session: &str) -> Result<String, ControlError> {
+    fn stop_monitoring(
+        &mut self,
+        session: &str,
+        owner: Option<&str>,
+    ) -> Result<String, ControlError> {
         let public_id = self.resolve_session(session)?;
         let path = format!("/api/v1/sessions/{}/stop", encode_path_segment(&public_id));
-        let reply = self.call(&ApiRequest::post_json(&path, &json!({})))?;
+        let request = ApiRequest {
+            method: "POST".to_owned(),
+            path,
+            query: owner
+                .map(|value| encode_query(&[("owner", value)]))
+                .unwrap_or_default(),
+            body: b"{}".to_vec(),
+        };
+        let reply = self.call(&request)?;
         // `@last` is resolved by the daemon. The id it stopped is the one it
         // names back; a reply that names nothing keeps what was sent.
         Ok(reply
@@ -445,7 +469,7 @@ impl DaemonSessions for UnwiredControl {
         Err(unwired())
     }
 
-    fn stop_monitoring(&mut self, _: &str) -> Result<String, ControlError> {
+    fn stop_monitoring(&mut self, _: &str, _: Option<&str>) -> Result<String, ControlError> {
         Err(unwired())
     }
 
@@ -522,7 +546,7 @@ pub(crate) fn run_with_sleeper(
     };
     if let Some(duration) = duration {
         sleeper.sleep(duration);
-        if let Err(error) = control.stop_monitoring(&handle.public_id) {
+        if let Err(error) = control.stop_monitoring(&handle.public_id, None) {
             return control_outcome(error, args.json);
         }
         return attached_outcome(&handle, true, false, args.json, pin_warning.as_deref());
@@ -569,9 +593,9 @@ fn prepare(args: &AttachArgs<'_>) -> Result<AttachRequest, Outcome> {
     };
     if args.group.is_some() {
         return Err(super::error_outcome(
-            exit::GENERAL,
-            "not_available",
-            "此构建的 attach 不支持 --group（P3/P5 提供）",
+            exit::NOT_IN_BUILD,
+            "not_in_build",
+            "`--group` 本版本未接入",
             args.json,
         ));
     }
@@ -735,7 +759,11 @@ mod tests {
             }
         }
 
-        fn stop_monitoring(&mut self, session: &str) -> Result<String, ControlError> {
+        fn stop_monitoring(
+            &mut self,
+            session: &str,
+            _: Option<&str>,
+        ) -> Result<String, ControlError> {
             self.stopped.push(session.to_owned());
             match self.stop_error.take() {
                 Some(error) => Err(error),
@@ -926,10 +954,16 @@ mod tests {
             ],
         );
         let mut control = HttpDaemonSessions::new(endpoint);
-        assert_eq!(control.stop_monitoring("@last").expect("@last"), "s-new");
-        assert_eq!(control.stop_monitoring("x").expect("by name"), "s-old");
         assert_eq!(
-            control.stop_monitoring("s-direct").expect("by id"),
+            control.stop_monitoring("@last", None).expect("@last"),
+            "s-new"
+        );
+        assert_eq!(
+            control.stop_monitoring("x", None).expect("by name"),
+            "s-old"
+        );
+        assert_eq!(
+            control.stop_monitoring("s-direct", None).expect("by id"),
             "s-direct"
         );
         let seen = server.join().expect("join");
@@ -989,7 +1023,9 @@ mod tests {
                 agent: Some("agent-b".to_owned()),
             })
             .expect("attach");
-        control.stop_monitoring(&attached.public_id).expect("stop");
+        control
+            .stop_monitoring(&attached.public_id, None)
+            .expect("stop");
         control.pin(&attached.public_id).expect("pin");
         let seen = server.join().expect("join");
         assert!(seen[0].starts_with("POST /api/v1/sessions/run HTTP/1.1"));

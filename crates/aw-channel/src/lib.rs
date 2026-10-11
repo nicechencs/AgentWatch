@@ -198,6 +198,9 @@ pub enum DialError {
     Unreachable(String),
     /// The socket or pipe exists but this user may not open it.
     Forbidden(String),
+    /// A Windows named pipe opened, but its server process was neither
+    /// LocalSystem nor this client user. No request bytes were sent.
+    UntrustedServer(String),
     /// Every pipe instance stayed busy for [`BUSY_RETRY`].
     Busy(String),
     /// No complete response within the timeout.
@@ -213,6 +216,7 @@ impl DialError {
         match self {
             Self::Unreachable(_) => "daemon_unreachable",
             Self::Forbidden(_) => "daemon_forbidden",
+            Self::UntrustedServer(_) => "daemon_untrusted_server",
             Self::Busy(_) => "daemon_busy",
             Self::Timeout(_) => "daemon_timeout",
             Self::Broken(_) => "channel_broken",
@@ -225,6 +229,7 @@ impl DialError {
         match self {
             Self::Unreachable(d)
             | Self::Forbidden(d)
+            | Self::UntrustedServer(d)
             | Self::Busy(d)
             | Self::Timeout(d)
             | Self::Broken(d) => d,
@@ -240,9 +245,12 @@ impl DialError {
             Self::Forbidden(_) => {
                 "AgentWatch 服务在运行，但当前账户没有连接权限。请让管理员把你加入 agentwatch 组（Windows 为 AgentWatch Users 组）。".to_owned()
             }
+            Self::UntrustedServer(_) => {
+                "连上的不是 AgentWatch 后台（管道被别的程序占用），已停止发送。".to_owned()
+            }
             Self::Busy(_) => "AgentWatch 服务正忙，请稍后重试。".to_owned(),
             Self::Timeout(_) => "AgentWatch 服务没有及时响应，请重试。".to_owned(),
-            Self::Broken(_) => "与 AgentWatch 服务的连接中断了，请重试。".to_owned(),
+            Self::Broken(_) => "跟后台的连接断了，请再试一次。".to_owned(),
         }
     }
 }
@@ -254,6 +262,76 @@ impl std::fmt::Display for DialError {
 }
 
 impl std::error::Error for DialError {}
+
+/// This OS's socket path limit, in bytes. `None` where a path has no such
+/// limit. The number lives in the OS module below; this function only picks it.
+fn socket_limit() -> Option<usize> {
+    os_path::socket_path_limit()
+}
+
+/// `Some` with a Chinese explanation when `path` is at least `limit` bytes.
+/// Names the limit and the actual length, so the failure is not reported as a
+/// bare `os error 22` / `invalid argument`. `None` when `limit` is `None`
+/// (this OS has no such limit) or the path is short enough.
+///
+/// Rust's standard library rejects an over-long path itself, before any
+/// syscall, as `ErrorKind::InvalidInput` ("path must be shorter than
+/// SUN_LEN"). A real `EINVAL` (errno 22) only appears when something else
+/// passes the path through. Both look like "invalid argument"; this check
+/// says which one it is. The limit comes from [`socket_limit`]: 104 on macOS,
+/// 108 on Linux, none on Windows.
+#[must_use]
+pub fn socket_path_too_long(path: &Path) -> Option<String> {
+    let limit = socket_limit()?;
+    let len = path.as_os_str().len();
+    if len < limit {
+        return None;
+    }
+    // Keep this diagnostic stable: channel callers and their structured logs
+    // need the English marker, while the CLI renders it through
+    // `human_socket_path_error` below.
+    Some(format!(
+        "通信口路径太长（{len} 字节），这个系统最多支持 {limit} 字节。请把 `AW_SOCKET` 换到短一点的目录。"
+    ))
+}
+
+/// Turn the internal overlong-socket detail into the one user-facing sentence.
+/// The English marker deliberately remains in [`DialError::detail`] for logs
+/// and structured diagnostics; callers must use this only for human output.
+#[must_use]
+pub fn human_socket_path_error(detail: &str) -> Option<String> {
+    let (_, rest) = detail.split_once("unusable socket path（套接字路径太长：")?;
+    let (len, rest) = rest.split_once(" 字节，这个系统的上限是 ")?;
+    let (limit, _) = rest.split_once(" 字节（")?;
+    let len = len.parse::<usize>().ok()?;
+    let limit = limit.parse::<usize>().ok()?;
+    Some(format!(
+        "通信口路径太长（{len} 字节），这个系统最多支持 {limit} 字节。请把 `AW_SOCKET` 换到短一点的目录。"
+    ))
+}
+
+/// Per-OS socket path limit. The number is the only thing that differs; the
+/// check and the message live above and are shared.
+mod os_path {
+    /// macOS `sockaddr_un.sun_path` is 104 bytes. A path of that length or
+    /// longer cannot be bound or connected.
+    #[cfg(target_os = "macos")]
+    pub(super) fn socket_path_limit() -> Option<usize> {
+        Some(104)
+    }
+
+    /// Linux `sockaddr_un.sun_path` is 108 bytes.
+    #[cfg(target_os = "linux")]
+    pub(super) fn socket_path_limit() -> Option<usize> {
+        Some(108)
+    }
+
+    /// Windows named pipes have no byte limit of this kind.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn socket_path_limit() -> Option<usize> {
+        None
+    }
+}
 
 /// A fresh, short scratch directory for tests that bind sockets. Unix
 /// socket paths are limited (`SUN_LEN`: 104 bytes on macOS, 108 on Linux)
@@ -448,13 +526,21 @@ mod platform {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{classify, roundtrip, DialError};
+    use super::{classify, roundtrip, socket_path_too_long, DialError};
 
     pub(super) fn exchange_raw(
         path: &Path,
         request: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, DialError> {
+        if let Some(reason) = socket_path_too_long(path) {
+            // The English token stays in this detail: existing tests assert it.
+            // `reason` itself is the Chinese sentence shown to the user.
+            return Err(DialError::Unreachable(format!(
+                "{}: unusable socket path ({reason})",
+                path.display()
+            )));
+        }
         let mut stream = UnixStream::connect(path).map_err(|err| classify(&err, path))?;
         let _ = stream.set_read_timeout(Some(timeout));
         let _ = stream.set_write_timeout(Some(timeout));
@@ -464,12 +550,22 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
 
     use super::{classify, roundtrip, DialError, BUSY_RETRY};
+
+    // `OpenOptionsExt::security_qos_flags` adds `SECURITY_SQOS_PRESENT` for
+    // CreateFileW. Without an explicit level, Rust's file open defaults to
+    // anonymous SQOS, so a LocalSystem pipe server cannot read the connected
+    // client's token. Identification is deliberately the maximum here: the
+    // server can inspect the SID/elevation/integrity, but can never act as the
+    // client.
+    const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 
     pub(super) fn exchange_raw(
         path: &Path,
@@ -483,9 +579,18 @@ mod platform {
             match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
+                .security_qos_flags(SECURITY_IDENTIFICATION)
                 .open(path)
             {
-                Ok(pipe) => break pipe,
+                Ok(pipe) => {
+                    // `CreateFileW` has connected us to one concrete server
+                    // instance. Validate that process before any request byte
+                    // leaves this client: the public pipe name can be claimed
+                    // while agentwatchd is stopped or restarting.
+                    aw_platform::verify_pipe_server(pipe.as_raw_handle())
+                        .map_err(|err| DialError::UntrustedServer(err.to_string()))?;
+                    break pipe;
+                }
                 Err(err) => {
                     let class = classify(&err, path);
                     if matches!(class, DialError::Busy(_)) && started.elapsed() < BUSY_RETRY {
@@ -504,7 +609,15 @@ mod platform {
         thread::Builder::new()
             .name("aw-channel-pipe".to_owned())
             .spawn(move || {
-                let _ = tx.send(roundtrip(&mut pipe, &bytes));
+                let result = roundtrip(&mut pipe, &bytes);
+                if result.is_ok() {
+                    // A complete reply means the server accepted the request
+                    // after its own peer-identification check. This runtime
+                    // fact feeds `aw doctor`; do not claim availability just
+                    // because the Win32 APIs compiled.
+                    aw_platform::note_pipe_peer_identification();
+                }
+                let _ = tx.send(result);
             })
             .map_err(|err| DialError::Broken(format!("helper thread: {err}")))?;
         match rx.recv_timeout(timeout) {
@@ -644,6 +757,16 @@ mod tests {
         if cfg!(windows) {
             assert_eq!(busy.code(), "daemon_busy");
         }
+    }
+
+    #[test]
+    fn untrusted_pipe_server_has_a_distinct_error_and_no_send_message() {
+        let err = DialError::UntrustedServer("unexpected server SID".to_owned());
+        assert_eq!(err.code(), "daemon_untrusted_server");
+        assert_eq!(
+            err.plain(),
+            "连上的不是 AgentWatch 后台（管道被别的程序占用），已停止发送。"
+        );
     }
 
     #[test]
@@ -848,6 +971,18 @@ mod fallback_tests {
         let err = exchange_first(&order, b"", TIMEOUT).unwrap_err();
         assert_eq!(err.code(), "daemon_forbidden", "{err}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn too_long_message_names_the_limit_and_the_length() {
+        let path = PathBuf::from(format!("/tmp/{}", "x".repeat(120)));
+        let len = path.as_os_str().len();
+        let reason = super::socket_path_too_long(&path).expect("too long");
+        assert!(reason.contains(&len.to_string()), "{reason}");
+        assert!(reason.contains("最多支持"), "{reason}");
+        assert!(reason.contains("AW_SOCKET"), "{reason}");
+        assert!(!reason.contains("unusable socket path"), "{reason}");
+        assert!(super::socket_path_too_long(std::path::Path::new("/tmp/short.sock")).is_none());
     }
 
     /// macOS SUN_LEN is 104, Linux 108: a longer path cannot be dialled.

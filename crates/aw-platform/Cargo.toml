@@ -1,0 +1,58 @@
+[package]
+name = "aw-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "AgentWatch operating-system boundary for launch, process identity, and local security."
+
+[features]
+test-hold-delay = []
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Already used by aw-daemon and present in Cargo.lock. It provides safe waitpid.
+nix = { version = "0.30", default-features = false, features = ["fs", "process", "socket", "user"] }
+aw-collector-linux = { path = "../aw-collector-linux" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+aw-collector-macos = { path = "../aw-collector-macos" }
+# The hold stage reads its spec as data. MIT OR Apache-2.0, already in
+# Cargo.lock (aw-daemon pins the same versions). macOS only: the Linux gate
+# does not parse a spec.
+serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive", "std"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+# libc 0.2.189 is already in Cargo.lock (via sysinfo). Pinned so `--locked`
+# resolves it. Used for proc_pidinfo / proc_listallpids / posix_spawn FFI.
+libc = "=0.2.189"
+# getpeereid and LOCAL_PEERPID. `user` + `socket` are the features aw-daemon
+# already enables; no new crate version.
+nix = { version = "0.30", default-features = false, features = ["user", "socket"] }
+
+[target.'cfg(windows)'.dependencies]
+aw-collector-windows = { path = "../aw-collector-windows" }
+# The pinned package and these feature flags are already represented in the
+# workspace lockfile.  Keep Win32 FFI at this OS boundary.
+windows = { version = "=0.57.0", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+# Not `workspace = true`. Inheriting the workspace table forces
+# `--forbid=unsafe_code` on the rustc command line, and a command-line forbid
+# cannot be relaxed by `#![deny]` / `#[allow]` (rust-lang/cargo#13157). The
+# workspace lint table is unchanged. This crate restates the clippy lints and
+# sets `unsafe_code` to deny, which the Windows and macOS FFI modules opt out
+# of. Same approach as aw-collector-windows.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

@@ -10,6 +10,7 @@
 //! Collector assembly stays in `collectors.rs`. This file does not name a platform.
 
 #![forbid(unsafe_code)]
+#![deny(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -97,6 +98,14 @@ fn dispatch(args: impl IntoIterator<Item = String>) -> Result<ExitCode, CliError
     if args[0] == api::LAUNCH_AS_HELPER_ARG {
         return Ok(api::launch_as_helper());
     }
+    // Internal: macOS hold stage. Started with a fixed environment; the
+    // account, program and environment arrive as data on a pipe. It blocks
+    // until release, switches, then execs. A failure exits with the step's
+    // code (121–127) and does not exec. See `aw_platform::gate_main`.
+    #[cfg(target_os = "macos")]
+    if args[0] == aw_platform::GATE_ARG {
+        aw_platform::gate_main();
+    }
 
     let mut foreground = false;
     let mut log_probe = false;
@@ -150,8 +159,8 @@ fn command_config(args: &[String]) -> Result<ExitCode, CliError> {
 }
 
 fn command_foreground(config_path: Option<&std::path::Path>) -> Result<ExitCode, CliError> {
-    let (config, warnings, _) = load_selected(config_path).map_err(CliError::Config)?;
-    run_foreground(&config, &warnings).map_err(CliError::Runtime)?;
+    let (config, warnings, loaded_path) = load_selected(config_path).map_err(CliError::Config)?;
+    run_foreground(&config, &warnings, loaded_path.as_deref()).map_err(CliError::Runtime)?;
     Ok(ExitCode::SUCCESS)
 }
 

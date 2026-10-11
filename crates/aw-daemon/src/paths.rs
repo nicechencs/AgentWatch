@@ -3,19 +3,11 @@
 //! `cfg(target_os)` is allowed only in this module. Business logic must call
 //! [`default_data_dir`] / [`default_config_path`] and must not branch on the OS.
 //!
-//! The task card names these data directories (no extra `data/` segment):
-//! Linux `/var/lib/agentwatch`, macOS `/Library/Application Support/AgentWatch`,
-//! Windows `%ProgramData%\AgentWatch`. architecture.md §7 puts Windows and macOS
-//! data under a `data` subdirectory of the same root. This card follows the
-//! task card. Config files still live where §7 says they do.
-//!
 //! Creating a directory that fails is an error. There is no fallback to the
 //! user home directory. This module never creates the three system directories
 //! by itself; callers pass a configured path (tests and `--foreground` use a
 //! temp directory via `storage.data_dir`).
 
-#[cfg(target_os = "windows")]
-use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -26,31 +18,9 @@ use std::path::{Path, PathBuf};
 /// On Windows, returns an error when `ProgramData` is unset. It does not invent
 /// a path under the user profile.
 pub fn default_data_dir() -> io::Result<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        Ok(PathBuf::from("/var/lib/agentwatch"))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Ok(PathBuf::from("/Library/Application Support/AgentWatch"))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let root = env::var_os("ProgramData").ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "ProgramData is unset; refusing to fall back to the user home directory",
-            )
-        })?;
-        Ok(PathBuf::from(root).join("AgentWatch"))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "no default AgentWatch data directory for this operating system",
-        ))
-    }
+    aw_platform::platform()
+        .default_data_dir()
+        .map_err(platform_error)
 }
 
 /// Default daemon config file for this platform (§7 locations).
@@ -59,27 +29,9 @@ pub fn default_data_dir() -> io::Result<PathBuf> {
 ///
 /// On Windows, returns an error when `ProgramData` is unset.
 pub fn default_config_path() -> io::Result<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        Ok(PathBuf::from("/etc/agentwatch/config.toml"))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Ok(PathBuf::from(
-            "/Library/Application Support/AgentWatch/config.toml",
-        ))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Ok(default_data_dir()?.join("config.toml"))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "no default AgentWatch config path for this operating system",
-        ))
-    }
+    aw_platform::platform()
+        .default_config_path()
+        .map_err(platform_error)
 }
 
 /// Create `dir` (and parents). Failure is returned as-is; nothing is written elsewhere.
@@ -89,6 +41,19 @@ pub fn default_config_path() -> io::Result<PathBuf> {
 /// Returns the `create_dir_all` error. Does not fall back to another directory.
 pub fn ensure_data_dir(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)
+}
+
+fn platform_error(error: aw_platform::PlatformError) -> io::Error {
+    match error {
+        aw_platform::PlatformError::Io(error) => error,
+        aw_platform::PlatformError::Unsupported { .. } => {
+            io::Error::new(io::ErrorKind::Unsupported, error)
+        }
+        aw_platform::PlatformError::Invalid { .. }
+        | aw_platform::PlatformError::PeerNotIdentified { .. } => {
+            io::Error::new(io::ErrorKind::InvalidInput, error)
+        }
+    }
 }
 
 #[cfg(test)]

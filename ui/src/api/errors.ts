@@ -55,12 +55,19 @@ const CODE_TEXT: Record<string, string> = {
   store_unavailable: "error.noDatabase",
   session_ended: "error.sessionEnded",
   write_failed: "error.writeFailed",
+  db_busy: "error.dbBusy",
 };
 
 export function describeError(error: unknown, t: T): string {
   if (error instanceof ApiError) {
     const coded = CODE_TEXT[error.code];
-    if (coded) return t(coded);
+    if (coded) {
+      if (error.code === "db_busy") {
+        const waited = /\bWaited\s+(\d+)\s+s\b/u.exec(error.message)?.[1] ?? "0";
+        return t(coded, { seconds: waited });
+      }
+      return t(coded);
+    }
     if (error.status === 401 || error.code === "unauthorized") return t("error.unauthorized");
     if (error.status === 403 || error.code === "forbidden") return t("error.forbidden");
     if (error.status === 501 || error.code === "not_implemented") return t("error.notImplemented");

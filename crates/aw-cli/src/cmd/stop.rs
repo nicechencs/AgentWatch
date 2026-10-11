@@ -13,7 +13,12 @@ use super::attach::DaemonSessions;
 use super::Outcome;
 
 /// Run `aw stop`.
-pub(crate) fn run(session: &str, json: bool, control: &mut dyn DaemonSessions) -> Outcome {
+pub(crate) fn run(
+    session: &str,
+    owner: Option<&str>,
+    json: bool,
+    control: &mut dyn DaemonSessions,
+) -> Outcome {
     let parsed = match parse_session(session) {
         Ok(parsed) => parsed,
         Err(detail) => {
@@ -24,7 +29,7 @@ pub(crate) fn run(session: &str, json: bool, control: &mut dyn DaemonSessions) -
         SessionRef::Last => "@last",
         SessionRef::IdOrName(name) => name.as_str(),
     };
-    match control.stop_monitoring(key) {
+    match control.stop_monitoring(key, owner) {
         Ok(public_id) => stopped_outcome(&public_id, json),
         Err(error) if error.no_sessions() => super::error_outcome(
             error.exit_code(),
@@ -103,7 +108,11 @@ mod tests {
             })
         }
 
-        fn stop_monitoring(&mut self, session: &str) -> Result<String, ControlError> {
+        fn stop_monitoring(
+            &mut self,
+            session: &str,
+            _: Option<&str>,
+        ) -> Result<String, ControlError> {
             self.stopped.push(session.to_owned());
             Ok(session.to_owned())
         }
@@ -118,7 +127,7 @@ mod tests {
     #[test]
     fn stop_only_stops_monitoring() {
         let mut control = FakeControl::default();
-        let outcome = run("s-1", false, &mut control);
+        let outcome = run("s-1", None, false, &mut control);
         assert_eq!(outcome.code, exit::OK);
         let text = String::from_utf8(outcome.stdout).expect("utf8");
         assert!(text.contains("已停止监控"), "{text}");
@@ -156,7 +165,11 @@ mod tests {
                 })
             }
 
-            fn stop_monitoring(&mut self, _: &str) -> Result<String, ControlError> {
+            fn stop_monitoring(
+                &mut self,
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<String, ControlError> {
                 Err(ControlError::Status {
                     status: 404,
                     code: None,
@@ -171,8 +184,8 @@ mod tests {
             }
         }
 
-        let outcome = run("s-missing", false, &mut Missing);
-        assert_eq!(outcome.code, exit::USAGE);
+        let outcome = run("s-missing", None, false, &mut Missing);
+        assert_eq!(outcome.code, exit::NOT_FOUND);
         assert_eq!(
             String::from_utf8(outcome.stderr).expect("utf8"),
             "aw: 找不到会话 `s-missing`\n"
@@ -212,7 +225,7 @@ mod tests {
             endpoint,
             Seen(Rc::clone(&seen)),
         );
-        let outcome = run("@last", false, &mut control);
+        let outcome = run("@last", None, false, &mut control);
         assert_eq!(
             outcome.code,
             exit::OK,
@@ -249,7 +262,11 @@ mod tests {
                 })
             }
 
-            fn stop_monitoring(&mut self, _: &str) -> Result<String, ControlError> {
+            fn stop_monitoring(
+                &mut self,
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<String, ControlError> {
                 Err(ControlError::Status {
                     status: 404,
                     code: Some("not_found".to_owned()),
@@ -270,7 +287,7 @@ mod tests {
             }
         }
 
-        let outcome = run("no-such-name", false, &mut Unknown);
+        let outcome = run("no-such-name", None, false, &mut Unknown);
         assert_eq!(
             String::from_utf8(outcome.stderr).expect("utf8"),
             "aw: 找不到会话 `no-such-name`\n"

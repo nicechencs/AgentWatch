@@ -28,6 +28,15 @@ export function sessionStatus(
       explanation: t("session.recordingInterruptedReason"),
     };
   }
+  if (session.end_reason === "attach_failed") {
+    return { kind: "program_exit", label: t("session.attachFailed"), explanation: null };
+  }
+  if (session.end_reason === "adopt_timeout") {
+    return { kind: "program_exit", label: t("session.adoptTimeout"), explanation: null };
+  }
+  if (session.end_reason === "exited" || session.end_reason === "program_exit") {
+    return { kind: "program_exit", label: t("session.programExited"), explanation: null };
+  }
   // `exited` / `program_exit`, null, and unknown legacy/future values all mean the
   // program is no longer running when the daemon has supplied an end time.
   return { kind: "program_exit", label: t("session.stopped"), explanation: null };

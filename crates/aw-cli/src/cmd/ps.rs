@@ -54,8 +54,10 @@ pub(crate) struct ProcessRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum PsError {
-    /// The daemon did not answer, or this account may not open its channel.
+    /// The daemon did not answer.
     Unreachable { detail: String },
+    /// The channel rejected this caller before a process table was returned.
+    Permission { detail: String, code: &'static str },
     /// The daemon answered but has no process table on this platform.
     NotCollected { detail: String },
     /// The exchange or the answer was broken.
@@ -68,6 +70,7 @@ impl std::fmt::Display for PsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unreachable { detail }
+            | Self::Permission { detail, .. }
             | Self::NotCollected { detail }
             | Self::Unavailable { detail }
             | Self::BadFilter { detail } => write!(f, "{detail}"),
@@ -113,11 +116,29 @@ impl ProcessTable for DaemonTable {
             client
                 .call(&ApiRequest::get("/api/v1/processes"))
                 .map_err(|err| match err {
-                    ClientError::Unreachable { .. } | ClientError::Forbidden { .. } => {
-                        PsError::Unreachable {
-                            detail: err.to_string(),
-                        }
-                    }
+                    ClientError::Unreachable { .. } => PsError::Unreachable {
+                        detail: err.to_string(),
+                    },
+                    ClientError::Forbidden { .. } => PsError::Permission {
+                        detail: err.to_string(),
+                        code: "forbidden",
+                    },
+                    ClientError::UntrustedServer { .. } => PsError::Permission {
+                        detail: err.to_string(),
+                        code: "daemon_untrusted_server",
+                    },
+                    ClientError::Status {
+                        status: 401 | 403,
+                        ref code,
+                        ..
+                    } => PsError::Permission {
+                        detail: err.to_string(),
+                        code: if code.as_deref() == Some("unidentified_peer") {
+                            "unidentified_peer"
+                        } else {
+                            "forbidden"
+                        },
+                    },
                     other => PsError::Unavailable {
                         detail: format!("请求进程表失败：{other}"),
                     },
@@ -201,6 +222,9 @@ pub(crate) fn run(
         Ok(rows) => rows,
         Err(PsError::Unreachable { detail }) => {
             return super::error_outcome(exit::UNREACHABLE, "unreachable", &detail, json);
+        }
+        Err(PsError::Permission { detail, code }) => {
+            return super::error_outcome(exit::PERMISSION, code, &detail, json);
         }
         Err(PsError::NotCollected { detail }) => {
             return super::error_outcome(exit::GENERAL, "not_collected", &detail, json);

@@ -15,11 +15,16 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+#[cfg(not(windows))]
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 
 use crate::api::ApiState;
 use crate::sample::{HostSampler, SampleTarget};
+
+#[cfg(not(windows))]
+use aw_platform::PlatformError;
+use aw_platform::{ReapOutcome, ReleasedChild};
 
 /// How long `POST /sessions/run` waits for `/adopt`. Same as the orchestrator.
 pub(crate) const ADOPT_TIMEOUT_NS: i64 = 5_000_000_000;
@@ -29,7 +34,7 @@ pub(crate) enum WatchRequest {
     /// Watch `target.root_pid`. `child` is set when the daemon spawned it.
     Start {
         target: Box<SampleTarget>,
-        child: Option<Child>,
+        child: Option<Box<dyn ReleasedChild>>,
     },
     /// Stop watching every root of this `sessions.id`. The row was already
     /// marked ended by the route.
@@ -45,7 +50,51 @@ pub(crate) struct PendingLaunch {
 
 struct Running {
     sampler: HostSampler,
-    child: Option<Child>,
+    child: Option<Box<dyn ReleasedChild>>,
+}
+
+/// Wrap the daemon's already-launched child in the interface-v2 ownership
+/// type. The watcher only ever reaps this owned handle, never a PID lookup.
+#[cfg(not(windows))]
+pub(crate) fn released_child(child: Child) -> Box<dyn ReleasedChild> {
+    Box::new(DaemonReleasedChild { child })
+}
+
+#[cfg(not(windows))]
+struct DaemonReleasedChild {
+    child: Child,
+}
+
+#[cfg(not(windows))]
+fn child_outcome(status: std::process::ExitStatus) -> ReapOutcome {
+    match status.code() {
+        Some(code) => ReapOutcome::Exited(code),
+        #[cfg(unix)]
+        None => {
+            use std::os::unix::process::ExitStatusExt;
+            ReapOutcome::Signaled(status.signal().unwrap_or_default())
+        }
+        #[cfg(not(unix))]
+        None => ReapOutcome::Signaled(0),
+    }
+}
+
+#[cfg(not(windows))]
+impl ReleasedChild for DaemonReleasedChild {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn try_reap(&mut self) -> Result<ReapOutcome, PlatformError> {
+        Ok(self
+            .child
+            .try_wait()?
+            .map_or(ReapOutcome::StillRunning, child_outcome))
+    }
+
+    fn wait(mut self: Box<Self>) -> Result<ReapOutcome, PlatformError> {
+        Ok(child_outcome(self.child.wait()?))
+    }
 }
 
 /// Samplers for API-started sessions. Owned by the foreground loop.
@@ -64,7 +113,7 @@ impl Watches {
 
     /// Close sessions a previous daemon run left open (not the daemon sample).
     pub(crate) fn recover(&self) {
-        if let Ok(conn) = rusqlite::Connection::open(&self.db_path) {
+        if let Ok(conn) = aw_store::open_connection(&self.db_path) {
             let _ = conn.execute(
                 "UPDATE sessions SET ended_ns = ?1, end_reason = 'daemon_restart' \
                  WHERE ended_ns IS NULL AND id <> 1",
@@ -107,12 +156,14 @@ impl Watches {
             let exit = running
                 .child
                 .as_mut()
-                .and_then(|child| child.try_wait().ok().flatten());
-            if exit.is_some() || !running.sampler.root_alive() {
-                finished.push((index, exit.and_then(|status| status.code())));
+                .and_then(|child| child.try_reap().ok());
+            if exit.is_some_and(|outcome| outcome != ReapOutcome::StillRunning)
+                || !running.sampler.root_alive()
+            {
+                finished.push((index, exit));
             }
         }
-        for (index, code) in finished.into_iter().rev() {
+        for (index, outcome) in finished.into_iter().rev() {
             let mut running = self.running.remove(index);
             running.sampler.flush();
             running.sampler.stop();
@@ -127,14 +178,28 @@ impl Watches {
                 // and a status with no code stay unknown; they are not written
                 // as 0. The poll sampler cannot see a non-child's status, so
                 // children are left NULL here too.
-                if let Some(code) = code {
+                if let Some(ReapOutcome::Exited(code)) = outcome {
                     if let Some(root) = running.sampler.target().root_hint.as_ref() {
                         record_root_exit(&self.db_path, db_id, root, code);
                     } else {
                         tracing::warn!(session = db_id, "root exit had no stored process identity");
                     }
                 }
-                self.end(db_id, "exited", code);
+                self.end(
+                    db_id,
+                    "exited",
+                    match outcome {
+                        Some(ReapOutcome::Exited(code)) => Some(code),
+                        _ => None,
+                    },
+                );
+            }
+            // A sampler can observe the process as gone before `try_reap`
+            // reports its status (or while that nonblocking call errors). The
+            // daemon still owns this handle, so always hand it to the waiter
+            // instead of dropping a possible zombie at session end.
+            if let Some(child) = running.child.take() {
+                reap_launched_child(child);
             }
         }
     }
@@ -173,7 +238,7 @@ impl Watches {
         self.running.len()
     }
 
-    fn start(&mut self, target: SampleTarget, child: Option<Child>) {
+    fn start(&mut self, target: SampleTarget, child: Option<Box<dyn ReleasedChild>>) {
         let db_id = target.db_id;
         let pid = target.root_pid;
         let mut sampler = HostSampler::for_target(self.db_path.clone(), target);
@@ -222,7 +287,7 @@ impl Watches {
     }
 
     fn end(&self, db_id: i64, reason: &str, exit_code: Option<i32>) {
-        let Ok(conn) = rusqlite::Connection::open(&self.db_path) else {
+        let Ok(conn) = aw_store::open_connection(&self.db_path) else {
             return;
         };
         let _ = conn.execute(
@@ -239,7 +304,7 @@ impl Watches {
 /// it neither changes SIGCHLD handling nor observes unrelated children. It
 /// deliberately has no database access: a user stop is final for recording
 /// purposes even if the target exits later.
-fn reap_launched_child(mut child: Child) {
+fn reap_launched_child(child: Box<dyn ReleasedChild>) {
     let _ = std::thread::Builder::new()
         .name("aw-launch-reaper".to_owned())
         .spawn(move || {
@@ -262,7 +327,7 @@ pub(crate) fn record_root_exit(
     root: &crate::sample::RootHint,
     code: i32,
 ) {
-    let Ok(conn) = rusqlite::Connection::open(db_path) else {
+    let Ok(conn) = aw_store::open_connection(db_path) else {
         return;
     };
     let code = i64::from(code);

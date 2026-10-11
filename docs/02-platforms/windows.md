@@ -1,7 +1,7 @@
 # Windows 采集器
 
 > 状态：草案
-> 最后更新：2026-10-07
+> 最后更新：2026-10-11
 > 关联：REQ-01~04、REQ-11、ADR-0008、ADR-0013、SPIKE-02、SPIKE-05、SPIKE-09、[capability-matrix](capability-matrix.md)、[inter-agent-communication](../01-architecture/inter-agent-communication.md)
 
 涉及 crate：`aw-collector-windows`，依赖 `ferrisetw` 和 `windows` crate。
@@ -126,12 +126,37 @@ P3-WIN-01（2026-10-08）没有在本机或 CI 上订阅 `Microsoft-Windows-PktM
 
 ### 4.1 启动模式
 
-1. CLI（普通权限）用 `CREATE_SUSPENDED` 创建目标进程，这样继承用户桌面、令牌和控制台。
-2. CLI 创建 Job Object，调用 `AssignProcessToJobObject`，然后把 Job 句柄的副本交给 daemon：可以通过 `DuplicateHandle` 到 daemon 进程，或者给 Job 命名【待验证 SPIKE-05】。
-3. 用 `JobObjectAssociateCompletionPortInformation` 关联一个 IOCP，接收 `JOB_OBJECT_MSG_NEW_PROCESS` 和 `JOB_OBJECT_MSG_EXIT_PROCESS`，并更新范围集合。
-4. `ResumeThread`。
-5. **不**设置 `JOB_OBJECT_LIMIT_BREAKAWAY_OK`。子进程如果尝试用 `CREATE_BREAKAWAY_FROM_JOB` 脱离，会失败。【待验证】这是否会影响某些程序正常运行，比如 Chrome、VS Code 会自己用 Job。Win8+ 支持嵌套 Job。
-6. 在 IOCP 消息到达之前，ETW 事件可能已经到了，所以需要**一个小的待定缓冲**：未知 PID 的事件暂存 200 ms，再用 ProcessStart 的 ParentProcessID 判断是否属于范围。
+`aw-platform` 已实现 Windows 的本地两阶段启动【未在真机验证】：以
+`CREATE_SUSPENDED` 创建目标后，立即放入带
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job。持有阶段创建者退出会使目标
+结束；`release()` 先清除该限制再 `ResumeThread`，返回唯一持有进程句柄的
+`ReleasedChild`，由它负责等待和回收。`aw run --no-daemon -- cmd /c exit 7`
+有 Windows 条件测试断言退出码保持为 7。`--env` 只构成子进程环境块，不发送到
+daemon、日志或数据库。【未在真机验证】
+
+命名管道创建时设置显式 DACL 并拒绝远程客户端。客户端以
+`SECURITY_IDENTIFICATION` 打开管道，并在发送前核对服务端进程令牌是 SYSTEM 或
+当前用户，防止后台未运行时同名管道被抢占。daemon 通过
+`aw_platform::identify_pipe_peer`（先读首个请求字节，再模拟客户端并在同一同步区间
+读取线程令牌、立即还原）取得 SID、提权状态与完整性级别；不能取得时返回
+`PeerNotIdentified`，绝不使用服务账户身份。`aw run` 由 CLI 以当前用户创建挂起目标，daemon 只通过 `/adopt` 接管并由
+CLI 放行。App 的「新建会话 / 后台直接启动」在 Windows 当前明确返回 503；尚未接入
+`CreateProcessAsUserW`，不能据此宣称服务可以代表普通用户启动程序。
+
+当前实现的本地启动顺序是：
+
+1. CLI 用 `CREATE_SUSPENDED` 创建目标进程，并立即将其加入一个带 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的临时 Job。
+2. CLI 通过 daemon 的 `/adopt` API 交出 PID；如果 daemon 拒绝，CLI 结束并回收这个仍被挂起的子进程。
+3. 接管成功后，CLI 清除临时 Job 的 kill-on-close 限制、恢复主线程，并保留唯一的进程回收句柄。
+
+这个 Job 目前只实现“接管前不得执行、失败即结束”的启动闸门；释放时 CLI 会关闭 Job，daemon 不接收 Job 句柄，也没有 IOCP / `JobObjectAssociateCompletionPortInformation` 路由。因此它**尚不**是释放后子进程树的 Windows 范围追踪实现，不能声称已阻止 breakaway 或已覆盖后代进程。【待验证 SPIKE-05】
+
+### 4.1.1 当前 CLI 命令与限制
+
+- `aw run [选项] -- <命令> [参数…]` 是启动入口。已解析的选项为 `--agent`、`--name`、`--cwd`、重复的 `--env KEY=VALUE`、`--summary none|short|full`、`--pin`、`--no-daemon`、`--raw <file>` 与 `--no-follow-children`。`--raw` 当前只记录请求，不写原始事件文件；daemon 模式不支持 `--no-follow-children`。`--no-daemon` 走本地启动路径；Windows 上该路径使用上述挂起 Job 闸门，采集状态仍应按命令输出解释，不把未知值当作零。
+- `--proxy`（可配 `--proxy-on-reject fail|tunnel`）当前只输出环境注入计划，**不会启动**代理或目标进程。`--self-report`、`--mcp-tap`、`--unsafe-no-redact`、`--include-proc`、`--group` 已被解析但在本构建中拒绝，不能把它们写成可用功能。
+- `aw stop <SESSION>` 只停止对该会话的监控，**不结束**目标进程；没有 Windows 专用 stop 标志。
+- `aw daemon status|start|stop|restart` 和 `aw daemon logs [-f|--follow] [-n|--lines <数量>]` 使用本地 daemon 通道。`aw daemon install [--yes]` 仅生成或打印给管理员执行的 `sc.exe` 文本，不注册服务；`aw daemon uninstall [--purge] [--check]` 也由当前构建的计划接口处理。全局可用的连接/输出选项是 `--json`、`--socket`、`--http`、`--token`、`--lang zh|en`、`-q|--quiet`、`-v|--verbose`。
 
 ### 4.2 附着模式
 

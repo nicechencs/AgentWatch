@@ -154,29 +154,45 @@ pub(crate) fn evidence_or_na(evidence: Option<&Evidence>) -> Evidence {
 }
 
 pub(crate) fn session_table(items: &[SessionItem]) -> Table {
+    // The daemon sends `user_id` only to an OS-identified administrator.  Do
+    // not add an empty column for normal users (or for an old daemon which
+    // does not expose an owner field).
+    let show_user = items.iter().any(|item| item.user_id.is_some());
+    let mut headers = vec![
+        "id".to_owned(),
+        "name".to_owned(),
+        "mode".to_owned(),
+        "agent".to_owned(),
+        "started_ns".to_owned(),
+        "ended_ns".to_owned(),
+        "end_reason".to_owned(),
+        "pinned".to_owned(),
+    ];
+    if show_user {
+        headers.push("User".to_owned());
+    }
     Table {
-        headers: vec![
-            "id".to_owned(),
-            "name".to_owned(),
-            "mode".to_owned(),
-            "agent".to_owned(),
-            "started_ns".to_owned(),
-            "ended_ns".to_owned(),
-            "pinned".to_owned(),
-        ],
+        headers,
         rows: items
             .iter()
-            .map(|item| Row {
-                cells: vec![
+            .map(|item| {
+                let mut cells = vec![
                     item.public_id.clone(),
                     opt_text(item.name.as_deref()),
                     item.mode.clone(),
                     opt_text(item.agent.as_deref()),
                     opt_i64(item.started_ns),
                     opt_i64(item.ended_ns),
+                    end_reason_label(item.end_reason.as_deref()).to_owned(),
                     pinned_text(item.pinned),
-                ],
-                evidence: item.evidence.clone(),
+                ];
+                if show_user {
+                    cells.push(opt_text(item.user_id.as_deref()));
+                }
+                Row {
+                    cells,
+                    evidence: item.evidence.clone(),
+                }
             })
             .collect(),
     }
@@ -189,16 +205,22 @@ pub(crate) fn session_json(items: &[SessionItem]) -> Value {
 }
 
 fn session_item_json(item: &SessionItem) -> Value {
-    json!({
+    let mut value = json!({
         "id": item.public_id,
         "name": item.name,
         "mode": item.mode,
         "agent": item.agent,
         "started_ns": item.started_ns,
         "ended_ns": item.ended_ns,
+        "end_reason": item.end_reason,
+        "end_reason_label": end_reason_label(item.end_reason.as_deref()),
         "pinned": item.pinned,
         "evidence": evidence_json(&item.evidence),
-    })
+    });
+    if let Some(owner) = &item.user_id {
+        value["user_id"] = Value::String(owner.clone());
+    }
+    value
 }
 
 pub(crate) fn show_table(show: &SessionShow) -> Table {
@@ -220,6 +242,11 @@ pub(crate) fn show_table(show: &SessionShow) -> Table {
             &show.item.evidence,
         ),
         stat_row("ended_ns", opt_i64(show.item.ended_ns), &show.item.evidence),
+        stat_row(
+            "end_reason",
+            end_reason_label(show.item.end_reason.as_deref()).to_owned(),
+            &show.item.evidence,
+        ),
         stat_row("pinned", pinned_text(show.item.pinned), &show.item.evidence),
         stat_row(
             "exit_code",
@@ -267,6 +294,18 @@ fn stat_row(field: &str, value: String, evidence: &Evidence) -> Row {
     Row {
         cells: vec![field.to_owned(), value],
         evidence: evidence.clone(),
+    }
+}
+
+/// The wording is shared with the App's session status mapping.
+pub(crate) fn end_reason_label(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("exited") | Some("program_exit") => "程序已退出",
+        Some("stopped") | Some("user_stop") => "已停止记录",
+        Some("daemon_shutdown") | Some("daemon_restart") => "记录已中断（后台重启）",
+        Some("attach_failed") => "附着失败",
+        Some("adopt_timeout") => "接管超时",
+        _ => "不可得",
     }
 }
 

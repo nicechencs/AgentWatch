@@ -37,6 +37,11 @@ pub(crate) enum QueryError {
     NotFound { session: String },
     /// `@last` for a caller who has no sessions.
     NoSessions,
+    /// The daemon authenticated the caller but did not authorize this action.
+    Permission { detail: String },
+    /// The local channel could not establish a trustworthy peer identity.
+    /// This preserves the fixed IPC failure wording. Exit 4.
+    IdentityFailure { detail: String, code: &'static str },
     /// `--group-by` / `--sort` / a time bound the command refused.
     BadArgument { detail: String },
     /// No query source is available. The message says why; it is not a fake empty list.
@@ -46,8 +51,10 @@ pub(crate) enum QueryError {
 impl std::fmt::Display for QueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotFound { session } => write!(f, "找不到会话 `{session}`"),
-            Self::NoSessions => write!(f, "还没有你的会话，@last 无处可指"),
+            Self::NotFound { session } => write!(f, "找不到会话「{session}」"),
+            Self::NoSessions => write!(f, "你还没有会话"),
+            Self::Permission { detail } => write!(f, "{detail}"),
+            Self::IdentityFailure { detail, .. } => write!(f, "{detail}"),
             Self::BadArgument { detail } => write!(f, "{detail}"),
             Self::Unavailable { detail } => write!(f, "{detail}"),
         }
@@ -59,6 +66,10 @@ impl std::fmt::Display for QueryError {
 pub(crate) struct SessionItem {
     /// Public id. Not a hostname.
     pub public_id: String,
+    /// Owner supplied only when the daemon identified this viewer as an
+    /// administrator.  `None` is deliberately different from an empty owner:
+    /// normal callers are not told that field at all.
+    pub user_id: Option<String>,
     /// User label, or unknown.
     pub name: Option<String>,
     /// `launch` or `attach`.
@@ -70,6 +81,8 @@ pub(crate) struct SessionItem {
     pub started_ns: Option<i64>,
     /// End, or still running.
     pub ended_ns: Option<i64>,
+    /// Daemon-recorded reason recording ended, when supplied.
+    pub end_reason: Option<String>,
     /// Excluded from retention. `None` when the reply did not carry `pinned`
     /// (the store summary omits it); printed as 没采, never as unpinned.
     pub pinned: Option<bool>,
@@ -276,14 +289,24 @@ pub(crate) trait QuerySource {
     /// # Errors
     ///
     /// [`QueryError::NotFound`].
-    fn rename_session(&mut self, key: &str, name: &str) -> Result<SessionItem, QueryError>;
+    fn rename_session(
+        &mut self,
+        key: &str,
+        name: &str,
+        owner: Option<&str>,
+    ) -> Result<SessionItem, QueryError>;
 
     /// Set or clear the pin.
     ///
     /// # Errors
     ///
     /// [`QueryError::NotFound`].
-    fn set_pinned(&mut self, key: &str, pinned: bool) -> Result<SessionItem, QueryError>;
+    fn set_pinned(
+        &mut self,
+        key: &str,
+        pinned: bool,
+        owner: Option<&str>,
+    ) -> Result<SessionItem, QueryError>;
 
     /// Delete. Returns how many were removed.
     ///
@@ -291,7 +314,7 @@ pub(crate) trait QuerySource {
     ///
     /// [`QueryError::NotFound`] naming the first missing key. Earlier keys in the
     /// same call are not removed (all-or-nothing).
-    fn delete_sessions(&mut self, keys: &[String]) -> Result<u64, QueryError>;
+    fn delete_sessions(&mut self, keys: &[String], owner: Option<&str>) -> Result<u64, QueryError>;
 
     /// One timeline page.
     ///
@@ -300,7 +323,8 @@ pub(crate) trait QuerySource {
     /// [`QueryError::NotFound`].
     fn timeline(&self, key: &str, bounds: &TimelineBounds) -> Result<TimelinePage, QueryError>;
 
-    /// Events that arrived after `after_ns` (exclusive). Used by `--follow`.
+    /// Events whose SSE record id is after `cursor` (exclusive). Used by
+    /// `--follow`.
     ///
     /// The daemon's `/sessions/{sid}/live` endpoint is an SSE stream. A source
     /// that cannot consume it returns [`QueryError::Unavailable`]. The memory
@@ -309,14 +333,24 @@ pub(crate) trait QuerySource {
     /// # Errors
     ///
     /// [`QueryError::NotFound`] or [`QueryError::Unavailable`].
-    fn follow(&self, key: &str, after_ns: Option<i64>) -> Result<Vec<TimelineItem>, QueryError>;
+    fn follow(
+        &self,
+        key: &str,
+        filter: Option<&str>,
+        cursor: Option<i64>,
+    ) -> Result<Vec<TimelineItem>, QueryError>;
 
     /// Processes. `tree` asks the source to fill [`ProcItem::children`].
     ///
     /// # Errors
     ///
     /// [`QueryError::NotFound`].
-    fn procs(&self, key: &str, tree: bool) -> Result<Vec<ProcItem>, QueryError>;
+    fn procs(
+        &self,
+        key: &str,
+        tree: bool,
+        filter: Option<&str>,
+    ) -> Result<Vec<ProcItem>, QueryError>;
 
     /// Flows, already grouped and sorted by the source.
     ///
@@ -329,6 +363,7 @@ pub(crate) trait QuerySource {
     fn flows(
         &self,
         key: &str,
+        filter: Option<&str>,
         group_by: Option<&str>,
         sort: Option<&str>,
     ) -> Result<Vec<FlowItem>, QueryError>;
@@ -777,19 +812,24 @@ impl QuerySource for UnavailableSource {
         })
     }
 
-    fn rename_session(&mut self, _: &str, _: &str) -> Result<SessionItem, QueryError> {
+    fn rename_session(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+    ) -> Result<SessionItem, QueryError> {
         Err(QueryError::Unavailable {
             detail: UNAVAILABLE.to_owned(),
         })
     }
 
-    fn set_pinned(&mut self, _: &str, _: bool) -> Result<SessionItem, QueryError> {
+    fn set_pinned(&mut self, _: &str, _: bool, _: Option<&str>) -> Result<SessionItem, QueryError> {
         Err(QueryError::Unavailable {
             detail: UNAVAILABLE.to_owned(),
         })
     }
 
-    fn delete_sessions(&mut self, _: &[String]) -> Result<u64, QueryError> {
+    fn delete_sessions(&mut self, _: &[String], _: Option<&str>) -> Result<u64, QueryError> {
         Err(QueryError::Unavailable {
             detail: UNAVAILABLE.to_owned(),
         })
@@ -801,13 +841,18 @@ impl QuerySource for UnavailableSource {
         })
     }
 
-    fn follow(&self, _: &str, _: Option<i64>) -> Result<Vec<TimelineItem>, QueryError> {
+    fn follow(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        _: Option<i64>,
+    ) -> Result<Vec<TimelineItem>, QueryError> {
         Err(QueryError::Unavailable {
-            detail: format!("{UNAVAILABLE}；没有订阅实时 /sessions/{{sid}}/live（真实订阅未接通）"),
+            detail: UNAVAILABLE.to_owned(),
         })
     }
 
-    fn procs(&self, _: &str, _: bool) -> Result<Vec<ProcItem>, QueryError> {
+    fn procs(&self, _: &str, _: bool, _: Option<&str>) -> Result<Vec<ProcItem>, QueryError> {
         Err(QueryError::Unavailable {
             detail: UNAVAILABLE.to_owned(),
         })
@@ -816,6 +861,7 @@ impl QuerySource for UnavailableSource {
     fn flows(
         &self,
         _: &str,
+        _: Option<&str>,
         _: Option<&str>,
         _: Option<&str>,
     ) -> Result<Vec<FlowItem>, QueryError> {
@@ -1008,19 +1054,29 @@ impl QuerySource for MemorySource {
         })
     }
 
-    fn rename_session(&mut self, key: &str, name: &str) -> Result<SessionItem, QueryError> {
+    fn rename_session(
+        &mut self,
+        key: &str,
+        name: &str,
+        _: Option<&str>,
+    ) -> Result<SessionItem, QueryError> {
         let index = self.find(key)?;
         self.sessions[index].item.name = Some(name.to_owned());
         Ok(self.sessions[index].item.clone())
     }
 
-    fn set_pinned(&mut self, key: &str, pinned: bool) -> Result<SessionItem, QueryError> {
+    fn set_pinned(
+        &mut self,
+        key: &str,
+        pinned: bool,
+        _: Option<&str>,
+    ) -> Result<SessionItem, QueryError> {
         let index = self.find(key)?;
         self.sessions[index].item.pinned = Some(pinned);
         Ok(self.sessions[index].item.clone())
     }
 
-    fn delete_sessions(&mut self, keys: &[String]) -> Result<u64, QueryError> {
+    fn delete_sessions(&mut self, keys: &[String], _: Option<&str>) -> Result<u64, QueryError> {
         let mut indexes = Vec::with_capacity(keys.len());
         for key in keys {
             indexes.push(self.find(key)?);
@@ -1060,24 +1116,58 @@ impl QuerySource for MemorySource {
         Ok(TimelinePage { rows, next })
     }
 
-    fn follow(&self, key: &str, after_ns: Option<i64>) -> Result<Vec<TimelineItem>, QueryError> {
+    fn follow(
+        &self,
+        key: &str,
+        filter: Option<&str>,
+        cursor: Option<i64>,
+    ) -> Result<Vec<TimelineItem>, QueryError> {
         // The memory source is the test stand-in for `/live`. It does not open
         // a socket. Callers that need the real stream still see UnavailableSource.
         let index = self.find(key)?;
         Ok(self.sessions[index]
             .timeline
             .iter()
-            .filter(|row| match after_ns {
-                Some(after) => row.ts_ns > after,
+            .filter(|row| match cursor {
+                Some(after) => row.id > after,
                 None => true,
+            })
+            .filter(|row| match filter {
+                Some(text) if !text.trim().is_empty() => row_matches_filter(row, text),
+                _ => true,
             })
             .cloned()
             .collect())
     }
 
-    fn procs(&self, key: &str, tree: bool) -> Result<Vec<ProcItem>, QueryError> {
+    fn procs(
+        &self,
+        key: &str,
+        tree: bool,
+        filter: Option<&str>,
+    ) -> Result<Vec<ProcItem>, QueryError> {
         let index = self.find(key)?;
         let roots = self.sessions[index].procs.clone();
+        if filter.is_some_and(|text| !text.trim().is_empty()) {
+            let needle = filter.unwrap_or_default().to_ascii_lowercase();
+            fn retain(nodes: &mut Vec<ProcItem>, needle: &str) {
+                nodes.retain_mut(|node| {
+                    retain(&mut node.children, needle);
+                    node.exe_name
+                        .as_deref()
+                        .is_some_and(|name| name.to_ascii_lowercase().contains(needle))
+                        || !node.children.is_empty()
+                });
+            }
+            let mut roots = roots;
+            retain(&mut roots, &needle);
+            if tree {
+                return Ok(roots);
+            }
+            let mut flat = Vec::new();
+            flatten_procs(&roots, &mut flat);
+            return Ok(flat);
+        }
         if tree {
             Ok(roots)
         } else {
@@ -1090,11 +1180,22 @@ impl QuerySource for MemorySource {
     fn flows(
         &self,
         key: &str,
+        filter: Option<&str>,
         group_by: Option<&str>,
         sort: Option<&str>,
     ) -> Result<Vec<FlowItem>, QueryError> {
         let index = self.find(key)?;
-        let mut rows = group_flow_rows(&self.sessions[index].flows, group_by)?;
+        let mut base = self.sessions[index].flows.clone();
+        if let Some(filter) = filter.filter(|text| !text.trim().is_empty()) {
+            let needle = filter.to_ascii_lowercase();
+            base.retain(|row| {
+                row.domain
+                    .as_deref()
+                    .is_some_and(|v| v.to_ascii_lowercase().contains(&needle))
+                    || row.remote_ip.as_deref().is_some_and(|v| v.contains(filter))
+            });
+        }
+        let mut rows = group_flow_rows(&base, group_by)?;
         sort_flow_rows(&mut rows, sort)?;
         Ok(rows)
     }
@@ -1749,8 +1850,9 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Result<i64, String> {
 /// Candidate polling interval for a stream-capable `--follow` source. Tests can
 /// inspect the fixed value without sleeping.
 #[must_use]
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) fn follow_poll_interval() -> Duration {
-    Duration::from_millis(200)
+    Duration::from_secs(1)
 }
 
 /// Marker printed on a gap line. ANSI red is added only when `color` is set.
@@ -1771,11 +1873,13 @@ pub(crate) fn sample_source() -> MemorySource {
     source.push(MemorySession {
         item: SessionItem {
             public_id: "s-7k2m".to_owned(),
+            user_id: None,
             name: Some("demo".to_owned()),
             mode: "launch".to_owned(),
             agent: Some("example-agent".to_owned()),
             started_ns: Some(1_700_000_000_000_000_000),
             ended_ns: Some(1_700_000_060_000_000_000),
+            end_reason: Some("exited".to_owned()),
             pinned: Some(false),
             evidence: Evidence::E1,
         },
@@ -2046,6 +2150,7 @@ mod tests {
             &SessionsCmd::Rename {
                 session: "s-7k2m".to_owned(),
                 name: "kept".to_owned(),
+                owner: None,
             },
             true,
             &mut source,
@@ -2057,6 +2162,7 @@ mod tests {
         let pinned = sessions::run(
             &SessionsCmd::Pin {
                 session: "kept".to_owned(),
+                owner: None,
             },
             false,
             &mut source,
@@ -2073,6 +2179,7 @@ mod tests {
             &SessionsCmd::Delete {
                 sessions: vec!["kept".to_owned()],
                 yes: false,
+                owner: None,
             },
             false,
             &mut source,
@@ -2084,6 +2191,7 @@ mod tests {
             &SessionsCmd::Delete {
                 sessions: vec!["kept".to_owned()],
                 yes: true,
+                owner: None,
             },
             true,
             &mut source,
@@ -2141,9 +2249,9 @@ mod tests {
 
     #[test]
     fn timeline_follow_renders_the_stub_format() {
-        // The HTTP client does not consume the SSE stream. The memory source
-        // stands in so the line format (gap marker, evidence column) can be
-        // checked. Delay under 2 s is not measured.
+        // The memory source stands in for one `/live` snapshot so the line
+        // format (gap marker, evidence column) can be checked without a
+        // daemon or a terminal interrupt.
         let source = sample_source();
         let outcome = timeline::run(
             TimelineArgs {
@@ -2161,8 +2269,7 @@ mod tests {
         .expect("follow");
         assert_eq!(outcome.code, exit::OK);
         let body = text(&outcome.stdout);
-        assert!(body.contains("真实订阅未接通"), "{body}");
-        assert!(body.contains("\"live_connected\": false"), "{body}");
+        assert!(body.contains("\"cat\": \"gap\""), "{body}");
         assert!(body.contains("\"level\": \"E1\""), "{body}");
         insta::assert_snapshot!("timeline_follow_json", body);
     }
@@ -2170,7 +2277,7 @@ mod tests {
     #[test]
     fn procs_tree_labels_placeholder_redaction() {
         let source = sample_source();
-        let outcome = procs::run("s-7k2m", true, false, &source).expect("procs");
+        let outcome = procs::run("s-7k2m", true, None, false, &source).expect("procs");
         assert_eq!(outcome.code, exit::OK);
         let rendered = text(&outcome.stdout);
         assert_evidence_column(&rendered);
@@ -2183,7 +2290,7 @@ mod tests {
         assert!(!rendered.contains("--token"), "{rendered}");
         insta::assert_snapshot!("procs_tree_table", rendered);
 
-        let json = procs::run("@last", true, true, &source).expect("procs");
+        let json = procs::run("@last", true, None, true, &source).expect("procs");
         let body = text(&json.stdout);
         assert!(body.contains("P1 脱敏为占位"), "{body}");
         assert!(body.contains("\"exit_code\": 7"), "{body}");
@@ -2195,10 +2302,10 @@ mod tests {
     #[test]
     fn flows_group_by_domain_json_totals_match_members() {
         let source = sample_source();
-        let ungrouped = source.flows("s-7k2m", None, None).expect("flows");
+        let ungrouped = source.flows("s-7k2m", None, None, None).expect("flows");
         let expected = total_bytes(&ungrouped);
-        let outcome =
-            flows::run("s-7k2m", Some("domain"), Some("total"), true, &source).expect("flows");
+        let outcome = flows::run("s-7k2m", None, Some("domain"), Some("total"), true, &source)
+            .expect("flows");
         assert_eq!(outcome.code, exit::OK);
         let body = text(&outcome.stdout);
         let value: serde_json::Value = serde_json::from_str(&body).expect("json");
@@ -2234,7 +2341,7 @@ mod tests {
         );
         insta::assert_snapshot!("flows_group_domain_json", body);
 
-        let table = flows::run("@last", Some("domain"), None, false, &source).expect("flows");
+        let table = flows::run("@last", None, Some("domain"), None, false, &source).expect("flows");
         let rendered = text(&table.stdout);
         assert_evidence_column(&rendered);
         assert!(rendered.contains("不可得"), "{rendered}");
@@ -2266,7 +2373,8 @@ mod tests {
     #[test]
     fn unknown_group_by_is_usage() {
         let source = sample_source();
-        let outcome = flows::run("s-7k2m", Some("host"), None, false, &source).expect("flows");
+        let outcome =
+            flows::run("s-7k2m", None, Some("host"), None, false, &source).expect("flows");
         assert_eq!(outcome.code, exit::USAGE, "{}", text(&outcome.stderr));
     }
 
@@ -2274,7 +2382,7 @@ mod tests {
     fn missing_session_is_not_an_empty_table() {
         let source = MemorySource::new();
         let outcome = gaps::run("missing", false, &source).expect("gaps");
-        assert_eq!(outcome.code, exit::GENERAL);
+        assert_eq!(outcome.code, exit::NOT_FOUND);
         assert!(text(&outcome.stderr).contains("找不到会话"));
         assert!(outcome.stdout.is_empty());
     }

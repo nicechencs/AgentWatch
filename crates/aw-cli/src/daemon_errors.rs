@@ -55,6 +55,11 @@ const ROWS: &[Row] = &[
         en: None,
     },
     Row {
+        code: "owner_action_forbidden",
+        zh: "只有会话主人能操作",
+        en: Some("only the session owner may operate it"),
+    },
+    Row {
         code: "not_your_process",
         zh: "不能接管其他用户的进程，需要管理员权限",
         // The daemon sends one of two messages with this code (attach names the
@@ -93,7 +98,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         code: "unidentified_peer",
-        zh: "无法识别管道另一端的调用者",
+        zh: "后台认不出你是哪个用户，已拒绝这次请求。请确认 `aw` 和后台是同一个版本，还不行就重启后台。",
         en: Some("pipe client could not be identified"),
     },
     Row {
@@ -144,6 +149,26 @@ const ROWS: &[Row] = &[
         en: None,
     },
     Row {
+        code: "invalid_config_key",
+        zh: "配置键不存在或不受支持",
+        en: None,
+    },
+    Row {
+        code: "invalid_config",
+        zh: "配置键或配置值无效",
+        en: None,
+    },
+    Row {
+        code: "config_path_unavailable",
+        zh: "后台没有可写的配置文件",
+        en: Some("后台没有可写的配置文件"),
+    },
+    Row {
+        code: "config_write_failed",
+        zh: "无法写入配置文件",
+        en: None,
+    },
+    Row {
         code: "bad_query",
         zh: "查询参数不正确",
         en: None,
@@ -174,6 +199,11 @@ const ROWS: &[Row] = &[
         code: "store",
         zh: "读写会话数据库失败",
         en: None,
+    },
+    Row {
+        code: "db_busy",
+        zh: "会话数据库正忙",
+        en: Some("The session database is busy (the service is writing)."),
     },
     Row {
         code: "export",
@@ -259,6 +289,13 @@ pub(crate) fn write_status(
     let Some(code) = code.filter(|code| !code.is_empty()) else {
         return write!(f, "后台返回 HTTP {status}：{message}");
     };
+    if code == "db_busy" {
+        let waited = busy_waited_seconds(message).unwrap_or(0);
+        return write!(
+            f,
+            "会话数据库正忙（后台在写入），等了 {waited} 秒还是没轮到，请稍后再试。"
+        );
+    }
     let Some(row) = ROWS.iter().find(|row| row.code == code) else {
         return write!(f, "后台返回错误 {code}（HTTP {status}）：{message}");
     };
@@ -267,6 +304,13 @@ pub(crate) fn write_status(
         write!(f, "（详情：{message}）")?;
     }
     Ok(())
+}
+
+fn busy_waited_seconds(message: &str) -> Option<u64> {
+    let marker = "Waited ";
+    let rest = message.split_once(marker)?.1;
+    let digits = rest.split_whitespace().next()?;
+    digits.parse().ok()
 }
 
 /// Whether `message` says something the mapped sentence does not.
@@ -410,6 +454,18 @@ mod tests {
         assert_eq!(
             render(404, None, "session not found"),
             "后台返回 HTTP 404：session not found"
+        );
+    }
+
+    #[test]
+    fn database_busy_uses_the_measured_wait_in_the_fixed_chinese_sentence() {
+        assert_eq!(
+            render(
+                503,
+                Some("db_busy"),
+                "The session database is busy (the service is writing). Waited 8 s and still couldn't get in; try again later."
+            ),
+            "会话数据库正忙（后台在写入），等了 8 秒还是没轮到，请稍后再试。"
         );
     }
 

@@ -133,6 +133,9 @@ pub enum ClientError {
     Unreachable { detail: String },
     /// The socket or pipe exists but this account may not open it. Exit 4.
     Forbidden { detail: String },
+    /// The Windows pipe was opened, but the server was not LocalSystem or the
+    /// current user. The client sent no request bytes. Exit 4.
+    UntrustedServer { detail: String },
     /// The exchange failed after connect. Exit 1.
     Transport { detail: String },
     /// The daemon answered with a non-success status.
@@ -149,13 +152,21 @@ pub enum ClientError {
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unreachable { detail } => write!(
-                f,
-                "连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：{detail}"
-            ),
+            Self::Unreachable { detail } => {
+                if let Some(text) = aw_channel::human_socket_path_error(detail) {
+                    return f.write_str(&text);
+                }
+                write!(
+                    f,
+                    "连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：{detail}"
+                )
+            }
             Self::Forbidden { detail } => write!(
                 f,
                 "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。详情：{detail}"
+            ),
+            Self::UntrustedServer { .. } => f.write_str(
+                "连上的不是 AgentWatch 后台（管道被别的程序占用），已停止发送。",
             ),
             Self::Transport { detail } => write!(f, "向后台发请求失败：{detail}"),
             Self::Status {
@@ -170,12 +181,25 @@ impl fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 impl ClientError {
+    /// Stable code for an IPC peer identity failure whose human message must
+    /// survive command-specific error wrappers unchanged.
+    #[must_use]
+    pub(crate) fn identity_failure_code(&self) -> Option<&'static str> {
+        match self {
+            Self::UntrustedServer { .. } => Some("daemon_untrusted_server"),
+            Self::Status { code, .. } if code.as_deref() == Some("unidentified_peer") => {
+                Some("unidentified_peer")
+            }
+            _ => None,
+        }
+    }
+
     /// Exit code for this failure.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Unreachable { .. } => exit::UNREACHABLE,
-            Self::Forbidden { .. } => exit::PERMISSION,
+            Self::Forbidden { .. } | Self::UntrustedServer { .. } => exit::PERMISSION,
             Self::Transport { .. } => exit::GENERAL,
             Self::Status { status, .. } => from_http_status(*status),
         }
@@ -365,6 +389,7 @@ fn local_exchange(
         .map_err(|err| match err {
             DialError::Unreachable(detail) => ClientError::Unreachable { detail },
             DialError::Forbidden(detail) => ClientError::Forbidden { detail },
+            DialError::UntrustedServer(detail) => ClientError::UntrustedServer { detail },
             other => ClientError::Transport {
                 detail: other.to_string(),
             },
@@ -599,6 +624,35 @@ mod tests {
             "{text}"
         );
         assert!(text.contains(detail), "{text}");
+    }
+
+    #[test]
+    fn unidentified_peer_is_the_fixed_permission_failure() {
+        let err = ClientError::Status {
+            status: 403,
+            code: Some("unidentified_peer".to_owned()),
+            message: "pipe client could not be identified".to_owned(),
+        };
+        assert_eq!(err.exit_code(), exit::PERMISSION);
+        assert_eq!(err.identity_failure_code(), Some("unidentified_peer"));
+        assert_eq!(
+            err.to_string(),
+            "后台认不出你是哪个用户，已拒绝这次请求。请确认 `aw` 和后台是同一个版本，还不行就重启后台。"
+        );
+    }
+
+    #[test]
+    fn overlong_socket_path_has_no_internal_english_in_human_output() {
+        let text = ClientError::Unreachable {
+            detail: "unusable socket path（套接字路径太长：120 字节，这个系统的上限是 108 字节（不含结尾的空字节））"
+                .to_owned(),
+        }
+        .to_string();
+        assert_eq!(
+            text,
+            "通信口路径太长（120 字节），这个系统最多支持 108 字节。请把 `AW_SOCKET` 换到短一点的目录。"
+        );
+        assert!(!text.contains("unusable socket path"), "{text}");
     }
 
     /// The bug: socket endpoints were refused before any dial, so `aw` could

@@ -12,6 +12,7 @@
 use serde_json::{json, Value};
 
 use aw_core::{Evidence, NaReason};
+use aw_platform::{Capability as PlatformCapability, CapabilityStatus};
 
 use crate::exit;
 use crate::output::{evidence_badge, evidence_code};
@@ -368,12 +369,19 @@ pub(crate) fn report_json(report: &DoctorReport) -> Value {
             })
         })
         .collect();
+    let platform_capabilities: Vec<Value> = platform_capabilities()
+        .into_iter()
+        .map(|(capability, status)| {
+            json!({ "capability": capability.as_str(), "status": capability_status_text(status) })
+        })
+        .collect();
     json!({
         "os": report.host.os,
         "version": report.host.version,
         "privileged": report.host.privileged,
         "collectors": collectors,
         "categories": categories,
+        "platform_capabilities": platform_capabilities,
     })
 }
 
@@ -435,16 +443,80 @@ fn report_text(report: &DoctorReport) -> String {
             fix
         ));
     }
+    out.push_str("platform capability  status\n");
+    for (capability, status) in platform_capabilities() {
+        out.push_str(&format!(
+            "{}  {}\n",
+            capability.zh(),
+            capability_text(capability, status)
+        ));
+    }
     out
+}
+
+/// Fixed interface-v2 capabilities are deliberately shown separately from
+/// collector matrix rows, whose existing wording and test contract stay intact.
+fn platform_capabilities() -> [(PlatformCapability, CapabilityStatus); 7] {
+    let platform = aw_platform::platform();
+    [
+        (
+            PlatformCapability::SpawnSuspended,
+            platform.capability(PlatformCapability::SpawnSuspended),
+        ),
+        (
+            PlatformCapability::SpawnAsCaller,
+            platform.capability(PlatformCapability::SpawnAsCaller),
+        ),
+        (
+            PlatformCapability::ProcessIdentity,
+            platform.capability(PlatformCapability::ProcessIdentity),
+        ),
+        (
+            PlatformCapability::ProcessTable,
+            platform.capability(PlatformCapability::ProcessTable),
+        ),
+        (
+            PlatformCapability::PeerIdentity,
+            platform.capability(PlatformCapability::PeerIdentity),
+        ),
+        (
+            PlatformCapability::SecureDataDir,
+            platform.capability(PlatformCapability::SecureDataDir),
+        ),
+        (
+            PlatformCapability::ExitCode,
+            platform.capability(PlatformCapability::ExitCode),
+        ),
+    ]
+}
+
+const fn capability_text(capability: PlatformCapability, status: CapabilityStatus) -> &'static str {
+    match (capability, status) {
+        (PlatformCapability::SpawnAsCaller, CapabilityStatus::Available)
+            if cfg!(target_os = "linux") =>
+        {
+            "可用（Linux 上由后台按你的身份启动程序）"
+        }
+        (_, status) => capability_status_text(status),
+    }
+}
+
+const fn capability_status_text(status: CapabilityStatus) -> &'static str {
+    match status {
+        CapabilityStatus::Available => "可用",
+        CapabilityStatus::Unavailable => "当前不可用",
+        CapabilityStatus::NotInThisBuild => "本版本未接入",
+        CapabilityStatus::NotSupportedOnThisOs => "这个系统不支持",
+    }
 }
 
 /// Run `aw doctor`. `--perf` is P2 and exits 2 without calling `source`.
 pub(crate) fn run(perf: bool, json: bool, source: &mut dyn DoctorSource) -> Outcome {
     if perf {
         return super::error_outcome(
-            exit::USAGE,
-            "not_implemented",
-            "`aw doctor --perf` 尚未实现（P2）",
+            exit::NOT_IN_BUILD,
+            "not_in_build",
+            "`--perf` 本版本未接入",
             json,
         );
     }
@@ -590,11 +662,41 @@ mod tests {
     }
 
     #[test]
+    fn platform_capability_names_are_localized_only_in_text() {
+        let report = Fixed.report();
+        let text = super::report_text(&report);
+        assert!(text.contains("挂起启动"), "{text}");
+        assert!(text.contains("以连接方身份启动"), "{text}");
+        assert!(!text.contains("spawn_suspended"), "{text}");
+
+        let json = report_json(&report);
+        let names: Vec<&str> = json["platform_capabilities"]
+            .as_array()
+            .expect("platform capabilities")
+            .iter()
+            .filter_map(|row| row["capability"].as_str())
+            .collect();
+        assert!(names.contains(&"spawn_suspended"), "{names:?}");
+        assert!(names.contains(&"spawn_as_caller"), "{names:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_spawn_as_caller_uses_the_launch_as_doctor_wording() {
+        let text = super::report_text(&Fixed.report());
+        assert!(
+            text.contains("以连接方身份启动  可用（Linux 上由后台按你的身份启动程序）"),
+            "{text}"
+        );
+        assert!(!text.contains("spawn_suspended"), "{text}");
+    }
+
+    #[test]
     fn perf_is_refused_as_p2() {
         let outcome = run(true, false, &mut Fixed);
-        assert_eq!(outcome.code, exit::USAGE);
+        assert_eq!(outcome.code, exit::NOT_IN_BUILD);
         let err = String::from_utf8(outcome.stderr).expect("utf8");
-        assert!(err.contains("P2"), "{err}");
+        assert!(err.contains("本版本未接入"), "{err}");
         assert!(outcome.stdout.is_empty());
     }
 

@@ -1,4 +1,4 @@
-//! [`RecordSink`]: one transaction per batch of already-aggregated rows.
+//! [`RecordSink`]: bounded transactions for already-aggregated rows.
 //!
 //! P1-PIPE-05 should depend on this trait. It must not declare a second one.
 //! `aw-pipeline` cannot depend on `rusqlite`; the trait and the row types live
@@ -18,26 +18,39 @@
 //! Rows are not `Debug`: `sessions.argv` and `process_images.argv` / `env` are
 //! sensitive. Do not print them.
 
+use std::time::Instant;
+
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
 use crate::error::StoreError;
 use crate::file_access::{self, FileAccessRow};
 use crate::fts::{self, FtsMode, FtsSource};
 use crate::http::{self, HttpRow};
-use crate::migrate::{self, Store};
+use crate::migrate::{self, immediate_transaction, Store};
 use crate::retention::WriteMode;
 
 /// Accepts one batch and commits it, or rolls it back.
 ///
 /// P1-PIPE-05 owns retry and gap reporting. This trait only returns the error.
 pub trait RecordSink {
-    /// Write `batch` in one `BEGIN IMMEDIATE` transaction.
+    /// Write `batch` in bounded `BEGIN IMMEDIATE` transactions.
     ///
     /// Order inside the transaction: `sessions`, `processes`, `process_images`,
     /// `file_access`, `net_flows`, `net_flow_buckets`, `dns`, `gaps`. Processes
-    /// are written before flows and file rows. A failure rolls the whole batch back.
+    /// are written before flows and file rows. Each transaction has at most
+    /// [`MAX_ROWS_PER_TRANSACTION`] rows, so a host attach or sampler snapshot
+    /// cannot keep the write lock for one unbounded transaction. A failure
+    /// reports the first uncommitted chunk; already committed chunks remain
+    /// durable and can be safely replayed by the UPSERT-based writers.
     fn write_batch(&mut self, batch: &WriteBatch) -> Result<(), StoreError>;
 }
+
+/// Maximum rows held by one writer transaction.
+///
+/// This is intentionally lower than the pipeline's normal delivery batch: a
+/// full-host attach can have thousands of processes even when normal event
+/// batches are small.
+pub const MAX_ROWS_PER_TRANSACTION: usize = 500;
 
 /// Rows for one commit. Empty vectors are skipped. Nothing is dropped silently:
 /// a constraint failure fails the batch.
@@ -331,6 +344,11 @@ pub struct SqliteSink<'a> {
 impl<'a> SqliteSink<'a> {
     /// Wrap the store's write connection. The store must not be read-only.
     pub fn new(store: &'a mut Store) -> Result<Self, StoreError> {
+        let started = Instant::now();
+        Self::new_inner(store).map_err(|err| err.with_busy_elapsed(started))
+    }
+
+    fn new_inner(store: &'a mut Store) -> Result<Self, StoreError> {
         if store.is_read_only() {
             return Err(StoreError::ReadOnly);
         }
@@ -355,6 +373,14 @@ impl<'a> SqliteSink<'a> {
 
 impl RecordSink for SqliteSink<'_> {
     fn write_batch(&mut self, batch: &WriteBatch) -> Result<(), StoreError> {
+        let started = Instant::now();
+        self.write_batch_inner(batch)
+            .map_err(|err| err.with_busy_elapsed(started))
+    }
+}
+
+impl SqliteSink<'_> {
+    fn write_batch_inner(&mut self, batch: &WriteBatch) -> Result<(), StoreError> {
         if !batch.file_access.is_empty() || image_has_argv(&batch.process_images) {
             // 0003–0005. A P1 database stays at SCHEMA_VERSION until the first
             // file row or indexed argv, which is what the P1 reopen test asserts.
@@ -390,22 +416,68 @@ impl RecordSink for SqliteSink<'_> {
                 ),
             ));
         }
-        let tx = self
-            .store
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|err| StoreError::sqlite("begin_batch", err))?;
-        let result = write_all(&tx, batch, fts);
-        match result {
-            Ok(()) => tx
-                .commit()
-                .map_err(|err| StoreError::sqlite("commit_batch", err)),
-            Err(err) => {
-                drop(tx);
-                Err(err)
+        for chunk in bounded_batches(batch) {
+            let tx = self
+                .store
+                .connection_mut()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|err| StoreError::sqlite("begin_batch", err))?;
+            let result = write_all(&tx, &chunk, fts);
+            match result {
+                Ok(()) => tx
+                    .commit()
+                    .map_err(|err| StoreError::sqlite("commit_batch", err))?,
+                Err(err) => {
+                    drop(tx);
+                    return Err(err);
+                }
             }
         }
+        Ok(())
     }
+}
+
+/// Split a large delivery into write-order-preserving chunks. Each vector is
+/// emitted independently so the transaction boundary never exceeds the row
+/// cap and foreign-key parents are committed before their children.
+fn bounded_batches(batch: &WriteBatch) -> Vec<WriteBatch> {
+    // Preserve the existing all-or-nothing contract for normal deliveries.
+    // The lock bound only changes a delivery that is actually larger than it.
+    if batch_row_count(batch) <= MAX_ROWS_PER_TRANSACTION {
+        return vec![batch.clone()];
+    }
+    let mut out = Vec::new();
+    macro_rules! push_chunks {
+        ($field:ident) => {
+            for rows in batch.$field.chunks(MAX_ROWS_PER_TRANSACTION) {
+                let mut chunk = WriteBatch::default();
+                chunk.$field = rows.to_vec();
+                out.push(chunk);
+            }
+        };
+    }
+    push_chunks!(sessions);
+    push_chunks!(processes);
+    push_chunks!(process_images);
+    push_chunks!(file_access);
+    push_chunks!(net_flows);
+    push_chunks!(net_flow_buckets);
+    push_chunks!(dns);
+    push_chunks!(http);
+    push_chunks!(gaps);
+    out
+}
+
+fn batch_row_count(batch: &WriteBatch) -> usize {
+    batch.sessions.len()
+        + batch.processes.len()
+        + batch.process_images.len()
+        + batch.file_access.len()
+        + batch.net_flows.len()
+        + batch.net_flow_buckets.len()
+        + batch.dns.len()
+        + batch.http.len()
+        + batch.gaps.len()
 }
 
 fn batch_has_detail(batch: &WriteBatch) -> bool {
@@ -448,9 +520,8 @@ pub fn apply_file_schema(store: &mut Store) -> Result<(), StoreError> {
         return Ok(());
     }
     let conn = store.connection();
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|err| StoreError::sqlite("begin_file_schema", err))?;
+    let tx =
+        immediate_transaction(conn).map_err(|err| StoreError::sqlite("begin_file_schema", err))?;
     let applied = (|| {
         for (version, sql) in migrate::file_schema_scripts() {
             tx.execute_batch(sql)
@@ -876,6 +947,44 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::migrate::OpenStatus;
+
+    #[test]
+    fn large_batches_are_partitioned_at_the_write_lock_bound() {
+        let batch = WriteBatch {
+            gaps: (0..(MAX_ROWS_PER_TRANSACTION + 1))
+                .map(|index| GapRow {
+                    id: Some(i64::try_from(index).expect("gap id")),
+                    session_id: None,
+                    collector: "test".to_owned(),
+                    kind: "test".to_owned(),
+                    affects: "[]".to_owned(),
+                    from_ns: 1,
+                    to_ns: 1,
+                    count: None,
+                    detail: None,
+                })
+                .collect(),
+            ..WriteBatch::default()
+        };
+        let chunks = bounded_batches(&batch);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| {
+            chunk.sessions.len()
+                + chunk.processes.len()
+                + chunk.process_images.len()
+                + chunk.file_access.len()
+                + chunk.net_flows.len()
+                + chunk.net_flow_buckets.len()
+                + chunk.dns.len()
+                + chunk.http.len()
+                + chunk.gaps.len()
+                <= MAX_ROWS_PER_TRANSACTION
+        }));
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.gaps.len()).sum::<usize>(),
+            501
+        );
+    }
 
     fn temp_db(label: &str) -> PathBuf {
         let nanos = SystemTime::now()

@@ -8,10 +8,9 @@
 //! can reach a filesystem socket.
 //!
 //! Peer identity:
-//! - Linux: `SO_PEERCRED` through `rustix`; macOS: `getpeereid` (the
-//!   `LOCAL_PEERCRED` uid) through `nix`. No `unsafe` in this crate. uid 0 is
-//!   an administrator. A peer whose uid cannot be read is [`UNVERIFIED_PEER`],
-//!   never an administrator.
+//! - Unix peer credentials are read only by `aw-platform`. uid 0 is an
+//!   administrator; an unidentified peer is refused with 403 and never given
+//!   a placeholder identity.
 //! - When a group named [`SOCKET_GROUP`] exists, the socket is
 //!   `root:agentwatch 0660`: members connect without root. Without the group
 //!   it is 0666: any local account may connect and is identified by uid (an
@@ -54,9 +53,6 @@ pub const MACOS_SOCKET: &str = aw_channel::MACOS_SOCKET;
 
 /// Windows named pipe (api-and-cli §1).
 pub const WINDOWS_PIPE: &str = aw_channel::WINDOWS_PIPE;
-
-/// `user_id` given to a peer whose uid could not be read. Not an administrator.
-pub const UNVERIFIED_PEER: &str = "unverified-peer";
 
 /// Socket mode when the [`SOCKET_GROUP`] group exists: owner and members.
 pub const SOCKET_MODE: u32 = 0o660;
@@ -182,7 +178,7 @@ mod unix {
     use nix::fcntl::{Flock, FlockArg};
 
     use super::super::routes::error_response;
-    use super::{answer, socket_mode, Control, SharedState, SOCKET_GROUP, UNVERIFIED_PEER};
+    use super::{answer, socket_mode, Control, SharedState, SOCKET_GROUP};
 
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const MAX_REQUEST: usize = 80 * 1024;
@@ -296,6 +292,12 @@ mod unix {
             // the other's fresh socket as stale and delete it.
             let lock = take_lock(path)?;
             clear_stale(path)?;
+            if let Some(reason) = aw_channel::socket_path_too_long(path) {
+                // `reason` is the Chinese sentence. The English token is only
+                // for logs; the bind error shown to the user is the sentence.
+                tracing::warn!(target: "aw_daemon::ipc", path = %path.display(), "unusable socket path");
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+            }
             let listener = UnixListener::bind(path)?;
             let grouped = set_group(path);
             fs::set_permissions(path, fs::Permissions::from_mode(socket_mode(grouped)))?;
@@ -384,44 +386,43 @@ mod unix {
         }
     }
 
-    /// The peer as an API caller. uid 0 is an administrator.
-    pub(super) fn peer_caller(stream: &UnixStream) -> Caller {
-        match peer_uid(stream) {
-            Some(uid) => Caller {
-                user_id: uid.to_string(),
-                admin: uid == 0,
-            },
-            None => Caller {
-                user_id: UNVERIFIED_PEER.to_owned(),
-                admin: false,
-            },
+    /// The peer as an API caller. The platform layer is the only code that
+    /// reads peer credentials, so an unverified socket can never become a
+    /// low-privilege placeholder identity.
+    pub(super) fn peer_caller(stream: &UnixStream) -> Result<Caller, aw_platform::PlatformError> {
+        let peer = aw_platform::identify_unix_peer(stream)?;
+        match peer.owner() {
+            aw_platform::Owner::Unix { euid, .. } => {
+                let admin = *euid == 0;
+                Ok(Caller {
+                    user_id: euid.to_string(),
+                    admin,
+                    peer: Some(peer),
+                })
+            }
+            aw_platform::Owner::Windows { .. } => {
+                Err(aw_platform::PlatformError::PeerNotIdentified {
+                    reason: "Unix socket peer did not have a Unix owner",
+                })
+            }
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn peer_uid(stream: &UnixStream) -> Option<u32> {
-        rustix::net::sockopt::socket_peercred(stream)
-            .ok()
-            .map(|cred| cred.uid.as_raw())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn peer_uid(stream: &UnixStream) -> Option<u32> {
-        nix::unistd::getpeereid(stream)
-            .ok()
-            .map(|(uid, _gid)| uid.as_raw())
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn peer_uid(_stream: &UnixStream) -> Option<u32> {
-        None
     }
 
     fn serve(mut stream: UnixStream, state: &SharedState, control: &Control) -> io::Result<()> {
         stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
-        let caller = peer_caller(&stream);
+        let caller = match peer_caller(&stream) {
+            Ok(caller) => caller,
+            Err(_) => {
+                let response = error_response(
+                    403,
+                    "unidentified_peer",
+                    "socket peer could not be identified",
+                );
+                return write_response(&mut stream, &response);
+            }
+        };
         let mut buf = vec![0_u8; 8 * 1024];
         let mut collected = Vec::new();
         // listen_port 0: the peer path never checks `Host`.
@@ -465,13 +466,15 @@ mod unix {
 mod pipe {
     use std::ffi::OsString;
     use std::io;
+    use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
-    use aw_collector_windows::pipe::{client_identity, create_server, pipe_sddl};
+    use aw_collector_windows::pipe::{create_server, flush_server, is_admin, pipe_sddl};
+    use aw_platform::{identify_pipe_peer, Owner};
     use tokio::net::windows::named_pipe::NamedPipeServer;
 
     use super::super::auth::Caller;
@@ -584,23 +587,6 @@ mod pipe {
         state: SharedState,
         control: Arc<Control>,
     ) -> io::Result<()> {
-        let caller = match client_identity(&pipe) {
-            Ok(client) => Caller {
-                user_id: client.sid,
-                admin: client.admin,
-            },
-            Err(err) => {
-                tracing::warn!(target: "aw_daemon::ipc", error = %err, "pipe client not identified");
-                let response = error_response(
-                    403,
-                    "unidentified_peer",
-                    "pipe client could not be identified",
-                );
-                write_all(&pipe, &response_bytes(&response)).await?;
-                // Dropped, not disconnected: see the end of `serve`.
-                return Ok(());
-            }
-        };
         let mut collected = Vec::new();
         let mut buf = vec![0_u8; 8 * 1024];
         let request = loop {
@@ -615,7 +601,8 @@ mod pipe {
                     if collected.len() > MAX_REQUEST {
                         let response =
                             error_response(413, "payload_too_large", "request body exceeds 64 KiB");
-                        return write_all(&pipe, &response_bytes(&response)).await;
+                        write_all(&pipe, &response_bytes(&response)).await?;
+                        return finish(&pipe).await;
                     }
                     if let Some(req) = parse_request(&collected, 0) {
                         break req;
@@ -625,6 +612,44 @@ mod pipe {
                 Err(err) => return Err(err),
             }
         };
+        // Windows does not allow a pipe server to impersonate a client until
+        // the server has read data from that client. This happens after the
+        // complete first request is available, but before any route or caller
+        // data is used. `identify_pipe_peer` is synchronous and reverts before
+        // returning, so this async task never awaits while impersonating.
+        let caller = match identify_pipe_peer(pipe.as_raw_handle()) {
+            Ok(peer) => match peer.owner() {
+                Owner::Windows { sid, elevated, .. } => {
+                    let user_id = sid.clone();
+                    let admin = is_admin(sid, *elevated);
+                    Caller {
+                        user_id,
+                        admin,
+                        peer: Some(peer),
+                    }
+                }
+                Owner::Unix { .. } => {
+                    tracing::error!(target: "aw_daemon::ipc", "Windows pipe returned a Unix peer owner");
+                    let response = error_response(
+                        403,
+                        "unidentified_peer",
+                        "pipe client could not be identified",
+                    );
+                    write_all(&pipe, &response_bytes(&response)).await?;
+                    return finish(&pipe).await;
+                }
+            },
+            Err(err) => {
+                tracing::warn!(target: "aw_daemon::ipc", error = %err, "pipe client not identified");
+                let response = error_response(
+                    403,
+                    "unidentified_peer",
+                    "pipe client could not be identified",
+                );
+                write_all(&pipe, &response_bytes(&response)).await?;
+                return finish(&pipe).await;
+            }
+        };
         // Routes are synchronous (SQLite); off the runtime thread so one slow
         // request (a large export) does not stall every other pipe client.
         let response =
@@ -632,15 +657,7 @@ mod pipe {
                 .await
                 .unwrap_or_else(|_| error_response(500, "internal", "request handler failed"));
         write_all(&pipe, &response_bytes(&response)).await?;
-        // Do not call `disconnect` (DisconnectNamedPipe) here: it throws away
-        // whatever the client has not read yet, and the client's read then
-        // fails with ERROR_PIPE_NOT_CONNECTED ("uncategorized error"), which
-        // made the pipe test fail on Windows CI. Dropping the instance closes
-        // the server handle; the client reads the buffered reply and then sees
-        // ERROR_BROKEN_PIPE, which std reports as end of file. Each instance
-        // serves one connection, so nothing reuses it.
-        drop(pipe);
-        Ok(())
+        finish(&pipe).await
     }
 
     async fn write_all(pipe: &NamedPipeServer, mut bytes: &[u8]) -> io::Result<()> {
@@ -653,6 +670,23 @@ mod pipe {
             }
         }
         Ok(())
+    }
+
+    /// Finish this one-request pipe instance. Flushing is blocking on Windows
+    /// (it waits until the client reads the buffered reply), so keep it off the
+    /// current-thread accept runtime. Always disconnect afterwards; a dropped
+    /// handle alone made later clients intermittently see a broken pipe.
+    async fn finish(pipe: &NamedPipeServer) -> io::Result<()> {
+        let raw = pipe.as_raw_handle() as usize;
+        let flushed = tokio::task::spawn_blocking(move || {
+            // SAFETY: `raw` came from `pipe`, which remains borrowed and alive
+            // until the blocking operation has completed.
+            flush_server(raw as std::os::windows::io::RawHandle)
+        })
+        .await
+        .map_err(|_| io::Error::other("named-pipe flush task failed"))?;
+        let disconnected = pipe.disconnect();
+        flushed.and(disconnected)
     }
 }
 

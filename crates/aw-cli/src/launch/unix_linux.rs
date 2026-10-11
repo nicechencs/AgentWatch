@@ -724,6 +724,23 @@ impl LocalCgroupHost {
         env_pairs: &[(String, String)],
         session_id: u64,
     ) -> Result<LaunchResult, LaunchError> {
+        self.launch_with_started(program, args, cwd, env_pairs, session_id, &mut |_| {})
+    }
+
+    /// Same as [`Self::launch`], notifying the foreground CLI after the child
+    /// exists but before it is waited.  The callback only arms signal
+    /// forwarding; cgroup placement and reaping remain this host's job.
+    pub fn launch_with_started(
+        &self,
+        program: &std::ffi::OsStr,
+        args: &[std::ffi::OsString],
+        cwd: Option<&str>,
+        env_pairs: &[(String, String)],
+        session_id: u64,
+        started: &mut dyn FnMut(u32),
+    ) -> Result<LaunchResult, LaunchError> {
+        use std::os::unix::process::CommandExt;
+
         let parent = delegated_parent()?;
         let session = parent.join(format!("agentwatch-{session_id}"));
         if let Err(err) = std::fs::create_dir(&session) {
@@ -733,6 +750,10 @@ impl LocalCgroupHost {
         }
         let mut child = std::process::Command::new(program);
         child.args(args);
+        // `aw run --no-daemon` relays SIGINT/SIGTERM to this group.  Normal
+        // descendants stay in it, so the foreground command does not strand
+        // a child when the user interrupts the run.
+        child.process_group(0);
         if let Some(dir) = cwd {
             child.current_dir(dir);
         }
@@ -748,6 +769,7 @@ impl LocalCgroupHost {
                 });
             }
         };
+        started(spawned.id());
         move_and_wait(spawned, &session)
     }
 }
@@ -893,6 +915,8 @@ fn move_and_wait(
     mut spawned: std::process::Child,
     session: &std::path::Path,
 ) -> Result<LaunchResult, LaunchError> {
+    use std::os::unix::process::ExitStatusExt;
+
     let pid = spawned.id();
     let procs = session.join("cgroup.procs");
     let write = std::fs::write(&procs, format!("{pid}"));
@@ -905,7 +929,9 @@ fn move_and_wait(
             detail: format!("等待失败：{err}"),
         })?;
         return Ok(LaunchResult {
-            code: status.code(),
+            code: status
+                .code()
+                .or_else(|| status.signal().map(|signal| 128 + signal)),
             pid,
             cgroup_path: String::new(),
             detail: format!(
@@ -918,7 +944,9 @@ fn move_and_wait(
     let status = spawned.wait().map_err(|err| LaunchError::WaitFailed {
         detail: format!("等待失败：{err}"),
     })?;
-    let code = status.code();
+    let code = status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal));
     let _ = std::fs::remove_dir(session);
     Ok(LaunchResult {
         code,

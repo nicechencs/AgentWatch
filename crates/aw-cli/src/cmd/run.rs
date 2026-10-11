@@ -2,12 +2,13 @@
 //!
 //! `--no-daemon` starts the target as the calling user through an injected
 //! [`Launcher`], then prints a session summary. The default daemon path first
-//! records `/sessions/run`, starts the child held (at a Unix pipe gate or with
-//! Windows `CREATE_SUSPENDED`), and hands it over through `/adopt` before
-//! releasing it. On Windows the local `--no-daemon` production launcher is
-//! [`launch::production`]: Job assignment is unavailable, so no process is
-//! created. On macOS it spawns with `Command` and says suspension was not
-//! applied. On Linux [`launch::LocalCgroupHost`] places the child in a delegated
+//! records `/sessions/run`, starts the child held (Linux and macOS through
+//! `aw-platform`'s suspended spawn, Windows through `aw-platform`'s suspended
+//! Job), and hands it over through `/adopt` before releasing it. On Windows
+//! `aw-platform` owns the suspended Job and process handles; release returns
+//! the sole reap handle. On macOS the suspended start lives in `aw-platform`
+//! and has not been run on a real Mac. On Linux [`launch::LocalCgroupHost`]
+//! places the child in a delegated
 //! cgroup v2 directory, or returns an error and starts nothing. Tests pass a
 //! fake and assert the target's exit code comes back unchanged.
 //!
@@ -27,25 +28,18 @@
 //! the launcher. They are not written to stdout, stderr, or an error string.
 
 use std::io::{self, Write};
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, OwnedFd};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
+#[cfg(not(any(unix, windows)))]
 use std::process::{Child, Command};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::sync::{
+    atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
+    Arc,
+};
 
-#[cfg(all(unix, not(target_os = "macos")))]
-use nix::fcntl::OFlag;
-#[cfg(unix)]
-use nix::fcntl::{fcntl, FcntlArg, FdFlag};
-#[cfg(target_os = "macos")]
-use nix::unistd::pipe;
-#[cfg(all(unix, not(target_os = "macos")))]
-use nix::unistd::pipe2;
-#[cfg(unix)]
-use nix::unistd::write;
-
+#[cfg(any(target_os = "linux", windows))]
+use aw_platform::{
+    platform, HeldChild, IdentifiedCaller, PlatformError, ReapOutcome, ReleasedChild, SpawnRequest,
+};
 use aw_proxy::{plan_injection, Injection, ProxyOnReject};
 
 use serde_json::{json, Value};
@@ -272,51 +266,53 @@ pub(crate) trait Spawner {
     ///
     /// # Errors
     ///
-    /// A short OS error class with no argv or environment values.
-    fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, String>;
+    /// A machine code plus a Chinese sentence. The sentence has no error code
+    /// and no English; the code is for the log and for `--json`.
+    fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, (&'static str, String)>;
 }
 
 /// Production caller-side spawner. It never creates a cgroup: the daemon
 /// records the adopted root pid and performs its own scope handling.
-/// Plain Chinese sentence for a failed spawn, by error kind, with the same
-/// codes the daemon uses (`program_not_found`, `program_not_permitted`,
-/// `spawn_failed`). The program and its arguments are not repeated (they can
-/// carry secrets).
+/// Plain Chinese sentence for a failed spawn, by error kind. The matching
+/// machine code (`program_not_found`, `program_not_permitted`, `spawn_failed`)
+/// is [`spawn_error_code`] and is not part of this sentence. The program and
+/// its arguments are not repeated (they can carry secrets).
 pub(crate) fn spawn_error_text(error: &std::io::Error) -> String {
+    // The code and the OS number stay out of this sentence. `spawn_failure`
+    // puts them in the log and, with `--json`, in `error.code`.
     match error.kind() {
-        std::io::ErrorKind::NotFound => {
-            "无法启动程序：找不到这个程序或工作目录（program_not_found）".to_owned()
-        }
+        std::io::ErrorKind::NotFound => "无法启动程序：找不到这个程序或工作目录".to_owned(),
         std::io::ErrorKind::PermissionDenied => {
-            "无法启动程序：没有权限运行它或进入工作目录（program_not_permitted）".to_owned()
+            "无法启动程序：没有权限运行它或进入工作目录".to_owned()
         }
-        _ => format!("无法启动程序（spawn_failed，{}）", os_code(error)),
+        _ => "无法启动程序：发生系统错误".to_owned(),
+    }
+}
+
+/// Machine code for a spawn failure, matching the daemon's launch errors.
+pub(crate) fn spawn_error_code(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "program_not_found",
+        std::io::ErrorKind::PermissionDenied => "program_not_permitted",
+        _ => "spawn_failed",
     }
 }
 
 /// Plain Chinese sentence when waiting for the started program failed.
-pub(crate) fn wait_error_text(error: &std::io::Error) -> String {
-    format!("等待程序结束失败（{}）", os_code(error))
-}
-
-fn os_code(error: &std::io::Error) -> String {
-    error.raw_os_error().map_or_else(
-        || "系统没有给出错误码".to_owned(),
-        |code| format!("系统错误码 {code}"),
-    )
+#[cfg(any(not(windows), test))]
+pub(crate) fn wait_error_text(_error: &std::io::Error) -> String {
+    "等待程序结束失败".to_owned()
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct CommandSpawner;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 struct ProcessChild {
     child: Child,
-    #[cfg(windows)]
-    suspended: bool,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl SpawnedChild for ProcessChild {
     fn pid(&self) -> u32 {
         self.child.id()
@@ -330,17 +326,6 @@ impl SpawnedChild for ProcessChild {
     }
 
     fn release(&mut self) -> Result<(), String> {
-        #[cfg(windows)]
-        {
-            if !self.suspended {
-                return Ok(());
-            }
-            windows_release::resume_primary_thread(self.child.id())
-                .map_err(|code| format!("无法放行被挂起的程序（系统错误码 {code}）"))?;
-            // Only clear this after ResumeThread succeeds, so repeated calls
-            // are harmless and never raise the thread's suspend count again.
-            self.suspended = false;
-        }
         Ok(())
     }
 
@@ -350,218 +335,168 @@ impl SpawnedChild for ProcessChild {
     }
 }
 
-/// Windows-specific FFI for releasing exactly one `CREATE_SUSPENDED` child.
-///
-/// `std::process::Child` exposes the PID but not the primary-thread handle, so
-/// locate that thread in a Toolhelp snapshot. A just-created suspended process
-/// has not executed target code, therefore its sole process-owned thread is
-/// the primary thread to resume.
-#[cfg(windows)]
-#[allow(unsafe_code)]
-mod windows_release {
-    use std::mem::size_of;
-
-    use windows::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_NOT_FOUND, ERROR_NO_MORE_FILES, HANDLE,
-    };
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-    };
-    use windows::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
-
-    /// Resume the single primary thread which `CREATE_SUSPENDED` stopped.
-    ///
-    /// The returned number is a Win32 system error code suitable for the
-    /// user-facing Chinese error at the caller.
-    pub(super) fn resume_primary_thread(pid: u32) -> Result<(), u32> {
-        // SAFETY: the requested snapshot flag and PID are plain values; the
-        // returned handle is closed exactly once below on every result path.
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
-            .map_err(|error| error_code(&error))?;
-        let result = resume_from_snapshot(snapshot, pid);
-        close_handle(snapshot);
-        result
-    }
-
-    fn resume_from_snapshot(snapshot: HANDLE, pid: u32) -> Result<(), u32> {
-        let mut entry = THREADENTRY32 {
-            dwSize: size_of::<THREADENTRY32>() as u32,
-            ..THREADENTRY32::default()
-        };
-        // SAFETY: `entry` is initialized with the ABI-required `dwSize` and
-        // remains valid for the synchronous Toolhelp call.
-        unsafe { Thread32First(snapshot, &mut entry) }.map_err(|error| error_code(&error))?;
-
-        loop {
-            if entry.th32OwnerProcessID == pid {
-                return resume_thread(entry.th32ThreadID);
-            }
-
-            entry.dwSize = size_of::<THREADENTRY32>() as u32;
-            // SAFETY: as above, `snapshot` remains open and `entry` points to
-            // writable initialized storage with the ABI-required size.
-            match unsafe { Thread32Next(snapshot, &mut entry) } {
-                Ok(()) => {}
-                Err(error) if error_code(&error) == ERROR_NO_MORE_FILES.0 => {
-                    return Err(ERROR_NOT_FOUND.0);
-                }
-                Err(error) => return Err(error_code(&error)),
-            }
-        }
-    }
-
-    fn resume_thread(thread_id: u32) -> Result<(), u32> {
-        // SAFETY: `thread_id` came from the current Toolhelp snapshot. The
-        // returned handle is closed exactly once before this function returns.
-        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, thread_id) }
-            .map_err(|error| error_code(&error))?;
-        // SAFETY: `thread` is a valid handle opened with THREAD_SUSPEND_RESUME.
-        let prior_suspend_count = unsafe { ResumeThread(thread) };
-        // ResumeThread reports failure only with u32::MAX. Read the thread's
-        // last-error value before CloseHandle can alter it.
-        let resume_error = (prior_suspend_count == u32::MAX).then(last_error);
-        close_handle(thread);
-        resume_error.map_or(Ok(()), Err)
-    }
-
-    fn error_code(error: &windows::core::Error) -> u32 {
-        // Win32 APIs above create HRESULT_FROM_WIN32 values. Their low word is
-        // the original system error code shown to the user.
-        error.code().0 as u32 & 0xffff
-    }
-
-    fn last_error() -> u32 {
-        // SAFETY: GetLastError reads the calling thread's error state only.
-        unsafe { GetLastError().0 }
-    }
-
-    fn close_handle(handle: HANDLE) {
-        // SAFETY: every caller passes one handle returned by the corresponding
-        // successful Win32 open/create call, and calls this helper once.
-        let _ = unsafe { CloseHandle(handle) };
-        // A close failure cannot reverse a successful ResumeThread. Retrying
-        // `release` to report it would resume the target more than once.
-    }
+/// macOS `aw run` child. `aw-platform` starts it with
+/// `POSIX_SPAWN_START_SUSPENDED` and holds the watchdog pipe, so this CLI is
+/// the creator: dropping the hold before `release` kills the program. After
+/// `release` the returned handle reaps only this child. 【待验证】not run on a
+/// real Mac.
+#[cfg(target_os = "macos")]
+struct PlatformChild {
+    held: Option<Box<dyn aw_platform::HeldChild>>,
+    released: Option<Box<dyn aw_platform::ReleasedChild>>,
 }
 
-/// The shell reads the gate from fd 3 and closes it before `exec`ing the
-/// target. Both pipe ends begin close-on-exec; [`keep_gate_read_fd_for_child`]
-/// creates fd 3 without that flag only in the shell child.
-#[cfg(unix)]
-const GATE_SHELL: &str = r#"IFS= read -r _ <&3 || exit 125; exec 3<&-; exec "$@""#;
-
-/// Descriptor reserved for the gate in the shell child. It is closed before
-/// the shell reaches the target `exec`.
-#[cfg(unix)]
-const GATE_FD: i32 = 3;
-
-/// Create a gate pipe whose descriptors are close-on-exec from birth whenever
-/// the platform supports `pipe2`. macOS has no `pipe2`, so set the flag on
-/// both descriptors before either can be handed to a child.
-#[cfg(unix)]
-fn gate_pipe() -> nix::Result<(OwnedFd, OwnedFd)> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        pipe2(OFlag::O_CLOEXEC)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let (read_fd, write_fd) = pipe()?;
-        set_cloexec(&read_fd)?;
-        set_cloexec(&write_fd)?;
-        Ok((read_fd, write_fd))
+#[cfg(target_os = "macos")]
+impl PlatformChild {
+    fn fail(error: &aw_platform::PlatformError) -> String {
+        match error {
+            aw_platform::PlatformError::Io(inner) => spawn_error_text(inner),
+            _ => "无法启动程序：发生系统错误".to_owned(),
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn set_cloexec(fd: &OwnedFd) -> nix::Result<()> {
-    let flags = fcntl(fd, FcntlArg::F_GETFD)?;
-    let flags = FdFlag::from_bits_truncate(flags) | FdFlag::FD_CLOEXEC;
-    fcntl(fd, FcntlArg::F_SETFD(flags)).map(drop)
-}
-
-/// Keep the read end available to the gate shell as fd 3. The original read
-/// descriptor remains close-on-exec, so only fd 3 is inherited; the shell
-/// closes it before starting the target.
-#[cfg(unix)]
-#[allow(unsafe_code)]
-fn keep_gate_read_fd_for_child(command: &mut Command, read_fd: OwnedFd) {
-    // SAFETY: The closure runs only between fork and exec. It invokes only
-    // `dup2` and, when the source is already fd 3, `fcntl(F_SETFD)`, which are
-    // async-signal-safe. The duplicated OwnedFd is intentionally forgotten so
-    // fd 3 stays open until the shell executes; no parent descriptor is
-    // changed because this runs in the child.
-    unsafe {
-        command.pre_exec(move || {
-            let duplicated =
-                nix::unistd::dup2_raw(&read_fd, GATE_FD).map_err(std::io::Error::from)?;
-            std::mem::forget(duplicated);
-            if read_fd.as_raw_fd() == GATE_FD {
-                let flags = fcntl(&read_fd, FcntlArg::F_GETFD).map_err(std::io::Error::from)?;
-                let flags = FdFlag::from_bits_truncate(flags) & !FdFlag::FD_CLOEXEC;
-                fcntl(&read_fd, FcntlArg::F_SETFD(flags)).map_err(std::io::Error::from)?;
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(unix)]
-struct GatedChild {
-    child: Child,
-    release_fd: Option<OwnedFd>,
-}
-
-#[cfg(unix)]
-impl SpawnedChild for GatedChild {
+impl SpawnedChild for PlatformChild {
     fn pid(&self) -> u32 {
-        self.child.id()
+        self.held
+            .as_ref()
+            .map(|child| child.pid())
+            .or_else(|| self.released.as_ref().map(|child| child.pid()))
+            .unwrap_or(0)
     }
 
     fn wait(&mut self) -> Result<i32, String> {
-        self.child
-            .wait()
-            .map(|status| status.code().unwrap_or(exit::GENERAL))
-            .map_err(|error| wait_error_text(&error))
+        let Some(child) = self.released.take() else {
+            return Err("程序还被挂住，不能等待它结束".to_owned());
+        };
+        match child.wait() {
+            Ok(aw_platform::ReapOutcome::Exited(code)) => Ok(code),
+            // Unix shells conventionally expose a signal result as 128+signo.
+            Ok(aw_platform::ReapOutcome::Signaled(signal)) => Ok(128 + signal),
+            Ok(aw_platform::ReapOutcome::StillRunning) => Err("等了很久，程序还没结束".to_owned()),
+            Err(aw_platform::PlatformError::Io(error)) => Err(wait_error_text(&error)),
+            Err(_) => Err("等待程序结束失败".to_owned()),
+        }
     }
 
     fn release(&mut self) -> Result<(), String> {
-        let Some(fd) = self.release_fd.take() else {
+        let Some(held) = self.held.take() else {
             return Ok(());
         };
-        let mut remaining = &b"1\n"[..];
-        while !remaining.is_empty() {
-            match write(&fd, remaining) {
-                Ok(0) => return Err("启动闸门未写入任何数据".to_owned()),
-                Ok(written) => remaining = &remaining[written..],
-                Err(error) => {
-                    return Err(format!("无法释放启动闸门（系统错误码 {}）", error as i32));
+        match held.release() {
+            Ok(released) => {
+                self.released = Some(released);
+                Ok(())
+            }
+            Err(error) => Err(Self::fail(&error)),
+        }
+    }
+
+    fn kill_and_reap(&mut self) {
+        if let Some(mut held) = self.held.take() {
+            let _ = held.abort();
+        }
+        if let Some(mut released) = self.released.take() {
+            let _ = released.try_reap();
+        }
+    }
+}
+
+/// Linux and Windows held children are owned by `aw-platform`. This thin CLI adapter only
+/// translates the pre-existing `Spawner` state machine to its ownership API;
+/// it deliberately does not contain a second pipe gate implementation.
+#[cfg(any(target_os = "linux", windows))]
+struct PlatformGatedChild {
+    held: Option<Box<dyn HeldChild>>,
+    released: Option<Box<dyn ReleasedChild>>,
+}
+
+#[cfg(any(target_os = "linux", windows))]
+impl SpawnedChild for PlatformGatedChild {
+    fn pid(&self) -> u32 {
+        self.held
+            .as_ref()
+            .map(|child| child.pid())
+            .or_else(|| self.released.as_ref().map(|child| child.pid()))
+            .unwrap_or_default()
+    }
+
+    fn wait(&mut self) -> Result<i32, String> {
+        let child = self
+            .released
+            .take()
+            .ok_or_else(|| "无法等待尚未放行的程序".to_owned())?;
+        match child
+            .wait()
+            .map_err(|error| platform_child_error(error).1)?
+        {
+            ReapOutcome::Exited(code) => Ok(code),
+            ReapOutcome::Signaled(signo) => {
+                #[cfg(windows)]
+                {
+                    Ok(signo)
+                }
+                #[cfg(not(windows))]
+                {
+                    Ok(128 + signo)
                 }
             }
+            ReapOutcome::StillRunning => Ok(exit::GENERAL),
         }
+    }
+
+    fn release(&mut self) -> Result<(), String> {
+        let held = self
+            .held
+            .take()
+            .ok_or_else(|| "启动闸门已经放行".to_owned())?;
+        self.released = Some(
+            held.release()
+                .map_err(|error| platform_child_error(error).1)?,
+        );
         Ok(())
     }
 
     fn kill_and_reap(&mut self) {
-        // Drop the write end before reaping. If a signal races with the shell,
-        // EOF makes it choose exit 125 rather than reaching the target exec.
-        self.release_fd.take();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut held) = self.held.take() {
+            let _ = held.abort();
+        }
     }
 }
 
+#[cfg(any(target_os = "linux", windows))]
+fn platform_child_error(error: PlatformError) -> (&'static str, String) {
+    match error {
+        PlatformError::Io(error) => (spawn_error_code(&error), spawn_error_text(&error)),
+        _ => ("spawn_failed", "无法操作被挂起的程序".to_owned()),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", not(any(unix, windows))))]
+fn spawn_failure(error: &std::io::Error) -> (&'static str, String) {
+    (spawn_error_code(error), spawn_error_text(error))
+}
+
+/// A caller identity failure is distinct from a program spawn failure.  Keep
+/// its machine code in the tuple so text output never has to inspect a message.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn caller_identity_error() -> (&'static str, String) {
+    (
+        "identity_unavailable",
+        "认不出当前用户，已停止启动：无法确认当前用户".to_owned(),
+    )
+}
+
 impl Spawner for CommandSpawner {
-    fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, String> {
-        let Some((program, args)) = spec.command.split_first() else {
-            return Err("程序名为空".to_owned());
-        };
-        #[cfg(unix)]
+    fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, (&'static str, String)> {
+        #[cfg(target_os = "linux")]
         {
-            // The gate shell's own `exec` would report a missing program in
-            // English (`exec: not found`) after the session was adopted. Resolve
-            // it here, the way exec would, and fail with the Chinese message
-            // before anything runs; the caller then discards the session.
+            let Some((program, args)) = spec.command.split_first() else {
+                return Err(("spawn_failed", "程序名为空".to_owned()));
+            };
+            // Keep the pre-flight lookup: the gate shell would otherwise emit
+            // an English error only after the daemon had adopted the session.
             let path_env = spec
                 .env
                 .iter()
@@ -570,41 +505,84 @@ impl Spawner for CommandSpawner {
                 .map(|(_, value)| value.clone())
                 .or_else(|| std::env::var("PATH").ok());
             let resolved = resolve_program(program, path_env.as_deref(), spec.cwd.as_deref())
-                .map_err(|error| spawn_error_text(&error))?;
-            let program = &resolved;
-            let (read_fd, write_fd) = gate_pipe().map_err(nix_spawn_error_text)?;
-            let mut command = Command::new("/bin/sh");
-            command
-                .arg("-c")
-                .arg(GATE_SHELL)
-                .arg("aw-run")
-                .arg(program)
-                .args(args);
-            configure_command(&mut command, spec);
-            keep_gate_read_fd_for_child(&mut command, read_fd);
-            let child = command.spawn().map_err(|error| spawn_error_text(&error))?;
-            Ok(Box::new(GatedChild {
-                child,
-                release_fd: Some(write_fd),
+                .map_err(|error| spawn_failure(&error))?;
+            let caller = IdentifiedCaller::current_user().map_err(|_| caller_identity_error())?;
+            let request = SpawnRequest {
+                command: std::iter::once(resolved)
+                    .chain(args.iter().cloned())
+                    .collect(),
+                cwd: spec.cwd.as_ref().map(std::path::PathBuf::from),
+                env: spec.env.clone(),
+            };
+            let held = platform()
+                .spawn_suspended(&caller, &request)
+                .map_err(platform_child_error)?;
+            Ok(Box::new(PlatformGatedChild {
+                held: Some(held),
+                released: None,
             }))
         }
-        #[cfg(not(unix))]
+        #[cfg(target_os = "macos")]
         {
+            let Some((program, args)) = spec.command.split_first() else {
+                return Err(("spawn_failed", "程序名为空".to_owned()));
+            };
+            // Same pre-flight as Linux: a missing program fails in Chinese
+            // before the daemon has adopted the session.
+            let path_env = spec
+                .env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value.clone())
+                .or_else(|| std::env::var("PATH").ok());
+            let resolved = resolve_program(program, path_env.as_deref(), spec.cwd.as_deref())
+                .map_err(|error| spawn_failure(&error))?;
+            let caller = aw_platform::IdentifiedCaller::current_user()
+                .map_err(|_| caller_identity_error())?;
+            let request = aw_platform::SpawnRequest {
+                command: std::iter::once(resolved)
+                    .chain(args.iter().cloned())
+                    .collect(),
+                cwd: spec.cwd.clone().map(std::path::PathBuf::from),
+                env: spec.env.clone(),
+            };
+            let held = aw_platform::platform()
+                .spawn_suspended(&caller, &request)
+                .map_err(|error| ("spawn_failed", PlatformChild::fail(&error)))?;
+            Ok(Box::new(PlatformChild {
+                held: Some(held),
+                released: None,
+            }))
+        }
+        #[cfg(windows)]
+        {
+            let caller = IdentifiedCaller::current_user().map_err(|_| caller_identity_error())?;
+            let request = SpawnRequest {
+                command: spec.command.clone(),
+                cwd: spec.cwd.as_ref().map(Into::into),
+                env: spec.env.clone(),
+            };
+            let held = platform()
+                .spawn_suspended(&caller, &request)
+                .map_err(platform_child_error)?;
+            Ok(Box::new(PlatformGatedChild {
+                held: Some(held),
+                released: None,
+            }))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let Some((program, args)) = spec.command.split_first() else {
+                return Err(("spawn_failed", "程序名为空".to_owned()));
+            };
             let mut command = Command::new(program);
             command.args(args);
             configure_command(&mut command, spec);
-            #[cfg(windows)]
-            command.creation_flags(0x0000_0004); // CREATE_SUSPENDED
             command
                 .spawn()
-                .map(|child| {
-                    Box::new(ProcessChild {
-                        child,
-                        #[cfg(windows)]
-                        suspended: true,
-                    }) as Box<dyn SpawnedChild>
-                })
-                .map_err(|error| spawn_error_text(&error))
+                .map(|child| Box::new(ProcessChild { child }) as Box<dyn SpawnedChild>)
+                .map_err(|error| spawn_failure(&error))
         }
     }
 }
@@ -666,6 +644,7 @@ pub(crate) fn resolve_program(
     }))
 }
 
+#[cfg(not(any(unix, windows)))]
 fn configure_command(command: &mut Command, spec: &RunSpec) {
     if let Some(cwd) = spec.cwd.as_deref() {
         command.current_dir(cwd);
@@ -675,18 +654,8 @@ fn configure_command(command: &mut Command, spec: &RunSpec) {
     }
 }
 
-#[cfg(unix)]
-fn nix_spawn_error_text(error: nix::errno::Errno) -> String {
-    spawn_error_text(&std::io::Error::from_raw_os_error(error as i32))
-}
-
-/// Windows production launcher.
-///
-/// Uses [`launch::production`]. Job assignment is unavailable in this crate
-/// (`forbid(unsafe_code)`, no `windows` dependency), so no process is created.
-/// The error is [`crate::launch::LaunchError::JobFailed`] and does not claim a
-/// Job. A real suspended `CreateProcess` needs the `windows` crate, which is
-/// out of scope for `aw-cli`.
+/// Windows production launcher. `aw-platform` holds the target in a Job until
+/// release and returns the owning reap handle after release.
 #[cfg(target_os = "windows")]
 #[derive(Debug, Default)]
 pub(crate) struct PlatformLauncher;
@@ -694,16 +663,46 @@ pub(crate) struct PlatformLauncher;
 #[cfg(target_os = "windows")]
 impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
-        let mut api = launch::production();
-        launch::dispatch_windows(&mut api, spec)
+        let caller =
+            IdentifiedCaller::current_user().map_err(|error| LaunchDispatchError::Platform {
+                detail: error.to_string(),
+            })?;
+        let request = SpawnRequest {
+            command: spec.command.clone(),
+            cwd: spec.cwd.as_ref().map(Into::into),
+            env: spec.env.clone(),
+        };
+        let held = platform()
+            .spawn_suspended(&caller, &request)
+            .map_err(|error| LaunchDispatchError::Platform {
+                detail: error.to_string(),
+            })?;
+        let pid = held.pid();
+        let released = held
+            .release()
+            .map_err(|error| LaunchDispatchError::Platform {
+                detail: error.to_string(),
+            })?;
+        let code = match released
+            .wait()
+            .map_err(|error| LaunchDispatchError::Platform {
+                detail: error.to_string(),
+            })? {
+            ReapOutcome::Exited(code) => code,
+            ReapOutcome::Signaled(_) | ReapOutcome::StillRunning => exit::GENERAL,
+        };
+        Ok(Launched {
+            code,
+            pid,
+            note: None,
+            sampling: spec.no_daemon,
+        })
     }
 
     fn forward_interrupt(&mut self, _pid: u32) -> Result<(), LaunchDispatchError> {
-        Err(LaunchDispatchError::Windows(
-            crate::launch::LaunchError::NotVerified {
-                step: "GenerateConsoleCtrlEvent",
-            },
-        ))
+        Err(LaunchDispatchError::NotImplemented {
+            detail: "中断转发不可用；Windows 启动器未创建控制台进程组".to_owned(),
+        })
     }
 }
 
@@ -720,15 +719,25 @@ pub(crate) struct PlatformLauncher;
 #[cfg(target_os = "linux")]
 impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
-        launch_linux(spec, &mut |program, argv, cwd, env| {
-            launch::LocalCgroupHost.launch(program, argv, cwd, env, session_token())
-        })
+        let forwarder = ProcessGroupForwarder::new()?;
+        launch_linux_with_started(
+            spec,
+            &mut |program, argv, cwd, env, started| {
+                launch::LocalCgroupHost.launch_with_started(
+                    program,
+                    argv,
+                    cwd,
+                    env,
+                    session_token(),
+                    started,
+                )
+            },
+            &mut |pid| forwarder.set_pid(pid),
+        )
     }
 
-    fn forward_interrupt(&mut self, _pid: u32) -> Result<(), LaunchDispatchError> {
-        Err(LaunchDispatchError::NotImplemented {
-            detail: "中断转发尚未接通；将等待子进程结束，不转发信号".to_owned(),
-        })
+    fn forward_interrupt(&mut self, pid: u32) -> Result<(), LaunchDispatchError> {
+        forward_unix_signal(pid, nix::sys::signal::Signal::SIGINT)
     }
 }
 
@@ -739,6 +748,7 @@ type CgroupAttempt<'a> = dyn FnMut(
         &[std::ffi::OsString],
         Option<&str>,
         &[(String, String)],
+        &mut dyn FnMut(u32),
     ) -> Result<launch::LinuxLaunchResult, launch::LinuxLaunchError>
     + 'a;
 
@@ -760,9 +770,22 @@ pub(crate) fn cgroup_fallback_allowed(err: &launch::LinuxLaunchError) -> bool {
 /// Linux `aw run --no-daemon`: try the cgroup scope, else track the process
 /// tree by pid (scope_pids) and say which capability is missing.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn launch_linux(
     spec: &RunSpec,
     attempt: &mut CgroupAttempt<'_>,
+) -> Result<Launched, LaunchDispatchError> {
+    launch_linux_with_started(spec, attempt, &mut |_| {})
+}
+
+/// Linux launch with a notification immediately after the target exists.
+/// Production uses this narrow hook only to arm Unix signal forwarding; the
+/// cgroup host still owns scope setup and reaping.
+#[cfg(target_os = "linux")]
+fn launch_linux_with_started(
+    spec: &RunSpec,
+    attempt: &mut CgroupAttempt<'_>,
+    started: &mut dyn FnMut(u32),
 ) -> Result<Launched, LaunchDispatchError> {
     let Some((program, args)) = spec.command.split_first() else {
         return Err(LaunchDispatchError::NotImplemented {
@@ -775,6 +798,7 @@ fn launch_linux(
         &argv,
         spec.cwd.as_deref(),
         &spec.env,
+        started,
     ) {
         Ok(done) => Ok(Launched {
             // A signalled child has no exit code. That is not success.
@@ -788,8 +812,13 @@ fn launch_linux(
             sampling: spec.no_daemon,
         }),
         Err(err) if cgroup_fallback_allowed(&err) => {
+            use std::os::unix::process::CommandExt;
+
             let mut child = std::process::Command::new(program);
             child.args(&argv);
+            // The relay below addresses this group, so descendants that keep
+            // the normal process group see the same terminal signal.
+            child.process_group(0);
             if let Some(dir) = spec.cwd.as_deref() {
                 child.current_dir(dir);
             }
@@ -806,13 +835,18 @@ fn launch_linux(
                         ),
                     })?;
             let pid = spawned.id();
+            started(pid);
             let status = spawned
                 .wait()
                 .map_err(|error| LaunchDispatchError::NotImplemented {
                     detail: wait_error_text(&error),
                 })?;
+            use std::os::unix::process::ExitStatusExt;
             Ok(Launched {
-                code: status.code().unwrap_or(exit::GENERAL),
+                code: status
+                    .code()
+                    .or_else(|| status.signal().map(|signal| 128 + signal))
+                    .unwrap_or(exit::GENERAL),
                 pid,
                 note: Some(PID_TREE_FALLBACK_NOTE),
                 sampling: spec.no_daemon,
@@ -866,10 +900,10 @@ impl Launcher for PlatformLauncher {
 
 /// macOS production launcher.
 ///
-/// [`launch::production`] spawns the child with `Command`. Suspension is not
-/// applied: `POSIX_SPAWN_START_SUSPENDED` is not available without `unsafe` or
-/// an extra crate. The returned note says so. This is not E1 scope, and
-/// grandchild tracking is left to the collector.
+/// `aw-platform` starts a hold stage that blocks on a pipe, then execs the
+/// program as the current user once released. `--no-daemon` releases and waits
+/// here; there is no daemon to adopt. 【待验证】not run on a real Mac.
+/// Grandchild tracking is left to the collector.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 pub(crate) struct PlatformLauncher;
@@ -877,28 +911,161 @@ pub(crate) struct PlatformLauncher;
 #[cfg(target_os = "macos")]
 impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
-        let mut api = launch::production();
-        let (code, pid, note, sampling) =
-            launch::launch_command(&mut api, spec.command.clone(), spec.no_daemon).map_err(
-                |err| LaunchDispatchError::NotImplemented {
-                    detail: err.to_string(),
-                },
-            )?;
+        let forwarder = ProcessGroupForwarder::new()?;
+        let mut child = CommandSpawner
+            .spawn(spec)
+            .map_err(|(_code, detail)| LaunchDispatchError::NotImplemented { detail })?;
+        let pid = child.pid();
+        make_child_process_group(pid)?;
+        forwarder.set_pid(pid);
+        child
+            .release()
+            .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
+        let code = child
+            .wait()
+            .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
         Ok(Launched {
             code,
             pid,
-            note,
-            sampling,
+            note: None,
+            sampling: spec.no_daemon,
         })
     }
 
-    fn forward_interrupt(&mut self, _pid: u32) -> Result<(), LaunchDispatchError> {
-        // No process group was created. A signal would need libc, which this
-        // crate does not link. Do not claim the interrupt was forwarded.
-        Err(LaunchDispatchError::NotImplemented {
-            detail: "中断转发不可用；没有创建进程组，且未链接 libc".to_owned(),
+    fn forward_interrupt(&mut self, pid: u32) -> Result<(), LaunchDispatchError> {
+        forward_unix_signal(pid, nix::sys::signal::Signal::SIGINT)
+    }
+}
+
+/// Safe foreground signal relay for a `--no-daemon` target.  The target gets
+/// its own process group before this is armed, so the relay reaches ordinary
+/// descendants too.  The registrations are removed before `aw` returns.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct ProcessGroupForwarder {
+    pid: Arc<AtomicI32>,
+    pending: Arc<AtomicUsize>,
+    done: Arc<AtomicBool>,
+    registrations: Vec<signal_hook::SigId>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl ProcessGroupForwarder {
+    fn new() -> Result<Self, LaunchDispatchError> {
+        use nix::sys::signal::Signal;
+
+        let pid = Arc::new(AtomicI32::new(0));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let mut registrations = Vec::new();
+        for signal in [Signal::SIGINT, Signal::SIGTERM] {
+            match signal_hook::flag::register_usize(
+                signal as i32,
+                Arc::clone(&pending),
+                signal as usize,
+            ) {
+                Ok(id) => registrations.push(id),
+                Err(error) => {
+                    for id in registrations {
+                        let _ = signal_hook::low_level::unregister(id);
+                    }
+                    return Err(LaunchDispatchError::NotImplemented {
+                        detail: format!("无法安装中断转发：{error}"),
+                    });
+                }
+            }
+        }
+        let worker_pid = Arc::clone(&pid);
+        let worker_pending = Arc::clone(&pending);
+        let worker_done = Arc::clone(&done);
+        let worker = std::thread::Builder::new()
+            .name("aw-run-signal-relay".to_owned())
+            .spawn(move || {
+                while !worker_done.load(Ordering::Relaxed) {
+                    let number = worker_pending.swap(0, Ordering::Relaxed);
+                    let child = worker_pid.load(Ordering::Relaxed);
+                    if number != 0 && child > 0 {
+                        let signal = if number == Signal::SIGTERM as usize {
+                            Signal::SIGTERM
+                        } else {
+                            Signal::SIGINT
+                        };
+                        let _ = forward_unix_signal(child as u32, signal);
+                    } else if number != 0 {
+                        // A signal arriving during spawn is still delivered as
+                        // soon as the child process group has a pid.
+                        worker_pending.store(number, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            })
+            .map_err(|error| {
+                for id in registrations.drain(..) {
+                    let _ = signal_hook::low_level::unregister(id);
+                }
+                LaunchDispatchError::NotImplemented {
+                    detail: format!("无法启动中断转发：{error}"),
+                }
+            })?;
+        Ok(Self {
+            pid,
+            pending,
+            done,
+            registrations,
+            worker: Some(worker),
         })
     }
+
+    fn set_pid(&self, pid: u32) {
+        if let Ok(pid) = i32::try_from(pid) {
+            self.pid.store(pid, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for ProcessGroupForwarder {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        for id in self.registrations.drain(..) {
+            let _ = signal_hook::low_level::unregister(id);
+        }
+        // Keep the flag allocated until after unregistering its callbacks.
+        let _ = self.pending.load(Ordering::Relaxed);
+    }
+}
+
+/// Put the macOS suspended child in the process group which signal forwarding
+/// addresses. Linux configures this before spawn in its cgroup host.
+#[cfg(target_os = "macos")]
+fn make_child_process_group(pid: u32) -> Result<(), LaunchDispatchError> {
+    let pid = i32::try_from(pid).map_err(|_| LaunchDispatchError::NotImplemented {
+        detail: "子进程号超出 Unix pid 范围".to_owned(),
+    })?;
+    let child = nix::unistd::Pid::from_raw(pid);
+    nix::unistd::setpgid(child, child).map_err(|error| LaunchDispatchError::NotImplemented {
+        detail: format!("无法为子进程建立进程组：{error}"),
+    })
+}
+
+/// Forward one terminal signal to the spawned Unix process group. The signal
+/// number is never formatted from user input.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn forward_unix_signal(
+    pid: u32,
+    signal: nix::sys::signal::Signal,
+) -> Result<(), LaunchDispatchError> {
+    let pid = i32::try_from(pid).map_err(|_| LaunchDispatchError::NotImplemented {
+        detail: "子进程号超出 Unix pid 范围".to_owned(),
+    })?;
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(-pid), signal).map_err(|error| {
+        LaunchDispatchError::NotImplemented {
+            detail: format!("无法转发中断给子进程：{error}"),
+        }
+    })
 }
 
 /// Run `aw run`.
@@ -990,6 +1157,14 @@ fn prepare(
     args: &RunArgs<'_>,
     deferred: DeferredFlags,
 ) -> Result<(SummaryLevel, RunSpec), Outcome> {
+    if args.raw.is_some() {
+        return Err(super::error_outcome(
+            exit::NOT_IN_BUILD,
+            "not_in_build",
+            "`--raw` 本版本未接入",
+            args.json,
+        ));
+    }
     let planned = match proxy_plan(args, deferred) {
         Ok(planned) => planned,
         Err(detail) => {
@@ -1022,8 +1197,8 @@ fn prepare(
     }
     if let Some(detail) = deferred_reason(deferred) {
         return Err(super::error_outcome(
-            exit::GENERAL,
-            "not_available",
+            exit::NOT_IN_BUILD,
+            "not_in_build",
             &detail,
             args.json,
         ));
@@ -1107,9 +1282,9 @@ pub(crate) fn daemon_run(
     };
     let mut child = match spawner.spawn(&spec) {
         Ok(child) => child,
-        Err(detail) => {
-            let _ = sessions.stop_monitoring(&launch.public_id);
-            return super::error_outcome(exit::GENERAL, "spawn_failed", &detail, args.json);
+        Err((code, detail)) => {
+            let _ = sessions.stop_monitoring(&launch.public_id, None);
+            return super::error_outcome(exit::GENERAL, code, &detail, args.json);
         }
     };
     if let Err(error) = sessions.adopt(&launch, child.pid()) {
@@ -1317,10 +1492,7 @@ fn deferred_reason(flags: DeferredFlags) -> Option<String> {
     // verified per-agent MCP config injection, so this process must not rewrite
     // a config and must not launch. The wrapper itself is `aw mcp-tap`.
     if flags.mcp_tap {
-        return Some(
-            "`aw run` 不支持 --mcp-tap：尚未实现每个 Agent 的 MCP 配置注入（SPIKE-09）；请手动使用 `aw mcp-tap -- <cmd>`。没有启动程序"
-                .to_owned(),
-        );
+        return Some("`--mcp-tap` 本版本未接入".to_owned());
     }
     let mut which = Vec::new();
     if flags.self_report {
@@ -1338,10 +1510,7 @@ fn deferred_reason(flags: DeferredFlags) -> Option<String> {
     if which.is_empty() {
         return None;
     }
-    Some(format!(
-        "此构建不支持 {}（P3/P5 提供）；没有启动程序",
-        which.join(", ")
-    ))
+    Some(format!("`{}` 本版本未接入", which.join(", ")))
 }
 
 fn parse_summary(text: Option<&str>) -> Result<SummaryLevel, String> {
@@ -1372,13 +1541,11 @@ fn split_env(raw: &[String]) -> Result<Vec<(String, String)>, String> {
     Ok(pairs)
 }
 
-fn mentions_daemon(err: &LaunchDispatchError) -> bool {
-    matches!(
-        err,
-        LaunchDispatchError::Windows(crate::launch::LaunchError::AdoptTimeout)
-            | LaunchDispatchError::Windows(crate::launch::LaunchError::AdoptFailed { .. })
-            | LaunchDispatchError::Windows(crate::launch::LaunchError::HandleHandoffFailed { .. })
-    )
+fn mentions_daemon(_: &LaunchDispatchError) -> bool {
+    // The Windows Job launch no longer performs the retired local
+    // handoff/adopt state machine. Daemon-path errors arrive through
+    // `daemon_run`, not through this local launcher.
+    false
 }
 
 fn write_summary(
@@ -1576,6 +1743,9 @@ mod tests {
     use crate::exit;
     use crate::launch::{LaunchDispatchError, Launched, RunSpec, UnixLauncher};
 
+    #[cfg(windows)]
+    use super::{Launcher, PlatformLauncher};
+
     struct FakeLaunch {
         code: i32,
         sampling_seen: Option<bool>,
@@ -1647,11 +1817,11 @@ mod tests {
         log: Rc<RefCell<Vec<&'static str>>>,
         spawned: usize,
         code: i32,
-        fail: Option<String>,
+        fail: Option<(&'static str, String)>,
     }
 
     impl Spawner for FakeSpawner {
-        fn spawn(&mut self, _: &RunSpec) -> Result<Box<dyn SpawnedChild>, String> {
+        fn spawn(&mut self, _: &RunSpec) -> Result<Box<dyn SpawnedChild>, (&'static str, String)> {
             self.spawned = self.spawned.saturating_add(1);
             self.log.borrow_mut().push("spawn");
             if let Some(error) = self.fail.take() {
@@ -1722,7 +1892,11 @@ mod tests {
             })
         }
 
-        fn stop_monitoring(&mut self, session: &str) -> Result<String, ControlError> {
+        fn stop_monitoring(
+            &mut self,
+            session: &str,
+            _: Option<&str>,
+        ) -> Result<String, ControlError> {
             self.stops.push(session.to_owned());
             Ok(session.to_owned())
         }
@@ -1983,7 +2157,7 @@ mod tests {
             for summary in sources {
                 let mut launcher = fake_exit_7();
                 let outcome = run(&ran, none(), &mut UnixAdapter(&mut launcher), summary);
-                assert_eq!(outcome.code, 7);
+                assert_eq!(outcome.code, exit::NOT_IN_BUILD);
                 assert!(outcome.stdout.is_empty());
                 let err = text(&outcome.stderr);
                 for marker in [
@@ -1996,7 +2170,8 @@ mod tests {
                 ] {
                     assert!(!err.contains(marker), "input marker appeared: {marker}");
                 }
-                assert_eq!(launcher.env_len, Some(1));
+                assert!(err.contains("`--raw` 本版本未接入"), "{err}");
+                assert_eq!(launcher.env_len, None);
             }
         }
     }
@@ -2312,7 +2487,7 @@ mod tests {
         let mut spec = RunSpec::new(command).expect("spec");
         spec.no_daemon = true;
         let mut attempts = 0;
-        let launched = super::launch_linux(&spec, &mut |_, _, _, _| {
+        let launched = super::launch_linux(&spec, &mut |_, _, _, _, _| {
             attempts += 1;
             Err(crate::launch::LinuxLaunchError::CreateFailed {
                 detail: "cgroup mkdir: /sys/fs/cgroup/agent/cgroup.subtree_control has no delegated controllers".to_owned(),
@@ -2349,7 +2524,7 @@ mod tests {
         }
         // A failure after the child started is reported, not retried.
         let spec = RunSpec::new(vec!["true".to_owned()]).expect("spec");
-        let err = super::launch_linux(&spec, &mut |_, _, _, _| {
+        let err = super::launch_linux(&spec, &mut |_, _, _, _, _| {
             Err(E::WriteProcsFailed {
                 detail: "denied".to_owned(),
             })
@@ -2600,11 +2775,12 @@ mod tests {
             Ok(_) => panic!("a missing program must not spawn"),
             Err(error) => error,
         };
+        assert_eq!(error.0, "program_not_found");
         assert_eq!(
-            error,
+            error.1,
             spawn_error_text(&std::io::Error::from(std::io::ErrorKind::NotFound))
         );
-        assert!(!error.contains("not found"), "{error}");
+        assert!(!error.1.contains("not found"), "{}", error.1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2612,16 +2788,26 @@ mod tests {
     fn spawn_errors_are_plain_chinese_by_kind() {
         use std::io::{Error, ErrorKind};
         let not_found = super::spawn_error_text(&Error::from(ErrorKind::NotFound));
-        assert!(not_found.contains("找不到") && not_found.contains("program_not_found"));
-        let denied = super::spawn_error_text(&Error::from(ErrorKind::PermissionDenied));
-        assert!(denied.contains("没有权限") && denied.contains("program_not_permitted"));
-        let other = super::spawn_error_text(&Error::from_raw_os_error(7));
-        assert!(
-            other.contains("spawn_failed") && other.contains("系统错误码 7"),
-            "{other}"
+        assert!(not_found.contains("找不到"));
+        assert_eq!(
+            super::spawn_error_code(&Error::from(ErrorKind::NotFound)),
+            "program_not_found"
         );
+        let denied = super::spawn_error_text(&Error::from(ErrorKind::PermissionDenied));
+        assert!(denied.contains("没有权限"));
+        assert_eq!(
+            super::spawn_error_code(&Error::from(ErrorKind::PermissionDenied)),
+            "program_not_permitted"
+        );
+        let other = super::spawn_error_text(&Error::from_raw_os_error(7));
+        assert_eq!(other, "无法启动程序：发生系统错误");
+        assert_eq!(
+            super::spawn_error_code(&Error::from_raw_os_error(7)),
+            "spawn_failed"
+        );
+        assert!(!other.contains("系统错误码"), "{other}");
         let wait = super::wait_error_text(&Error::from(ErrorKind::Other));
-        assert!(wait.starts_with("等待程序结束失败"), "{wait}");
+        assert_eq!(wait, "等待程序结束失败");
         for text in [not_found, denied, other, wait] {
             assert!(
                 !text.contains("entity") && !text.contains("could not"),
@@ -2639,9 +2825,10 @@ mod tests {
             log: Rc::clone(&log),
             spawned: 0,
             code: 0,
-            fail: Some(super::spawn_error_text(&std::io::Error::from(
-                std::io::ErrorKind::NotFound,
-            ))),
+            fail: Some((
+                "spawn_failed",
+                super::spawn_error_text(&std::io::Error::from(std::io::ErrorKind::NotFound)),
+            )),
         };
         let mut parsed = args(&command);
         parsed.json = true;
@@ -2659,6 +2846,38 @@ mod tests {
         assert_eq!(body["error"]["code"], "spawn_failed");
         assert!(!text.contains("private-tool"), "{text}");
         assert!(!text.contains("--secret"), "{text}");
+    }
+
+    #[test]
+    fn identity_failure_uses_the_tuple_code_without_putting_it_in_the_message() {
+        let command = vec!["private-tool".to_owned()];
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sessions = FakeSessions::new(Rc::clone(&log));
+        let mut spawner = FakeSpawner {
+            log,
+            spawned: 0,
+            code: 0,
+            fail: Some((
+                "identity_unavailable",
+                "认不出当前用户，已停止启动：无法确认当前用户".to_owned(),
+            )),
+        };
+        let mut parsed = args(&command);
+        parsed.json = true;
+        let outcome = daemon_run(
+            &parsed,
+            none(),
+            &mut sessions,
+            &mut spawner,
+            &mut EmptySummary,
+        );
+        assert_eq!(outcome.code, exit::GENERAL);
+        let body: serde_json::Value = serde_json::from_slice(&outcome.stderr).expect("json");
+        assert_eq!(body["error"]["code"], "identity_unavailable");
+        assert_eq!(
+            body["error"]["message"],
+            "认不出当前用户，已停止启动：无法确认当前用户"
+        );
     }
 
     #[test]
@@ -2702,6 +2921,15 @@ mod tests {
         assert_eq!(outcome.code, 7);
         assert!(sessions.seen_begin.is_none());
         assert!(sessions.stops.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_no_daemon_releases_the_held_child_and_keeps_exit_7() {
+        let spec = RunSpec::new(vec!["cmd".to_owned(), "/c".to_owned(), "exit 7".to_owned()])
+            .expect("spec");
+        let launched = PlatformLauncher.launch(&spec).expect("Windows launch");
+        assert_eq!(launched.code, 7);
     }
 
     fn sample_summary() -> Summary {

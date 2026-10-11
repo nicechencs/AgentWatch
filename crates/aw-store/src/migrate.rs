@@ -24,10 +24,11 @@
 
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
+use crate::connection::{open_connection, open_connection_with_flags};
 use crate::error::StoreError;
 
 /// Bootstrap version installed by [`MIGRATION_0001`].
@@ -151,9 +152,8 @@ pub fn apply_http_schema(store: &mut Store) -> Result<(), StoreError> {
             found: Some(store.schema_version()?),
         });
     }
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|err| StoreError::sqlite("begin_http_schema", err))?;
+    let tx =
+        immediate_transaction(conn).map_err(|err| StoreError::sqlite("begin_http_schema", err))?;
     let applied = (|| {
         for (version, sql) in http_schema_scripts() {
             tx.execute_batch(sql)
@@ -210,9 +210,8 @@ pub fn apply_proxy_schema(store: &mut Store) -> Result<(), StoreError> {
     }
     let field_sql = alter_statement(MIGRATION_0008, "field_evidence");
     let na_sql = alter_statement(MIGRATION_0008, "na_reason");
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|err| StoreError::sqlite("begin_proxy_schema", err))?;
+    let tx =
+        immediate_transaction(conn).map_err(|err| StoreError::sqlite("begin_proxy_schema", err))?;
     let applied = (|| {
         // Statements are the two ALTERs in MIGRATION_0008, in that order.
         // Running the whole script would fail once either column already exists.
@@ -270,9 +269,8 @@ pub fn apply_agent_schema(store: &mut Store) -> Result<(), StoreError> {
     if table_present(conn, "agent_events", "probe_agent_events")? {
         return Ok(());
     }
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|err| StoreError::sqlite("begin_agent_schema", err))?;
+    let tx =
+        immediate_transaction(conn).map_err(|err| StoreError::sqlite("begin_agent_schema", err))?;
     let applied = (|| {
         tx.execute_batch(MIGRATION_0009)
             .map_err(|err| StoreError::sqlite("migrate_agent_events", err))?;
@@ -317,8 +315,7 @@ pub fn apply_inter_agent_schema(store: &mut Store) -> Result<(), StoreError> {
     if table_present(conn, "watch_groups", "probe_watch_groups")? {
         return Ok(());
     }
-    let tx = conn
-        .unchecked_transaction()
+    let tx = immediate_transaction(conn)
         .map_err(|err| StoreError::sqlite("begin_inter_agent_schema", err))?;
     let applied = (|| {
         tx.execute_batch(MIGRATION_0010)
@@ -461,6 +458,20 @@ impl Store {
         Self::open_with_scripts(path.as_ref(), &[])
     }
 
+    /// Open a database for the running daemon or its clients.
+    ///
+    /// The bootstrap-only [`Self::open`] remains available to migration tests
+    /// and offline import code. A user-facing database, however, must always
+    /// have the file-search tables regardless of which collector the current
+    /// OS can run. This prevents a fresh Windows database from being shaped
+    /// differently from a fresh Linux or macOS one.
+    pub fn open_runtime(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let started = Instant::now();
+        let mut store = Self::open(path)?;
+        crate::sink::apply_file_schema(&mut store).map_err(|err| err.with_busy_elapsed(started))?;
+        Ok(store)
+    }
+
     /// Like [`Store::open`], then run `extra` as additional migration scripts.
     ///
     /// Each entry is `(version, sql)`. Versions must be strictly increasing and
@@ -469,6 +480,11 @@ impl Store {
     /// A stored version above this binary's supported ceiling remains read-only,
     /// even when `extra` is supplied. Production callers should use [`Store::open`].
     pub fn open_with_scripts(path: &Path, extra: &[(u32, &str)]) -> Result<Self, StoreError> {
+        let started = Instant::now();
+        Self::open_with_scripts_inner(path, extra).map_err(|err| err.with_busy_elapsed(started))
+    }
+
+    fn open_with_scripts_inner(path: &Path, extra: &[(u32, &str)]) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|err| {
@@ -481,7 +497,7 @@ impl Store {
         let (found, needs_migration) = if existed {
             let found = read_version_quietly(path)?;
             if found > SUPPORTED_SCHEMA_VERSION {
-                let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                let conn = open_connection_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                     .map_err(|err| StoreError::sqlite("open_read_only", err))?;
                 return Ok(Self {
                     conn,
@@ -499,7 +515,8 @@ impl Store {
 
         if !needs_migration {
             let conn = open_writable(path)?;
-            apply_pragmas(&conn)?;
+            apply_connection_pragmas(&conn)?;
+            verify_wal_mode(&conn)?;
             let _ = restrict_unix(path);
             return Ok(Self {
                 conn,
@@ -516,9 +533,18 @@ impl Store {
         };
 
         let conn = open_writable(path)?;
-        // auto_vacuum is set before the first CREATE and is not followed by VACUUM.
-        // On an existing database the pragma is a no-op until a vacuum this crate does not run.
-        apply_pragmas(&conn)?;
+        apply_connection_pragmas(&conn)?;
+        if existed {
+            // Reopening an existing database never rewrites persistent PRAGMAs.
+            // `journal_mode` is read only, so an active writer does not fail the
+            // open just because it owns the write lock.
+            verify_wal_mode(&conn)?;
+        } else {
+            // These two persistent settings need an exclusive lock. This is the
+            // only point they are written: after the busy handler was installed,
+            // and before migration 0001 creates the first table.
+            apply_new_database_pragmas(&conn)?;
+        }
 
         let from = found.unwrap_or(0);
         let result = apply_pending(&conn, from, extra);
@@ -584,14 +610,14 @@ fn open_writable(path: &Path) -> Result<Connection, StoreError> {
         .append(true)
         .open(path)
         .map_err(|err| StoreError::io("create_db", Some(path.to_path_buf()), err))?;
-    Connection::open(path).map_err(|err| StoreError::sqlite("open", err))
+    open_connection(path).map_err(|err| StoreError::sqlite("open", err))
 }
 
-fn apply_pragmas(conn: &Connection) -> Result<(), StoreError> {
-    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
-        .map_err(|err| StoreError::sqlite("pragma_auto_vacuum", err))?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|err| StoreError::sqlite("pragma_journal_mode", err))?;
+/// Connection-local settings for a normal writable store connection.
+///
+/// The shared opener has already set `busy_timeout`, so no statement here can
+/// bypass the wait window.
+fn apply_connection_pragmas(conn: &Connection) -> Result<(), StoreError> {
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|err| StoreError::sqlite("pragma_synchronous", err))?;
     conn.pragma_update(None, "foreign_keys", "ON")
@@ -601,6 +627,28 @@ fn apply_pragmas(conn: &Connection) -> Result<(), StoreError> {
     conn.pragma_update(None, "mmap_size", 268_435_456_i64)
         .map_err(|err| StoreError::sqlite("pragma_mmap_size", err))?;
     Ok(())
+}
+
+/// Persistent PRAGMAs for a brand-new, empty database only.
+fn apply_new_database_pragmas(conn: &Connection) -> Result<(), StoreError> {
+    conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+        .map_err(|err| StoreError::sqlite("pragma_auto_vacuum", err))?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|err| StoreError::sqlite("pragma_journal_mode", err))?;
+    verify_wal_mode(conn)?;
+    Ok(())
+}
+
+/// Read and verify, but never change, the journal mode of an existing file.
+fn verify_wal_mode(conn: &Connection) -> Result<(), StoreError> {
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .map_err(|err| StoreError::sqlite("read_journal_mode", err))?;
+    if mode.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(StoreError::UnexpectedJournalMode { found: mode })
+    }
 }
 
 fn apply_pending(conn: &Connection, from: u32, extra: &[(u32, &str)]) -> Result<u32, StoreError> {
@@ -618,9 +666,8 @@ fn apply_pending(conn: &Connection, from: u32, extra: &[(u32, &str)]) -> Result<
         return Ok(from);
     }
 
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|err| StoreError::sqlite("begin_migration", err))?;
+    let tx =
+        immediate_transaction(conn).map_err(|err| StoreError::sqlite("begin_migration", err))?;
     let mut to = from;
     let applied = (|| {
         for (version, sql) in &scripts {
@@ -735,7 +782,7 @@ fn read_version(conn: &Connection) -> Result<u32, StoreError> {
 }
 
 fn read_version_quietly(path: &Path) -> Result<u32, StoreError> {
-    let conn = Connection::open_with_flags(
+    let conn = open_connection_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
@@ -744,6 +791,15 @@ fn read_version_quietly(path: &Path) -> Result<u32, StoreError> {
     let found = read_version(&conn)?;
     drop(conn);
     Ok(found)
+}
+
+/// Start a write transaction with a RESERVED lock request up front.
+///
+/// A deferred transaction can read first and then fail its read-to-write
+/// upgrade immediately, skipping SQLite's busy handler. `BEGIN IMMEDIATE`
+/// asks for the lock at the point where the configured timeout applies.
+pub(crate) fn immediate_transaction(conn: &Connection) -> rusqlite::Result<Transaction<'_>> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
 }
 
 fn parse_version(value: Option<String>) -> Result<u32, StoreError> {
@@ -988,7 +1044,7 @@ mod tests {
     }
 
     fn table_names_at(path: &Path) -> Vec<String> {
-        let conn = Connection::open(path).expect("open");
+        let conn = crate::open_connection(path).expect("open");
         table_names(&conn)
     }
 }

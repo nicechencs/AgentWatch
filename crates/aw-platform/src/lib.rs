@@ -1,0 +1,418 @@
+//! Explicit operating-system boundary for AgentWatch shared code.
+//!
+//! `unsafe_code` is `deny`, not the workspace `forbid`: a `forbid` cannot be
+//! relaxed, and the Windows and macOS modules need FFI. Those modules are the
+//! only places that opt back in (`#[allow(unsafe_code)]`), and every call
+//! there has a `SAFETY` comment. Shared code in this file stays safe.
+#![deny(unsafe_code)]
+
+/// OS-independent Windows Job launch state machine.
+///
+/// The Windows platform module supplies the FFI primitives; this module keeps
+/// the ordering and failure rules testable on every supported target.
+pub mod held_launch;
+
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::gate_main;
+#[cfg(target_os = "macos")]
+pub use macos::GATE_ARG;
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "linux")]
+use linux::CurrentPlatform;
+#[cfg(target_os = "macos")]
+use macos::CurrentPlatform;
+#[cfg(target_os = "windows")]
+use windows::CurrentPlatform;
+
+/// Operating system version for `aw doctor`. `None` when this build cannot read
+/// it; the caller prints 「不可得」 and never an empty string.
+#[must_use]
+pub fn os_version() -> Option<String> {
+    os_version_of()
+}
+#[cfg(target_os = "linux")]
+fn os_version_of() -> Option<String> {
+    linux::os_version()
+}
+#[cfg(target_os = "macos")]
+fn os_version_of() -> Option<String> {
+    macos::os_version()
+}
+#[cfg(target_os = "windows")]
+fn os_version_of() -> Option<String> {
+    windows::os_version()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedKind {
+    NotInThisBuild,
+    NotSupportedOnThisOs,
+}
+impl UnsupportedKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotInThisBuild => "not_in_this_build",
+            Self::NotSupportedOnThisOs => "not_supported_on_this_os",
+        }
+    }
+    pub const fn zh(self) -> &'static str {
+        match self {
+            Self::NotInThisBuild => "本版本未接入",
+            Self::NotSupportedOnThisOs => "这个系统不支持",
+        }
+    }
+    pub const fn en(self) -> &'static str {
+        match self {
+            Self::NotInThisBuild => "Not in this build",
+            Self::NotSupportedOnThisOs => "Not supported on this OS",
+        }
+    }
+}
+impl fmt::Display for UnsupportedKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.en())
+    }
+}
+
+#[derive(Debug)]
+pub enum PlatformError {
+    Unsupported {
+        capability: &'static str,
+        os: &'static str,
+        kind: UnsupportedKind,
+    },
+    /// Never convert a missing OS credential into a daemon/default identity.
+    PeerNotIdentified {
+        reason: &'static str,
+    },
+    Io(std::io::Error),
+    Invalid {
+        capability: &'static str,
+        detail: &'static str,
+    },
+}
+impl fmt::Display for PlatformError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported {
+                capability,
+                os,
+                kind,
+            } => write!(
+                f,
+                "{capability} is unsupported on {os}: {} ({})",
+                kind.en(),
+                kind.as_str()
+            ),
+            Self::PeerNotIdentified { reason } => write!(f, "peer was not identified: {reason}"),
+            Self::Io(error) => write!(f, "platform I/O error: {error}"),
+            Self::Invalid { capability, detail } => write!(f, "{capability}: {detail}"),
+        }
+    }
+}
+impl std::error::Error for PlatformError {}
+impl From<std::io::Error> for PlatformError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProcessKey {
+    pub pid: u32,
+    pub start_time: u64,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityLevel {
+    Low,
+    Medium,
+    High,
+    System,
+    Other(u32),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Owner {
+    Unix {
+        ruid: u32,
+        euid: u32,
+        suid: u32,
+        rgid: u32,
+        egid: u32,
+        sgid: u32,
+        /// Supplementary groups when the platform can authenticate them.
+        /// `None` means the platform peer API does not expose them.
+        groups: Option<Vec<u32>>,
+    },
+    Windows {
+        sid: String,
+        elevated: bool,
+        integrity: Option<IntegrityLevel>,
+    },
+}
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProcessEntry {
+    pub key: ProcessKey,
+    pub ppid: Option<u32>,
+    pub exe: Option<PathBuf>,
+    pub argv: Option<Vec<String>>,
+    pub owner: Option<Owner>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SamplingProcess {
+    pub key: ProcessKey,
+    pub ppid: u32,
+    pub start_ns: u64,
+    pub boot_id: Vec<u8>,
+}
+impl fmt::Debug for ProcessEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProcessEntry")
+            .field("key", &self.key)
+            .field("ppid", &self.ppid)
+            .field("exe", &self.exe)
+            .field("argv_len", &self.argv.as_ref().map(Vec::len))
+            .field("owner", &self.owner)
+            .finish()
+    }
+}
+#[derive(Clone, PartialEq, Eq)]
+pub struct SpawnRequest {
+    pub command: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: Vec<(String, String)>,
+}
+impl fmt::Debug for SpawnRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpawnRequest")
+            .field("command_len", &self.command.len())
+            .field("has_cwd", &self.cwd.is_some())
+            .field("env_len", &self.env.len())
+            .finish()
+    }
+}
+
+/// Owns a process only until release. Dropping/aborting it terminates and reaps it.
+pub trait HeldChild: Send {
+    fn pid(&self) -> u32;
+    fn release(self: Box<Self>) -> Result<Box<dyn ReleasedChild>, PlatformError>;
+    fn abort(&mut self) -> Result<(), PlatformError>;
+}
+/// The sole owner of a released OS child handle. It cannot reap an arbitrary PID.
+pub trait ReleasedChild: Send {
+    fn pid(&self) -> u32;
+    fn try_reap(&mut self) -> Result<ReapOutcome, PlatformError>;
+    fn wait(self: Box<Self>) -> Result<ReapOutcome, PlatformError>;
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapOutcome {
+    Exited(i32),
+    Signaled(i32),
+    StillRunning,
+}
+
+/// An OS-authenticated peer. Private fields prevent request data from forging it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerIdentity {
+    owner: Owner,
+    pid: Option<u32>,
+}
+impl PeerIdentity {
+    #[allow(dead_code)] // constructed by OS modules that identify peers in this build
+    pub(crate) fn new(owner: Owner, pid: Option<u32>) -> Self {
+        Self { owner, pid }
+    }
+    pub fn owner(&self) -> &Owner {
+        &self.owner
+    }
+    pub const fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentifiedCaller {
+    owner: Owner,
+}
+impl IdentifiedCaller {
+    /// The only way to name a caller who connected. `PeerIdentity` is built
+    /// inside this crate from an OS credential, so a uid and gid from a
+    /// request cannot become a caller.
+    pub fn from_peer(peer: PeerIdentity) -> Self {
+        Self { owner: peer.owner }
+    }
+
+    pub fn current_user() -> Result<Self, PlatformError> {
+        Ok(Self {
+            owner: platform().current_owner()?,
+        })
+    }
+    pub fn owner(&self) -> &Owner {
+        &self.owner
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    SpawnSuspended,
+    SpawnAsCaller,
+    ProcessIdentity,
+    ProcessTable,
+    PeerIdentity,
+    SecureDataDir,
+    ExitCode,
+}
+impl Capability {
+    /// Stable machine-readable capability name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SpawnSuspended => "spawn_suspended",
+            Self::SpawnAsCaller => "spawn_as_caller",
+            Self::ProcessIdentity => "process_identity",
+            Self::ProcessTable => "process_table",
+            Self::PeerIdentity => "peer_identity",
+            Self::SecureDataDir => "secure_data_dir",
+            Self::ExitCode => "exit_code",
+        }
+    }
+
+    /// Chinese display name used by human-facing `aw doctor` output.
+    pub const fn zh(self) -> &'static str {
+        match self {
+            Self::SpawnSuspended => "挂起启动",
+            Self::SpawnAsCaller => "以连接方身份启动",
+            Self::ProcessIdentity => "进程身份",
+            Self::ProcessTable => "进程表",
+            Self::PeerIdentity => "认出连接方",
+            Self::SecureDataDir => "数据目录权限",
+            Self::ExitCode => "退出码",
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityStatus {
+    Available,
+    /// The primitive is compiled in, but its required runtime check has not
+    /// succeeded in this daemon yet.
+    Unavailable,
+    NotInThisBuild,
+    NotSupportedOnThisOs,
+}
+
+pub trait Platform: Send + Sync {
+    fn os(&self) -> &'static str;
+    /// Existing root of the OS process tree used by the daemon-wide sampler.
+    /// This is not a universal numeric constant: Windows has no pid 1.
+    fn host_anchor_pid(&self) -> u32;
+    fn capability(&self, capability: Capability) -> CapabilityStatus;
+    fn spawn_suspended(
+        &self,
+        caller: &IdentifiedCaller,
+        request: &SpawnRequest,
+    ) -> Result<Box<dyn HeldChild>, PlatformError>;
+    fn process_identity(&self, pid: u32) -> Result<Option<ProcessEntry>, PlatformError>;
+    fn process_table(&self) -> Result<Vec<ProcessEntry>, PlatformError>;
+    fn sampling_process(&self, pid: u32) -> Result<Option<SamplingProcess>, PlatformError>;
+    fn sampling_process_table(&self) -> Result<Vec<SamplingProcess>, PlatformError>;
+    fn secure_data_dir(&self, path: &Path) -> Result<(), PlatformError>;
+    fn default_data_dir(&self) -> Result<PathBuf, PlatformError>;
+    fn default_config_path(&self) -> Result<PathBuf, PlatformError>;
+    fn is_privileged(&self) -> Option<bool>;
+    fn current_user_id(&self) -> Option<String>;
+    fn current_owner(&self) -> Result<Owner, PlatformError>;
+}
+#[must_use]
+pub fn platform() -> &'static dyn Platform {
+    static CURRENT: CurrentPlatform = CurrentPlatform;
+    &CURRENT
+}
+
+#[cfg(unix)]
+pub fn identify_unix_peer(
+    stream: &std::os::unix::net::UnixStream,
+) -> Result<PeerIdentity, PlatformError> {
+    identify_peer(stream)
+}
+#[cfg(target_os = "linux")]
+fn identify_peer(stream: &std::os::unix::net::UnixStream) -> Result<PeerIdentity, PlatformError> {
+    linux::identify_unix_peer(stream)
+}
+#[cfg(target_os = "macos")]
+fn identify_peer(stream: &std::os::unix::net::UnixStream) -> Result<PeerIdentity, PlatformError> {
+    macos::identify_unix_peer(stream)
+}
+#[cfg(windows)]
+pub fn identify_pipe_peer(
+    handle: std::os::windows::io::RawHandle,
+) -> Result<PeerIdentity, PlatformError> {
+    windows::identify_pipe_peer(handle)
+}
+
+/// Refuse a Windows named-pipe server unless its process token is LocalSystem
+/// or the same user as this client. This is the client-side half of protecting
+/// the well-known pipe name from a process that claimed it while the daemon
+/// was stopped.
+#[cfg(windows)]
+pub fn verify_pipe_server(handle: std::os::windows::io::RawHandle) -> Result<(), PlatformError> {
+    windows::verify_pipe_server(handle)
+}
+
+/// Record that a complete Windows named-pipe request made the round trip after
+/// the peer checks. `aw doctor` uses this runtime fact rather than advertising
+/// peer identification merely because this build contains the API.
+#[cfg(windows)]
+pub fn note_pipe_peer_identification() {
+    windows::note_pipe_peer_identification();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unsupported_words() {
+        assert_eq!(
+            UnsupportedKind::NotInThisBuild.as_str(),
+            "not_in_this_build"
+        );
+        assert_eq!(UnsupportedKind::NotSupportedOnThisOs.zh(), "这个系统不支持");
+    }
+
+    #[test]
+    fn capability_names_are_stable() {
+        assert_eq!(Capability::SpawnSuspended.as_str(), "spawn_suspended");
+        assert_eq!(Capability::SpawnAsCaller.as_str(), "spawn_as_caller");
+        assert_eq!(Capability::SpawnAsCaller.zh(), "以连接方身份启动");
+        assert_eq!(Capability::ExitCode.zh(), "退出码");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reports_spawn_as_caller_available() {
+        assert_eq!(
+            platform().capability(Capability::SpawnAsCaller),
+            CapabilityStatus::Available
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_peer_identity_reports_current_uid() -> Result<(), PlatformError> {
+        use std::os::unix::net::UnixStream;
+
+        let (server, _client) = UnixStream::pair()?;
+        let peer = identify_unix_peer(&server)?;
+        let Owner::Unix { euid, .. } = peer.owner() else {
+            return Err(PlatformError::PeerNotIdentified {
+                reason: "Unix stream peer did not have a Unix owner",
+            });
+        };
+        assert_eq!(*euid, nix::unistd::geteuid().as_raw());
+        Ok(())
+    }
+}

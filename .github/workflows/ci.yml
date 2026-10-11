@@ -34,8 +34,19 @@ jobs:
         run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: daemon cannot use its own identity
+        if: runner.os == 'Linux'
+        shell: bash
+        run: scripts/check-daemon-current-user.sh
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
+      # macOS: these two crates' tests must actually run. `cargo test
+      # --workspace` above includes them; this step prints their names so a
+      # green log shows macos::launch::tests, macos::tests and macos::spawn::tests
+      # as ok, not skipped by cfg.
+      - name: macOS platform and daemon tests
+        if: runner.os == 'macOS'
+        run: cargo test -p aw-platform -p aw-daemon -- --nocapture
       - name: root daemon tests
         if: runner.os == 'Linux'
         shell: bash

@@ -1,8 +1,7 @@
 //! AgentWatch command-line entry point: parses commands, resolves the daemon endpoint, and dispatches.
 
-// Unsafe code is denied. `cmd::run` has two documented exceptions: the Unix
-// `pre_exec` that keeps the pipe gate out of the target, and the Windows FFI
-// that resumes a CREATE_SUSPENDED child after daemon adoption.
+// Unsafe code is denied. Suspended launch and Win32 FFI live in `aw-platform`,
+// so this binary has no `pre_exec` gate and no CREATE_SUSPENDED resume of its own.
 #![deny(unsafe_code)]
 
 mod client;
@@ -12,15 +11,6 @@ mod endpoint;
 mod exit;
 mod launch;
 mod output;
-
-// P1-MAC-03. On macOS, `launch/mod.rs` already compiles `unix_macos.rs`, and
-// this include is skipped so the file is not compiled twice. Everywhere else
-// the test binary still needs the state machine (and `UnverifiedSpawnApi`).
-// The `UnixLauncher` impl inside the file is `cfg(target_os = "macos")`, so
-// this copy never implements a trait its parent does not define.
-#[cfg(all(test, not(target_os = "macos")))]
-#[path = "launch/unix_macos.rs"]
-mod launch_unix_macos;
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -34,6 +24,14 @@ fn main() -> ExitCode {
                 let _ = writeln!(io::stderr(), "aw: 写出结果失败：{err}");
                 return ExitCode::from(1);
             }
+            #[cfg(windows)]
+            {
+                // Windows process statuses are signed 32-bit values, including
+                // values above 255 and NTSTATUS failures such as 0xC0000005.
+                // ExitCode truncates to u8, so hand the raw child code to the OS.
+                std::process::exit(code);
+            }
+            #[cfg(not(windows))]
             exit_code(code)
         }
         Err(err) => {
@@ -52,6 +50,7 @@ fn write_outcome(outcome: &cmd::Outcome) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn exit_code(code: i32) -> ExitCode {
     u8::try_from(code).map_or(ExitCode::from(1), ExitCode::from)
 }

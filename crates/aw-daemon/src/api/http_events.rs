@@ -49,14 +49,17 @@ pub(crate) fn get_http(state: &ApiState, caller: &Caller, sid: &str, query: &str
     let redact_paths = flag_on(pairs.get("redact_paths").map(String::as_str));
     let redact_hosts = flag_on(pairs.get("redact_hosts").map(String::as_str));
 
-    let (store, session_id) = match open_owned(state, &caller.user_id, sid) {
+    // The peer-identified administrator may read another user's data. Resolve
+    // its stored owner first, then keep the query's ownership predicate bound
+    // to that owner; a request query/header never selects it.
+    let (store, session_id, owner) = match open_visible(state, caller, sid) {
         Ok(Some(pair)) => pair,
         Ok(None) => return error_response(404, "not_found", "session not found"),
         Err(response) => return response,
     };
     let conn = store.connection();
 
-    let proxy = match proxy_enabled(conn, session_id, &caller.user_id) {
+    let proxy = match proxy_enabled(conn, session_id, &owner) {
         Ok(Some(on)) => on,
         Ok(None) => return error_response(404, "not_found", "session not found"),
         Err(message) => return error_response(500, "store", &message),
@@ -84,7 +87,7 @@ pub(crate) fn get_http(state: &ApiState, caller: &Caller, sid: &str, query: &str
         conn,
         &HttpQuery {
             session_id,
-            user_id: &caller.user_id,
+            user_id: &owner,
             filter: &filter,
             from_ns,
             to_ns,
@@ -360,7 +363,10 @@ pub(crate) fn open_owned(
     let Some(path) = state.query.db_path.as_deref() else {
         return Ok(None);
     };
-    let store = Store::open(path).map_err(|err| error_response(500, "store", &err.to_string()))?;
+    let store = Store::open_runtime(path).map_err(|err| {
+        super::routes::database_busy_response(&err)
+            .unwrap_or_else(|| error_response(500, "store", &err.to_string()))
+    })?;
     match state.query.resolve_id(&store, user_id, sid) {
         Ok(Some(id)) => Ok(Some((store, id))),
         Ok(None) => Ok(None),
@@ -371,6 +377,45 @@ pub(crate) fn open_owned(
         )),
         Err(error) => Err(error_response(500, "store", &error.to_string())),
     }
+}
+
+/// Open a session visible to the caller. Administrators may read another
+/// account's session, but this still obtains the owner from SQLite rather than
+/// from a request field. `@last` remains the caller's own latest session.
+pub(crate) fn open_visible(
+    state: &ApiState,
+    caller: &crate::api::auth::Caller,
+    sid: &str,
+) -> Result<Option<(Store, i64, String)>, ApiResponse> {
+    let Some(path) = state.query.db_path.as_deref() else {
+        return Ok(None);
+    };
+    let store = Store::open(path).map_err(|err| error_response(500, "store", &err.to_string()))?;
+    let owner = match state.query.owner_for_viewer(caller, sid) {
+        Ok(Some(owner)) => owner,
+        Ok(None) => return Ok(None),
+        Err(QueryBackendError::NoSessions) => {
+            return Err(error_response(
+                404,
+                "no_sessions",
+                "this account has no sessions",
+            ))
+        }
+        Err(error) => return Err(error_response(500, "store", &error.to_string())),
+    };
+    let id = match state.query.resolve_id(&store, &owner, sid) {
+        Ok(Some(id)) => id,
+        Ok(None) => return Ok(None),
+        Err(QueryBackendError::NoSessions) => {
+            return Err(error_response(
+                404,
+                "no_sessions",
+                "this account has no sessions",
+            ))
+        }
+        Err(error) => return Err(error_response(500, "store", &error.to_string())),
+    };
+    Ok(Some((store, id, owner)))
 }
 
 pub(crate) fn page_limit(raw: Option<&str>) -> Result<i64, ApiResponse> {

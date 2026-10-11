@@ -102,7 +102,15 @@ fn own_user_id() -> Option<String> {
     Some(nix::unistd::geteuid().as_raw().to_string())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn own_user_id() -> Option<String> {
+    // Keep the daemon owner in the same SID form the named-pipe peer uses, so
+    // an ordinary-user foreground daemon can authorize its own `aw daemon
+    // stop` request without treating it as an administrator.
+    aw_platform::platform().current_user_id()
+}
+
+#[cfg(not(any(unix, windows)))]
 fn own_user_id() -> Option<String> {
     None
 }
@@ -259,6 +267,7 @@ mod tests {
         Caller {
             user_id: user.to_owned(),
             admin,
+            peer: None,
         }
     }
 

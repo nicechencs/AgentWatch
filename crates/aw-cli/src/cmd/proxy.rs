@@ -10,6 +10,8 @@
 //! stops and asks. `trust` without `--user` is refused: the only supported
 //! scope is the user store, and even that is not installed by this process.
 
+use std::io::{self, IsTerminal, Write};
+
 use crate::exit;
 
 use super::tree::ProxyCmd;
@@ -69,23 +71,52 @@ pub(crate) trait ProxyApi {
     fn note_trust(&mut self, plan: &TrustPlan) -> Result<(), String>;
 }
 
+/// Confirmation boundary for certificate-store plans. Tests can fake terminal
+/// answers without touching the process stdin.
+pub(crate) trait Confirm {
+    /// Ask once and return whether the user explicitly agreed.
+    fn confirm(&mut self, prompt: &str) -> bool;
+}
+
+/// Real terminal confirmation. Redirected stdin is an immediate refusal.
+#[derive(Debug, Default)]
+pub(crate) struct StdinConfirm;
+
+impl Confirm for StdinConfirm {
+    fn confirm(&mut self, prompt: &str) -> bool {
+        if !io::stdin().is_terminal() {
+            return false;
+        }
+        let _ = write!(io::stderr(), "{prompt}");
+        let _ = io::stderr().flush();
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).is_ok()
+            && matches!(
+                answer.trim().to_ascii_lowercase().as_str(),
+                "是" | "y" | "yes"
+            )
+    }
+}
+
 /// Production client. No socket is opened.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct UnwiredProxy;
 
-const UNWIRED: &str = "后台代理 API 未接通；aw proxy 不会读取 ca.key。请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）";
+const CA_INFO_UNWIRED: &str = "`aw proxy ca-info` 本版本未接入";
+const ROTATE_CA_UNWIRED: &str = "`aw proxy rotate-ca` 本版本未接入";
+const TRUST_UNWIRED: &str = "后台代理 API 未接通；aw proxy 不会读取 ca.key。请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）";
 
 impl ProxyApi for UnwiredProxy {
     fn ca_info(&mut self) -> Result<CaInfoView, String> {
-        Err(UNWIRED.to_owned())
+        Err(CA_INFO_UNWIRED.to_owned())
     }
 
     fn rotate(&mut self, _revoke_now: bool) -> Result<CaInfoView, String> {
-        Err(UNWIRED.to_owned())
+        Err(ROTATE_CA_UNWIRED.to_owned())
     }
 
     fn note_trust(&mut self, _plan: &TrustPlan) -> Result<(), String> {
-        Err(UNWIRED.to_owned())
+        Err(TRUST_UNWIRED.to_owned())
     }
 }
 
@@ -94,7 +125,13 @@ impl ProxyApi for UnwiredProxy {
 /// `confirm` is the extra `--confirm` switch for `trust` / `untrust`. The clap
 /// tree does not have that flag yet (the tree is shared and this card does not
 /// edit it), so dispatch passes `false` and `trust` always stops at the prompt.
-pub(crate) fn run(cmd: &ProxyCmd, json: bool, confirm: bool, api: &mut dyn ProxyApi) -> Outcome {
+pub(crate) fn run(
+    cmd: &ProxyCmd,
+    json: bool,
+    yes: bool,
+    api: &mut dyn ProxyApi,
+    confirm: &mut dyn Confirm,
+) -> Outcome {
     match cmd {
         ProxyCmd::CaInfo => match api.ca_info() {
             Ok(info) => render_info(&info, json),
@@ -104,7 +141,7 @@ pub(crate) fn run(cmd: &ProxyCmd, json: bool, confirm: bool, api: &mut dyn Proxy
             Ok(info) => render_info(&info, json),
             Err(detail) => super::error_outcome(exit::UNREACHABLE, "unreachable", &detail, json),
         },
-        ProxyCmd::Trust { user } => {
+        ProxyCmd::Trust { user, .. } => {
             if !user {
                 return super::error_outcome(
                     exit::USAGE,
@@ -113,8 +150,9 @@ pub(crate) fn run(cmd: &ProxyCmd, json: bool, confirm: bool, api: &mut dyn Proxy
                     json,
                 );
             }
-            let plan = trust_plan(confirm);
-            if !confirm {
+            let confirmed = yes || confirm.confirm("将修改当前用户证书库。确定吗？[是/否]");
+            let plan = trust_plan(confirmed);
+            if !confirmed {
                 return render_plan(&plan, json, true);
             }
             match api.note_trust(&plan) {
@@ -124,14 +162,15 @@ pub(crate) fn run(cmd: &ProxyCmd, json: bool, confirm: bool, api: &mut dyn Proxy
                 }
             }
         }
-        ProxyCmd::Untrust => {
+        ProxyCmd::Untrust { .. } => {
+            let confirmed = yes || confirm.confirm("将修改当前用户证书库。确定吗？[是/否]");
             let plan = TrustPlan {
                 action: "untrust",
                 scope: "user",
                 steps: untrust_steps(),
-                confirmed: confirm,
+                confirmed,
             };
-            if !confirm {
+            if !confirmed {
                 return render_plan(&plan, json, true);
             }
             match api.note_trust(&plan) {

@@ -19,6 +19,8 @@
 //! confirmation ([`Confirm`]) they exit 2, and a non-TTY with no `--yes`
 //! refuses rather than prompting.
 
+use std::io::{self, IsTerminal, Write};
+
 use serde_json::json;
 
 use crate::exit;
@@ -146,8 +148,8 @@ impl Clock for FixedClock {
 pub(crate) enum DbOp {
     /// `stats`.
     Stats,
-    /// `vacuum`.
-    Vacuum,
+    /// `vacuum`. `yes` skips the terminal confirmation.
+    Vacuum { yes: bool },
     /// `migrate`.
     Migrate {
         /// `--dry-run`.
@@ -182,6 +184,27 @@ pub(crate) struct NotInteractive;
 impl Confirm for NotInteractive {
     fn confirm(&mut self, _prompt: &str) -> bool {
         false
+    }
+}
+
+/// Production confirmation. It prompts only when stdin is a terminal, so a
+/// redirected invocation cannot hang or accept an accidental default answer.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct StdinConfirm;
+
+impl Confirm for StdinConfirm {
+    fn confirm(&mut self, prompt: &str) -> bool {
+        if !io::stdin().is_terminal() {
+            return false;
+        }
+        let _ = write!(io::stderr(), "{prompt}");
+        let _ = io::stderr().flush();
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).is_ok()
+            && matches!(
+                answer.trim().to_ascii_lowercase().as_str(),
+                "是" | "y" | "yes"
+            )
     }
 }
 
@@ -241,6 +264,9 @@ pub(crate) enum DbApiError {
     Failed { detail: String },
     /// Authenticated and refused. Exit 4.
     Forbidden { detail: String },
+    /// The local channel could not establish a trustworthy peer identity.
+    /// This preserves the fixed IPC failure wording. Exit 4.
+    IdentityFailure { detail: String, code: &'static str },
 }
 
 impl std::fmt::Display for DbApiError {
@@ -249,6 +275,7 @@ impl std::fmt::Display for DbApiError {
             Self::Unreachable { detail } => write!(f, "{detail}"),
             Self::Failed { detail } => write!(f, "{detail}"),
             Self::Forbidden { detail } => write!(f, "{detail}"),
+            Self::IdentityFailure { detail, .. } => write!(f, "{detail}"),
         }
     }
 }
@@ -406,10 +433,12 @@ impl DbApi for HttpDbApi {
                 opt_db_u64(value, "max_db_bytes")?,
             ),
         };
-        // `sessions` on this view is the unpinned count. The daemon sends a
-        // table row count, which includes pinned rows, so it is not that
-        // number. Leave both counts unset rather than print the table size as
-        // "unpinned". The table line still shows `sessions`.
+        // The daemon's `sessions` table count is the only count it currently
+        // exports. It is a real total even though it is not split by pin state.
+        let sessions = tables
+            .iter()
+            .find(|(name, _)| name == "sessions")
+            .map(|(_, rows)| *rows);
         Ok(DbStatsView {
             db_bytes: opt_db_u64(&body, "db_bytes")?,
             wal_bytes: opt_db_u64(&body, "wal_bytes")?,
@@ -418,7 +447,7 @@ impl DbApi for HttpDbApi {
             oldest_ended_ns,
             max_age_days,
             max_db_bytes,
-            sessions: None,
+            sessions,
             pinned_sessions: None,
         })
     }
@@ -564,11 +593,18 @@ fn opt_db_u64(value: &serde_json::Value, name: &str) -> Result<Option<u64>, DbAp
 }
 
 fn client_to_db(err: crate::client::ClientError) -> DbApiError {
+    if let Some(code) = err.identity_failure_code() {
+        return DbApiError::IdentityFailure {
+            detail: clip_db(&err.to_string()),
+            code,
+        };
+    }
     match &err {
         crate::client::ClientError::Unreachable { .. } => DbApiError::Unreachable {
             detail: clip_db(&err.to_string()),
         },
         crate::client::ClientError::Forbidden { .. }
+        | crate::client::ClientError::UntrustedServer { .. }
         | crate::client::ClientError::Status {
             status: 401 | 403, ..
         } => DbApiError::Forbidden {
@@ -603,13 +639,13 @@ pub(crate) fn run(
             Ok(view) => stats_view_outcome(&view, json),
             Err(err) => api_error(err, json),
         },
-        DbOp::Vacuum => {
-            if !confirm.confirm("VACUUM 会重写数据库，可能耗时很久。是否继续？")
+        DbOp::Vacuum { yes } => {
+            if !yes && !confirm.confirm("将压缩数据库，可能耗时很久。确定吗？[是/否]")
             {
                 return super::error_outcome(
                     exit::USAGE,
                     "usage",
-                    "`db vacuum` 会重写数据库；请在终端确认，否则拒绝这个非交互调用",
+                    "现在不在终端里，没法确认删除。确定要删的话，请加上 `--yes`（删除后无法恢复）",
                     json,
                 );
             }
@@ -620,6 +656,12 @@ pub(crate) fn run(
         }
         DbOp::Migrate { dry_run } => match api.migrate(dry_run) {
             Ok(report) => migrate_outcome(&report, json),
+            Err(DbApiError::Forbidden { .. }) => super::error_outcome(
+                exit::PERMISSION,
+                "permission",
+                "需要管理员权限才能迁移数据库",
+                json,
+            ),
             Err(err) => api_error(err, json),
         },
         DbOp::Purge {
@@ -689,13 +731,12 @@ fn purge_api(args: PurgeArgs<'_>, api: &mut dyn DbApi, confirm: &mut dyn Confirm
             json,
         );
     }
-    let confirmed =
-        yes || confirm.confirm("purge 会删除已结束的会话。保留和活动会话会留下。是否继续？");
+    let confirmed = yes || confirm.confirm("将删除 N 个会话，删除后无法恢复。确定吗？[是/否]");
     if !confirmed {
         return super::error_outcome(
             exit::USAGE,
             "usage",
-            "`db purge` 会删除会话；请传入 --yes 或在终端确认。没有 --yes 的非交互调用会被拒绝",
+            "现在不在终端里，没法确认删除。确定要删的话，请加上 `--yes`（删除后无法恢复）",
             json,
         );
     }
@@ -713,6 +754,7 @@ fn api_error(err: DbApiError, json: bool) -> Outcome {
     let (code, machine) = match &err {
         DbApiError::Unreachable { .. } => (exit::UNREACHABLE, "unreachable"),
         DbApiError::Forbidden { .. } => (exit::PERMISSION, "permission"),
+        DbApiError::IdentityFailure { code, .. } => (exit::PERMISSION, *code),
         DbApiError::Failed { .. } => (exit::GENERAL, "db"),
     };
     super::error_outcome(code, machine, &err.to_string(), json)
@@ -821,7 +863,7 @@ pub(crate) fn run_store(
 ) -> Outcome {
     match op {
         DbOp::Stats => stats_outcome(&store.stats(), json),
-        DbOp::Vacuum => match store.vacuum() {
+        DbOp::Vacuum { .. } => match store.vacuum() {
             Ok(detail) => note("vacuum", &detail, json),
             Err(detail) => super::error_outcome(exit::GENERAL, "db", &detail, json),
         },

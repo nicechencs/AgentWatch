@@ -12,6 +12,8 @@
 //! The daemon owns the log path (its data dir), so `aw` never guesses a file
 //! location and never needs read access to it.
 
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::thread;
 use std::time::Duration;
@@ -23,6 +25,9 @@ use super::{error_outcome, Outcome};
 use crate::client::{ApiRequest, Client, Transport};
 use crate::endpoint::Endpoint;
 use crate::exit;
+
+#[cfg(unix)]
+use nix::fcntl::{Flock, FlockArg};
 
 /// How long `stop` waits for `/health` to go away.
 pub(crate) const STOP_WAIT: Duration = Duration::from_secs(20);
@@ -58,17 +63,43 @@ pub(crate) fn daemon_stop(
     wait: Duration,
     json: bool,
 ) -> Outcome {
-    if health(endpoint, open()).is_none() {
-        return ok(state_line("stopped", "没有运行", endpoint, json));
+    match health(endpoint, open()) {
+        Ok(_) => {}
+        Err(crate::client::ClientError::Unreachable { .. }) => {
+            return ok(state_line("stopped", "没有运行", endpoint, json));
+        }
+        Err(err) => return client_error(&err, endpoint, json),
     }
     let mut client = Client::new(endpoint.clone(), open());
     if let Err(err) = client.call(&ApiRequest::post_json("/api/v1/daemon/stop", &json!({}))) {
+        if err.identity_failure_code().is_some() {
+            return client_error(&err, endpoint, json);
+        }
+        if is_permission_error(&err) {
+            return error_outcome(
+                exit::PERMISSION,
+                "permission",
+                "需要管理员权限才能停止后台",
+                json,
+            );
+        }
         return client_error(&err, endpoint, json);
     }
     let mut waited = Duration::ZERO;
     loop {
-        if health(endpoint, open()).is_none() {
-            return ok(state_line("stopped", "后台已停止", endpoint, json));
+        match health(endpoint, open()) {
+            Err(crate::client::ClientError::Unreachable { .. }) => {
+                return ok(state_line("stopped", "后台已停止", endpoint, json));
+            }
+            Ok(_) => {}
+            // An identity refusal is an answer, not a stop in progress.
+            Err(err) if err.identity_failure_code().is_some() => {
+                return client_error(&err, endpoint, json);
+            }
+            // A reset or half-closed connection while the old daemon tears
+            // down is still "stopping": keep polling until it is unreachable
+            // or the wait runs out (which is reported, never claimed stopped).
+            Err(_) => {}
         }
         if waited >= wait {
             return error_outcome(
@@ -97,7 +128,18 @@ pub(crate) fn daemon_restart(
 ) -> Outcome {
     let stopped = daemon_stop(endpoint, open, stop_wait, json);
     if stopped.code != exit::OK {
+        if stopped.code == exit::PERMISSION {
+            return error_outcome(
+                exit::PERMISSION,
+                "permission",
+                "需要管理员权限才能重启后台",
+                json,
+            );
+        }
         return stopped;
+    }
+    if let Err(detail) = wait_for_shutdown_release(endpoint, stop_wait) {
+        return error_outcome(exit::GENERAL, "restart_timeout", &detail, json);
     }
     let started = daemon_start(endpoint, open, starter, start_wait, json);
     if json || started.code != exit::OK {
@@ -106,6 +148,70 @@ pub(crate) fn daemon_restart(
     let mut stdout = stopped.stdout;
     stdout.extend_from_slice(&started.stdout);
     Outcome { stdout, ..started }
+}
+
+/// Wait until the old daemon has released its internal-channel start lock.
+///
+/// `POST /daemon/stop` is deliberately acknowledged before the foreground
+/// loop has flushed collectors and closed its store.  The health endpoint goes
+/// away when IPC starts shutting down, which is earlier than releasing this
+/// lock.  Starting at that point races the old daemon's data-dir lock.
+///
+/// Unix sockets have an adjacent flock specifically for serialising startup.
+/// Named pipes and HTTP have no equivalent lock file, so their daemon-side
+/// bounded instance-lock retry is the fallback.
+fn wait_for_shutdown_release(endpoint: &Endpoint, wait: Duration) -> Result<(), String> {
+    #[cfg(unix)]
+    let lock = match endpoint {
+        Endpoint::Unix { path } => {
+            let mut name = path.as_os_str().to_owned();
+            name.push(".lock");
+            Some(std::path::PathBuf::from(name))
+        }
+        _ => None,
+    };
+    #[cfg(not(unix))]
+    let lock: Option<std::path::PathBuf> = None;
+
+    let Some(lock) = lock else {
+        return Ok(());
+    };
+    let mut waited = Duration::ZERO;
+    loop {
+        if channel_lock_is_free(&lock)? {
+            return Ok(());
+        }
+        if waited >= wait {
+            return Err(format!(
+                "agentwatchd 已停止响应，但 {} 秒后仍未释放重启锁；没有启动新实例，以免与旧实例争用数据目录 [{endpoint}]",
+                wait.as_secs()
+            ));
+        }
+        thread::sleep(STOP_POLL);
+        waited += STOP_POLL;
+    }
+}
+
+#[cfg(unix)]
+fn channel_lock_is_free(path: &std::path::Path) -> Result<bool, String> {
+    let file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(err) => return Err(format!("无法检查重启锁 {}：{}", path.display(), err.kind())),
+    };
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => {
+            drop(lock);
+            Ok(true)
+        }
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(false),
+        Err((_, err)) => Err(format!("无法检查重启锁 {}：{err}", path.display())),
+    }
+}
+
+#[cfg(not(unix))]
+fn channel_lock_is_free(_path: &std::path::Path) -> Result<bool, String> {
+    Ok(true)
 }
 
 /// One logs read: `(text, next offset)`.
@@ -118,7 +224,20 @@ fn fetch(
     let mut client = Client::new(endpoint.clone(), open());
     let reply = client
         .call(&ApiRequest::get_query("/api/v1/daemon/logs", query))
-        .map_err(|err| client_error(&err, endpoint, json))?;
+        .map_err(|err| {
+            if err.identity_failure_code().is_some() {
+                client_error(&err, endpoint, json)
+            } else if is_permission_error(&err) {
+                error_outcome(
+                    exit::PERMISSION,
+                    "permission",
+                    "需要管理员权限才能查看后台日志",
+                    json,
+                )
+            } else {
+                client_error(&err, endpoint, json)
+            }
+        })?;
     let body = reply.json().unwrap_or(Value::Null);
     let text = body
         .get("text")
@@ -127,6 +246,18 @@ fn fetch(
         .to_owned();
     let offset = body.get("offset").and_then(Value::as_u64).unwrap_or(0);
     Ok((body, text, offset))
+}
+
+fn is_permission_error(error: &crate::client::ClientError) -> bool {
+    matches!(
+        error,
+        crate::client::ClientError::Forbidden { .. }
+            | crate::client::ClientError::UntrustedServer { .. }
+            | crate::client::ClientError::Status {
+                status: 401 | 403,
+                ..
+            }
+    )
 }
 
 /// `-f` loop settings.

@@ -19,7 +19,7 @@ mod sql;
 
 use std::collections::BTreeMap;
 
-use rusqlite::{params_from_iter, Connection, OptionalExtension, Row};
+use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, OptionalExtension, Row};
 
 use crate::query::filter::{parse, Expr};
 // `pub(crate)` so `export` can compile a filter without copying the SQL builder.
@@ -95,6 +95,8 @@ pub struct SessionFilter {
 pub struct SessionListItem {
     /// `sessions.id`.
     pub id: i64,
+    /// Owning user. Returned only to administrator viewers by the daemon.
+    pub user_id: String,
     /// Public id. Not a hostname.
     pub public_id: String,
     /// User label, or unknown.
@@ -385,12 +387,32 @@ pub fn list_sessions(
     user_id: &str,
     filter: &SessionFilter,
 ) -> Result<Vec<SessionListItem>, QueryError> {
+    list_sessions_visible(conn, Some(user_id), filter)
+}
+
+/// Sessions visible to an administrator, newest first.
+pub fn list_all_sessions(
+    conn: &Connection,
+    filter: &SessionFilter,
+) -> Result<Vec<SessionListItem>, QueryError> {
+    list_sessions_visible(conn, None, filter)
+}
+
+fn list_sessions_visible(
+    conn: &Connection,
+    user_id: Option<&str>,
+    filter: &SessionFilter,
+) -> Result<Vec<SessionListItem>, QueryError> {
     let pred = compile_optional(filter.expr.as_deref(), Target::Sessions, None, None)?;
     let mut sql = String::from(
-        "SELECT id, public_id, name, mode, platform, os_version, agent, started_ns, ended_ns, end_reason, pinned, collectors, argv \
-         FROM sessions WHERE user_id = ?",
+        "SELECT id, public_id, user_id, name, mode, platform, os_version, agent, started_ns, ended_ns, end_reason, pinned, collectors, argv \
+         FROM sessions WHERE 1 = 1",
     );
-    let mut bind: Vec<Param> = vec![Param::Text(user_id.to_string())];
+    let mut bind: Vec<Param> = Vec::new();
+    if let Some(user_id) = user_id {
+        sql.push_str(" AND user_id = ?");
+        bind.push(Param::Text(user_id.to_string()));
+    }
     if let Some(q) = filter.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         // `instr` treats every byte in user text literally, unlike `LIKE`.
         // `argv` is a redacted JSON array when present. Check validity before
@@ -445,17 +467,18 @@ pub fn list_sessions(
             Ok(SessionListItem {
                 id: row.get(0)?,
                 public_id: row.get(1)?,
-                name: row.get(2)?,
-                mode: row.get(3)?,
-                platform: row.get(4)?,
-                os_version: row.get(5)?,
-                agent: row.get(6)?,
-                started_ns: row.get(7)?,
-                ended_ns: row.get(8)?,
-                end_reason: row.get(9)?,
-                pinned: row.get(10)?,
-                collectors: row.get(11)?,
-                argv: row.get(12)?,
+                user_id: row.get(2)?,
+                name: row.get(3)?,
+                mode: row.get(4)?,
+                platform: row.get(5)?,
+                os_version: row.get(6)?,
+                agent: row.get(7)?,
+                started_ns: row.get(8)?,
+                ended_ns: row.get(9)?,
+                end_reason: row.get(10)?,
+                pinned: row.get(11)?,
+                collectors: row.get(12)?,
+                argv: row.get(13)?,
                 counts: SessionCounts::default(),
             })
         })
@@ -556,27 +579,62 @@ pub fn process_tree(
     user_id: &str,
     session_id: i64,
 ) -> Result<Option<Vec<ProcessNode>>, QueryError> {
+    process_tree_filtered(conn, user_id, session_id, None)
+}
+
+/// Process tree narrowed by the shared filter compiler.
+///
+/// A matching child whose parent was filtered out becomes a root. This makes
+/// the result truthful: the missing parent was not returned, rather than
+/// inventing an ancestor that did not match.
+pub fn process_tree_filtered(
+    conn: &Connection,
+    user_id: &str,
+    session_id: i64,
+    filter: Option<&StoreExpr>,
+) -> Result<Option<Vec<ProcessNode>>, QueryError> {
     if !session_visible(conn, user_id, session_id)? {
         return Ok(None);
     }
+    let pred = match filter {
+        Some(expr) => compile_predicate(
+            expr,
+            StoreTarget::Procs,
+            &CompileCtx {
+                session_start_ns: session_started(conn, session_id)?,
+                ..CompileCtx::default()
+            },
+        )?,
+        None => Compiled {
+            sql: "1".to_owned(),
+            params: Vec::new(),
+            target: StoreTarget::Procs,
+            warnings: Vec::new(),
+        },
+    };
+    let mut sql = String::from(
+        "SELECT processes.proc_uid, processes.pid, processes.parent_uid, processes.depth, \
+                processes.start_ns, processes.exit_ns, processes.exit_code, processes.evidence, \
+                (SELECT CASE \
+                    WHEN exe IS NULL THEN NULL \
+                    ELSE replace(exe, rtrim(exe, replace(replace(exe, char(92), char(47)), char(47), '')), '') \
+                 END FROM process_images i \
+                 WHERE i.session_id = processes.session_id AND i.proc_uid = processes.proc_uid \
+                 ORDER BY i.ts_ns DESC LIMIT 1) \
+         FROM processes WHERE processes.session_id = ? AND (",
+    );
+    sql.push_str(&pred.sql);
+    sql.push_str(") ORDER BY processes.start_ns, processes.proc_uid");
+    let mut bind = vec![SqlValue::Integer(session_id)];
+    bind.extend(pred.params.into_iter().map(|param| match param {
+        StoreParam::Text(text) => SqlValue::Text(text),
+        StoreParam::Int(value) => SqlValue::Integer(value),
+    }));
     let mut stmt = conn
-        .prepare(
-            "SELECT p.proc_uid, p.pid, p.parent_uid, p.depth, p.start_ns, p.exit_ns, p.exit_code, \
-                    p.evidence, \
-                    (SELECT CASE \
-                        WHEN exe IS NULL THEN NULL \
-                        ELSE replace(exe, rtrim(exe, replace(replace(exe, char(92), char(47)), char(47), '')), '') \
-                     END \
-                     FROM process_images i \
-                     WHERE i.session_id = p.session_id AND i.proc_uid = p.proc_uid \
-                     ORDER BY i.ts_ns DESC LIMIT 1) \
-             FROM processes p \
-             WHERE p.session_id = ? \
-             ORDER BY p.start_ns, p.proc_uid",
-        )
+        .prepare(&sql)
         .map_err(|err| QueryError::sqlite("process_tree", err))?;
     let flat = stmt
-        .query_map(rusqlite::params![session_id], |row| {
+        .query_map(params_from_iter(bind.iter()), |row| {
             Ok(FlatProc {
                 proc_uid: row.get(0)?,
                 pid: row.get(1)?,
@@ -1054,6 +1112,11 @@ pub fn search(
     limit: Option<i64>,
 ) -> Result<Vec<SearchHit>, QueryError> {
     let page = clamp_page(limit)?;
+    // A pre-FTS database can retain `storage.fts = true` (or be opened by a
+    // caller which cached that setting) while its optional 0005 table is
+    // absent. Search remains usable by using the `instr` query rather than
+    // preparing a statement against the missing table.
+    let fts = fts && fts_table_present(conn)?;
     let needle_param = if fts {
         StoreParam::Text(crate::fts::match_query(needle))
     } else {
@@ -1123,6 +1186,15 @@ pub fn search(
         hits.retain(|hit| hit.ts_ns.unwrap_or(i64::MIN) >= since);
     }
     Ok(hits)
+}
+
+fn fts_table_present(conn: &Connection) -> Result<bool, QueryError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fts_text')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(|err| QueryError::sqlite("probe_fts_text", err))
 }
 
 /// The caller's newest session: the greatest `started_ns`, then the greatest
@@ -2301,7 +2373,7 @@ mod tests {
     use super::*;
 
     fn conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = crate::open_in_memory_connection().unwrap();
         conn.execute_batch(include_str!("../../migrations/0001_init.sql"))
             .unwrap();
         conn.execute(
@@ -2760,7 +2832,7 @@ mod tests {
         let conn = conn();
         session(&conn, 1, "user-a", 1);
         proc_row(&conn, 1, 7, 100, None, 1);
-        let tx = conn.unchecked_transaction().unwrap();
+        let tx = crate::migrate::immediate_transaction(&conn).unwrap();
         for i in 0..20_000_i64 {
             let domain = if i % 50 == 0 {
                 "hit.example.com"
@@ -2841,6 +2913,21 @@ mod tests {
         assert!(search(&conn, "other", "node", false, None, None)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn search_falls_back_when_fts_is_enabled_but_its_table_is_missing() {
+        // An old database can retain `storage.fts = true` while migration
+        // 0005 was skipped. Passing true reproduces the caller's setting.
+        let conn = conn();
+        conn.execute_batch(include_str!("../../migrations/0003_file_access.sql"))
+            .unwrap();
+        session(&conn, 1, "u", 10);
+        image(&conn, 1, 7, 1_000, Some("/usr/bin/node"));
+
+        let hits = search(&conn, "u", "node", true, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text.as_deref(), Some("/usr/bin/node"));
     }
 
     /// UI review of #143, detail 7: the list said 「不可得」 where the

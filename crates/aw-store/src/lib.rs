@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod agent_events;
+mod connection;
 mod error;
 mod export;
 mod file_access;
@@ -31,6 +32,10 @@ pub use retention::{
 pub use agent_events::{
     insert_agent_event, insert_self_report_gap, session_id_by_public, store_agent_event,
     AgentEventInsert,
+};
+pub use connection::{
+    configure_connection, open_connection, open_connection_with_flags, open_in_memory_connection,
+    BUSY_TIMEOUT,
 };
 pub use error::StoreError;
 pub use export::{
@@ -57,19 +62,20 @@ pub use migrate::{
 };
 pub use query::{
     around, around_sql, compile_predicate, compile_store_expr, delete_session, dns_events,
-    ensure_timeline, files, flow_buckets, flows, gaps, keyset_suffix, list_sessions,
-    newest_session_for_user, parse_filter, patch_session, process_detail, process_tree,
-    public_id_by_session_id, search, search_sql, search_sql_instr, session_by_public_id,
-    session_counts, session_summary, stop_session, timeline, timeline_histogram, traffic,
-    AroundRow, CompileCtx, Compiled, Cursor, DnsEvent, DnsPage, FileGroupBy, FilePage, FileQuery,
-    FileRow, FilterExpr, FlowBucket, FlowGroupBy, FlowQuery, FlowRow, FlowSort, GapItem,
-    HistBucket, ProcessDetail, ProcessImage, ProcessNode, QueryError, SearchHit, SessionCounts,
-    SessionFilter, SessionListItem, SessionSummary, StoreExpr, StoreField, StoreOp, StoreParam,
-    StoreTarget, StoreTerm, StoreValue, TimelinePage, TimelineQuery, TimelineRow, TrafficBucket,
+    ensure_timeline, files, flow_buckets, flows, gaps, keyset_suffix, list_all_sessions,
+    list_sessions, newest_session_for_user, parse_filter, patch_session, process_detail,
+    process_tree, process_tree_filtered, public_id_by_session_id, search, search_sql,
+    search_sql_instr, session_by_public_id, session_counts, session_summary, stop_session,
+    timeline, timeline_histogram, traffic, AroundRow, CompileCtx, Compiled, Cursor, DnsEvent,
+    DnsPage, FileGroupBy, FilePage, FileQuery, FileRow, FilterExpr, FlowBucket, FlowGroupBy,
+    FlowQuery, FlowRow, FlowSort, GapItem, HistBucket, ProcessDetail, ProcessImage, ProcessNode,
+    QueryError, SearchHit, SessionCounts, SessionFilter, SessionListItem, SessionSummary,
+    StoreExpr, StoreField, StoreOp, StoreParam, StoreTarget, StoreTerm, StoreValue, TimelinePage,
+    TimelineQuery, TimelineRow, TrafficBucket,
 };
 pub use sink::{
     apply_file_schema, DnsRow, GapRow, NetFlowBucketRow, NetFlowRow, ProcessImageRow, ProcessRow,
-    RecordSink, SessionRow, SqliteSink, WriteBatch,
+    RecordSink, SessionRow, SqliteSink, WriteBatch, MAX_ROWS_PER_TRANSACTION,
 };
 
 /// Empty marker so the daemon can name this crate before it constructs a [`Store`].

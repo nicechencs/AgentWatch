@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
@@ -184,6 +185,9 @@ pub struct ApiState {
     pub query: StoreQuery,
     /// Effective config snapshot for `GET /config`. Not a secret store.
     pub config_json: serde_json::Value,
+    /// The configuration file that supplied `config_json`. Kept in memory only
+    /// so an administrator's `config set` can merge a single key into it.
+    pub config_path: Option<PathBuf>,
     /// SSE subscribers, keyed by session public id. Slow clients are lagged.
     pub live: LiveHub,
     /// `AW_UI_DEV_URL`, captured at construction. Empty means embedded assets.
@@ -210,6 +214,7 @@ impl Default for ApiState {
             next_session: 0,
             query: StoreQuery::disconnected(),
             config_json: serde_json::json!({}),
+            config_path: None,
             live: LiveHub::default(),
             ui_dev_url: match crate::assets::AssetMode::from_env() {
                 crate::assets::AssetMode::DevProxy { origin } => Some(origin),
@@ -1110,6 +1115,7 @@ fn req_host_bad(host: &Option<String>, port: u16) -> bool {
         caller: Some(Caller {
             user_id: "probe".to_owned(),
             admin: false,
+            peer: None,
         }),
         operation: "probe".to_owned(),
         session_owner: None,
@@ -1157,13 +1163,16 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
             let rows: Vec<Value> = visible
                 .into_iter()
                 .map(|session| {
-                    json!({
+                    let mut row = json!({
                         "id": session.id,
-                        "user_id": session.user_id,
                         "name": session.name,
                         "platform": null,
                         "os_version": null,
-                    })
+                    });
+                    if caller.admin {
+                        row["user_id"] = Value::String(session.user_id.clone());
+                    }
+                    row
                 })
                 .collect();
             return ApiResponse::json(200, &json!({ "sessions": rows }));
@@ -1172,13 +1181,13 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
             Ok(q) => q,
             Err(response) => return response,
         };
-        return match state.query.list_sessions(&caller.user_id, &query) {
+        return match state.query.list_sessions_for_viewer(caller, &query) {
             Ok(page) => {
                 let rows: Vec<Value> = page
                     .rows
                     .iter()
                     .map(|row| {
-                        json!({
+                        let mut value = json!({
                             "id": row.public_id,
                             "session_id": row.id,
                             "name": row.name,
@@ -1193,7 +1202,11 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
                             "collectors": stored_collectors_json(&row.collectors),
                             "argv": super::query::argv_value(row.argv.as_deref()),
                             "stats": counts_json(&row.counts),
-                        })
+                        });
+                        if caller.admin {
+                            value["user_id"] = Value::String(row.user_id.clone());
+                        }
+                        value
                     })
                     .collect();
                 ApiResponse::json(
@@ -1260,13 +1273,7 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
         ("POST", "/api/v1/db/vacuum") => db_admin(state, caller, StoreOp::Vacuum),
         ("POST", "/api/v1/db/migrate") => db_admin(state, caller, StoreOp::Migrate),
         ("PUT", "/api/v1/config") => put_config(state, caller, &req.body),
-        ("GET", "/api/v1/config") => ApiResponse::json(
-            200,
-            &json!({
-                "config": state.config_json,
-                "builtin_redaction_rules": builtin_redaction_json(),
-            }),
-        ),
+        ("GET", "/api/v1/config") => get_config(state, &req.query),
         ("GET", "/api/v1/openapi.json") => {
             ApiResponse::json(200, &super::openapi::document(req.listen_port))
         }
@@ -1452,15 +1459,34 @@ fn session_sub(
                 &json!({ "id": sid, "user_id": owner, "name": session.name }),
             );
         }
-        return map_summary(state.query.session_detail(&caller.user_id, &sid));
+        let owner = match state.query.owner_for_viewer(caller, &sid) {
+            Ok(Some(owner)) => owner,
+            Ok(None) => return not_found_session(),
+            Err(err) => return from_backend(err),
+        };
+        return map_summary(state.query.session_detail(&owner, &sid));
     }
     if tail.is_empty() && method == "DELETE" {
+        let requested_owner = query_value(query, "owner");
         if memory.is_none() {
-            return match state.query.delete_session(&caller.user_id, &sid) {
+            let owner = match mutation_owner(state, caller, &sid, requested_owner) {
+                Ok(owner) => owner,
+                Err(response) => return response,
+            };
+            return match state.query.delete_session(&owner, &sid) {
                 Ok(None) => not_found_session(),
                 Ok(Some(())) => ApiResponse::json(200, &json!({ "deleted": sid })),
                 Err(err) => from_backend(err),
             };
+        }
+        let allowed =
+            owner == caller.user_id || (caller.admin && requested_owner == Some(owner.as_str()));
+        if !allowed {
+            return error_response(
+                403,
+                "owner_action_forbidden",
+                "only the session owner may operate it",
+            );
         }
         let input = AuthInput {
             http: false,
@@ -1573,22 +1599,60 @@ fn patch_memory_or_store(
     let value: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
     let name = value.get("name").and_then(serde_json::Value::as_str);
     let pinned = value.get("pinned").and_then(serde_json::Value::as_bool);
+    let requested_owner = value.get("owner").and_then(serde_json::Value::as_str);
     if let Some(session) = state.sessions.iter_mut().find(|row| row.id == sid) {
-        if !caller.admin && session.user_id != caller.user_id {
-            return not_found_session();
+        if session.user_id != caller.user_id
+            && (!caller.admin || requested_owner != Some(session.user_id.as_str()))
+        {
+            return error_response(
+                403,
+                "owner_action_forbidden",
+                "only the session owner may operate it",
+            );
         }
         if let Some(name) = name {
             session.name = name.to_owned();
         }
         return ApiResponse::json(200, &json!({ "id": sid, "name": session.name }));
     }
-    match state
-        .query
-        .patch_session(&caller.user_id, sid, name, pinned)
-    {
+    let owner = match mutation_owner(state, caller, sid, requested_owner) {
+        Ok(owner) => owner,
+        Err(response) => return response,
+    };
+    match state.query.patch_session(&owner, sid, name, pinned) {
         Ok(None) => not_found_session(),
         Ok(Some(())) => ApiResponse::json(200, &json!({ "id": sid })),
         Err(err) => from_backend(err),
+    }
+}
+
+/// Owner-only actions cannot be widened by merely being root: the caller must
+/// name the target owner explicitly.  The owner comes from the stored row,
+/// never from the request, and `@last` was resolved as the caller's own row.
+fn mutation_owner(
+    state: &ApiState,
+    caller: &Caller,
+    sid: &str,
+    requested_owner: Option<&str>,
+) -> Result<String, ApiResponse> {
+    let owner = match state.query.owner_for_viewer(caller, sid) {
+        Ok(Some(owner)) => owner,
+        Ok(None) => return Err(not_found_session()),
+        Err(error) => return Err(from_backend(error)),
+    };
+    let allowed = if owner == caller.user_id {
+        requested_owner.is_none() || (caller.admin && requested_owner == Some(owner.as_str()))
+    } else {
+        caller.admin && requested_owner == Some(owner.as_str())
+    };
+    if allowed {
+        Ok(owner)
+    } else {
+        Err(error_response(
+            403,
+            "owner_action_forbidden",
+            "only the session owner may operate it",
+        ))
     }
 }
 
@@ -1793,6 +1857,29 @@ pub fn error_response(status: u16, code: &str, message: &str) -> ApiResponse {
     )
 }
 
+/// A measured SQLite lock timeout. The human message deliberately says only
+/// that the service is writing; SQLite's English diagnostic stays in a log and
+/// the structured JSON `detail`, never in a localized UI/CLI sentence.
+pub(crate) fn database_busy_response(err: &aw_store::StoreError) -> Option<ApiResponse> {
+    let waited_seconds = err.busy_waited_seconds()?;
+    let detail = err.busy_detail().unwrap_or_default();
+    tracing::warn!(waited_seconds, sqlite_detail = %detail, "session database remained busy");
+    let message = format!(
+        "The session database is busy (the service is writing). Waited {waited_seconds} s and still couldn't get in; try again later."
+    );
+    Some(ApiResponse::json(
+        503,
+        &json!({
+            "error": {
+                "code": "db_busy",
+                "message": message,
+                "waited_seconds": waited_seconds,
+                "detail": detail,
+            }
+        }),
+    ))
+}
+
 fn error_at(status: u16, code: &str, message: &str, offset: Option<usize>) -> ApiResponse {
     let mut body = json!({ "error": { "code": code, "message": message } });
     if let Some(offset) = offset {
@@ -1816,6 +1903,26 @@ fn from_backend(err: QueryBackendError) -> ApiResponse {
             error_response(404, "no_sessions", "this account has no sessions")
         }
         QueryBackendError::Unimplemented { what } => not_implemented(what),
+        QueryBackendError::Busy {
+            waited_seconds,
+            detail,
+        } => {
+            tracing::warn!(waited_seconds, sqlite_detail = %detail, "session database remained busy");
+            let message = format!(
+                "The session database is busy (the service is writing). Waited {waited_seconds} s and still couldn't get in; try again later."
+            );
+            ApiResponse::json(
+                503,
+                &json!({
+                    "error": {
+                        "code": "db_busy",
+                        "message": message,
+                        "waited_seconds": waited_seconds,
+                        "detail": detail,
+                    }
+                }),
+            )
+        }
         QueryBackendError::Store(message) => error_response(500, "store", &message),
     }
 }
@@ -1982,7 +2089,19 @@ fn session_query_route(
         Ok(q) => q,
         Err(response) => return Some(response),
     };
-    let user = caller.user_id.as_str();
+    // Store helpers take a user id because their SQL predicates enforce
+    // ownership.  Resolve the actual row owner first for an administrator;
+    // the `Caller` itself came solely from peer credentials / a bound token.
+    let owner = if state.query.db_path.is_some() {
+        match state.query.owner_for_viewer(caller, sid) {
+            Ok(Some(owner)) => Some(owner),
+            Ok(None) => return Some(not_found_session()),
+            Err(err) => return Some(from_backend(err)),
+        }
+    } else {
+        None
+    };
+    let user = owner.as_deref().unwrap_or(caller.user_id.as_str());
     // Memory stub sessions are not in SQLite. Query endpoints 404 them the same
     // way a hidden id does, except `/live`, which is in-process.
     let response = match (method, tail) {
@@ -2011,30 +2130,42 @@ fn session_query_route(
         },
         ("GET", "files") => map_opt(state.query.files(user, sid, &parsed)),
         ("GET", "live") => live_snapshot(state, sid, caller, &parsed),
-        ("POST", "stop") => match state.query.stop_session(user, sid) {
-            Ok(None) => stop_memory(state, sid, caller),
-            Ok(Some(public_id)) => {
-                // A `/sessions/run` the CLI never adopted (it could not start the
-                // program) has no process to record. Stopping it discards the
-                // empty row instead of leaving a session that never ran.
-                let unadopted = state.pending_launches.contains_key(&public_id);
-                super::watch_routes::stopped(state, &public_id);
-                if unadopted {
-                    match state.query.delete_session(user, &public_id) {
-                        Ok(Some(())) => {
-                            return Some(ApiResponse::json(
-                                200,
-                                &json!({ "stopped": sid, "id": public_id, "discarded": true }),
-                            ));
-                        }
-                        Ok(None) => {}
-                        Err(err) => return Some(from_backend(err)),
-                    }
-                }
-                ApiResponse::json(200, &json!({ "stopped": sid, "id": public_id }))
+        ("POST", "stop") => {
+            // Viewing a foreign session is useful to an administrator, but a
+            // mutating action must name that session's owner explicitly.  The
+            // owner came from the store after peer-credential authorization;
+            // it is never accepted as an authority-bearing request field.
+            let requested_owner = query_value(query, "owner");
+            if owner.as_deref() != Some(caller.user_id.as_str())
+                && !(caller.admin && requested_owner == owner.as_deref())
+            {
+                return Some(owner_action_forbidden());
             }
-            Err(err) => from_backend(err),
-        },
+            match state.query.stop_session(user, sid) {
+                Ok(None) => stop_memory(state, sid, caller),
+                Ok(Some(public_id)) => {
+                    // A `/sessions/run` the CLI never adopted (it could not start the
+                    // program) has no process to record. Stopping it discards the
+                    // empty row instead of leaving a session that never ran.
+                    let unadopted = state.pending_launches.contains_key(&public_id);
+                    super::watch_routes::stopped(state, &public_id);
+                    if unadopted {
+                        match state.query.delete_session(user, &public_id) {
+                            Ok(Some(())) => {
+                                return Some(ApiResponse::json(
+                                    200,
+                                    &json!({ "stopped": sid, "id": public_id, "discarded": true }),
+                                ));
+                            }
+                            Ok(None) => {}
+                            Err(err) => return Some(from_backend(err)),
+                        }
+                    }
+                    ApiResponse::json(200, &json!({ "stopped": sid, "id": public_id }))
+                }
+                Err(err) => from_backend(err),
+            }
+        }
         _ => {
             return session_p3_route(
                 state,
@@ -2051,6 +2182,14 @@ fn session_query_route(
         }
     };
     Some(response)
+}
+
+fn owner_action_forbidden() -> ApiResponse {
+    error_response(
+        403,
+        "owner_action_forbidden",
+        "only the session owner may operate it",
+    )
 }
 
 struct P3Route<'a> {
@@ -2185,7 +2324,7 @@ fn add_row_details(state: &ApiState, body: &mut serde_json::Value) {
         return;
     };
     let Ok(conn) =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        aw_store::open_connection_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
     else {
         return;
     };
@@ -2248,7 +2387,7 @@ fn live_snapshot(state: &ApiState, sid: &str, caller: &Caller, query: &ListQuery
     // the id, still serve the hub: the store check below hides foreign ids
     // when a database is configured.
     if !visible && state.query.db_path.is_some() {
-        match state.query.session_detail(&caller.user_id, sid) {
+        match state.query.owner_for_viewer(caller, sid) {
             Ok(None) | Err(_) => return not_found_session(),
             Ok(Some(_)) => {}
         }
@@ -2335,6 +2474,7 @@ fn doctor(state: &ApiState) -> ApiResponse {
             "capabilities": crate::collector_state::doctor_capabilities(&caps),
             "host": {
                 "os": std::env::consts::OS,
+                "version": aw_platform::os_version(),
                 "privileged": crate::privilege::current(),
                 "privileged_note": "poll collector only in this build; eBPF, ETW, and eslogger are not attached even when privileged",
             },
@@ -2360,6 +2500,33 @@ fn search(state: &ApiState, caller: &Caller, req: &HttpRequest) -> ApiResponse {
     }
 }
 
+fn get_config(state: &ApiState, query: &str) -> ApiResponse {
+    let mut config = state.config_json.clone();
+    if let Some(key) = query_value(query, "key") {
+        for part in key.split('.') {
+            let Some(next) = config.get(part) else {
+                return error_response(400, "invalid_config_key", &format!("未知配置键 `{key}`"));
+            };
+            config = next.clone();
+        }
+        return ApiResponse::json(200, &json!({ "config": config }));
+    }
+    ApiResponse::json(
+        200,
+        &json!({
+            "config": config,
+            "builtin_redaction_rules": builtin_redaction_json(),
+        }),
+    )
+}
+
+fn query_value<'a>(query: &'a str, wanted: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == wanted).then_some(value)
+    })
+}
+
 fn put_config(state: &mut ApiState, caller: &Caller, body: &[u8]) -> ApiResponse {
     let input = AuthInput {
         http: false,
@@ -2374,13 +2541,38 @@ fn put_config(state: &mut ApiState, caller: &Caller, body: &[u8]) -> ApiResponse
     if !matches!(authorize(&input), AuthDecision::Allow(_)) {
         return forbidden();
     }
-    let value: serde_json::Value = match serde_json::from_slice(body) {
+    let input: serde_json::Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(_) => return error_response(400, "bad_request", "config body is not JSON"),
     };
-    // In-memory only. Disk write and hot reload belong to the config owner.
-    state.config_json = value;
-    ApiResponse::json(200, &json!({ "applied": "memory" }))
+    let Some(key) = input.get("key").and_then(Value::as_str) else {
+        return error_response(400, "bad_request", "配置请求缺少 key");
+    };
+    let Some(value) = input.get("value") else {
+        return error_response(400, "bad_request", "配置请求缺少 value");
+    };
+    let Some(path) = state.config_path.as_deref() else {
+        return error_response(409, "config_path_unavailable", "后台没有可写的配置文件");
+    };
+    let config = match crate::config::merge_set_path(path, key, value) {
+        Ok(config) => config,
+        Err(crate::config::ConfigError::Invalid { detail, .. }) => {
+            return error_response(
+                400,
+                "invalid_config",
+                &format!("配置键 `{key}` 无效：{detail}"),
+            );
+        }
+        Err(err) => {
+            return error_response(500, "config_write_failed", &format!("无法写入配置：{err}"))
+        }
+    };
+    state.config_json = crate::config::effective_json(&config);
+    state.preview_ui = config.debug.preview_ui;
+    ApiResponse::json(
+        200,
+        &json!({ "applied": "file", "config": state.config_json }),
+    )
 }
 
 fn static_asset(state: &ApiState, req: &HttpRequest) -> ApiResponse {
@@ -2744,7 +2936,7 @@ mod tests {
 
     /// Session row `(mode, ended_ns, end_reason, exit_code)` by public id.
     fn session_end(db: &std::path::Path, sid: &str) -> Option<SessionEnd> {
-        rusqlite::Connection::open(db)
+        aw_store::open_connection(db)
             .and_then(|c| {
                 c.query_row(
                     "SELECT mode, ended_ns, end_reason, exit_code FROM sessions WHERE public_id = ?1",
@@ -2756,7 +2948,7 @@ mod tests {
     }
 
     fn proc_rows(db: &std::path::Path, sid: &str, pid: u32) -> i64 {
-        rusqlite::Connection::open(db)
+        aw_store::open_connection(db)
             .and_then(|c| {
                 c.query_row(
                     "SELECT COUNT(*) FROM processes p JOIN sessions s ON s.id = p.session_id \
@@ -2773,7 +2965,7 @@ mod tests {
         sid: &str,
         pid: u32,
     ) -> Option<(Option<i64>, Option<i64>)> {
-        rusqlite::Connection::open(db)
+        aw_store::open_connection(db)
             .and_then(|c| {
                 c.query_row(
                     "SELECT p.exit_ns, p.exit_code FROM processes p JOIN sessions s ON s.id = p.session_id \
@@ -3014,11 +3206,11 @@ mod tests {
         let (dir, db) = seeded_db("null-platform", "");
         // New rows require a platform, but a query must remain useful for an
         // imported older row whose column is nullable.
-        let legacy_schema = rusqlite::Connection::open(&db).and_then(|connection| {
+        let legacy_schema = aw_store::open_connection(&db).and_then(|connection| {
             connection.execute_batch(
                 "
                 PRAGMA foreign_keys = OFF;
-                BEGIN;
+                BEGIN IMMEDIATE;
                 CREATE TABLE sessions_legacy (
                   id INTEGER PRIMARY KEY,
                   public_id TEXT NOT NULL UNIQUE,
@@ -3242,7 +3434,7 @@ mod tests {
             child.try_wait().ok().flatten().is_none(),
             "target still running"
         );
-        let argv: String = rusqlite::Connection::open(&db)
+        let argv: String = aw_store::open_connection(&db)
             .and_then(|c| {
                 c.query_row(
                     "SELECT argv FROM sessions WHERE public_id = ?1",
@@ -3258,7 +3450,7 @@ mod tests {
     }
 
     fn session_count(db: &std::path::Path) -> i64 {
-        rusqlite::Connection::open(db)
+        aw_store::open_connection(db)
             .and_then(|c| c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)))
             .unwrap_or(-1)
     }
@@ -3372,7 +3564,7 @@ mod tests {
             let (status, response) = post(state, &token, "/api/v1/sessions/run", body);
             assert_eq!(status, 201, "{response}");
             let sid = response["id"].as_str().unwrap_or_default().to_owned();
-            rusqlite::Connection::open(&db)
+            aw_store::open_connection(&db)
                 .and_then(|c| {
                     c.query_row(
                         "SELECT name FROM sessions WHERE public_id = ?1",
@@ -3451,7 +3643,7 @@ mod tests {
 
         // A pid can be reused. Seed another depth-0 row with this pid but a
         // different identity; `/exit` must only update the adopted root row.
-        let (db_id, root_proc_uid, start_ns): (i64, i64, i64) = rusqlite::Connection::open(&db)
+        let (db_id, root_proc_uid, start_ns): (i64, i64, i64) = aw_store::open_connection(&db)
             .and_then(|conn| {
                 let db_id: i64 = conn.query_row(
                     "SELECT id FROM sessions WHERE public_id = ?1",
@@ -3472,7 +3664,7 @@ mod tests {
             })
             .expect("adopted root row");
         let reused_proc_uid = root_proc_uid.wrapping_add(1);
-        rusqlite::Connection::open(&db)
+        aw_store::open_connection(&db)
             .and_then(|conn| {
                 conn.execute(
                     "INSERT INTO processes \
@@ -3495,7 +3687,7 @@ mod tests {
         );
         assert_eq!(status, 200, "{body}");
         let root_code = |db: &std::path::Path| -> Vec<Option<i64>> {
-            let conn = rusqlite::Connection::open(db).expect("db");
+            let conn = aw_store::open_connection(db).expect("db");
             let mut stmt = conn
                 .prepare(
                     "SELECT p.exit_code FROM processes p JOIN sessions s ON s.id = p.session_id \
@@ -3508,7 +3700,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(root_code(&db), vec![Some(7)], "before any poll");
-        let reused_code: Option<i64> = rusqlite::Connection::open(&db)
+        let reused_code: Option<i64> = aw_store::open_connection(&db)
             .and_then(|conn| {
                 conn.query_row(
                     "SELECT exit_code FROM processes WHERE session_id = ?1 AND proc_uid = ?2",
@@ -3602,7 +3794,7 @@ mod tests {
         assert_eq!(body["id"], sid);
         assert_eq!(body["exit_code"], 7);
         assert_eq!(session_end(&db, &sid).and_then(|row| row.3), Some(7));
-        let root_code: Option<i64> = rusqlite::Connection::open(&db)
+        let root_code: Option<i64> = aw_store::open_connection(&db)
             .and_then(|c| {
                 c.query_row(
                     "SELECT p.exit_code FROM processes p JOIN sessions s ON s.id = p.session_id \
@@ -3980,7 +4172,7 @@ mod tests {
             .map(|rows| rows.iter().filter_map(|r| r["id"].as_str()).collect())
             .unwrap_or_default();
         assert_eq!(ids, vec!["s-usersess"], "{body}");
-        let ended: Option<i64> = rusqlite::Connection::open(&db)
+        let ended: Option<i64> = aw_store::open_connection(&db)
             .and_then(|c| {
                 c.query_row("SELECT ended_ns FROM sessions WHERE id = 2", [], |r| {
                     r.get(0)
@@ -3989,6 +4181,182 @@ mod tests {
             .unwrap_or(Some(-1));
         assert_eq!(ended, None, "root's session was not stopped");
         assert_eq!(call(&user, "GET", "/api/v1/sessions/s-usersess").0, 200);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admin_can_view_and_export_all_but_must_name_owner_for_mutations() {
+        let (dir, db) = seeded_db(
+            "admin-session-scope",
+            "INSERT INTO sessions (id, public_id, name, mode, user_id, started_ns, platform, collectors, pinned) VALUES \
+               (1, 's-alice', 'alice-session', 'attach', 'alice', 10, 'linux', '[]', 0), \
+               (2, 's-root', 'root-session', 'attach', 'root', 20, 'linux', '[]', 0);",
+        );
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let alice = token_for(&mut state, "alice", false);
+        let root = token_for(&mut state, "root", true);
+        let mut call = |token: &str, method: &str, path: &str, query: &str, body: &[u8]| {
+            let mut request = req(method, path, Some("127.0.0.1:7456"), Some(token), body);
+            request.query = query.to_owned();
+            dispatch(&mut state, &request)
+        };
+
+        let admin_list = call(&root, "GET", "/api/v1/sessions", "", b"");
+        assert_eq!(admin_list.status, 200);
+        let rows = json_body(&admin_list)["sessions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|row| row["user_id"].is_string()),
+            "{rows:?}"
+        );
+
+        // A token identifies Alice. A caller-supplied identity header cannot
+        // widen the query to root's session.
+        drop(call);
+        let mut claimed_admin = req(
+            "GET",
+            "/api/v1/sessions",
+            Some("127.0.0.1:7456"),
+            Some(&alice),
+            b"",
+        );
+        claimed_admin
+            .headers
+            .insert("x-user-id".to_owned(), "root".to_owned());
+        let alice_list = dispatch(&mut state, &claimed_admin);
+        assert_eq!(alice_list.status, 200);
+        let rows = json_body(&alice_list)["sessions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "s-alice");
+        assert!(rows[0].get("user_id").is_none());
+
+        let mut call = |token: &str, method: &str, path: &str, query: &str, body: &[u8]| {
+            let mut request = req(method, path, Some("127.0.0.1:7456"), Some(token), body);
+            request.query = query.to_owned();
+            dispatch(&mut state, &request)
+        };
+
+        // Views and export span owners for a peer-identified administrator.
+        assert_eq!(
+            call(&root, "GET", "/api/v1/sessions/s-alice", "", b"").status,
+            200
+        );
+        assert_eq!(
+            call(
+                &root,
+                "GET",
+                "/api/v1/sessions/s-alice/export",
+                "format=jsonl",
+                b""
+            )
+            .status,
+            200
+        );
+        // `@last` remains root's own newest session rather than Alice's.
+        let last = call(&root, "GET", "/api/v1/sessions/@last", "", b"");
+        assert_eq!(last.status, 200);
+        assert_eq!(json_body(&last)["id"], "s-root");
+
+        // Mutations need the actual stored owner. A missing or invented owner
+        // cannot turn read-all administrator scope into write-all scope.
+        for query in ["", "owner=bob"] {
+            let response = call(&root, "POST", "/api/v1/sessions/s-alice/stop", query, b"{}");
+            assert_eq!(response.status, 403, "{query}");
+            assert_eq!(
+                json_body(&response)["error"]["code"],
+                "owner_action_forbidden"
+            );
+        }
+        assert_eq!(
+            call(
+                &root,
+                "PATCH",
+                "/api/v1/sessions/s-alice",
+                "",
+                br#"{"name":"renamed"}"#,
+            )
+            .status,
+            403
+        );
+        assert_eq!(
+            call(
+                &root,
+                "PATCH",
+                "/api/v1/sessions/s-alice",
+                "",
+                br#"{"name":"renamed","owner":"alice"}"#,
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            call(
+                &root,
+                "PATCH",
+                "/api/v1/sessions/s-alice",
+                "",
+                br#"{"pinned":true}"#,
+            )
+            .status,
+            403
+        );
+        assert_eq!(
+            call(
+                &root,
+                "PATCH",
+                "/api/v1/sessions/s-alice",
+                "",
+                br#"{"pinned":true,"owner":"alice"}"#,
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            call(
+                &root,
+                "POST",
+                "/api/v1/sessions/s-alice/stop",
+                "owner=alice",
+                b"{}"
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            call(
+                &root,
+                "PATCH",
+                "/api/v1/sessions/s-alice",
+                "",
+                br#"{"pinned":false,"owner":"alice"}"#,
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            call(&root, "DELETE", "/api/v1/sessions/s-alice", "", b"").status,
+            403
+        );
+        let deleted = call(
+            &root,
+            "DELETE",
+            "/api/v1/sessions/s-alice",
+            "owner=alice",
+            b"",
+        );
+        assert_eq!(
+            deleted.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&deleted.body)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4019,7 +4387,7 @@ mod tests {
             (response.status, json_body(&response))
         };
         let count = || {
-            rusqlite::Connection::open(&db)
+            aw_store::open_connection(&db)
                 .and_then(|c| {
                     c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
                 })
@@ -4167,6 +4535,7 @@ mod tests {
         let peer = super::Caller {
             user_id: "alice".to_owned(),
             admin: false,
+            peer: None,
         };
         let over_channel =
             super::take_slow(&mut state, &request(None, "format=jsonl"), Some(&peer));

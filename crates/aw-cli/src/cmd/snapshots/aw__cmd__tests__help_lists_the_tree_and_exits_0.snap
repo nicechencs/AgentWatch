@@ -4,49 +4,40 @@ expression: help
 ---
 AgentWatch 命令行客户端
 
-Usage: aw [OPTIONS] <COMMAND>
+用法: aw [OPTIONS] <COMMAND>
 
-Commands:
-  run       启动模式
+命令：
+  run       启动程序并记录
   attach    附着到已有进程
-  stop      停止监控，不结束进程
+  stop      停止记录（程序继续运行）
   ps        列出可附着的进程
-  sessions  会话
-  timeline  时间线
-  procs     进程
+  sessions  查看和管理会话
+  timeline  查看会话时间线
+  procs     会话里的进程（含退出码）
   files     文件访问
-  flows     网络流
+  flows     会话里的网络流
   http      HTTP 记录
-  findings  发现
+  findings  查看发现
   gaps      采集缺口
   around    查看某条记录前后的事件
   search    跨会话搜索
-  export    导出
-  ui        打开本地 Web UI
-  doctor    自检
-  daemon    管理 daemon
+  export    导出会话记录
+  ui        打开 AgentWatch 界面
+  doctor    检查本机能力
+  daemon    管理后台
   config    配置
-  proxy     代理 CA
   db        数据库
-  fixtures  开发用夹具
-  group     监控组
-  agents    Agent 实例
-  links     Agent 间链路
-  rpc       MCP 或 A2A 调用
-  chain     委托链路
   merge     跨主机离线合并
-  hook      接收 Agent hook 事件
-  mcp-tap   stdio 透明包装器
-  dev       单进程模式
+  hook      由智能体自动调用，一般不用手动运行
   version   版本
 
-Options:
+选项：
       --json             机器可读的 JSON 输出
       --socket <SOCKET>  Unix socket 或 Windows 命名管道
       --http <HTTP>      改用回环 HTTP。只接受 http://127.0.0.1:<port> 或 http://localhost:<port>
       --token <TOKEN>    HTTP Bearer 令牌，也可用环境变量 AW_TOKEN。不会写入日志
-      --lang <LANG>      语言：zh 或 en [possible values: zh, en]
+      --lang <LANG>      语言：zh 或 en
   -q, --quiet            安静模式
   -v, --verbose...       更详细的日志，可重复
-  -h, --help             Print help
+  -h, --help             显示帮助
   -V, --version          Print version

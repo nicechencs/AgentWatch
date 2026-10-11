@@ -8,18 +8,18 @@ const catalogs = { zh, en } as const;
 const expected = {
   zh: {
     stopped: ["已停止记录", null],
-    exited: ["已停止", null],
+    exited: ["程序已退出", null],
     user_stop: ["已停止记录", null],
-    program_exit: ["已停止", null],
+    program_exit: ["程序已退出", null],
     daemon_restart: ["记录已中断", "后台重启，记录已中断"],
     daemon_shutdown: ["记录已中断", "后台重启，记录已中断"],
     stop: ["停止记录", "程序还在运行，只是不再记录"],
   },
   en: {
     stopped: ["Recording stopped", null],
-    exited: ["stopped", null],
+    exited: ["Program exited", null],
     user_stop: ["Recording stopped", null],
-    program_exit: ["stopped", null],
+    program_exit: ["Program exited", null],
     daemon_restart: ["Recording interrupted", "The background service restarted; recording was interrupted"],
     daemon_shutdown: ["Recording interrupted", "The background service restarted; recording was interrupted"],
     stop: ["Stop recording", "The program is still running; it is just no longer recorded"],

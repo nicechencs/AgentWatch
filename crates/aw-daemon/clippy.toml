@@ -1,0 +1,3 @@
+disallowed-methods = [
+  { path = "aw_platform::IdentifiedCaller::current_user", reason = "后台只能用连接方身份启动程序，不能用后台自己的身份" },
+]

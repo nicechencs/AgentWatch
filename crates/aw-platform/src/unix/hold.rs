@@ -1253,7 +1253,11 @@ mod tests {
         // `sh` inserts `PWD` (its own working directory) into a command it runs.
         // That is the shell, not the environment it was exec'd with. Everything
         // else must be exactly the base five plus the one requested name.
-        got.retain(|line| !line.starts_with("PWD="));
+        // macOS's `sh` (bash) also adds `SHLVL` and `_`; those come from the
+        // shell too, not from the environment it was exec'd with.
+        got.retain(|line| {
+            !line.starts_with("PWD=") && !line.starts_with("SHLVL=") && !line.starts_with("_=")
+        });
         let mut want: Vec<String> = base
             .iter()
             .map(|(key, value)| format!("{key}={value}"))

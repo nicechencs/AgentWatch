@@ -358,6 +358,11 @@ impl SpawnedChild for ProcessChild {
 struct PlatformChild {
     held: Option<Box<dyn aw_platform::HeldChild>>,
     released: Option<Box<dyn aw_platform::ReleasedChild>>,
+    /// The program name, for the one launch error that may repeat it (the
+    /// child reports a lookup miss at release). Not an argument.
+    program: String,
+    /// The working directory the caller asked for, for the directory sentence.
+    cwd: Option<String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -393,7 +398,9 @@ impl SpawnedChild for PlatformChild {
                 self.released = Some(released);
                 Ok(())
             }
-            Err(error) => Err(platform_child_error(error).1),
+            // A lookup or cwd miss is reported by the child at release; use
+            // the same sentence (with the program name) as Linux and Windows.
+            Err(error) => Err(platform_spawn_error(&self.program, self.cwd.as_deref(), error).1),
         }
     }
 
@@ -610,6 +617,8 @@ impl Spawner for CommandSpawner {
             Ok(Box::new(PlatformChild {
                 held: Some(held),
                 released: None,
+                program: program.clone(),
+                cwd: spec.cwd.clone(),
             }))
         }
         #[cfg(windows)]

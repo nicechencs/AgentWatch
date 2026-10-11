@@ -45,6 +45,12 @@ jobs:
         run: scripts/check-daemon-current-user.sh
       - name: cargo test
         run: cargo test --workspace --no-fail-fast
+        # Temporary mac129 diagnosis: the macOS job runs only the two terminal
+        # tests that return 129, with the signal recorder enabled. Remove with
+        # the diagnostic commit.
+        env:
+          AW_MAC129_DIAG: ${{ runner.os == 'macOS' && '1' || '' }}
+          AW_MAC129_FILTER: ${{ runner.os == 'macOS' && 'mac129_sh_background_child_records_signals,forwarded_interrupt_reaches_the_group_and_removes_grandchild,pty_default_and_no_daemon_cover_input_signals_and_terminal_close' || '' }}
       # Review 14:40: `aw daemon uninstall --purge --data-dir` exists only in
       # test builds (feature test-purge-data-dir). Run its own tests with the
       # feature, then prove the RELEASE binary rejects the flag and leaves an

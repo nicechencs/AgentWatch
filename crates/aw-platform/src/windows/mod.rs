@@ -1,8 +1,8 @@
 //! Windows process identity.  FFI stays in the smallest functions that need it.
 
 use crate::{
-    Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner, PeerIdentity,
-    PipeServerVerificationError, Platform, PlatformError, ProcessEntry, ProcessKey,
+    is_reserved_env_name, Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner,
+    PeerIdentity, PipeServerVerificationError, Platform, PlatformError, ProcessEntry, ProcessKey,
     SamplingProcess, SpawnRequest, UnsupportedKind,
 };
 use std::collections::BTreeMap;
@@ -11,7 +11,7 @@ use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use windows::core::{Error, PWSTR};
 use windows::Win32::Foundation::{
@@ -44,6 +44,7 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -72,6 +73,10 @@ pub(crate) struct CurrentPlatform;
 /// named-pipe exchange has successfully read a client token.  A compiled API
 /// alone is not evidence that the service can identify its callers.
 static PIPE_PEER_IDENTIFICATION_WORKS: AtomicBool = AtomicBool::new(false);
+
+/// Counts malformed UTF-16 entries received from `CreateEnvironmentBlock`.
+/// The entries themselves are deliberately not retained or logged.
+static ACCOUNT_BASE_ENV_INVALID_UTF16_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
 const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 
@@ -918,6 +923,191 @@ fn current_data_dir_policy() -> Result<DataDirPolicy, PlatformError> {
     })();
     close(token);
     policy
+}
+
+const ACCOUNT_BASE_ENV_ALLOWLIST: [&str; 16] = [
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    "ComSpec",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "USERNAME",
+    "USERDOMAIN",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+    "ProgramFiles",
+];
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+/// Owns the `userenv.dll` allocation until every entry has been copied out.
+struct ProfileEnvironmentBlock {
+    pointer: *mut c_void,
+}
+
+impl ProfileEnvironmentBlock {
+    fn for_current_process_token() -> Result<Self, PlatformError> {
+        let mut token = HANDLE::default();
+        // SAFETY: the current-process pseudo-handle is valid and `token` is
+        // writable storage for the owned TOKEN_QUERY handle.
+        #[allow(unsafe_code)]
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+            .map_err(io_error)?;
+
+        let mut pointer = std::ptr::null_mut();
+        // SAFETY: `token` is an open token for the current process; `pointer`
+        // is valid writable storage. Passing false prevents inheriting the
+        // daemon environment into the account-profile environment block.
+        #[allow(unsafe_code)]
+        let created = unsafe { CreateEnvironmentBlock(&mut pointer, token, false) };
+        close(token);
+        created.map_err(io_error)?;
+        if pointer.is_null() {
+            return Err(PlatformError::Invalid {
+                capability: "account_base_env",
+                detail: "CreateEnvironmentBlock returned a null environment",
+            });
+        }
+        Ok(Self { pointer })
+    }
+
+    fn entries(&self) -> Vec<Vec<u16>> {
+        let mut entries = Vec::new();
+        // SAFETY: CreateEnvironmentBlock returned a live, double-NUL
+        // terminated UTF-16 environment block. We copy each NUL-delimited
+        // entry before this owner calls DestroyEnvironmentBlock in Drop.
+        #[allow(unsafe_code)]
+        unsafe {
+            let mut cursor = self.pointer.cast::<u16>();
+            loop {
+                let start = cursor;
+                while *cursor != 0 {
+                    cursor = cursor.add(1);
+                }
+                if cursor == start {
+                    break;
+                }
+                let length = cursor.offset_from(start) as usize;
+                entries.push(std::slice::from_raw_parts(start, length).to_vec());
+                cursor = cursor.add(1);
+            }
+        }
+        entries
+    }
+}
+
+impl Drop for ProfileEnvironmentBlock {
+    fn drop(&mut self) {
+        if !self.pointer.is_null() {
+            // SAFETY: the pointer was allocated by CreateEnvironmentBlock and
+            // remains owned by this wrapper until this single Drop call.
+            #[allow(unsafe_code)]
+            let _ = unsafe { DestroyEnvironmentBlock(self.pointer) };
+        }
+    }
+}
+
+struct FilteredProfileEnvironment {
+    values: Vec<(String, String)>,
+    invalid_utf16_entries: u64,
+}
+
+fn account_base_env_name(name: &str) -> bool {
+    ACCOUNT_BASE_ENV_ALLOWLIST
+        .iter()
+        .any(|allowed| name.eq_ignore_ascii_case(allowed))
+}
+
+fn insert_profile_value(values: &mut Vec<(String, String)>, name: String, value: String) {
+    if let Some((existing_name, existing_value)) = values
+        .iter_mut()
+        .find(|(existing_name, _)| existing_name.eq_ignore_ascii_case(&name))
+    {
+        *existing_name = name;
+        *existing_value = value;
+    } else {
+        values.push((name, value));
+    }
+}
+
+fn filter_profile_environment_entries(
+    entries: impl IntoIterator<Item = Vec<u16>>,
+) -> FilteredProfileEnvironment {
+    let mut values = Vec::new();
+    let mut invalid_utf16_entries = 0_u64;
+    for entry in entries {
+        let Ok(entry) = String::from_utf16(&entry) else {
+            invalid_utf16_entries = invalid_utf16_entries.saturating_add(1);
+            continue;
+        };
+        let Some((name, value)) = entry.split_once('=') else {
+            continue;
+        };
+        if account_base_env_name(name) {
+            // The profile's own spelling is kept. The Windows environment
+            // lookup rules remain case-insensitive at process creation time.
+            insert_profile_value(&mut values, name.to_owned(), value.to_owned());
+        }
+    }
+    FilteredProfileEnvironment {
+        values,
+        invalid_utf16_entries,
+    }
+}
+
+fn fixed_path(system_root: &str) -> String {
+    format!(
+        "{system_root}\\system32;{system_root};{system_root}\\System32\\Wbem;{system_root}\\System32\\WindowsPowerShell\\v1.0\\"
+    )
+}
+
+fn account_base_env_from_profile(
+    mut values: Vec<(String, String)>,
+) -> Result<Vec<(String, String)>, PlatformError> {
+    let Some(system_root) = values
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("SystemRoot"))
+        .map(|(_, value)| value.clone())
+    else {
+        return Err(PlatformError::Invalid {
+            capability: "account_base_env",
+            detail: "profile environment has no SystemRoot",
+        });
+    };
+    if !values
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("PATHEXT"))
+    {
+        values.push(("PATHEXT".to_owned(), DEFAULT_PATHEXT.to_owned()));
+    }
+    // Do not preserve a daemon- or profile-provided Path. This fixed search
+    // path is the contract for a process started by the daemon.
+    values.retain(|(name, _)| !name.eq_ignore_ascii_case("Path"));
+    values.push(("Path".to_owned(), fixed_path(&system_root)));
+    Ok(values)
+}
+
+/// Build the Windows launch base environment from the current account profile.
+///
+/// `CreateEnvironmentBlock` consults the account profile/registry. Passing
+/// `bInherit = FALSE` ensures no daemon-process variables are copied in.
+pub fn account_base_env() -> Result<Vec<(String, String)>, PlatformError> {
+    let block = ProfileEnvironmentBlock::for_current_process_token()?;
+    let filtered = filter_profile_environment_entries(block.entries());
+    ACCOUNT_BASE_ENV_INVALID_UTF16_ENTRIES
+        .fetch_add(filtered.invalid_utf16_entries, Ordering::Relaxed);
+    account_base_env_from_profile(filtered.values)
+}
+
+/// Windows treats environment variable names case-insensitively.
+#[must_use]
+pub fn windows_reserved_env_name(name: &str) -> bool {
+    is_reserved_env_name(name, true)
 }
 
 fn image_for_process(process: HANDLE) -> Option<PathBuf> {
@@ -1855,9 +2045,12 @@ pub fn os_version() -> Option<String> {
 mod tests {
     #[allow(unused_imports)] // Kept with the named-pipe-fix test import set.
     use super::{
-        close, current_token_owner, data_dir_policy_for_token, environment_from, open_data_object,
+        account_base_env, account_base_env_from_profile, account_base_env_name, close,
+        current_token_owner, data_dir_policy_for_token, environment_from,
+        filter_profile_environment_entries, fixed_path, open_data_object,
         secure_data_dir_with_policy, set_data_dir_dacl, sid_text, trusted_pipe_owner,
-        CurrentPlatform, DataDirAcl, DataDirPolicy, ADMINISTRATORS_SID, SYSTEM_SID,
+        windows_reserved_env_name, CurrentPlatform, DataDirAcl, DataDirPolicy, ADMINISTRATORS_SID,
+        SYSTEM_SID,
     };
     use crate::{
         platform, Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner,
@@ -1884,6 +2077,128 @@ mod tests {
     struct DaclReadback {
         protected: bool,
         aces: Vec<(String, u32, u8)>,
+    }
+
+    fn account_value<'a>(environment: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        environment
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn profile_environment_filter_keeps_only_account_values_and_fixes_path() {
+        let filtered = filter_profile_environment_entries([
+            "sYsTeMrOoT=C:\\Windows".encode_utf16().collect(),
+            "UserName=profile-user".encode_utf16().collect(),
+            "LANG=must-not-pass".encode_utf16().collect(),
+            vec![0xD800],
+        ]);
+        assert_eq!(filtered.invalid_utf16_entries, 1);
+        assert!(filtered
+            .values
+            .iter()
+            .all(|(name, _)| account_base_env_name(name)));
+
+        let environment = account_base_env_from_profile(filtered.values).expect("base environment");
+        assert_eq!(
+            account_value(&environment, "Path"),
+            Some(
+                "C:\\Windows\\system32;C:\\Windows;C:\\Windows\\System32\\Wbem;C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\"
+            )
+        );
+        assert_eq!(
+            account_value(&environment, "PATHEXT"),
+            Some(".COM;.EXE;.BAT;.CMD")
+        );
+        assert_eq!(
+            account_value(&environment, "sYsTeMrOoT"),
+            Some("C:\\Windows")
+        );
+        assert!(account_value(&environment, "LANG").is_none());
+    }
+
+    #[test]
+    fn windows_reserved_environment_names_are_case_insensitive() {
+        for name in ["Path", "path", "PATH", "Home"] {
+            assert!(windows_reserved_env_name(name), "{name} must be reserved");
+        }
+        for name in ["LANG", "TZ", "LC_ALL"] {
+            assert!(!windows_reserved_env_name(name), "{name} is not reserved");
+        }
+    }
+
+    #[test]
+    fn account_base_environment_ignores_the_daemon_environment() {
+        let expected_path = account_value(
+            &account_base_env().expect("account profile environment"),
+            "Path",
+        )
+        .expect("fixed profile Path")
+        .to_owned();
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "windows::tests::account_base_environment_ignores_the_daemon_environment_in_child",
+                "--nocapture",
+            ])
+            .env("AW_SECRET_PROBE", "must-not-be-in-profile-base-environment")
+            .env("LANG", "daemon-language")
+            .env("TZ", "Daemon/Timezone")
+            .env("Path", r"C:\daemon-only-path")
+            .env("USERPROFILE", r"C:\daemon-only-profile")
+            .env("AW_EXPECTED_PROFILE_PATH", expected_path)
+            // The parent's own USERPROFILE is the real profile of this account;
+            // the child must get it from the profile even though its process
+            // environment says otherwise.
+            .env(
+                "AW_EXPECTED_USERPROFILE",
+                std::env::var("USERPROFILE").expect("test account USERPROFILE"),
+            )
+            .output()
+            .expect("run isolated environment test");
+        assert!(
+            output.status.success(),
+            "isolated environment test stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn account_base_environment_ignores_the_daemon_environment_in_child() {
+        // Only meaningful when started by the parent test above with a
+        // poisoned process environment.
+        let Ok(expected_profile) = std::env::var("AW_EXPECTED_USERPROFILE") else {
+            return;
+        };
+        let environment = account_base_env().expect("account profile environment");
+        assert!(environment
+            .iter()
+            .all(|(name, _)| { account_base_env_name(name) || name.eq_ignore_ascii_case("Path") }));
+        for forbidden in ["AW_SECRET_PROBE", "LANG", "TZ"] {
+            assert!(
+                account_value(&environment, forbidden).is_none(),
+                "{forbidden} leaked from the daemon environment"
+            );
+        }
+
+        let system_root = account_value(&environment, "SystemRoot").expect("profile SystemRoot");
+        let path = account_value(&environment, "Path").expect("fixed Path");
+        assert_eq!(path, fixed_path(system_root));
+        assert_eq!(
+            path,
+            std::env::var("AW_EXPECTED_PROFILE_PATH").expect("expected profile Path")
+        );
+        assert_ne!(path, r"C:\daemon-only-path");
+        assert_ne!(
+            account_value(&environment, "USERPROFILE"),
+            Some(r"C:\daemon-only-profile")
+        );
+        // USERPROFILE points at the caller's (this account's) profile.
+        assert_eq!(
+            account_value(&environment, "USERPROFILE").map(str::to_ascii_lowercase),
+            Some(expected_profile.to_ascii_lowercase())
+        );
     }
 
     /// `icacls`-equivalent readback used by the ACL test. It deliberately

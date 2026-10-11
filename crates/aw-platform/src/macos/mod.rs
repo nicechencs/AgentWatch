@@ -14,7 +14,7 @@
 #[allow(dead_code)]
 mod launch;
 mod spawn;
-pub use spawn::gate_main;
+pub use spawn::{gate_main, GATE_ARG};
 
 use crate::{
     Capability, CapabilityStatus, IdentifiedCaller, Owner, PeerIdentity, Platform, PlatformError,

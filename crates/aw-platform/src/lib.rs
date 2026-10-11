@@ -21,6 +21,8 @@ mod linux;
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::gate_main;
+#[cfg(target_os = "macos")]
+pub use macos::GATE_ARG;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "linux")]
@@ -239,28 +241,13 @@ pub struct IdentifiedCaller {
     owner: Owner,
 }
 impl IdentifiedCaller {
+    /// The only way to name a caller who connected. `PeerIdentity` is built
+    /// inside this crate from an OS credential, so a uid and gid from a
+    /// request cannot become a caller.
     pub fn from_peer(peer: PeerIdentity) -> Self {
         Self { owner: peer.owner }
     }
 
-    /// A caller the operating system already authenticated, named by its
-    /// account rather than by a connection. The daemon uses this for a peer
-    /// whose uid and gid `getpeereid` returned. It is not a request field:
-    /// callers must pass only ids the OS gave them.
-    pub fn from_unix_ids(uid: u32, gid: u32) -> Self {
-        Self {
-            owner: Owner::Unix {
-                ruid: uid,
-                euid: uid,
-                suid: uid,
-                rgid: gid,
-                egid: gid,
-                sgid: gid,
-                // getpeereid reports one gid, not the supplementary list.
-                groups: None,
-            },
-        }
-    }
     pub fn current_user() -> Result<Self, PlatformError> {
         Ok(Self {
             owner: platform().current_owner()?,

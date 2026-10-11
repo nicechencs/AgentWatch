@@ -189,6 +189,8 @@ dependencies = [
  "aw-collector-windows",
  "libc",
  "nix",
+ "serde",
+ "serde_json",
  "windows 0.57.0",
 ]
 

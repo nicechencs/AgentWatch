@@ -293,6 +293,9 @@ mod unix {
             let lock = take_lock(path)?;
             clear_stale(path)?;
             if let Some(reason) = aw_channel::socket_path_too_long(path) {
+                // `reason` is the Chinese sentence. The English token is only
+                // for logs; the bind error shown to the user is the sentence.
+                tracing::warn!(target: "aw_daemon::ipc", path = %path.display(), "unusable socket path");
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
             }
             let listener = UnixListener::bind(path)?;
@@ -389,10 +392,14 @@ mod unix {
     pub(super) fn peer_caller(stream: &UnixStream) -> Result<Caller, aw_platform::PlatformError> {
         let peer = aw_platform::identify_unix_peer(stream)?;
         match peer.owner() {
-            aw_platform::Owner::Unix { euid, .. } => Ok(Caller {
-                user_id: euid.to_string(),
-                admin: *euid == 0,
-            }),
+            aw_platform::Owner::Unix { euid, .. } => {
+                let admin = *euid == 0;
+                Ok(Caller {
+                    user_id: euid.to_string(),
+                    admin,
+                    peer: Some(peer),
+                })
+            }
             aw_platform::Owner::Windows { .. } => {
                 Err(aw_platform::PlatformError::PeerNotIdentified {
                     reason: "Unix socket peer did not have a Unix owner",
@@ -582,10 +589,14 @@ mod pipe {
     ) -> io::Result<()> {
         let caller = match identify_pipe_peer(pipe.as_raw_handle()) {
             Ok(peer) => match peer.owner() {
-                Owner::Windows { sid, elevated, .. } => Caller {
-                    user_id: sid.clone(),
-                    admin: is_admin(sid, *elevated),
-                },
+                Owner::Windows { sid, elevated, .. } => {
+                    let admin = is_admin(sid, *elevated);
+                    Caller {
+                        user_id: sid.clone(),
+                        admin,
+                        peer: Some(peer),
+                    }
+                }
                 Owner::Unix { .. } => unreachable!("Windows pipe peer has a Windows owner"),
             },
             Err(err) => {

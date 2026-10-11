@@ -280,7 +280,7 @@ pub fn socket_path_too_long(path: &Path) -> Option<String> {
         return None;
     }
     Some(format!(
-        "unusable socket path（套接字路径太长：{len} 字节，这个系统的上限是 {limit} 字节（不含结尾的空字节））"
+        "通信口路径太长（{len} 字节），这个系统最多支持 {limit} 字节。请把 `AW_SOCKET` 换到短一点的目录。"
     ))
 }
 
@@ -508,6 +508,8 @@ mod platform {
         timeout: Duration,
     ) -> Result<Vec<u8>, DialError> {
         if let Some(reason) = socket_path_too_long(path) {
+            // The English token stays in this detail: existing tests assert it.
+            // `reason` itself is the Chinese sentence shown to the user.
             return Err(DialError::Unreachable(format!(
                 "{}: unusable socket path ({reason})",
                 path.display()
@@ -914,7 +916,9 @@ mod fallback_tests {
         let len = path.as_os_str().len();
         let reason = super::socket_path_too_long(&path).expect("too long");
         assert!(reason.contains(&len.to_string()), "{reason}");
-        assert!(reason.contains("上限"), "{reason}");
+        assert!(reason.contains("最多支持"), "{reason}");
+        assert!(reason.contains("AW_SOCKET"), "{reason}");
+        assert!(!reason.contains("unusable socket path"), "{reason}");
         assert!(super::socket_path_too_long(std::path::Path::new("/tmp/short.sock")).is_none());
     }
 

@@ -410,25 +410,32 @@ fn create_inner(
                         "the program did not switch to the caller's account and was stopped",
                     )
                 };
-                // macOS: `aw-platform` returns the released child, not a bare pid.
-                // The gate switches accounts before exec and exits 125 if it cannot.
-                // The watcher reaps this handle; dropping it would leave a zombie.
+                // macOS: both accounts go through the hold stage. It blocks on a
+                // pipe, switches (when the caller is someone else) and only then
+                // uses the caller's cwd and env. The watcher reaps this handle.
                 #[cfg(target_os = "macos")]
-                let (pid, child) = match &who {
-                    Some(who) => {
-                        let released = super::launch_as::spawn_as(who, &argv, cwd.as_deref(), &env)
-                            .map_err(|err| match err {
-                                super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
-                                super::launch_as::SpawnAsError::Drop(step) => {
-                                    drop_failed(who.uid, &step)
-                                }
-                            })?;
-                        (released.pid(), ChildHandoff::Released(released))
-                    }
-                    None => {
-                        let child = spawn_as_self(&argv, cwd.as_deref(), &env)?;
-                        (child.id(), ChildHandoff::Process(child))
-                    }
+                let (pid, child) = {
+                    let Some(peer) = caller.peer.clone() else {
+                        return Err(error_response(
+                            403,
+                            "caller_unidentified",
+                            "the caller's account could not be identified",
+                        ));
+                    };
+                    let released = super::launch_as::spawn_as(
+                        peer,
+                        &account_of(who.as_ref(), &caller.user_id)?,
+                        &argv,
+                        cwd.as_deref(),
+                        &env,
+                    )
+                    .map_err(|err| match err {
+                        super::launch_as::SpawnAsError::Program(err) => spawn_error(&err),
+                        super::launch_as::SpawnAsError::Drop(step) => {
+                            drop_failed(caller.user_id.parse().unwrap_or(0), &step)
+                        }
+                    })?;
+                    (released.pid(), ChildHandoff::Released(released))
                 };
                 #[cfg(not(target_os = "macos"))]
                 #[allow(unused_mut)]
@@ -491,6 +498,20 @@ fn create_inner(
             "bad_argument",
             "mode: expected \"attach\" or \"launch\"",
         )),
+    }
+}
+
+/// The account a macOS launch starts as. `who` is `Some` when the daemon must
+/// drop to another account; `None` means the caller is the daemon's own
+/// account, looked up so the program still gets that account's home and shell.
+#[cfg(target_os = "macos")]
+fn account_of(
+    who: Option<&super::launch_as::Identity>,
+    user_id: &str,
+) -> Result<super::launch_as::Identity, ApiResponse> {
+    match who {
+        Some(who) => Ok(who.clone()),
+        None => super::launch_as::own_account(user_id),
     }
 }
 
@@ -940,6 +961,7 @@ mod ownership_tests {
         let caller = Caller {
             user_id: crate::sample::current_user_id(),
             admin: false,
+            peer: None,
         };
         let mut child = std::process::Command::new("sleep")
             .arg("5")

@@ -259,6 +259,7 @@ mod tests {
         Caller {
             user_id: user.to_owned(),
             admin,
+            peer: None,
         }
     }
 

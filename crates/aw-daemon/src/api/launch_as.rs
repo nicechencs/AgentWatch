@@ -159,6 +159,21 @@ fn lookup(_uid: u32) -> Result<Identity, ApiResponse> {
     Err(no_account_switch())
 }
 
+/// This daemon's own account, for a same-uid launch that still has to name a
+/// home and a shell. macOS uses it; the caller id is the one the peer credential
+/// already produced.
+#[cfg(target_os = "macos")]
+pub(crate) fn own_account(user_id: &str) -> Result<Identity, ApiResponse> {
+    let uid = user_id.parse::<u32>().map_err(|_| {
+        error_response(
+            403,
+            "caller_unidentified",
+            "the caller's account could not be identified",
+        )
+    })?;
+    lookup(uid)
+}
+
 /// Environment a dropped launch starts with: `LANG`/`LC_ALL`/`TZ` from the
 /// daemon, the account's basics, then the request's `env`. Nothing else of the
 /// daemon's environment (root's HOME, sockets, tokens) leaks in.
@@ -289,8 +304,7 @@ fn helper_exe() -> std::io::Result<PathBuf> {
 pub(crate) fn helper_main() -> std::process::ExitCode {
     use std::io::{Read, Write};
     use std::os::fd::AsFd;
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, ExitCode, Stdio};
+    use std::process::ExitCode;
 
     // `try_clone_to_owned` duplicates with F_DUPFD_CLOEXEC: `exec` closes it,
     // which is how the daemon learns the program started.
@@ -315,6 +329,20 @@ pub(crate) fn helper_main() -> std::process::ExitCode {
     if let Err(step) = switch_account(&spec) {
         return fail(serde_json::json!({ "drop": step }));
     }
+    // The switch stuck. Only now is the caller's directory entered and the
+    // caller's environment applied, and only to the program being exec'd.
+    // `execve` replaces the environment outright, so nothing this root stage
+    // was started with (and nothing a caller put in `LD_PRELOAD`) is inherited.
+    let err = exec_as_caller(&spec);
+    fail(serde_json::json!({"errno": err}))
+}
+
+/// `execve` of the caller's program with the caller's environment. Runs only
+/// after [`switch_account`]. Does not return on success.
+#[cfg(target_os = "linux")]
+fn exec_as_caller(spec: &HelperSpec) -> i32 {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
     let err = Command::new(&spec.argv[0])
         .args(&spec.argv[1..])
         .env_clear()
@@ -324,7 +352,7 @@ pub(crate) fn helper_main() -> std::process::ExitCode {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .exec();
-    fail(serde_json::json!({"errno": err.raw_os_error().unwrap_or(EIO)}))
+    err.raw_os_error().unwrap_or(EIO)
 }
 
 #[cfg(target_os = "linux")]
@@ -391,20 +419,27 @@ fn root_gid_regained(primary_gid: u32, setgid_succeeded: bool) -> bool {
     primary_gid != 0 && setgid_succeeded
 }
 
-/// macOS (root daemon): `aw-platform` spawns a suspended gate that switches
-/// with `initgroups` / `setgid` / `setuid`, checks the switch stuck and that
-/// `setuid(0)` now fails, then execs the program. A failed switch exits 125 and
-/// the program never runs as root. The returned handle reaps only this child;
-/// dropping it would leave a zombie. 【待验证】not run on a real Mac.
+/// macOS: `aw-platform` starts a hold stage of this binary with a fixed
+/// environment. The stage blocks on a pipe. On release it switches with
+/// `initgroups` / `setgid` / `setuid` (skipped when the caller is already this
+/// account), checks the switch stuck and that `setuid(0)` fails, and only then
+/// enters `cwd` and execs. The program, directory and environment travel as
+/// data on the pipe, never as the stage's own environment. A failed step exits
+/// with its own code (121–127) and the program never runs as root. The
+/// returned handle reaps only this child. 【待验证】not run on a real Mac.
+///
+/// `peer` is the identity `getpeereid` returned for this connection. A caller
+/// with no peer (a UI token) cannot be launched: rebuilding the account from
+/// the stored user id would make the identity forgeable.
 #[cfg(target_os = "macos")]
 pub(crate) fn spawn_as(
+    peer: aw_platform::PeerIdentity,
     who: &Identity,
     argv: &[String],
     cwd: Option<&str>,
     extra_env: &[(String, String)],
 ) -> Result<Box<dyn aw_platform::ReleasedChild>, SpawnAsError> {
-    // `who` came from the OS peer credential, not from the request body.
-    let caller = aw_platform::IdentifiedCaller::from_unix_ids(who.uid, who.gid);
+    let caller = aw_platform::IdentifiedCaller::from_peer(peer);
     let request = aw_platform::SpawnRequest {
         command: argv.to_vec(),
         cwd: Some(cwd.map_or_else(|| who.home.clone(), PathBuf::from)),
@@ -413,8 +448,8 @@ pub(crate) fn spawn_as(
     let held = aw_platform::platform()
         .spawn_suspended(&caller, &request)
         .map_err(platform_spawn_error)?;
-    // Release consumes the hold. A failure here aborts through Drop, so the
-    // suspended program does not keep running unmonitored.
+    // Release consumes the hold. A failure here aborts through Drop: the pipe
+    // closes, the stage sees EOF and exits without exec.
     held.release().map_err(platform_spawn_error)
 }
 
@@ -627,6 +662,67 @@ mod tests {
         assert!(!who.name.is_empty());
         assert!(who.home.is_absolute());
         assert_eq!(who.groups.first(), Some(&who.gid));
+    }
+
+    /// A caller's `LD_PRELOAD` (or `DYLD_*`) is data in the spec, not the
+    /// environment the root stage is exec'd with. `spawn_as` starts the helper
+    /// with `env_clear` and `current_dir("/")`; the caller's variables are in
+    /// the stdin spec and reach only the program exec'd after the switch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn caller_preload_does_not_reach_the_root_stage() {
+        let preload = "/no/such/libaw-preload.so";
+        let me = nix::unistd::getuid().as_raw();
+        if me == 0 {
+            return;
+        }
+        let gid = nix::unistd::getgid().as_raw();
+        let groups = nix::unistd::getgroups()
+            .unwrap()
+            .into_iter()
+            .map(|g| g.as_raw())
+            .collect::<Vec<_>>();
+        // The helper is started with a cleared environment. The caller's
+        // preload is in the spec on stdin, which the helper reads as data and
+        // does not apply to itself. It then blocks in setgroups (this test is
+        // not root), so its environ can be read while it is still the
+        // privileged stage.
+        let spec = serde_json::json!({
+            "uid": me,
+            "gid": gid,
+            "groups": super::login_groups(gid, &groups),
+            "argv": ["/bin/true"],
+            "cwd": "/",
+            "env": [["LD_PRELOAD", preload], ["DYLD_INSERT_LIBRARIES", preload]],
+        });
+        let exe = super::helper_exe().unwrap();
+        let mut stage = std::process::Command::new(exe);
+        stage
+            .arg(super::HELPER_ARG)
+            .env_clear()
+            .current_dir("/")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut stage = stage.spawn().expect("stage");
+        use std::io::Write as _;
+        stage
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(spec.to_string().as_bytes())
+            .unwrap();
+        // The stage reads the spec, then blocks in setgroups. Reading earlier
+        // would race the read and could observe it before the spec arrived.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let environ = std::fs::read(format!("/proc/{}/environ", stage.id())).unwrap_or_default();
+        let text = String::from_utf8_lossy(&environ);
+        assert!(
+            !text.contains("LD_PRELOAD") && !text.contains("DYLD_"),
+            "the root stage is running with a caller preload: {text:?}"
+        );
+        let _ = stage.kill();
+        let _ = stage.wait();
     }
 
     #[cfg(target_os = "linux")]

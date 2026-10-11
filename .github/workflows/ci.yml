@@ -40,6 +40,13 @@ jobs:
         run: scripts/check-daemon-current-user.sh
       - name: cargo test
         run: cargo test --workspace
+      # macOS: these two crates' tests must actually run. `cargo test
+      # --workspace` above includes them; this step prints their names so a
+      # green log shows macos::launch::tests, macos::tests and macos::spawn::tests
+      # as ok, not skipped by cfg.
+      - name: macOS platform and daemon tests
+        if: runner.os == 'macOS'
+        run: cargo test -p aw-platform -p aw-daemon -- --nocapture
       - name: root daemon tests
         if: runner.os == 'Linux'
         shell: bash

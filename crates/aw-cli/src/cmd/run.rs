@@ -261,39 +261,42 @@ pub(crate) trait Spawner {
     ///
     /// # Errors
     ///
-    /// A short OS error class with no argv or environment values.
-    fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, String>;
+    /// A machine code plus a Chinese sentence. The sentence has no error code
+    /// and no English; the code is for the log and for `--json`.
+    fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, (&'static str, String)>;
 }
 
 /// Production caller-side spawner. It never creates a cgroup: the daemon
 /// records the adopted root pid and performs its own scope handling.
-/// Plain Chinese sentence for a failed spawn, by error kind, with the same
-/// codes the daemon uses (`program_not_found`, `program_not_permitted`,
-/// `spawn_failed`). The program and its arguments are not repeated (they can
-/// carry secrets).
+/// Plain Chinese sentence for a failed spawn, by error kind. The matching
+/// machine code (`program_not_found`, `program_not_permitted`, `spawn_failed`)
+/// is [`spawn_error_code`] and is not part of this sentence. The program and
+/// its arguments are not repeated (they can carry secrets).
 pub(crate) fn spawn_error_text(error: &std::io::Error) -> String {
+    // The code and the OS number stay out of this sentence. `spawn_failure`
+    // puts them in the log and, with `--json`, in `error.code`.
     match error.kind() {
-        std::io::ErrorKind::NotFound => {
-            "无法启动程序：找不到这个程序或工作目录（program_not_found）".to_owned()
-        }
+        std::io::ErrorKind::NotFound => "无法启动程序：找不到这个程序或工作目录".to_owned(),
         std::io::ErrorKind::PermissionDenied => {
-            "无法启动程序：没有权限运行它或进入工作目录（program_not_permitted）".to_owned()
+            "无法启动程序：没有权限运行它或进入工作目录".to_owned()
         }
-        _ => format!("无法启动程序（spawn_failed，{}）", os_code(error)),
+        _ => "无法启动程序".to_owned(),
+    }
+}
+
+/// Machine code for a spawn failure, matching the daemon's launch errors.
+pub(crate) fn spawn_error_code(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "program_not_found",
+        std::io::ErrorKind::PermissionDenied => "program_not_permitted",
+        _ => "spawn_failed",
     }
 }
 
 /// Plain Chinese sentence when waiting for the started program failed.
 #[cfg(any(not(windows), test))]
-pub(crate) fn wait_error_text(error: &std::io::Error) -> String {
-    format!("等待程序结束失败（{}）", os_code(error))
-}
-
-fn os_code(error: &std::io::Error) -> String {
-    error.raw_os_error().map_or_else(
-        || "系统没有给出错误码".to_owned(),
-        |code| format!("系统错误码 {code}"),
-    )
+pub(crate) fn wait_error_text(_error: &std::io::Error) -> String {
+    "等待程序结束失败".to_owned()
 }
 
 #[derive(Debug, Default)]
@@ -343,7 +346,7 @@ impl PlatformChild {
     fn fail(error: &aw_platform::PlatformError) -> String {
         match error {
             aw_platform::PlatformError::Io(inner) => spawn_error_text(inner),
-            other => format!("无法启动程序（spawn_failed，{other}）"),
+            _ => "无法启动程序".to_owned(),
         }
     }
 }
@@ -366,11 +369,9 @@ impl SpawnedChild for PlatformChild {
             Ok(aw_platform::ReapOutcome::Exited(code)) => Ok(code),
             // A signal death has no exit code. That is not success.
             Ok(aw_platform::ReapOutcome::Signaled(_)) => Ok(exit::GENERAL),
-            Ok(aw_platform::ReapOutcome::StillRunning) => {
-                Err("等待结束，但程序仍在运行".to_owned())
-            }
+            Ok(aw_platform::ReapOutcome::StillRunning) => Err("等了很久，程序还没结束".to_owned()),
             Err(aw_platform::PlatformError::Io(error)) => Err(wait_error_text(&error)),
-            Err(error) => Err(format!("等待程序结束失败（{error}）")),
+            Err(_) => Err("等待程序结束失败".to_owned()),
         }
     }
 
@@ -421,7 +422,10 @@ impl SpawnedChild for PlatformGatedChild {
             .released
             .take()
             .ok_or_else(|| "无法等待尚未放行的程序".to_owned())?;
-        match child.wait().map_err(platform_child_error)? {
+        match child
+            .wait()
+            .map_err(|error| platform_child_error(error).1)?
+        {
             ReapOutcome::Exited(code) => Ok(code),
             ReapOutcome::Signaled(signo) => {
                 #[cfg(windows)]
@@ -442,7 +446,10 @@ impl SpawnedChild for PlatformGatedChild {
             .held
             .take()
             .ok_or_else(|| "启动闸门已经放行".to_owned())?;
-        self.released = Some(held.release().map_err(platform_child_error)?);
+        self.released = Some(
+            held.release()
+                .map_err(|error| platform_child_error(error).1)?,
+        );
         Ok(())
     }
 
@@ -454,19 +461,24 @@ impl SpawnedChild for PlatformGatedChild {
 }
 
 #[cfg(any(target_os = "linux", windows))]
-fn platform_child_error(error: PlatformError) -> String {
+fn platform_child_error(error: PlatformError) -> (&'static str, String) {
     match error {
-        PlatformError::Io(error) => spawn_error_text(&error),
-        _ => "无法操作被挂起的程序（platform_error）".to_owned(),
+        PlatformError::Io(error) => (spawn_error_code(&error), spawn_error_text(&error)),
+        _ => ("spawn_failed", "无法操作被挂起的程序".to_owned()),
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos", not(any(unix, windows))))]
+fn spawn_failure(error: &std::io::Error) -> (&'static str, String) {
+    (spawn_error_code(error), spawn_error_text(error))
+}
+
 impl Spawner for CommandSpawner {
-    fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, String> {
+    fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, (&'static str, String)> {
         #[cfg(target_os = "linux")]
         {
             let Some((program, args)) = spec.command.split_first() else {
-                return Err("程序名为空".to_owned());
+                return Err(("spawn_failed", "程序名为空".to_owned()));
             };
             // Keep the pre-flight lookup: the gate shell would otherwise emit
             // an English error only after the daemon had adopted the session.
@@ -478,7 +490,7 @@ impl Spawner for CommandSpawner {
                 .map(|(_, value)| value.clone())
                 .or_else(|| std::env::var("PATH").ok());
             let resolved = resolve_program(program, path_env.as_deref(), spec.cwd.as_deref())
-                .map_err(|error| spawn_error_text(&error))?;
+                .map_err(|error| spawn_failure(&error))?;
             let caller = IdentifiedCaller::current_user().map_err(platform_child_error)?;
             let request = SpawnRequest {
                 command: std::iter::once(resolved)
@@ -498,7 +510,7 @@ impl Spawner for CommandSpawner {
         #[cfg(target_os = "macos")]
         {
             let Some((program, args)) = spec.command.split_first() else {
-                return Err("程序名为空".to_owned());
+                return Err(("spawn_failed", "程序名为空".to_owned()));
             };
             // Same pre-flight as Linux: a missing program fails in Chinese
             // before the daemon has adopted the session.
@@ -510,9 +522,9 @@ impl Spawner for CommandSpawner {
                 .map(|(_, value)| value.clone())
                 .or_else(|| std::env::var("PATH").ok());
             let resolved = resolve_program(program, path_env.as_deref(), spec.cwd.as_deref())
-                .map_err(|error| spawn_error_text(&error))?;
+                .map_err(|error| spawn_failure(&error))?;
             let caller = aw_platform::IdentifiedCaller::current_user()
-                .map_err(|error| format!("无法确认当前用户（spawn_failed，{error}）"))?;
+                .map_err(|_| ("spawn_failed", "无法确认当前用户".to_owned()))?;
             let request = aw_platform::SpawnRequest {
                 command: std::iter::once(resolved)
                     .chain(args.iter().cloned())
@@ -522,7 +534,7 @@ impl Spawner for CommandSpawner {
             };
             let held = aw_platform::platform()
                 .spawn_suspended(&caller, &request)
-                .map_err(|error| PlatformChild::fail(&error))?;
+                .map_err(|error| ("spawn_failed", PlatformChild::fail(&error)))?;
             Ok(Box::new(PlatformChild {
                 held: Some(held),
                 released: None,
@@ -547,7 +559,7 @@ impl Spawner for CommandSpawner {
         #[cfg(not(any(unix, windows)))]
         {
             let Some((program, args)) = spec.command.split_first() else {
-                return Err("程序名为空".to_owned());
+                return Err(("spawn_failed", "程序名为空".to_owned()));
             };
             let mut command = Command::new(program);
             command.args(args);
@@ -555,7 +567,7 @@ impl Spawner for CommandSpawner {
             command
                 .spawn()
                 .map(|child| Box::new(ProcessChild { child }) as Box<dyn SpawnedChild>)
-                .map_err(|error| spawn_error_text(&error))
+                .map_err(|error| spawn_failure(&error))
         }
     }
 }
@@ -836,10 +848,10 @@ impl Launcher for PlatformLauncher {
 
 /// macOS production launcher.
 ///
-/// `aw-platform` starts the child with `POSIX_SPAWN_START_SUSPENDED` as the
-/// current user and releases it here. `--no-daemon` waits for it; there is no
-/// daemon to adopt. 【待验证】not run on a real Mac. Grandchild tracking is
-/// left to the collector.
+/// `aw-platform` starts a hold stage that blocks on a pipe, then execs the
+/// program as the current user once released. `--no-daemon` releases and waits
+/// here; there is no daemon to adopt. 【待验证】not run on a real Mac.
+/// Grandchild tracking is left to the collector.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 pub(crate) struct PlatformLauncher;
@@ -849,7 +861,7 @@ impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
         let mut child = CommandSpawner
             .spawn(spec)
-            .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
+            .map_err(|(_code, detail)| LaunchDispatchError::NotImplemented { detail })?;
         let pid = child.pid();
         child
             .release()
@@ -1102,9 +1114,9 @@ pub(crate) fn daemon_run(
     };
     let mut child = match spawner.spawn(&spec) {
         Ok(child) => child,
-        Err(detail) => {
+        Err((code, detail)) => {
             let _ = sessions.stop_monitoring(&launch.public_id);
-            return super::error_outcome(exit::GENERAL, "spawn_failed", &detail, args.json);
+            return super::error_outcome(exit::GENERAL, code, &detail, args.json);
         }
     };
     if let Err(error) = sessions.adopt(&launch, child.pid()) {
@@ -1641,11 +1653,11 @@ mod tests {
     }
 
     impl Spawner for FakeSpawner {
-        fn spawn(&mut self, _: &RunSpec) -> Result<Box<dyn SpawnedChild>, String> {
+        fn spawn(&mut self, _: &RunSpec) -> Result<Box<dyn SpawnedChild>, (&'static str, String)> {
             self.spawned = self.spawned.saturating_add(1);
             self.log.borrow_mut().push("spawn");
             if let Some(error) = self.fail.take() {
-                return Err(error);
+                return Err(("spawn_failed", error));
             }
             Ok(Box::new(FakeChild {
                 pid: 71,
@@ -2591,11 +2603,12 @@ mod tests {
             Ok(_) => panic!("a missing program must not spawn"),
             Err(error) => error,
         };
+        assert_eq!(error.0, "program_not_found");
         assert_eq!(
-            error,
+            error.1,
             spawn_error_text(&std::io::Error::from(std::io::ErrorKind::NotFound))
         );
-        assert!(!error.contains("not found"), "{error}");
+        assert!(!error.1.contains("not found"), "{}", error.1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2603,16 +2616,26 @@ mod tests {
     fn spawn_errors_are_plain_chinese_by_kind() {
         use std::io::{Error, ErrorKind};
         let not_found = super::spawn_error_text(&Error::from(ErrorKind::NotFound));
-        assert!(not_found.contains("找不到") && not_found.contains("program_not_found"));
-        let denied = super::spawn_error_text(&Error::from(ErrorKind::PermissionDenied));
-        assert!(denied.contains("没有权限") && denied.contains("program_not_permitted"));
-        let other = super::spawn_error_text(&Error::from_raw_os_error(7));
-        assert!(
-            other.contains("spawn_failed") && other.contains("系统错误码 7"),
-            "{other}"
+        assert!(not_found.contains("找不到"));
+        assert_eq!(
+            super::spawn_error_code(&Error::from(ErrorKind::NotFound)),
+            "program_not_found"
         );
+        let denied = super::spawn_error_text(&Error::from(ErrorKind::PermissionDenied));
+        assert!(denied.contains("没有权限"));
+        assert_eq!(
+            super::spawn_error_code(&Error::from(ErrorKind::PermissionDenied)),
+            "program_not_permitted"
+        );
+        let other = super::spawn_error_text(&Error::from_raw_os_error(7));
+        assert_eq!(other, "无法启动程序");
+        assert_eq!(
+            super::spawn_error_code(&Error::from_raw_os_error(7)),
+            "spawn_failed"
+        );
+        assert!(!other.contains("系统错误码"), "{other}");
         let wait = super::wait_error_text(&Error::from(ErrorKind::Other));
-        assert!(wait.starts_with("等待程序结束失败"), "{wait}");
+        assert_eq!(wait, "等待程序结束失败");
         for text in [not_found, denied, other, wait] {
             assert!(
                 !text.contains("entity") && !text.contains("could not"),

@@ -98,11 +98,12 @@ fn dispatch(args: impl IntoIterator<Item = String>) -> Result<ExitCode, CliError
     if args[0] == api::LAUNCH_AS_HELPER_ARG {
         return Ok(api::launch_as_helper());
     }
-    // Internal: macOS suspended-launch gate. Switches to the caller, then execs.
-    // argv carries the account, never a secret; a failure exits 125 and does
-    // not exec. See `aw_platform::gate_main`.
+    // Internal: macOS hold stage. Started with a fixed environment; the
+    // account, program and environment arrive as data on a pipe. It blocks
+    // until release, switches, then execs. A failure exits with the step's
+    // code (121–127) and does not exec. See `aw_platform::gate_main`.
     #[cfg(target_os = "macos")]
-    if args[0] == "aw-mac-gate" {
+    if args[0] == aw_platform::GATE_ARG {
         aw_platform::gate_main();
     }
 

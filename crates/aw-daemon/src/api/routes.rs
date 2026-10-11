@@ -1115,6 +1115,7 @@ fn req_host_bad(host: &Option<String>, port: u16) -> bool {
         caller: Some(Caller {
             user_id: "probe".to_owned(),
             admin: false,
+            peer: None,
         }),
         operation: "probe".to_owned(),
         session_owner: None,
@@ -4262,6 +4263,7 @@ mod tests {
         let peer = super::Caller {
             user_id: "alice".to_owned(),
             admin: false,
+            peer: None,
         };
         let over_channel =
             super::take_slow(&mut state, &request(None, "format=jsonl"), Some(&peer));

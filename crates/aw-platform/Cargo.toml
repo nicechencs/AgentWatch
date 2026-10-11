@@ -16,6 +16,11 @@ aw-collector-linux = { path = "../aw-collector-linux" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 aw-collector-macos = { path = "../aw-collector-macos" }
+# The hold stage reads its spec as data. MIT OR Apache-2.0, already in
+# Cargo.lock (aw-daemon pins the same versions). macOS only: the Linux gate
+# does not parse a spec.
+serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive", "std"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 # libc 0.2.189 is already in Cargo.lock (via sysinfo). Pinned so `--locked`
 # resolves it. Used for proc_pidinfo / proc_listallpids / posix_spawn FFI.
 libc = "=0.2.189"

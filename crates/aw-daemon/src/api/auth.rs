@@ -36,6 +36,10 @@ pub struct Caller {
     pub user_id: String,
     /// `true` for root / Administrators. Ordinary users are `false`.
     pub admin: bool,
+    /// The OS-authenticated peer, when this caller came from a connection.
+    /// Absent for a UI token and for `aw run`'s current user. Never filled
+    /// from the request body.
+    pub peer: Option<aw_platform::PeerIdentity>,
 }
 
 /// What the transport observed, before any allow/deny.
@@ -237,7 +241,14 @@ impl TicketStore {
             self.tokens.remove(token);
             return Err(AuthError::UnknownToken);
         }
-        Ok(Caller { user_id, admin })
+        // A token remembers the account it was issued to. It does not carry the
+        // socket peer: the launch path needs that peer, which only a connection
+        // has.
+        Ok(Caller {
+            user_id,
+            admin,
+            peer: None,
+        })
     }
 }
 
@@ -369,6 +380,7 @@ mod tests {
         let user = Caller {
             user_id: "a".to_owned(),
             admin: false,
+            peer: None,
         };
         let decision = authorize(&http_input(Some("evil.com"), Some(user), "sessions_list"));
         assert_eq!(decision, AuthDecision::Misdirected);
@@ -461,6 +473,7 @@ mod tests {
         let alice = Caller {
             user_id: "alice".to_owned(),
             admin: false,
+            peer: None,
         };
         let visible = visible_sessions(&sessions, &alice);
         assert_eq!(visible.len(), 1);
@@ -484,6 +497,7 @@ mod tests {
         let root = Caller {
             user_id: "root".to_owned(),
             admin: true,
+            peer: None,
         };
         assert_eq!(visible_sessions(&sessions, &root).len(), 2);
     }
@@ -493,6 +507,7 @@ mod tests {
         let user = Caller {
             user_id: "alice".to_owned(),
             admin: false,
+            peer: None,
         };
         for op in ["attach_other_user", "db_purge", "config_put"] {
             let decision = authorize(&http_input(Some("localhost:7456"), Some(user.clone()), op));
@@ -505,6 +520,7 @@ mod tests {
         let admin = Caller {
             user_id: "root".to_owned(),
             admin: true,
+            peer: None,
         };
         let decision = authorize(&http_input(Some("127.0.0.1:7456"), Some(admin), "db_purge"));
         assert!(matches!(decision, AuthDecision::Allow(_)));

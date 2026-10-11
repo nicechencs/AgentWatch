@@ -8,7 +8,7 @@ use nix::unistd::{pipe2, write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::{fs, io};
 
 pub(crate) struct CurrentPlatform;
@@ -313,8 +313,7 @@ fn spawn_gate(request: &SpawnRequest) -> Result<Box<dyn HeldChild>, PlatformErro
         .arg(script)
         .arg("aw-platform")
         .arg(program)
-        .args(args)
-        .stdin(Stdio::null());
+        .args(args);
     if let Some(cwd) = &request.cwd {
         command.current_dir(cwd);
     }

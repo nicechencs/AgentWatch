@@ -225,8 +225,20 @@ fn require_writable_database(path: &std::path::Path) -> Result<(), ApiResponse> 
 
 /// Allocate `sessions.id` and insert the row. Id 1 stays the daemon sample's.
 fn insert_session(path: &std::path::Path, target: &mut SampleTarget) -> Result<(), ApiResponse> {
-    let store_error =
-        |err: &aw_store::StoreError, what: &str| super::routes::database_store_response(err, what);
+    // Opening a runtime store can inspect/migrate schema before the actual
+    // session insert. Keep any lock waits across all of those SQLite steps
+    // within one request-wide budget rather than granting each a new eight
+    // seconds.
+    let busy_deadline = aw_store::BusyDeadline::start(aw_store::BUSY_TIMEOUT);
+    let store_error = |err: &aw_store::StoreError, what: &str| {
+        if let Some(detail) = err.busy_detail() {
+            return super::routes::database_busy_json(
+                Some(busy_deadline.elapsed().as_secs().max(1)),
+                Some(&detail),
+            );
+        }
+        super::routes::database_store_response(err, what)
+    };
     let mut store = aw_store::Store::open_runtime(path)
         .map_err(|err| store_error(&err, "cannot open the database"))?;
     if store.is_read_only() {
@@ -1177,6 +1189,10 @@ mod database_busy_tests {
         assert!(
             writer_release.is_ok(),
             "writer hold limit elapsed; {diagnostic}"
+        );
+        assert!(
+            elapsed < aw_store::BUSY_TIMEOUT + Duration::from_secs(3),
+            "insert_session exceeded the one busy-timeout budget; {diagnostic}"
         );
         assert_eq!(response.status, 503, "{diagnostic}");
         let body: serde_json::Value = serde_json::from_slice(&response.body).expect("busy JSON");

@@ -1902,7 +1902,7 @@ pub(crate) fn database_read_only_newer_response() -> ApiResponse {
     )
 }
 
-fn database_busy_json(waited_seconds: Option<u64>, detail: Option<&str>) -> ApiResponse {
+pub(crate) fn database_busy_json(waited_seconds: Option<u64>, detail: Option<&str>) -> ApiResponse {
     if let (Some(waited_seconds), Some(detail)) = (waited_seconds, detail) {
         tracing::warn!(waited_seconds, sqlite_detail = %detail, "session database remained busy");
         let message = format!(

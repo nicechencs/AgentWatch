@@ -6,8 +6,9 @@
 //! needs an exclusive lock.  [`crate::Store`] applies those two settings only
 //! while creating an empty database.
 
+use std::cell::Cell;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -17,6 +18,63 @@ use crate::test_support;
 /// How long SQLite waits for an existing writer before returning `SQLITE_BUSY`.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(8);
 
+thread_local! {
+    /// A caller may bound several SQLite operations with one deadline.  SQLite
+    /// invokes a busy handler on the same thread as the operation that needs a
+    /// lock, so this remains local to the request and never affects another
+    /// daemon worker.
+    static BUSY_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// One end-to-end budget for a sequence of SQLite operations on this thread.
+///
+/// Connections opened while this guard lives use a busy handler that stops at
+/// the shared deadline.  Without it, [`BUSY_TIMEOUT`] remains a per-statement
+/// SQLite timeout, which is appropriate for independent background work.
+pub struct BusyDeadline {
+    previous: Option<Instant>,
+    started: Instant,
+}
+
+impl BusyDeadline {
+    /// Start an end-to-end SQLite lock budget for the current thread.
+    #[must_use]
+    pub fn start(timeout: Duration) -> Self {
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let previous = BUSY_DEADLINE.with(|current| current.replace(Some(deadline)));
+        Self { previous, started }
+    }
+
+    /// Elapsed time in the bounded sequence.
+    #[must_use]
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
+impl Drop for BusyDeadline {
+    fn drop(&mut self) {
+        BUSY_DEADLINE.with(|current| current.set(self.previous));
+    }
+}
+
+fn shared_deadline_active() -> bool {
+    BUSY_DEADLINE.with(|current| current.get().is_some())
+}
+
+fn deadline_busy_handler(_attempt: i32) -> bool {
+    const RETRY_DELAY: Duration = Duration::from_millis(1);
+    let Some(deadline) = BUSY_DEADLINE.with(Cell::get) else {
+        return false;
+    };
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return false;
+    };
+    std::thread::sleep(remaining.min(RETRY_DELAY));
+    Instant::now() < deadline
+}
+
 /// Configure a newly opened SQLite connection.
 ///
 /// This must remain the first database operation on every connection.  The
@@ -24,9 +82,21 @@ pub const BUSY_TIMEOUT: Duration = Duration::from_secs(8);
 /// writable connections need them, rather than to read-only inspection opens.
 pub fn configure_connection(conn: &mut Connection) -> rusqlite::Result<()> {
     let started = std::time::Instant::now();
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+    let shared_deadline = shared_deadline_active();
+    if shared_deadline {
+        conn.busy_handler(Some(deadline_busy_handler))?;
+    } else {
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+    }
     #[cfg(feature = "test-support")]
-    test_support::record("sqlite3_busy_timeout", started.elapsed());
+    test_support::record(
+        if shared_deadline {
+            "sqlite3_busy_handler_deadline"
+        } else {
+            "sqlite3_busy_timeout"
+        },
+        started.elapsed(),
+    );
     #[cfg(not(feature = "test-support"))]
     let _ = started;
     Ok(())
@@ -77,4 +147,25 @@ pub fn open_connection_with_flags(
     #[cfg(feature = "test-support")]
     test_support::install_profile(&mut conn);
     Ok(conn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{shared_deadline_active, BusyDeadline};
+    use std::time::Duration;
+
+    #[test]
+    fn deadline_scope_is_current_thread_only_and_restores_the_previous_value() {
+        assert!(!shared_deadline_active());
+        let outer = BusyDeadline::start(Duration::from_secs(1));
+        assert!(shared_deadline_active());
+        {
+            let inner = BusyDeadline::start(Duration::from_secs(1));
+            assert!(shared_deadline_active());
+            drop(inner);
+        }
+        assert!(shared_deadline_active());
+        drop(outer);
+        assert!(!shared_deadline_active());
+    }
 }

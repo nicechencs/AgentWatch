@@ -39,7 +39,7 @@ pub use agent_events::{
 };
 pub use connection::{
     configure_connection, open_connection, open_connection_with_flags, open_in_memory_connection,
-    BUSY_TIMEOUT,
+    BusyDeadline, BUSY_TIMEOUT,
 };
 pub use error::StoreError;
 pub use export::{

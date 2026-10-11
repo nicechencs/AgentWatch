@@ -307,7 +307,11 @@ pub(crate) fn daemon_start(
 /// The daemon answered, but refused us or is not the daemon: never treated as
 /// "not running yet".
 fn is_refusal(err: &ClientError) -> bool {
-    err.identity_failure_code().is_some() || matches!(err, ClientError::UntrustedServer { .. })
+    err.identity_failure_code().is_some()
+        || matches!(
+            err,
+            ClientError::UntrustedServer { .. } | ClientError::ServerVerificationUnavailable { .. }
+        )
 }
 
 pub(crate) fn health(
@@ -346,6 +350,7 @@ pub(crate) fn client_error(err: &ClientError, endpoint: &Endpoint, json: bool) -
         ClientError::Unreachable { .. } => "unreachable",
         ClientError::Forbidden { .. } => "forbidden",
         ClientError::UntrustedServer { .. } => "daemon_untrusted_server",
+        ClientError::ServerVerificationUnavailable { .. } => "daemon_server_unverified",
         ClientError::Transport { .. } => "transport",
         ClientError::Status { .. } => "status",
     };

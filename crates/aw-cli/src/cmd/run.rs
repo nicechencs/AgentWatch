@@ -484,7 +484,7 @@ fn platform_child_error(error: PlatformError) -> (&'static str, String) {
             "not_supported_on_this_os",
             "这个系统不支持启动这个程序。".to_owned(),
         ),
-        PlatformError::PeerNotIdentified { .. } => (
+        PlatformError::PeerNotIdentified { .. } | PlatformError::PipePeerNotIdentified { .. } => (
             "identity_unavailable",
             "认不出当前用户，已停止启动：系统没有提供可确认的身份。".to_owned(),
         ),

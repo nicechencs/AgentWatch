@@ -134,9 +134,11 @@ P3-WIN-01（2026-10-08）没有在本机或 CI 上订阅 `Microsoft-Windows-PktM
 有 Windows 条件测试断言退出码保持为 7。`--env` 只构成子进程环境块，不发送到
 daemon、日志或数据库。【未在真机验证】
 
-命名管道创建时设置显式 DACL 并拒绝远程客户端。客户端以
-`SECURITY_IDENTIFICATION` 打开管道，并在发送前核对服务端进程令牌是 SYSTEM 或
-当前用户，防止后台未运行时同名管道被抢占。daemon 通过
+命名管道创建时设置显式 DACL、拒绝远程客户端，并把 owner 显式写为服务模式的
+SYSTEM 或开发模式的当前用户。客户端以 `SECURITY_IDENTIFICATION` 打开管道，并在
+发送前用该客户端管道句柄上的 `GetSecurityInfo(..., OWNER_SECURITY_INFORMATION)`
+核对 owner 是 SYSTEM 或当前用户，防止后台未运行时同名管道被抢占；无法查询 owner
+与已查询但 owner 不可信是两个不同的失败码，二者都不发送请求字节。daemon 通过
 `aw_platform::identify_pipe_peer`（先读首个请求字节，再模拟客户端并在同一同步区间
 读取线程令牌、立即还原）取得 SID、提权状态与完整性级别；不能取得时返回
 `PeerNotIdentified`，绝不使用服务账户身份。`aw run` 由 CLI 以当前用户创建挂起目标，daemon 只通过 `/adopt` 接管并由

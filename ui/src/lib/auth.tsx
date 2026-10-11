@@ -1,8 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { api, getToken, setToken } from "@/api/client";
 import { isDesktop } from "@/api/transport";
-import { isApiError } from "@/api/errors";
+import { describeError, isApiError } from "@/api/errors";
 import type { Me } from "@/api/types";
+import { useI18n } from "@/lib/i18n";
 
 /**
  * Desktop app only:
@@ -22,12 +23,18 @@ export type AuthStatus =
   | "busy"
   | "timeout"
   | "broken"
+  | "unidentified_peer"
+  | "untrusted_server"
+  | "server_unverified"
   | "failed";
 
 /** Which desktop status a failed first call means. Only `daemon_unreachable` is "not running". */
 export function desktopFailure(caught: unknown): AuthStatus {
   if (isApiError(caught)) {
     if (caught.code === "daemon_unreachable") return "unreachable";
+    if (caught.code === "unidentified_peer") return "unidentified_peer";
+    if (caught.code === "daemon_untrusted_server") return "untrusted_server";
+    if (caught.code === "daemon_server_unverified") return "server_unverified";
     if (caught.code === "daemon_forbidden" || caught.status === 403) return "forbidden";
     if (caught.code === "daemon_busy") return "busy";
     if (caught.code === "daemon_timeout") return "timeout";
@@ -111,6 +118,7 @@ export function resetAuthForTests(): void {
  * asking for a ticket that was already spent (P2-UI-01).
  */
 export function AuthProvider({ children }: { children: ReactNode }) {
+  const { t } = useI18n();
   const [status, setStatus] = useState<AuthStatus>(getToken() ? "signed-in" : "checking");
   const [me, setMe] = useState<Me | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -145,7 +153,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         })
         .catch((caught: unknown) => {
           if (cancelled) return;
-          setError(caught instanceof Error ? caught.message : String(caught));
+          setError(describeError(caught, t));
           setStatus(desktopFailure(caught));
         });
       return () => {
@@ -188,7 +196,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [loadMe, attempt]);
+  }, [loadMe, attempt, t]);
 
   const value = useMemo(() => ({ status, me, error, retry }), [status, me, error, retry]);
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

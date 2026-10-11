@@ -127,6 +127,10 @@ impl ProcessTable for DaemonTable {
                         detail: err.to_string(),
                         code: "daemon_untrusted_server",
                     },
+                    ClientError::ServerVerificationUnavailable { .. } => PsError::Permission {
+                        detail: err.to_string(),
+                        code: "daemon_server_unverified",
+                    },
                     ClientError::Status {
                         status: 401 | 403,
                         ref code,

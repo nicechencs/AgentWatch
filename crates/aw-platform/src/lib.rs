@@ -103,6 +103,13 @@ pub enum PlatformError {
     PeerNotIdentified {
         reason: &'static str,
     },
+    /// Windows named-pipe peer authentication failed at a Win32 call. Keep
+    /// the operation and exact code so the daemon can diagnose a 403 without
+    /// exposing it in a human-facing error message.
+    PipePeerNotIdentified {
+        operation: &'static str,
+        win32_error: i32,
+    },
     Io(std::io::Error),
     Invalid {
         capability: &'static str,
@@ -123,12 +130,62 @@ impl fmt::Display for PlatformError {
                 kind.as_str()
             ),
             Self::PeerNotIdentified { reason } => write!(f, "peer was not identified: {reason}"),
+            Self::PipePeerNotIdentified {
+                operation,
+                win32_error,
+            } => write!(
+                f,
+                "named-pipe peer was not identified: {operation} failed (Win32 error {win32_error})"
+            ),
             Self::Io(error) => write!(f, "platform I/O error: {error}"),
             Self::Invalid { capability, detail } => write!(f, "{capability}: {detail}"),
         }
     }
 }
 impl std::error::Error for PlatformError {}
+
+impl PlatformError {
+    /// The exact Win32 error from a named-pipe peer-authentication primitive.
+    /// Other platform errors deliberately do not claim to carry one.
+    #[must_use]
+    pub const fn pipe_peer_win32_error(&self) -> Option<i32> {
+        match self {
+            Self::PipePeerNotIdentified { win32_error, .. } => Some(*win32_error),
+            _ => None,
+        }
+    }
+}
+
+/// Why a client could not establish that a connected Windows named pipe is an
+/// AgentWatch daemon pipe. The client must send no request bytes on either
+/// outcome, but the stable categories intentionally differ for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipeServerVerificationError {
+    /// The pipe object's owner SID could not be queried.
+    CannotQuery {
+        operation: &'static str,
+        win32_error: u32,
+    },
+    /// The owner SID was read successfully but is not trusted as a daemon.
+    NotDaemon,
+}
+
+impl fmt::Display for PipeServerVerificationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CannotQuery {
+                operation,
+                win32_error,
+            } => write!(
+                f,
+                "named-pipe server owner query failed: {operation} (Win32 error {win32_error})"
+            ),
+            Self::NotDaemon => f.write_str("named-pipe server owner is not trusted"),
+        }
+    }
+}
+
+impl std::error::Error for PipeServerVerificationError {}
 impl From<std::io::Error> for PlatformError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
@@ -368,13 +425,26 @@ pub fn identify_pipe_peer(
     windows::identify_pipe_peer(handle)
 }
 
-/// Refuse a Windows named-pipe server unless its process token is LocalSystem
-/// or the same user as this client. This is the client-side half of protecting
-/// the well-known pipe name from a process that claimed it while the daemon
-/// was stopped.
+/// Refuse a Windows named-pipe server unless its pipe-object owner is
+/// LocalSystem or the same user as this client. This is the client-side half
+/// of protecting the well-known pipe name from a process that claimed it
+/// while the daemon was stopped.
 #[cfg(windows)]
-pub fn verify_pipe_server(handle: std::os::windows::io::RawHandle) -> Result<(), PlatformError> {
+pub fn verify_pipe_server(
+    handle: std::os::windows::io::RawHandle,
+) -> Result<(), PipeServerVerificationError> {
     windows::verify_pipe_server(handle)
+}
+
+/// Testable form of [`verify_pipe_server`] with an explicit trusted-owner
+/// allowlist. Product callers must use [`verify_pipe_server`].
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn verify_pipe_server_for_owners(
+    handle: std::os::windows::io::RawHandle,
+    trusted_owners: &[&str],
+) -> Result<(), PipeServerVerificationError> {
+    windows::verify_pipe_server_for_owners(handle, trusted_owners)
 }
 
 /// Record that a complete Windows named-pipe request made the round trip after

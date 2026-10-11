@@ -233,6 +233,7 @@ fn client_to_config(err: crate::client::ClientError) -> ConfigError {
         },
         crate::client::ClientError::Forbidden { .. }
         | crate::client::ClientError::UntrustedServer { .. }
+        | crate::client::ClientError::ServerVerificationUnavailable { .. }
         | crate::client::ClientError::Status {
             status: 401 | 403, ..
         } => ConfigError::Forbidden {

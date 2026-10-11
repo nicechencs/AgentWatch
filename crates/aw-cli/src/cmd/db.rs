@@ -605,6 +605,7 @@ fn client_to_db(err: crate::client::ClientError) -> DbApiError {
         },
         crate::client::ClientError::Forbidden { .. }
         | crate::client::ClientError::UntrustedServer { .. }
+        | crate::client::ClientError::ServerVerificationUnavailable { .. }
         | crate::client::ClientError::Status {
             status: 401 | 403, ..
         } => DbApiError::Forbidden {

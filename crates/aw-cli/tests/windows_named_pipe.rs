@@ -36,7 +36,7 @@ fn pipe_name() -> PathBuf {
 fn separate_aw_processes_are_identified_and_each_get_a_fresh_pipe_instance() {
     let path = pipe_name();
     let name = path.as_os_str().to_owned();
-    let sddl = pipe_sddl();
+    let sddl = pipe_sddl().expect("pipe SDDL");
     let expected = platform().current_owner().expect("current token owner");
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (done_tx, done_rx) = mpsc::sync_channel(1);
@@ -76,6 +76,47 @@ fn separate_aw_processes_are_identified_and_each_get_a_fresh_pipe_instance() {
         .recv_timeout(Duration::from_secs(15))
         .expect("server result")
         .unwrap_or_else(|err| panic!("server: {err}"));
+    server.join().expect("server thread");
+}
+
+#[test]
+fn untrusted_pipe_owner_receives_zero_request_bytes() {
+    let path = pipe_name();
+    let name = path.as_os_str().to_owned();
+    let sddl = pipe_sddl().expect("pipe SDDL");
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let server = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(async move {
+            let server = create_server(&name, true, &sddl).map_err(|err| err.to_string())?;
+            ready_tx.send(()).map_err(|err| err.to_string())?;
+            server.connect().await.map_err(|err| err.to_string())?;
+            bytes_before_client_close(&server).await
+        });
+        let _ = result_tx.send(result);
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("temporary pipe listener ready");
+
+    // This is a real pipe owned by this test process, but the protected client
+    // is told that no owner is trusted. It must fail after the owner query and
+    // before a single HTTP request byte is written.
+    let err = aw_channel::open_pipe_client_with_trusted_owners(&path, &["S-1-5-0"])
+        .expect_err("untrusted owner must be refused");
+    assert_eq!(err.code(), "daemon_untrusted_server", "{err}");
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("server byte count")
+            .expect("server read"),
+        0,
+        "the untrusted server must receive no request bytes"
+    );
     server.join().expect("server thread");
 }
 
@@ -126,6 +167,22 @@ async fn read_request(server: &NamedPipeServer) -> Result<(), String> {
             Err(err) => return Err(err.to_string()),
         }
     }
+}
+
+async fn bytes_before_client_close(server: &NamedPipeServer) -> Result<usize, String> {
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut one = [0_u8; 1];
+        loop {
+            server.readable().await.map_err(|err| err.to_string())?;
+            match server.try_read(&mut one) {
+                Ok(n) => return Ok(n),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+    })
+    .await;
+    outcome.map_err(|_| "client did not close the rejected pipe".to_owned())?
 }
 
 async fn write_all(server: &NamedPipeServer, mut bytes: &[u8]) -> Result<(), String> {

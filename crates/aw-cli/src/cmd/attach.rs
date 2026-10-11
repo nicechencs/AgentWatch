@@ -101,6 +101,9 @@ pub(crate) enum ControlError {
     /// A process other than LocalSystem or the current user owned the opened
     /// Windows pipe. No request bytes were sent.
     UntrustedServer { detail: String },
+    /// The Windows pipe owner could not be queried. No request bytes were
+    /// sent, and this is distinct from an owner known not to be the daemon.
+    ServerVerificationUnavailable { detail: String },
     /// The request or response transport failed.
     Transport { detail: String },
     /// The daemon returned a non-success HTTP status.
@@ -125,9 +128,14 @@ impl std::fmt::Display for ControlError {
                 "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。详情：{detail}"
             ),
             Self::UntrustedServer { .. } => {
-                f.write_str("连上的不是 AgentWatch 后台（管道被别的程序占用），已停止发送。")
+                f.write_str("连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为了安全，这次没有发送任何内容。")
             }
-            Self::Transport { detail } => write!(f, "向后台发请求失败：{detail}"),
+            Self::ServerVerificationUnavailable { .. } => f.write_str(
+                "没法确认连上的是不是 AgentWatch 后台，为了安全，这次没有发送任何内容。请重启后台后再试。",
+            ),
+            // Keep OS/pipe details for `--json`; the terminal gets the shared
+            // #147 wording only.
+            Self::Transport { .. } => f.write_str("跟后台的连接断了，请再试一次。"),
             Self::Status {
                 status,
                 code,
@@ -146,6 +154,9 @@ impl From<ClientError> for ControlError {
             ClientError::Unreachable { detail } => Self::Unreachable { detail },
             ClientError::Forbidden { detail } => Self::Forbidden { detail },
             ClientError::UntrustedServer { detail } => Self::UntrustedServer { detail },
+            ClientError::ServerVerificationUnavailable { detail } => {
+                Self::ServerVerificationUnavailable { detail }
+            }
             ClientError::Transport { detail } => Self::Transport { detail },
             ClientError::Status {
                 status,
@@ -161,12 +172,26 @@ impl From<ClientError> for ControlError {
 }
 
 impl ControlError {
+    /// Technical channel detail for machine-readable output. Human output uses
+    /// the fixed wording in [`std::fmt::Display`].
+    #[must_use]
+    pub(crate) fn json_detail(&self) -> Option<&str> {
+        match self {
+            Self::Transport { detail }
+            | Self::UntrustedServer { detail }
+            | Self::ServerVerificationUnavailable { detail } => Some(detail),
+            _ => None,
+        }
+    }
+
     /// Exit code consistent with [`ClientError::exit_code`].
     #[must_use]
     pub(crate) fn exit_code(&self) -> i32 {
         match self {
             Self::Unreachable { .. } => exit::UNREACHABLE,
-            Self::Forbidden { .. } | Self::UntrustedServer { .. } => exit::PERMISSION,
+            Self::Forbidden { .. }
+            | Self::UntrustedServer { .. }
+            | Self::ServerVerificationUnavailable { .. } => exit::PERMISSION,
             Self::Transport { .. } | Self::BadReply { .. } => exit::GENERAL,
             Self::Status { status, .. } => exit::from_http_status(*status),
         }
@@ -183,6 +208,7 @@ impl ControlError {
             Self::Unreachable { .. } => "unreachable",
             Self::Forbidden { .. } => "forbidden",
             Self::UntrustedServer { .. } => "daemon_untrusted_server",
+            Self::ServerVerificationUnavailable { .. } => "daemon_server_unverified",
             Self::Status { code, status, .. } => code.as_deref().unwrap_or(match *status {
                 401 => "unauthorized",
                 403 => "forbidden",
@@ -665,12 +691,12 @@ fn span_to_duration(count: u64, unit: crate::output::TimeUnit) -> Result<Duratio
 
 /// Render a daemon-session failure with the same exit class as the HTTP client.
 pub(crate) fn control_outcome(error: ControlError, json: bool) -> Outcome {
-    super::error_outcome(
-        error.exit_code(),
-        error.machine_code(),
-        &error.to_string(),
-        json,
-    )
+    let message = if json {
+        error.json_detail().unwrap_or(&error.to_string()).to_owned()
+    } else {
+        error.to_string()
+    };
+    super::error_outcome(error.exit_code(), error.machine_code(), &message, json)
 }
 
 fn pin_warning(error: &ControlError) -> String {
@@ -871,6 +897,18 @@ mod tests {
         };
         let outcome = run_with_sleeper(&args(), &mut unreachable, &mut sleeper);
         assert_eq!(outcome.code, exit::UNREACHABLE);
+    }
+
+    #[test]
+    fn transport_uses_the_fixed_human_wording_and_keeps_machine_detail() {
+        let err = ControlError::Transport {
+            detail: "channel_broken (read: ERROR_BROKEN_PIPE 109)".to_owned(),
+        };
+        assert_eq!(err.to_string(), "跟后台的连接断了，请再试一次。");
+        assert!(err
+            .json_detail()
+            .unwrap_or_default()
+            .contains("ERROR_BROKEN_PIPE"));
     }
 
     /// Read one HTTP/1.1 request: headers, then `Content-Length` body bytes,

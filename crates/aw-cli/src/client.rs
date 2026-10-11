@@ -136,6 +136,9 @@ pub enum ClientError {
     /// The Windows pipe was opened, but the server was not LocalSystem or the
     /// current user. The client sent no request bytes. Exit 4.
     UntrustedServer { detail: String },
+    /// The Windows pipe owner could not be queried before any bytes were sent.
+    /// This must stay distinct from a queried but untrusted owner. Exit 4.
+    ServerVerificationUnavailable { detail: String },
     /// The exchange failed after connect. Exit 1.
     Transport { detail: String },
     /// The daemon answered with a non-success status.
@@ -166,9 +169,14 @@ impl fmt::Display for ClientError {
                 "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。详情：{detail}"
             ),
             Self::UntrustedServer { .. } => f.write_str(
-                "连上的不是 AgentWatch 后台（管道被别的程序占用），已停止发送。",
+                "连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为了安全，这次没有发送任何内容。",
             ),
-            Self::Transport { detail } => write!(f, "向后台发请求失败：{detail}"),
+            Self::ServerVerificationUnavailable { .. } => f.write_str(
+                "没法确认连上的是不是 AgentWatch 后台，为了安全，这次没有发送任何内容。请重启后台后再试。",
+            ),
+            // The transport detail is for logs and `--json`; it often has a
+            // Win32 code and must not become a second, English user message.
+            Self::Transport { .. } => f.write_str("跟后台的连接断了，请再试一次。"),
             Self::Status {
                 status,
                 code,
@@ -181,12 +189,25 @@ impl fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 impl ClientError {
+    /// Technical channel detail for machine-readable output. Human output uses
+    /// the fixed wording in [`std::fmt::Display`].
+    #[must_use]
+    pub(crate) fn json_detail(&self) -> Option<&str> {
+        match self {
+            Self::Transport { detail }
+            | Self::UntrustedServer { detail }
+            | Self::ServerVerificationUnavailable { detail } => Some(detail),
+            _ => None,
+        }
+    }
+
     /// Stable code for an IPC peer identity failure whose human message must
     /// survive command-specific error wrappers unchanged.
     #[must_use]
     pub(crate) fn identity_failure_code(&self) -> Option<&'static str> {
         match self {
             Self::UntrustedServer { .. } => Some("daemon_untrusted_server"),
+            Self::ServerVerificationUnavailable { .. } => Some("daemon_server_unverified"),
             Self::Status { code, .. } if code.as_deref() == Some("unidentified_peer") => {
                 Some("unidentified_peer")
             }
@@ -199,7 +220,9 @@ impl ClientError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Unreachable { .. } => exit::UNREACHABLE,
-            Self::Forbidden { .. } | Self::UntrustedServer { .. } => exit::PERMISSION,
+            Self::Forbidden { .. }
+            | Self::UntrustedServer { .. }
+            | Self::ServerVerificationUnavailable { .. } => exit::PERMISSION,
             Self::Transport { .. } => exit::GENERAL,
             Self::Status { status, .. } => from_http_status(*status),
         }
@@ -390,6 +413,9 @@ fn local_exchange(
             DialError::Unreachable(detail) => ClientError::Unreachable { detail },
             DialError::Forbidden(detail) => ClientError::Forbidden { detail },
             DialError::UntrustedServer(detail) => ClientError::UntrustedServer { detail },
+            DialError::ServerVerificationUnavailable(detail) => {
+                ClientError::ServerVerificationUnavailable { detail }
+            }
             other => ClientError::Transport {
                 detail: other.to_string(),
             },
@@ -639,6 +665,47 @@ mod tests {
             err.to_string(),
             "后台认不出你是哪个用户，已拒绝这次请求。请确认 `aw` 和后台是同一个版本，还不行就重启后台。"
         );
+    }
+
+    #[test]
+    fn pipe_server_verification_failures_keep_the_two_fixed_sentences() {
+        let untrusted = ClientError::UntrustedServer {
+            detail: "owner mismatch".to_owned(),
+        };
+        assert_eq!(untrusted.exit_code(), exit::PERMISSION);
+        assert_eq!(
+            untrusted.identity_failure_code(),
+            Some("daemon_untrusted_server")
+        );
+        assert_eq!(
+            untrusted.to_string(),
+            "连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为了安全，这次没有发送任何内容。"
+        );
+        let unavailable = ClientError::ServerVerificationUnavailable {
+            detail: "GetSecurityInfo failed".to_owned(),
+        };
+        assert_eq!(unavailable.exit_code(), exit::PERMISSION);
+        assert_eq!(
+            unavailable.identity_failure_code(),
+            Some("daemon_server_unverified")
+        );
+        assert_eq!(
+            unavailable.to_string(),
+            "没法确认连上的是不是 AgentWatch 后台，为了安全，这次没有发送任何内容。请重启后台后再试。"
+        );
+        assert_eq!(unavailable.json_detail(), Some("GetSecurityInfo failed"));
+    }
+
+    #[test]
+    fn transport_uses_the_fixed_human_wording_and_keeps_machine_detail() {
+        let err = ClientError::Transport {
+            detail: "channel_broken (read: ERROR_BROKEN_PIPE 109)".to_owned(),
+        };
+        assert_eq!(err.to_string(), "跟后台的连接断了，请再试一次。");
+        assert!(err
+            .json_detail()
+            .unwrap_or_default()
+            .contains("ERROR_BROKEN_PIPE"));
     }
 
     #[test]

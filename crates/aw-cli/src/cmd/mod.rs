@@ -1164,6 +1164,7 @@ fn client_outcome(err: ClientError, endpoint: &Endpoint, json: bool) -> Outcome 
         ClientError::Unreachable { .. } => "unreachable",
         ClientError::Forbidden { .. } => "forbidden",
         ClientError::UntrustedServer { .. } => "daemon_untrusted_server",
+        ClientError::ServerVerificationUnavailable { .. } => "daemon_server_unverified",
         ClientError::Transport { .. } => "transport",
         ClientError::Status { status, .. } => match *status {
             401 => "unauthorized",
@@ -1172,7 +1173,13 @@ fn client_outcome(err: ClientError, endpoint: &Endpoint, json: bool) -> Outcome 
             _ => "status",
         },
     };
-    let mut message = err.to_string();
+    // Terminal output uses the reviewed Chinese sentence. JSON is for
+    // tooling, so preserve a transport's technical diagnostic.
+    let mut message = if json {
+        err.json_detail().unwrap_or(&err.to_string()).to_owned()
+    } else {
+        err.to_string()
+    };
     if matches!(err, ClientError::Status { .. }) {
         message.push_str("; ");
         message.push_str(&endpoint.to_string());

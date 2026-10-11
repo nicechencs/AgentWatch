@@ -1,8 +1,9 @@
 //! Windows process identity.  FFI stays in the smallest functions that need it.
 
 use crate::{
-    Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner, PeerIdentity, Platform,
-    PlatformError, ProcessEntry, ProcessKey, SamplingProcess, SpawnRequest, UnsupportedKind,
+    Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner, PeerIdentity,
+    PipeServerVerificationError, Platform, PlatformError, ProcessEntry, ProcessKey,
+    SamplingProcess, SpawnRequest, UnsupportedKind,
 };
 use std::collections::BTreeMap;
 use std::ffi::{c_void, OsStr, OsString};
@@ -19,7 +20,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    GetNamedSecurityInfoW, GetSecurityInfo, SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    SE_KERNEL_OBJECT,
 };
 use windows::Win32::Security::{
     GetSecurityDescriptorDacl, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
@@ -42,9 +44,7 @@ use windows::Win32::System::JobObjects::{
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows::Win32::System::Pipes::{
-    GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, ImpersonateNamedPipeClient,
-};
+use windows::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
 #[allow(unused_imports)] // Kept with the named-pipe-fix import set for its boot-time helpers.
 use windows::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
 use windows::Win32::System::SystemServices::{
@@ -295,6 +295,16 @@ fn io_error(error: Error) -> PlatformError {
     PlatformError::Io(std::io::Error::from_raw_os_error(error.code().0 & 0xffff))
 }
 
+/// Preserve the exact Win32 failure from a pipe-authentication primitive. The
+/// daemon turns it into its fixed 403 response, while its warning log retains
+/// the operation and code for diagnosis.
+fn pipe_peer_error(operation: &'static str, error: Error) -> PlatformError {
+    PlatformError::PipePeerNotIdentified {
+        operation,
+        win32_error: error.code().0 & 0xffff,
+    }
+}
+
 fn close(handle: HANDLE) {
     if !handle.is_invalid() {
         // SAFETY: each owned handle is passed here at most once.
@@ -457,10 +467,10 @@ fn owner_for_process(process: HANDLE) -> Option<Owner> {
     result
 }
 
-fn owner_for_token(token: HANDLE) -> Option<Owner> {
-    Some(Owner::Windows {
-        sid: sid_for_token(token).ok()?,
-        elevated: elevated_for_token(token).ok()?,
+fn owner_for_token(token: HANDLE) -> Result<Owner, PlatformError> {
+    Ok(Owner::Windows {
+        sid: sid_for_token(token)?,
+        elevated: elevated_for_token(token)?,
         integrity: integrity_for_token(token),
     })
 }
@@ -997,11 +1007,8 @@ pub fn identify_pipe_peer(
     let mut pid = 0_u32;
     // SAFETY: `handle` is supplied by the live server end of a named pipe.
     #[allow(unsafe_code)]
-    unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) }.map_err(|_| {
-        PlatformError::PeerNotIdentified {
-            reason: "named-pipe client process id is unavailable",
-        }
-    })?;
+    unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) }
+        .map_err(|error| pipe_peer_error("GetNamedPipeClientProcessId", error))?;
     // Keep impersonation synchronous and as small as possible. In particular,
     // do not await while this thread has the client token. `Drop` is also the
     // error path for OpenThreadToken, so RevertToSelf is never skipped.
@@ -1015,18 +1022,22 @@ pub fn identify_pipe_peer(
     // refuses to revert, continuing this IPC thread would run future requests
     // as the client, so `PipeImpersonation` terminates the process instead.
     impersonation.revert_or_abort();
-    if opened.is_err() {
-        return Err(PlatformError::PeerNotIdentified {
-            reason: "named-pipe client token is unavailable",
-        });
+    if let Err(error) = opened {
+        return Err(pipe_peer_error("OpenThreadToken", error));
     }
-    let owner = owner_for_token(token);
+    let owner = owner_for_token(token).map_err(|error| {
+        let win32_error = match error {
+            PlatformError::Io(ref inner) => inner.raw_os_error().unwrap_or_default(),
+            PlatformError::PipePeerNotIdentified { win32_error, .. } => win32_error,
+            _ => 0,
+        };
+        PlatformError::PipePeerNotIdentified {
+            operation: "GetTokenInformation(client token)",
+            win32_error,
+        }
+    });
     close(token);
-    let peer = owner
-        .map(|owner| PeerIdentity::new(owner, Some(pid)))
-        .ok_or(PlatformError::PeerNotIdentified {
-            reason: "named-pipe client token ownership is unavailable",
-        })?;
+    let peer = owner.map(|owner| PeerIdentity::new(owner, Some(pid)))?;
     note_pipe_peer_identification();
     Ok(peer)
 }
@@ -1043,11 +1054,8 @@ impl PipeImpersonation {
         // SAFETY: `pipe` is the connected server end supplied by the IPC
         // listener, after it has read request bytes from this client.
         #[allow(unsafe_code)]
-        unsafe { ImpersonateNamedPipeClient(pipe) }.map_err(|_| {
-            PlatformError::PeerNotIdentified {
-                reason: "named-pipe client impersonation failed",
-            }
-        })?;
+        unsafe { ImpersonateNamedPipeClient(pipe) }
+            .map_err(|error| pipe_peer_error("ImpersonateNamedPipeClient", error))?;
         Ok(Self { active: true })
     }
 
@@ -1076,57 +1084,114 @@ impl Drop for PipeImpersonation {
     }
 }
 
-/// Verify the process that owns the connected server end of a client pipe.
-/// Only LocalSystem and the current user's SID are valid daemon identities.
-/// The caller turns every failure into a local refusal before sending bytes.
-pub fn verify_pipe_server(handle: std::os::windows::io::RawHandle) -> Result<(), PlatformError> {
-    let pipe = HANDLE(handle as isize);
-    let mut pid = 0_u32;
-    // SAFETY: `handle` is the connected client end just returned by CreateFileW.
-    #[allow(unsafe_code)]
-    unsafe { GetNamedPipeServerProcessId(pipe, &mut pid) }.map_err(|_| {
-        PlatformError::PeerNotIdentified {
-            reason: "named-pipe server process id is unavailable",
-        }
-    })?;
-    if pid == 0 {
-        return Err(PlatformError::PeerNotIdentified {
-            reason: "named-pipe server process id is invalid",
-        });
-    }
-    // SAFETY: `pid` came from the kernel for this connected pipe. The returned
-    // handle is closed below on every path after this call succeeds.
-    #[allow(unsafe_code)]
-    let process =
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.map_err(io_error)?;
-    let server = owner_for_process(process);
-    close(process);
-    let Some(Owner::Windows {
-        sid: server_sid, ..
-    }) = server
-    else {
-        return Err(PlatformError::PeerNotIdentified {
-            reason: "named-pipe server token ownership is unavailable",
-        });
-    };
-    let Owner::Windows {
-        sid: current_sid, ..
-    } = CurrentPlatform.current_owner()?
-    else {
-        return Err(PlatformError::PeerNotIdentified {
-            reason: "current process token ownership is unavailable",
-        });
-    };
-    if trusted_pipe_server_sid(&server_sid, &current_sid) {
-        return Ok(());
-    }
-    Err(PlatformError::PeerNotIdentified {
-        reason: "named-pipe server is neither LocalSystem nor the current user",
-    })
+/// Verify the owner of the connected pipe object itself. This deliberately
+/// does not inspect the server process token: ordinary users can read the
+/// pipe object's `READ_CONTROL` owner even when the daemon runs as LocalSystem
+/// and its process token is inaccessible to them.
+///
+/// Only LocalSystem and the current user's SID are valid daemon owners. The
+/// caller turns both failure kinds into a local refusal before sending bytes.
+pub fn verify_pipe_server(
+    handle: std::os::windows::io::RawHandle,
+) -> Result<(), PipeServerVerificationError> {
+    let current_sid = current_pipe_client_sid()?;
+    verify_pipe_server_for_owners(handle, &[LOCAL_SYSTEM_SID, &current_sid])
 }
 
-fn trusted_pipe_server_sid(server_sid: &str, current_sid: &str) -> bool {
-    server_sid == LOCAL_SYSTEM_SID || server_sid == current_sid
+/// Verify an already-connected pipe against an explicit owner allowlist.
+///
+/// The production caller uses [`verify_pipe_server`]. Keeping the allowlist
+/// explicit here gives Windows integration tests a way to prove that a
+/// connected but untrusted peer receives zero request bytes.
+pub fn verify_pipe_server_for_owners(
+    handle: std::os::windows::io::RawHandle,
+    trusted_owners: &[&str],
+) -> Result<(), PipeServerVerificationError> {
+    let owner_sid = pipe_owner_sid(HANDLE(handle as isize))?;
+    if trusted_pipe_owner(&owner_sid, trusted_owners) {
+        Ok(())
+    } else {
+        Err(PipeServerVerificationError::NotDaemon)
+    }
+}
+
+fn trusted_pipe_owner(owner_sid: &str, trusted_owners: &[&str]) -> bool {
+    trusted_owners.contains(&owner_sid)
+}
+
+fn current_pipe_client_sid() -> Result<String, PipeServerVerificationError> {
+    match CurrentPlatform.current_owner() {
+        Ok(Owner::Windows { sid, .. }) => Ok(sid),
+        Ok(Owner::Unix { .. }) => Err(PipeServerVerificationError::CannotQuery {
+            operation: "GetTokenInformation(current process)",
+            win32_error: 0,
+        }),
+        Err(error) => Err(PipeServerVerificationError::CannotQuery {
+            operation: "GetTokenInformation(current process)",
+            win32_error: platform_win32_error(&error),
+        }),
+    }
+}
+
+fn pipe_owner_sid(pipe: HANDLE) -> Result<String, PipeServerVerificationError> {
+    let mut owner = PSID::default();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `pipe` is this process's open client handle. The output pointers
+    // are writable and the returned LocalAlloc descriptor is freed below.
+    #[allow(unsafe_code)]
+    let status = unsafe {
+        GetSecurityInfo(
+            pipe,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            Some(&mut descriptor),
+        )
+    };
+    if status.is_err() {
+        return Err(PipeServerVerificationError::CannotQuery {
+            operation: "GetSecurityInfo(pipe owner)",
+            win32_error: status.0,
+        });
+    }
+    let result = pipe_sid_text(owner).map_err(|error| PipeServerVerificationError::CannotQuery {
+        operation: "ConvertSidToStringSidW(pipe owner)",
+        win32_error: error.code().0 as u32 & 0xffff,
+    });
+    // SAFETY: successful GetSecurityInfo allocated `descriptor` with LocalAlloc.
+    #[allow(unsafe_code)]
+    let _ = unsafe { LocalFree(HLOCAL(descriptor.0.cast())) };
+    result
+}
+
+fn pipe_sid_text(sid: PSID) -> Result<String, Error> {
+    if sid.0.is_null() {
+        return Err(Error::from_win32());
+    }
+    let mut text = PWSTR::null();
+    // SAFETY: `sid` is valid for the duration of this call; Windows allocates
+    // a NUL-terminated string which is freed below on every outcome.
+    #[allow(unsafe_code)]
+    unsafe { ConvertSidToStringSidW(sid, &mut text) }?;
+    // SAFETY: a successful conversion returned a NUL-terminated LocalAlloc
+    // string. `to_string` copies it before the allocation is freed.
+    #[allow(unsafe_code)]
+    let result = unsafe { text.to_string() };
+    // SAFETY: ConvertSidToStringSidW allocated `text` with LocalAlloc.
+    #[allow(unsafe_code)]
+    let _ = unsafe { LocalFree(HLOCAL(text.0.cast())) };
+    result.map_err(|_| Error::from_win32())
+}
+
+fn platform_win32_error(error: &PlatformError) -> u32 {
+    match error {
+        PlatformError::Io(inner) => inner.raw_os_error().unwrap_or_default() as u32,
+        PlatformError::PipePeerNotIdentified { win32_error, .. } => *win32_error as u32,
+        _ => 0,
+    }
 }
 
 impl Platform for CurrentPlatform {
@@ -1362,7 +1427,7 @@ mod tests {
     #[allow(unused_imports)] // Kept with the named-pipe-fix test import set.
     use super::{
         close, environment_from, owner_sid_for_path, secure_data_dir_with_policy,
-        set_data_dir_dacl, sid_text, trusted_pipe_server_sid, CurrentPlatform, DataDirAcl,
+        set_data_dir_dacl, sid_text, trusted_pipe_owner, CurrentPlatform, DataDirAcl,
         ADMINISTRATORS_SID, SYSTEM_SID,
     };
     use crate::{
@@ -1547,9 +1612,12 @@ mod tests {
     #[test]
     fn pipe_server_must_be_system_or_this_user() {
         let user = "S-1-5-21-10-20-30-1001";
-        assert!(trusted_pipe_server_sid("S-1-5-18", user));
-        assert!(trusted_pipe_server_sid(user, user));
-        assert!(!trusted_pipe_server_sid("S-1-5-21-10-20-30-1002", user));
+        assert!(trusted_pipe_owner("S-1-5-18", &["S-1-5-18", user]));
+        assert!(trusted_pipe_owner(user, &["S-1-5-18", user]));
+        assert!(!trusted_pipe_owner(
+            "S-1-5-21-10-20-30-1002",
+            &["S-1-5-18", user]
+        ));
     }
 
     #[test]

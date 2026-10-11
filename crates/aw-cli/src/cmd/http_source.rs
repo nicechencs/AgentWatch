@@ -488,6 +488,7 @@ fn client_to_query_for(err: &ClientError, key: Option<&str>) -> QueryError {
         },
         ClientError::Forbidden { .. }
         | ClientError::UntrustedServer { .. }
+        | ClientError::ServerVerificationUnavailable { .. }
         | ClientError::Status {
             status: 401 | 403, ..
         } => QueryError::Permission {

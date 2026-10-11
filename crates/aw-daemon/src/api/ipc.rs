@@ -504,8 +504,8 @@ mod pipe {
         /// the first instance is `PermissionDenied` / `AccessDenied`).
         pub fn bind(path: &Path, state: SharedState, control: Arc<Control>) -> io::Result<Self> {
             let name = path.as_os_str().to_owned();
-            let sddl = pipe_sddl();
-            tracing::info!(target: "aw_daemon::ipc", sddl = %sddl, "pipe DACL");
+            let sddl = pipe_sddl()?;
+            tracing::info!(target: "aw_daemon::ipc", "pipe DACL configured");
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
@@ -640,7 +640,12 @@ mod pipe {
                 }
             },
             Err(err) => {
-                tracing::warn!(target: "aw_daemon::ipc", error = %err, "pipe client not identified");
+                tracing::warn!(
+                    target: "aw_daemon::ipc",
+                    error = %err,
+                    win32_error = ?err.pipe_peer_win32_error(),
+                    "pipe client not identified"
+                );
                 let response = error_response(
                     403,
                     "unidentified_peer",
@@ -1057,6 +1062,7 @@ mod tests {
 #[cfg(all(test, windows))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod pipe_tests {
+    use std::io::{Read, Write};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1112,6 +1118,24 @@ mod pipe_tests {
             Some(aw_collector_windows::privilege::is_privileged().unwrap_or(false)),
             "admin follows the caller's elevation: {me}"
         );
+        server.shutdown();
+    }
+
+    #[test]
+    fn anonymous_pipe_client_is_rejected_as_unidentified_peer() {
+        let path = pipe_name();
+        let state = Arc::new(Mutex::new(ApiState::default()));
+        let mut server = IpcServer::bind(&path, state, Control::new(None)).expect("bind pipe");
+        let request = aw_channel::encode_request("GET", "/health", "*/*", b"");
+        let mut pipe = aw_channel::open_anonymous_pipe_client_for_test(&path)
+            .expect("anonymous client can open the daemon pipe");
+        pipe.write_all(&request).expect("send request");
+        let mut raw = Vec::new();
+        pipe.read_to_end(&mut raw).expect("read rejection");
+        let reply = aw_channel::parse_response(&raw).expect("parse rejection");
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).expect("JSON rejection");
+        assert_eq!(reply.status, 403, "{body}");
+        assert_eq!(body["error"]["code"], "unidentified_peer", "{body}");
         server.shutdown();
     }
 

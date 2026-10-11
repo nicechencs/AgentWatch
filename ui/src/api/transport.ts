@@ -124,6 +124,8 @@ export function channelError(err: unknown): { code: string; message: string; det
 const CHANNEL_STATUS: Record<string, number> = {
   daemon_unreachable: 503,
   daemon_forbidden: 403,
+  daemon_untrusted_server: 403,
+  daemon_server_unverified: 403,
   daemon_busy: 503,
   daemon_timeout: 504,
   refused: 400,

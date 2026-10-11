@@ -253,6 +253,7 @@ fn is_permission_error(error: &crate::client::ClientError) -> bool {
         error,
         crate::client::ClientError::Forbidden { .. }
             | crate::client::ClientError::UntrustedServer { .. }
+            | crate::client::ClientError::ServerVerificationUnavailable { .. }
             | crate::client::ClientError::Status {
                 status: 401 | 403,
                 ..

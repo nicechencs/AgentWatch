@@ -27,25 +27,26 @@
 //! the launcher. They are not written to stdout, stderr, or an error string.
 
 use std::io::{self, Write};
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use std::os::fd::{AsRawFd, OwnedFd};
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(not(target_os = "linux"))]
 use std::process::{Child, Command};
 
-#[cfg(all(unix, not(target_os = "macos")))]
-use nix::fcntl::OFlag;
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 #[cfg(target_os = "macos")]
 use nix::unistd::pipe;
-#[cfg(all(unix, not(target_os = "macos")))]
-use nix::unistd::pipe2;
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use nix::unistd::write;
 
+#[cfg(target_os = "linux")]
+use aw_platform::{
+    platform, HeldChild, IdentifiedCaller, PlatformError, ReleasedChild, SpawnRequest,
+};
 use aw_proxy::{plan_injection, Injection, ProxyOnReject};
 
 use serde_json::{json, Value};
@@ -447,30 +448,23 @@ mod windows_release {
 /// The shell reads the gate from fd 3 and closes it before `exec`ing the
 /// target. Both pipe ends begin close-on-exec; [`keep_gate_read_fd_for_child`]
 /// creates fd 3 without that flag only in the shell child.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 const GATE_SHELL: &str = r#"IFS= read -r _ <&3 || exit 125; exec 3<&-; exec "$@""#;
 
 /// Descriptor reserved for the gate in the shell child. It is closed before
 /// the shell reaches the target `exec`.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 const GATE_FD: i32 = 3;
 
 /// Create a gate pipe whose descriptors are close-on-exec from birth whenever
 /// the platform supports `pipe2`. macOS has no `pipe2`, so set the flag on
 /// both descriptors before either can be handed to a child.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn gate_pipe() -> nix::Result<(OwnedFd, OwnedFd)> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        pipe2(OFlag::O_CLOEXEC)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let (read_fd, write_fd) = pipe()?;
-        set_cloexec(&read_fd)?;
-        set_cloexec(&write_fd)?;
-        Ok((read_fd, write_fd))
-    }
+    let (read_fd, write_fd) = pipe()?;
+    set_cloexec(&read_fd)?;
+    set_cloexec(&write_fd)?;
+    Ok((read_fd, write_fd))
 }
 
 #[cfg(target_os = "macos")]
@@ -483,7 +477,7 @@ fn set_cloexec(fd: &OwnedFd) -> nix::Result<()> {
 /// Keep the read end available to the gate shell as fd 3. The original read
 /// descriptor remains close-on-exec, so only fd 3 is inherited; the shell
 /// closes it before starting the target.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 fn keep_gate_read_fd_for_child(command: &mut Command, read_fd: OwnedFd) {
     // SAFETY: The closure runs only between fork and exec. It invokes only
@@ -506,13 +500,13 @@ fn keep_gate_read_fd_for_child(command: &mut Command, read_fd: OwnedFd) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 struct GatedChild {
     child: Child,
     release_fd: Option<OwnedFd>,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 impl SpawnedChild for GatedChild {
     fn pid(&self) -> u32 {
         self.child.id()
@@ -551,12 +545,97 @@ impl SpawnedChild for GatedChild {
     }
 }
 
+/// Linux's held child is owned by `aw-platform`.  This thin CLI adapter only
+/// translates the pre-existing `Spawner` state machine to its ownership API;
+/// it deliberately does not contain a second pipe gate implementation.
+#[cfg(target_os = "linux")]
+struct PlatformGatedChild {
+    held: Option<Box<dyn HeldChild>>,
+    released: Option<Box<dyn ReleasedChild>>,
+}
+
+#[cfg(target_os = "linux")]
+impl SpawnedChild for PlatformGatedChild {
+    fn pid(&self) -> u32 {
+        self.held
+            .as_ref()
+            .map(|child| child.pid())
+            .or_else(|| self.released.as_ref().map(|child| child.pid()))
+            .unwrap_or_default()
+    }
+
+    fn wait(&mut self) -> Result<i32, String> {
+        let child = self
+            .released
+            .take()
+            .ok_or_else(|| "无法等待尚未放行的程序".to_owned())?;
+        match child.wait().map_err(platform_child_error)? {
+            aw_platform::ReapOutcome::Exited(code) => Ok(code),
+            aw_platform::ReapOutcome::Signaled(_) | aw_platform::ReapOutcome::StillRunning => {
+                Ok(exit::GENERAL)
+            }
+        }
+    }
+
+    fn release(&mut self) -> Result<(), String> {
+        let held = self
+            .held
+            .take()
+            .ok_or_else(|| "启动闸门已经放行".to_owned())?;
+        self.released = Some(held.release().map_err(platform_child_error)?);
+        Ok(())
+    }
+
+    fn kill_and_reap(&mut self) {
+        if let Some(mut held) = self.held.take() {
+            let _ = held.abort();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_child_error(error: PlatformError) -> String {
+    match error {
+        PlatformError::Io(error) => spawn_error_text(&error),
+        _ => "无法操作被挂起的程序（platform_error）".to_owned(),
+    }
+}
+
 impl Spawner for CommandSpawner {
     fn spawn(&mut self, spec: &RunSpec) -> Result<Box<dyn SpawnedChild>, String> {
         let Some((program, args)) = spec.command.split_first() else {
             return Err("程序名为空".to_owned());
         };
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        {
+            // Keep the pre-flight lookup: the gate shell would otherwise emit
+            // an English error only after the daemon had adopted the session.
+            let path_env = spec
+                .env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, value)| value.clone())
+                .or_else(|| std::env::var("PATH").ok());
+            let resolved = resolve_program(program, path_env.as_deref(), spec.cwd.as_deref())
+                .map_err(|error| spawn_error_text(&error))?;
+            let caller = IdentifiedCaller::current_user().map_err(platform_child_error)?;
+            let request = SpawnRequest {
+                command: std::iter::once(resolved)
+                    .chain(args.iter().cloned())
+                    .collect(),
+                cwd: spec.cwd.as_ref().map(std::path::PathBuf::from),
+                env: spec.env.clone(),
+            };
+            let held = platform()
+                .spawn_suspended(&caller, &request)
+                .map_err(platform_child_error)?;
+            Ok(Box::new(PlatformGatedChild {
+                held: Some(held),
+                released: None,
+            }))
+        }
+        #[cfg(target_os = "macos")]
         {
             // The gate shell's own `exec` would report a missing program in
             // English (`exec: not found`) after the session was adopted. Resolve
@@ -588,7 +667,7 @@ impl Spawner for CommandSpawner {
                 release_fd: Some(write_fd),
             }))
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let mut command = Command::new(program);
             command.args(args);
@@ -666,6 +745,7 @@ pub(crate) fn resolve_program(
     }))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn configure_command(command: &mut Command, spec: &RunSpec) {
     if let Some(cwd) = spec.cwd.as_deref() {
         command.current_dir(cwd);
@@ -675,7 +755,7 @@ fn configure_command(command: &mut Command, spec: &RunSpec) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn nix_spawn_error_text(error: nix::errno::Errno) -> String {
     spawn_error_text(&std::io::Error::from_raw_os_error(error as i32))
 }

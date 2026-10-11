@@ -24,7 +24,7 @@ mod query;
 mod routes;
 mod system_procs;
 mod timeline_rows;
-mod watch_routes;
+pub(crate) mod watch_routes;
 
 pub(crate) use agent::OtlpRegistry;
 pub(crate) use findings::share;

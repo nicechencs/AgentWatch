@@ -46,4 +46,17 @@ describe("process exit code", () => {
     expect(cells).toEqual(["7", "0", ZH["coverage.notCollectedShort"]]);
     expect(container.textContent).toContain(ZH["procs.col.exitCode"]);
   });
+
+  it("shows the initial scan pending message instead of an empty process list", async () => {
+    const { ProcessesPage } = await import("@/features/processes/ProcessesPage");
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["processes", "s-1"], { roots: [], scan_pending: true });
+    client.setQueryData(["session", "s-1"], { public_id: "s-1", collectors: [], ended_ns: null });
+    const { container } = render(
+      <QueryClientProvider client={client}>
+        <ProcessesPage />
+      </QueryClientProvider>,
+    );
+    expect(container.textContent).toBe("正在读取进程…");
+  });
 });

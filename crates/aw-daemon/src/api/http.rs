@@ -211,7 +211,15 @@ fn serve_conn(
             "request"
         );
     }
-    write_response(&mut stream, &response)
+    if let Err(err) = write_response(&mut stream, &response) {
+        let mut guard = match state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        super::watch_routes::reply_delivery_failed(&mut guard, &request, &response);
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// Collapse a request path to its route shape.

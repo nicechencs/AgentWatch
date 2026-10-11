@@ -39,7 +39,7 @@ export function Overview({ summary, filter }: { summary: SessionSummary; filter:
   const recording = session.ended_ns == null && !session.purged;
   // Right after 「开始」 the first sample is not written yet: 「0 进程」 next to
   // 「没有记录到采集缺口」 read as "nothing is running". Say it is waiting.
-  const waitingFirstSample = recording && (stats?.proc_count ?? 0) === 0;
+  const waitingFirstSample = session.scan_pending || (recording && (stats?.proc_count ?? 0) === 0);
 
   const jump = (page: "files" | "network", expression: string) => {
     const f = [filter, expression].filter(Boolean).join(" ");
@@ -56,7 +56,7 @@ export function Overview({ summary, filter }: { summary: SessionSummary; filter:
     {
       label: t("overview.procs"),
       value: waitingFirstSample ? (
-        <span className="text-sm text-ink-faint" data-waiting-sample="">{t("overview.procsWaiting")}</span>
+        <span className="text-sm text-ink-faint" data-waiting-sample="">{session.scan_pending ? "正在读取进程…" : t("overview.procsWaiting")}</span>
       ) : (
         <Count value={stats?.proc_count} approximate={approx} approximateReason={reason} />
       ),

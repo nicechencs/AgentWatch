@@ -33,6 +33,10 @@ describe("daemon shape adapters", () => {
     expect(page.items).toHaveLength(1);
     expect(page.items[0]).toMatchObject({ id: 1, public_id: "daemon-sample", pinned: false, mode: "attach", collectors: [] });
   });
+  it("keeps an initial process scan pending instead of inventing an empty result", () => {
+    const session = toSession({ id: "s-pending", session_id: 2, scan_pending: true });
+    expect(session.scan_pending).toBe(true);
+  });
   it("maps timeline rows and summary", () => {
     const row = toTimelineItem({ cat: "proc", evidence: "S", id: 9, proc_uid: "u", session_id: 1, ts_ns: 1 });
     expect(row).toMatchObject({ kind: "proc", summary: "", fields: {}, proc: null });

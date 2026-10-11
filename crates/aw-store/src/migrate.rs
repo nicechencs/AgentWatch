@@ -599,7 +599,7 @@ impl Store {
 
         let conn = open_writable(path)?;
         apply_connection_pragmas(&conn)?;
-        if found.is_some() || !new_database_needs_pragmas_locked(&conn)? {
+        if found.is_some() {
             // An old database can be safely upgraded to WAL once. If SQLite
             // refuses, surface a dedicated startup error with the path and
             // reason rather than continuing in rollback-journal mode.
@@ -607,7 +607,10 @@ impl Store {
         } else {
             // These two persistent settings need an exclusive lock. This is the
             // only point they are written: after the busy handler was installed,
-            // and before migration 0001 creates the first table.
+            // and before *any* transaction or migration creates the first table.
+            // SQLite silently leaves `auto_vacuum` at NONE if a transaction has
+            // already initialized the database file; a lock-probe transaction
+            // here made retention unable to reclaim pages from fresh databases.
             apply_new_database_pragmas(&conn, path)?;
         }
 
@@ -710,19 +713,6 @@ fn apply_new_database_pragmas(conn: &Connection, path: &Path) -> Result<(), Stor
             reason: format!("journal_mode remained {mode}"),
         })
     }
-}
-
-/// Decide whether persistent new-database pragmas are needed while holding
-/// the same SQLite write lock that guards bootstrap migration. A process can
-/// observe a non-empty file between `open_writable` and 0001; the outer file
-/// probe is only an optimization and is not authoritative.
-fn new_database_needs_pragmas_locked(conn: &Connection) -> Result<bool, StoreError> {
-    let tx = immediate_transaction(conn)
-        .map_err(|err| StoreError::sqlite("begin_probe_new_database", err))?;
-    let needs = !table_present(&tx, "schema_meta", "probe_schema_meta_new_locked")?;
-    tx.commit()
-        .map_err(|err| StoreError::sqlite("commit_probe_new_database", err))?;
-    Ok(needs)
 }
 
 /// Read the current journal mode.
@@ -1055,6 +1045,25 @@ mod tests {
         assert_eq!(host.len(), 36);
         assert!(!host.contains('\\') && !host.contains('/'));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fresh_database_enables_incremental_auto_vacuum_before_migration() {
+        let path = temp_db("auto-vacuum");
+        let _ = fs::remove_file(&path);
+        let store = Store::open(&path).expect("open empty");
+        let auto_vacuum: i64 = store
+            .connection()
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .expect("auto_vacuum");
+        // SQLite: NONE=0, FULL=1, INCREMENTAL=2.  A transaction before this
+        // pragma silently leaves a new file at NONE, which prevents retention
+        // from giving freed pages back to the filesystem.
+        assert_eq!(auto_vacuum, 2);
+        drop(store);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(sibling(&path, "-wal"));
+        let _ = fs::remove_file(sibling(&path, "-shm"));
     }
 
     #[test]

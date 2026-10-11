@@ -110,6 +110,11 @@ pub struct SampleTarget {
     /// Identity captured at adoption. It makes a root that exits before the
     /// first poll recordable without pretending the missing fields were seen.
     pub root_hint: Option<RootHint>,
+    /// Identity checked before the session was created. Unlike [`RootHint`],
+    /// this does not claim that a process snapshot was persisted; it only
+    /// prevents a reused pid from becoming the watched root and records the
+    /// root identity the daemon actually verified.
+    pub root_identity: Option<ProcUid>,
 }
 
 impl SampleTarget {
@@ -126,6 +131,7 @@ impl SampleTarget {
             agent: None,
             write_session_row: true,
             root_hint: None,
+            root_identity: None,
         }
     }
 
@@ -140,7 +146,9 @@ impl SampleTarget {
         row.root_proc_uid = self
             .root_hint
             .as_ref()
-            .map(|hint| i64::from_ne_bytes(hint.uid.0.to_ne_bytes()));
+            .map(|hint| hint.uid)
+            .or(self.root_identity)
+            .map(|uid| i64::from_ne_bytes(uid.0.to_ne_bytes()));
         row.argv.clone_from(&self.argv_json);
         row.agent.clone_from(&self.agent);
         row
@@ -236,12 +244,13 @@ impl HostSampler {
             }
             return false;
         };
-        if self
+        let expected_root = self
             .target
             .root_hint
             .as_ref()
-            .is_some_and(|hint| hint.uid != uid)
-        {
+            .map(|hint| hint.uid)
+            .or(self.target.root_identity);
+        if expected_root.is_some_and(|expected| expected != uid) {
             tracing::warn!(
                 pid = self.target.root_pid,
                 "poll sampler not started: root process identity changed"

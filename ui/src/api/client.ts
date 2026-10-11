@@ -133,6 +133,7 @@ export function toSession(raw: unknown): Session {
     os_version: strOrNull(r.os_version),
     collectors: arr(r.collectors).map(toCollector).filter((c): c is Session["collectors"][number] => c !== null),
     pinned: Boolean(r.pinned),
+    scan_pending: r.scan_pending === true,
     stats: stats ? { ...(stats as object), proc_count: numOrNull(stats.proc_count ?? stats.process_count) } : null,
   } as Session;
 }
@@ -498,8 +499,8 @@ export const api = {
     toPage(await get<unknown>(`/sessions/${sid}/around${qs({ ref, window })}`), ["rows"], toTimelineItem),
 
   processes: async (sid: string, tree = true) => {
-    const raw = await get<{ roots?: unknown[]; processes?: unknown[] }>(`/sessions/${sid}/processes${qs({ tree: tree ? 1 : 0 })}`);
-    return { roots: arr(raw.roots ?? raw.processes).map(toProcessNode) };
+    const raw = await get<{ roots?: unknown[]; processes?: unknown[]; scan_pending?: boolean }>(`/sessions/${sid}/processes${qs({ tree: tree ? 1 : 0 })}`);
+    return { roots: arr(raw.roots ?? raw.processes).map(toProcessNode), scan_pending: raw.scan_pending === true };
   },
   processChildren: async (sid: string, procUid: string) => {
     const raw = await get<{ children?: unknown[] }>(`/sessions/${sid}/processes/${procUid}`);

@@ -23,8 +23,8 @@ use crate::endpoint::Endpoint;
 use super::query::{
     encode_path_segment, encode_query, AroundItem, AroundPage, AroundQuery, FileItem, FileQuery,
     FindingItem, FindingQuery, FindingRef, FlowItem, GapItem, HttpItem, HttpPage, HttpQuery,
-    ProcItem, QueryError, QuerySource, SearchHit, SearchQuery, SessionItem, SessionQuery,
-    SessionShow, TimelineBounds, TimelineItem, TimelinePage,
+    ProcItem, ProcessList, QueryError, QuerySource, SearchHit, SearchQuery, SessionItem,
+    SessionQuery, SessionShow, TimelineBounds, TimelineItem, TimelinePage,
 };
 
 /// Lends a [`Transport`] to [`Client`], which takes one by value.
@@ -279,7 +279,7 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
         key: &str,
         tree: bool,
         filter: Option<&str>,
-    ) -> Result<Vec<ProcItem>, QueryError> {
+    ) -> Result<ProcessList, QueryError> {
         let mut pairs: Vec<(String, String)> = if tree {
             vec![("tree".to_owned(), "1".to_owned())]
         } else {
@@ -293,7 +293,17 @@ impl<T: Transport> QuerySource for HttpQuerySource<T> {
         // 「找不到会话 ``」.
         let body = self.call_session(&get_pairs(&path, &pairs), Some(key))?;
         let rows = array_field(&body, "processes")?;
-        rows.iter().map(|row| proc_item(row, tree)).collect()
+        let nodes = rows
+            .iter()
+            .map(|row| proc_item(row, tree))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ProcessList {
+            nodes,
+            scan_pending: body
+                .get("scan_pending")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
     }
 
     fn flows(

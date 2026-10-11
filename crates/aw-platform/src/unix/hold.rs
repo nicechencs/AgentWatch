@@ -1228,14 +1228,18 @@ mod tests {
         let base = account_base_env(caller_uid(&caller));
         let mut env = base.clone();
         env.push(("AW_RV".to_owned(), "1".to_owned()));
-        // `sh` writes the env it was exec'd with into the file. Redirecting this
-        // process's own stdout would be inherited by any other test that forked
-        // at the same moment, so the target writes the file itself.
+        // `awk` writes the environment it was exec'd with (ENVIRON) into the
+        // file, with no shell in between: a shell adds its own variables
+        // (`PWD`; macOS bash also `SHLVL` and `_`), which would hide whether the
+        // daemon passed anything extra. Redirecting this process's own stdout
+        // would be inherited by any other test that forked at the same moment,
+        // so the target writes the file itself.
         let request = SpawnRequest {
             command: vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                format!("env > '{}'", out.display()),
+                "awk".to_owned(),
+                "-v".to_owned(),
+                format!("out={}", out.display()),
+                "BEGIN { for (name in ENVIRON) print name \"=\" ENVIRON[name] > out }".to_owned(),
             ],
             cwd: None,
             env,
@@ -1250,14 +1254,7 @@ mod tests {
         let text = std::fs::read_to_string(&out).expect("env file");
         let mut got: Vec<String> = text.lines().map(str::to_owned).collect();
         got.sort();
-        // `sh` inserts `PWD` (its own working directory) into a command it runs.
-        // That is the shell, not the environment it was exec'd with. Everything
-        // else must be exactly the base five plus the one requested name.
-        // macOS's `sh` (bash) also adds `SHLVL` and `_`; those come from the
-        // shell too, not from the environment it was exec'd with.
-        got.retain(|line| {
-            !line.starts_with("PWD=") && !line.starts_with("SHLVL=") && !line.starts_with("_=")
-        });
+        // Exactly the base five plus the one requested name: no filtering.
         let mut want: Vec<String> = base
             .iter()
             .map(|(key, value)| format!("{key}={value}"))

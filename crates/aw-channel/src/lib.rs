@@ -1280,7 +1280,11 @@ mod windows_pipe_owner_tests {
     static PIPE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn runtime() -> tokio::runtime::Runtime {
-        Builder::new_current_thread().enable_time().build().unwrap()
+        Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap()
     }
 
     async fn assert_no_request_bytes(pipe: &NamedPipeServer) {
@@ -1299,7 +1303,9 @@ mod windows_pipe_owner_tests {
 
     #[test]
     fn installed_service_refuses_a_same_user_server_without_sending_or_falling_back() {
-        let _lock = PIPE_TEST_LOCK.lock().unwrap();
+        let _lock = PIPE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         runtime().block_on(async {
             let path = PathBuf::from(WINDOWS_PIPE);
             let sddl = pipe_sddl().expect("current-user pipe SDDL");
@@ -1361,7 +1367,9 @@ mod windows_pipe_owner_tests {
 
     #[test]
     fn no_service_allows_a_same_user_development_pipe() {
-        let _lock = PIPE_TEST_LOCK.lock().unwrap();
+        let _lock = PIPE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         runtime().block_on(async {
             let sddl = pipe_sddl().expect("current-user pipe SDDL");
             let _server = create_server(OsStr::new(WINDOWS_PIPE), true, &sddl)

@@ -290,16 +290,19 @@ pub(crate) fn write_status(
     status: u16,
     code: Option<&str>,
     message: &str,
+    waited_seconds: Option<u64>,
 ) -> fmt::Result {
     let Some(code) = code.filter(|code| !code.is_empty()) else {
         return write!(f, "后台返回 HTTP {status}：{message}");
     };
     if code == "db_busy" {
-        let waited = busy_waited_seconds(message).unwrap_or(0);
-        return write!(
-            f,
-            "会话数据库正忙（后台在写入），等了 {waited} 秒还是没轮到，请稍后再试。"
-        );
+        return match waited_seconds {
+            Some(waited) => write!(
+                f,
+                "会话数据库正忙（后台在写入），等了 {waited} 秒还是没轮到，请稍后再试。"
+            ),
+            None => f.write_str("会话数据库正忙（后台在写入），请稍后再试。"),
+        };
     }
     let Some(row) = ROWS.iter().find(|row| row.code == code) else {
         return write!(f, "后台返回错误 {code}（HTTP {status}）：{message}");
@@ -309,13 +312,6 @@ pub(crate) fn write_status(
         write!(f, "（详情：{message}）")?;
     }
     Ok(())
-}
-
-fn busy_waited_seconds(message: &str) -> Option<u64> {
-    let marker = "Waited ";
-    let rest = message.split_once(marker)?.1;
-    let digits = rest.split_whitespace().next()?;
-    digits.parse().ok()
 }
 
 /// Whether `message` says something the mapped sentence does not.
@@ -396,10 +392,31 @@ mod tests {
         struct Shown(u16, Option<String>, String);
         impl fmt::Display for Shown {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write_status(f, self.0, self.1.as_deref(), &self.2)
+                write_status(f, self.0, self.1.as_deref(), &self.2, None)
             }
         }
         Shown(status, code.map(str::to_owned), message.to_owned()).to_string()
+    }
+
+    fn render_waited(
+        status: u16,
+        code: Option<&str>,
+        message: &str,
+        waited_seconds: Option<u64>,
+    ) -> String {
+        struct Shown(u16, Option<String>, String, Option<u64>);
+        impl fmt::Display for Shown {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write_status(f, self.0, self.1.as_deref(), &self.2, self.3)
+            }
+        }
+        Shown(
+            status,
+            code.map(str::to_owned),
+            message.to_owned(),
+            waited_seconds,
+        )
+        .to_string()
     }
 
     #[test]
@@ -465,12 +482,17 @@ mod tests {
     #[test]
     fn database_busy_uses_the_measured_wait_in_the_fixed_chinese_sentence() {
         assert_eq!(
-            render(
+            render_waited(
                 503,
                 Some("db_busy"),
-                "The session database is busy (the service is writing). Waited 8 s and still couldn't get in; try again later."
+                "The session database is busy (the service is writing). Waited 8 s and still couldn't get in; try again later.",
+                Some(8),
             ),
             "会话数据库正忙（后台在写入），等了 8 秒还是没轮到，请稍后再试。"
+        );
+        assert_eq!(
+            render(503, Some("db_busy"), "developer detail"),
+            "会话数据库正忙（后台在写入），请稍后再试。"
         );
     }
 

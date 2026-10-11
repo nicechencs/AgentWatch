@@ -40,11 +40,17 @@ describe("error text", () => {
         error: {
           code: "db_busy",
           message: "The session database is busy (the service is writing). Waited 8 s and still couldn't get in; try again later.",
+          waited_seconds: 8,
         },
       },
       "x",
     );
     expect(describeError(err, t)).toBe("会话数据库正忙（后台在写入），等了 8 秒还是没轮到，请稍后再试。");
+  });
+
+  it("does not invent a database-lock wait when the daemon did not measure one", () => {
+    const err = new ApiError(503, { error: { code: "db_busy", message: "developer detail" } }, "x");
+    expect(describeError(err, t)).toBe("会话数据库正忙（后台在写入），请稍后再试。");
   });
 
   it("uses the agreed Chinese wording for Windows peer-identity failures", () => {

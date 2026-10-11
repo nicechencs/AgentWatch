@@ -11,8 +11,8 @@ const expected = {
     exited: ["程序已退出", null],
     user_stop: ["已停止记录", null],
     program_exit: ["程序已退出", null],
-    daemon_restart: ["记录已中断", "后台重启，记录已中断"],
-    daemon_shutdown: ["记录已中断", "后台重启，记录已中断"],
+    daemon_restart: ["记录已中断（后台重启）", "后台重启，记录已中断，程序可能还在运行"],
+    daemon_shutdown: ["记录已中断（后台重启）", "后台重启，记录已中断，程序可能还在运行"],
     stop: ["停止记录", "程序还在运行，只是不再记录"],
   },
   en: {
@@ -20,8 +20,8 @@ const expected = {
     exited: ["Program exited", null],
     user_stop: ["Recording stopped", null],
     program_exit: ["Program exited", null],
-    daemon_restart: ["Recording interrupted", "The background service restarted; recording was interrupted"],
-    daemon_shutdown: ["Recording interrupted", "The background service restarted; recording was interrupted"],
+    daemon_restart: ["Recording interrupted (service restarted)", "The background service restarted; recording was interrupted; the program may still be running"],
+    daemon_shutdown: ["Recording interrupted (service restarted)", "The background service restarted; recording was interrupted; the program may still be running"],
     stop: ["Stop recording", "The program is still running; it is just no longer recorded"],
   },
 } as const;

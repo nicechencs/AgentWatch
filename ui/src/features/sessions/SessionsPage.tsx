@@ -63,7 +63,9 @@ export function SessionsPage() {
     // 「已停止」 without reopening the page.
     refetchInterval: refreshListWhileRecording,
   });
+  const doctor = useQuery({ queryKey: ["doctor"], queryFn: () => api.doctor(), refetchInterval: 10_000 });
   const stats = useQuery({ queryKey: ["db-stats"], queryFn: () => api.dbStats() });
+  const readOnly = doctor.data?.database?.read_only === true;
 
   const agents = useMemo(() => {
     const names = new Set<string>();
@@ -103,9 +105,15 @@ export function SessionsPage() {
     <main className="px-4 py-3">
       <div className="flex items-center gap-3">
         <h1 className="text-base font-semibold">{t("sessions.title")}</h1>
-        <Link to="/new" className="rounded bg-ink px-2 py-1 text-xs text-paper">
-          + {t("sessions.new")}
-        </Link>
+        {readOnly ? (
+          <button type="button" disabled title={t("error.dbReadOnlyNewer")} className="rounded bg-ink px-2 py-1 text-xs text-paper disabled:opacity-50">
+            + {t("sessions.new")}
+          </button>
+        ) : (
+          <Link to="/new" className="rounded bg-ink px-2 py-1 text-xs text-paper">
+            + {t("sessions.new")}
+          </Link>
+        )}
         <span className="ml-auto text-xs text-ink-faint">
           {stats.data ? <Disk stats={stats.data} /> : null}
         </span>
@@ -174,6 +182,7 @@ export function SessionsPage() {
                 key={session.public_id}
                 session={session}
                 ownerActions={!admin || session.user_id === me?.user_id}
+                readOnly={readOnly}
                 showUser={admin}
                 checked={picked.has(session.public_id)}
                 renaming={renaming === session.public_id}
@@ -281,12 +290,13 @@ function Disk({ stats }: { stats: DbStats }) {
 }
 
 function SessionRow({
-  session, checked, renaming, ownerActions, showUser, onToggle, onOpen, onRenameStart, onRename, onPin, onStop, stopping, stopNotice, onDelete,
+  session, checked, renaming, ownerActions, readOnly, showUser, onToggle, onOpen, onRenameStart, onRename, onPin, onStop, stopping, stopNotice, onDelete,
 }: {
   session: Session;
   checked: boolean;
   renaming: boolean;
   ownerActions: boolean;
+  readOnly: boolean;
   showUser: boolean;
   onToggle: () => void;
   onOpen: () => void;
@@ -362,10 +372,10 @@ function SessionRow({
       <td className="px-2 py-1 text-right">
         {purged ? null : (
           <span className="inline-flex gap-2 text-ink-faint">
-            <button type="button" disabled={!ownerActions} title={!ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onRenameStart}>{t("sessions.rename")}</button>
-            <button type="button" disabled={!ownerActions} title={!ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onPin}>{session.pinned ? t("sessions.unpin") : t("sessions.pin")}</button>
-            {active ? <button type="button" disabled={!ownerActions || stopping} title={!ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onStop}>{stopping ? t("session.stopping") : t("session.stop")}</button> : null}
-            <button type="button" disabled={!ownerActions} title={!ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onDelete}>{t("sessions.delete")}</button>
+            <button type="button" disabled={!ownerActions || readOnly} title={readOnly ? t("error.dbReadOnlyNewer") : !ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onRenameStart}>{t("sessions.rename")}</button>
+            <button type="button" disabled={!ownerActions || readOnly} title={readOnly ? t("error.dbReadOnlyNewer") : !ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onPin}>{session.pinned ? t("sessions.unpin") : t("sessions.pin")}</button>
+            {active ? <button type="button" disabled={!ownerActions || readOnly || stopping} title={readOnly ? t("error.dbReadOnlyNewer") : !ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onStop}>{stopping ? t("session.stopping") : t("session.stop")}</button> : null}
+            <button type="button" disabled={!ownerActions || readOnly} title={readOnly ? t("error.dbReadOnlyNewer") : !ownerActions ? t("sessions.ownerOnly") : undefined} onClick={onDelete}>{t("sessions.delete")}</button>
             <button
               type="button"
               disabled={exporter.pending !== null}

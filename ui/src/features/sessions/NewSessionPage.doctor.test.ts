@@ -18,5 +18,11 @@ describe("new-session doctor probe", () => {
     expect(doctor.probed).toBe(false);
     expect(doctor.platform).toBe("linux");
     expect(doctor.privileged).toBe(false);
+    expect(doctor.database.read_only).toBeNull();
+  });
+
+  it("keeps the daemon's newer-schema read-only flag", () => {
+    const doctor = toDoctor({ database: { read_only: true } });
+    expect(doctor.database.read_only).toBe(true);
   });
 });

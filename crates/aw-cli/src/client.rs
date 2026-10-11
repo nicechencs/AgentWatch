@@ -149,6 +149,8 @@ pub enum ClientError {
         code: Option<String>,
         /// Short message taken from the JSON body, or a fallback. No token.
         message: String,
+        /// Measured SQLite wait, when the daemon supplied it structurally.
+        waited_seconds: Option<u64>,
     },
 }
 
@@ -181,7 +183,14 @@ impl fmt::Display for ClientError {
                 status,
                 code,
                 message,
-            } => crate::daemon_errors::write_status(f, *status, code.as_deref(), message),
+                waited_seconds,
+            } => crate::daemon_errors::write_status(
+                f,
+                *status,
+                code.as_deref(),
+                message,
+                *waited_seconds,
+            ),
         }
     }
 }
@@ -271,6 +280,7 @@ impl<T: Transport> Client<T> {
                 status: reply.status,
                 code: status_code(&reply),
                 message: status_message(&reply),
+                waited_seconds: status_waited_seconds(&reply),
             })
         }
     }
@@ -301,6 +311,12 @@ fn status_code(reply: &ApiReply) -> Option<String> {
     reply
         .json()
         .and_then(|value| value.get("error")?.get("code")?.as_str().map(str::to_owned))
+}
+
+fn status_waited_seconds(reply: &ApiReply) -> Option<u64> {
+    reply
+        .json()
+        .and_then(|value| value.get("error")?.get("waited_seconds")?.as_u64())
 }
 
 /// Production HTTP transport. Dials `127.0.0.1` only, writes one HTTP/1.1
@@ -622,6 +638,37 @@ mod tests {
     }
 
     #[test]
+    fn database_busy_uses_only_the_structured_waited_seconds() {
+        let measured = MemoryTransport::replying(
+            503,
+            br#"{"error":{"code":"db_busy","message":"developer detail","waited_seconds":8}}"#
+                .to_vec(),
+        );
+        let mut measured = Client::new(http_endpoint(), measured);
+        let err = measured
+            .call(&ApiRequest::get("/api/v1/sessions"))
+            .expect_err("busy response");
+        assert_eq!(
+            err.to_string(),
+            "会话数据库正忙（后台在写入），等了 8 秒还是没轮到，请稍后再试。"
+        );
+
+        let unknown = MemoryTransport::replying(
+            503,
+            br#"{"error":{"code":"db_busy","message":"Waited 99 s in unstructured text"}}"#
+                .to_vec(),
+        );
+        let mut unknown = Client::new(http_endpoint(), unknown);
+        let err = unknown
+            .call(&ApiRequest::get("/api/v1/sessions"))
+            .expect_err("busy response");
+        assert_eq!(
+            err.to_string(),
+            "会话数据库正忙（后台在写入），请稍后再试。"
+        );
+    }
+
+    #[test]
     fn missing_socket_is_unreachable_exit_3() {
         let endpoint = resolve(&EndpointInput {
             socket: Some("/tmp/aw-does-not-exist.sock".to_owned()),
@@ -661,6 +708,7 @@ mod tests {
             status: 403,
             code: Some("unidentified_peer".to_owned()),
             message: "pipe client could not be identified".to_owned(),
+            waited_seconds: None,
         };
         assert_eq!(err.exit_code(), exit::PERMISSION);
         assert_eq!(err.identity_failure_code(), Some("unidentified_peer"));

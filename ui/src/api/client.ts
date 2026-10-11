@@ -219,6 +219,7 @@ export function toSystemProcessTable(raw: unknown): SystemProcessTable {
 export function toDoctor(raw: unknown): DoctorReport {
   const r = isObj(raw) ? raw : {};
   const host = isObj(r.host) ? r.host : {};
+  const database = isObj(r.database) ? r.database : {};
   const caps = arr(r.capabilities).filter(isObj) as unknown as DoctorReport["capabilities"];
   return {
     ...(r as object),
@@ -231,6 +232,7 @@ export function toDoctor(raw: unknown): DoctorReport {
     reason: strOrNull(r.reason),
     privileged: typeof host.privileged === "boolean" ? host.privileged : null,
     privileged_note: strOrNull(host.privileged_note),
+    database: { read_only: typeof database.read_only === "boolean" ? database.read_only : null },
   } as DoctorReport;
 }
 

@@ -40,8 +40,8 @@ describe("session header stop action", () => {
   it("shows an interrupted reason in the header and title", () => {
     view(toSession({ ...base, ended_ns: 2, end_reason: "daemon_restart" }));
     const status = screen.getByText(/记录已中断/u);
-    expect(status).toHaveTextContent("记录已中断 · 后台重启，记录已中断");
-    expect(status).toHaveAttribute("title", "后台重启，记录已中断");
+    expect(status).toHaveTextContent("记录已中断（后台重启） · 后台重启，记录已中断，程序可能还在运行");
+    expect(status).toHaveAttribute("title", "后台重启，记录已中断，程序可能还在运行");
   });
 
   it("uses Stop recording wording and shows the success notice", async () => {
@@ -56,5 +56,16 @@ describe("session header stop action", () => {
     await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("程序还在运行，只是不再记录"));
     expect(session).toHaveBeenCalledWith("s-1");
     expect(screen.getByText("○ 已停止记录")).toBeInTheDocument();
+  });
+
+  it("shows the newer-schema banner and disables stopping", () => {
+    const active = toSession({ ...base, ended_ns: null, end_reason: null });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["session", "s-1"], active);
+    client.setQueryData(["doctor"], { database: { read_only: true } });
+    render(<QueryClientProvider client={client}><SessionLayout /></QueryClientProvider>);
+
+    expect(screen.getByRole("alert")).toHaveTextContent("这份记录是更新版本的 AgentWatch 写的，现在只能查看，不能新建或修改。请升级 AgentWatch。");
+    expect(screen.getByRole("button", { name: "停止记录" })).toBeDisabled();
   });
 });

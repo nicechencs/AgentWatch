@@ -14,6 +14,7 @@ import { sessionQueryOptions } from "@/lib/live-session";
 import { sessionTitle } from "@/lib/session-title";
 import { sessionStatus } from "@/lib/session-status";
 import { useI18n } from "@/lib/i18n";
+import { ReadOnlyNewerBanner } from "@/components/ReadOnlyNewerBanner";
 
 const TABS = [
   { to: "/s/$sid", key: "nav.overview", exact: true },
@@ -37,6 +38,7 @@ export function SessionLayout() {
   const [stopNotice, setStopNotice] = useState(false);
   const client = useQueryClient();
   const session = useQuery(sessionQueryOptions(sid));
+  const doctor = useQuery({ queryKey: ["doctor"], queryFn: () => api.doctor(), refetchInterval: 10_000 });
   const ended = session.data ? session.data.ended_ns !== null || Boolean(session.data.purged) : null;
   const wasRecording = useRef(false);
   useEffect(() => {
@@ -75,6 +77,7 @@ export function SessionLayout() {
   const data = session.data;
   const status = sessionStatus(data, t);
   const active = status.kind === "recording";
+  const readOnly = doctor.data?.database?.read_only === true;
 
   const stop = async () => {
     setStopping(true);
@@ -121,7 +124,7 @@ export function SessionLayout() {
         {data.scan_pending ? <span className="text-xs text-ink-faint">正在读取进程…</span> : null}
         <div className="ml-auto flex gap-2">
           {active ? (
-            <button type="button" onClick={stop} disabled={stopping} className="rounded border border-line px-2 py-1 text-xs">
+            <button type="button" onClick={stop} disabled={stopping || readOnly} title={readOnly ? t("error.dbReadOnlyNewer") : undefined} className="rounded border border-line px-2 py-1 text-xs">
               {stopping ? t("session.stopping") : t("session.stop")}
             </button>
           ) : null}
@@ -156,6 +159,7 @@ export function SessionLayout() {
           ) : null}
         </div>
       </header>
+      <ReadOnlyNewerBanner />
       {stopNotice ? <p role="status" className="px-3 py-1 text-xs text-ink-soft">{t("session.stopNotice")}</p> : null}
       {stopError ? <ErrorNote error={stopError} /> : null}
       <nav className="flex gap-1 border-b border-line px-3">

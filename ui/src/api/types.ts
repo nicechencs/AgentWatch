@@ -45,7 +45,7 @@ export interface Page<T> {
 }
 
 export interface ApiErrorBody {
-  error: { code: string; message: string; column?: number; suggestion?: string };
+  error: { code: string; message: string; column?: number; suggestion?: string; waited_seconds?: number };
 }
 
 export type SessionMode = "launch" | "attach";
@@ -359,6 +359,8 @@ export interface DoctorReport {
   reason: string | null;
   privileged: boolean | null;
   privileged_note: string | null;
+  /** `true` only when this database was written by a newer AgentWatch. */
+  database: { read_only: boolean | null };
 }
 
 export interface SystemProcess {

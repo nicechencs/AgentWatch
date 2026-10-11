@@ -2449,6 +2449,7 @@ mod tests {
             status: 410,
             code: None,
             message: "adopt_timeout".to_owned(),
+            waited_seconds: None,
         });
         let mut spawner = FakeSpawner {
             log: Rc::clone(&log),
@@ -2915,6 +2916,7 @@ mod tests {
             status: 503,
             code: Some("collector_unavailable".to_owned()),
             message: "collector unavailable".to_owned(),
+            waited_seconds: None,
         });
         let mut spawner = FakeSpawner {
             log,

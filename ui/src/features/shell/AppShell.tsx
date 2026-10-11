@@ -1,5 +1,6 @@
 import { Link, Outlet } from "@tanstack/react-router";
 import { useI18n } from "@/lib/i18n";
+import { ReadOnlyNewerBanner } from "@/components/ReadOnlyNewerBanner";
 
 /** Chrome for pages that are not inside a session. */
 export function AppShell() {
@@ -25,6 +26,7 @@ export function AppShell() {
           </Link>
         </nav>
       </header>
+      <ReadOnlyNewerBanner />
       <div className="min-h-0 flex-1 overflow-auto">
         <Outlet />
       </div>

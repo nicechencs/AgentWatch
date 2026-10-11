@@ -4,7 +4,7 @@
  */
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import zh from "@/i18n/zh.json";
 
@@ -43,5 +43,11 @@ describe("launch command box", () => {
     rerender(<LaunchForm pending={false} onStart={onStart} />);
     fireEvent.submit(input.form as HTMLFormElement);
     expect(onStart).toHaveBeenCalledWith(expect.objectContaining({ mode: "launch", argv: ["sleep", "60"] }));
+  });
+
+  it("disables creating a session for a newer-schema database", async () => {
+    const { LaunchForm } = await import("@/features/sessions/NewSessionPage");
+    render(<LaunchForm pending={false} readOnly onStart={() => undefined} />);
+    expect(screen.getByRole("button", { name: "开始" })).toBeDisabled();
   });
 });

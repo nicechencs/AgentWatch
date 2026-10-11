@@ -16,6 +16,7 @@ export function NewSessionPage() {
   const navigate = useNavigate();
   const client = useQueryClient();
   const doctor = useQuery({ queryKey: ["doctor"], queryFn: () => api.doctor() });
+  const readOnly = doctor.data?.database?.read_only === true;
   const [error, setError] = useState<unknown>(null);
   const [pending, setPending] = useState(false);
 
@@ -46,8 +47,8 @@ export function NewSessionPage() {
     <main className="px-4 py-3">
       <h1 className="text-base font-semibold">{t("new.title")}</h1>
       <div className="mt-3 grid gap-4 lg:grid-cols-2">
-        <LaunchForm pending={pending} onStart={start} onEdit={clearError} />
-        <AttachForm pending={pending} onStart={start} onPick={clearError} />
+        <LaunchForm pending={pending} readOnly={readOnly} onStart={start} onEdit={clearError} />
+        <AttachForm pending={pending} readOnly={readOnly} onStart={start} onPick={clearError} />
       </div>
       {error ? <ErrorNote error={error} /> : null}
       <section className="mt-4">
@@ -118,10 +119,12 @@ export function CapabilityList({ capabilities }: { capabilities: DoctorCapabilit
  */
 export const LaunchForm = memo(function LaunchForm({
   pending,
+  readOnly = false,
   onStart,
   onEdit,
 }: {
   pending: boolean;
+  readOnly?: boolean;
   onStart: (body: Parameters<typeof api.createSession>[0]) => void;
   /** Called when the command or directory is edited. The inputs stay uncontrolled. */
   onEdit?: () => void;
@@ -141,7 +144,7 @@ export const LaunchForm = memo(function LaunchForm({
         event.preventDefault();
         const argv = splitCommand(commandRef.current?.value ?? "");
         const cwd = (cwdRef.current?.value ?? "").trim();
-        if (argv.length === 0) return;
+        if (argv.length === 0 || readOnly) return;
         onStart({
           mode: "launch",
           argv,
@@ -207,7 +210,7 @@ export const LaunchForm = memo(function LaunchForm({
         </label>
       </div>
       <p className="mt-3 text-[11px] text-ink-faint">{t("new.noTty")}</p>
-      <button type="submit" disabled={pending} className="mt-3 rounded bg-ink px-3 py-1 text-xs text-paper disabled:opacity-50">
+      <button type="submit" disabled={pending || readOnly} title={readOnly ? t("error.dbReadOnlyNewer") : undefined} className="mt-3 rounded bg-ink px-3 py-1 text-xs text-paper disabled:opacity-50">
         {t("new.start")}
       </button>
     </form>
@@ -216,10 +219,12 @@ export const LaunchForm = memo(function LaunchForm({
 
 function AttachForm({
   pending,
+  readOnly,
   onStart,
   onPick,
 }: {
   pending: boolean;
+  readOnly: boolean;
   onStart: (body: Parameters<typeof api.createSession>[0]) => void;
   /** Called when a process is picked. A failed launch must not stay on screen. */
   onPick?: () => void;
@@ -265,7 +270,7 @@ function AttachForm({
       className="rounded border border-line p-3"
       onSubmit={(event) => {
         event.preventDefault();
-        if (selected === null) return;
+        if (selected === null || readOnly) return;
         onStart({ mode: "attach", pid: selected, include_existing_children: includeChildren, follow_children: true });
       }}
     >
@@ -310,7 +315,7 @@ function AttachForm({
         <input type="checkbox" checked={includeChildren} onChange={(event) => setIncludeChildren(event.target.checked)} />
         {t("new.includeChildren")}
       </label>
-      <button type="submit" disabled={pending || selected === null} className="mt-3 rounded bg-ink px-3 py-1 text-xs text-paper disabled:opacity-50">
+      <button type="submit" disabled={pending || readOnly || selected === null} title={readOnly ? t("error.dbReadOnlyNewer") : undefined} className="mt-3 rounded bg-ink px-3 py-1 text-xs text-paper disabled:opacity-50">
         {t("new.attachButton")}
       </button>
     </form>

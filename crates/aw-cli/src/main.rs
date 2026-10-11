@@ -16,6 +16,10 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if launch::watchdog::is_internal() {
+        return exit_code(launch::watchdog::run_internal());
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match cmd::execute_args(&args) {
         Ok(outcome) => {

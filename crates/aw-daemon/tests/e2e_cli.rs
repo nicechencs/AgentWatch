@@ -415,6 +415,77 @@ fn proc_ids(pid: u64, key: &str) -> Vec<u32> {
         .collect()
 }
 
+fn watchdog_test_root(label: &str) -> PathBuf {
+    let root = PathBuf::from(format!("/tmp/aw-watchdog-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create watchdog test directory");
+    root
+}
+
+fn marker_pids(marker: &Path) -> Vec<u32> {
+    std::fs::read_to_string(marker)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+fn wait_for_marker_pids(marker: &Path, minimum: usize) -> Vec<u32> {
+    let started = Instant::now();
+    loop {
+        let pids = marker_pids(marker);
+        if pids.len() >= minimum {
+            return pids;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "watchdog descendants did not publish {minimum} pids"
+        );
+        sleep(Duration::from_millis(25));
+    }
+}
+
+fn assert_reaped(pid: u32) {
+    let started = Instant::now();
+    loop {
+        if !Path::new(&format!("/proc/{pid}")).exists() {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "watchdog descendant {pid} survived cleanup"
+        );
+        sleep(Duration::from_millis(25));
+    }
+}
+
+fn assert_marked_descendants_reaped(marker: &Path) {
+    let pids = marker_pids(marker);
+    assert!(!pids.is_empty(), "watchdog test did not mark a descendant");
+    for pid in pids {
+        assert_reaped(pid);
+    }
+}
+
+fn start_no_daemon_watchdog_run(marker: &Path, script: &str) -> Child {
+    Command::new(aw_bin())
+        .env("AW_E2E_GRANDCHILD_PID", marker)
+        .args(["run", "--no-daemon", "-q", "--", "sh", "-c", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn local aw run")
+}
+
+fn signal_process(pid: u32, signal: &str) {
+    let status = Command::new("kill")
+        .args([&format!("-{signal}"), &pid.to_string()])
+        .status()
+        .expect("signal aw");
+    assert!(status.success(), "could not send {signal} to aw");
+}
+
 fn my_uid() -> u32 {
     proc_ids(u64::from(std::process::id()), "Uid:")[0]
 }
@@ -586,6 +657,11 @@ fn daemon_launch_starts_and_tracks_without_cgroup() {
         vec![my_uid(); 4],
         "runs as the caller"
     );
+    assert_eq!(
+        proc_ids(pid, "PPid:")[0],
+        daemon.child.id(),
+        "a daemon-launched program is not wrapped in the CLI watchdog"
+    );
     // Recording while the program runs: not ended before it exits.
     let (_, live) = daemon.http("GET", &format!("/api/v1/sessions/{sid}"), "");
     assert!(
@@ -735,6 +811,119 @@ fn no_daemon_run_relays_sigterm_to_the_target_process_group() {
         "--no-daemon should return the target code: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn linux_default_run_normal_exit_reaps_setsid_grandchild() {
+    let root = watchdog_test_root("default-normal");
+    let marker = root.join("descendants.pid");
+    let daemon = Daemon::start(As::Me);
+    let marker_arg = marker.to_string_lossy().to_string();
+    let out = daemon.aw(&[
+        "run",
+        "-q",
+        "--env",
+        &format!("AW_E2E_GRANDCHILD_PID={marker_arg}"),
+        "--",
+        "sh",
+        "-c",
+        "setsid sh -c 'echo $$ >> \"$AW_E2E_GRANDCHILD_PID\"; while :; do sleep 1; done' & exit 17",
+    ]);
+    assert_eq!(out.status.code(), Some(17));
+    wait_for_marker_pids(&marker, 1);
+    assert_marked_descendants_reaped(&marker);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn linux_no_daemon_normal_exit_reaps_setsid_grandchild() {
+    let root = watchdog_test_root("no-daemon-normal");
+    let marker = root.join("descendants.pid");
+    let child = start_no_daemon_watchdog_run(
+        &marker,
+        "setsid sh -c 'echo $$ >> \"$AW_E2E_GRANDCHILD_PID\"; while :; do sleep 1; done' & exit 17",
+    );
+    let output = child.wait_with_output().expect("wait local aw run");
+    assert_eq!(output.status.code(), Some(17));
+    wait_for_marker_pids(&marker, 1);
+    assert_marked_descendants_reaped(&marker);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn signal_cleanup_case(signal: &str, expected_code: i32) {
+    let root = watchdog_test_root(signal);
+    let marker = root.join("descendants.pid");
+    let script = format!(
+        "setsid sh -c 'echo $$ >> \"$AW_E2E_GRANDCHILD_PID\"; while :; do sleep 1; done' & trap 'exit {expected_code}' {signal}; while :; do sleep 0.1; done"
+    );
+    let child = start_no_daemon_watchdog_run(&marker, &script);
+    wait_for_marker_pids(&marker, 1);
+    signal_process(child.id(), signal);
+    let output = child.wait_with_output().expect("wait signalled aw run");
+    assert_eq!(output.status.code(), Some(expected_code), "{signal}");
+    assert_marked_descendants_reaped(&marker);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn linux_no_daemon_sigint_reaps_setsid_grandchild() {
+    signal_cleanup_case("INT", 24);
+}
+
+#[test]
+fn linux_no_daemon_sigterm_reaps_setsid_grandchild() {
+    signal_cleanup_case("TERM", 23);
+}
+
+#[test]
+fn linux_no_daemon_sighup_reaps_setsid_grandchild() {
+    signal_cleanup_case("HUP", 25);
+}
+
+#[test]
+fn linux_no_daemon_sigkill_of_aw_reaps_setsid_grandchild() {
+    let root = watchdog_test_root("sigkill");
+    let marker = root.join("descendants.pid");
+    let child = start_no_daemon_watchdog_run(
+        &marker,
+        "setsid sh -c 'echo $$ >> \"$AW_E2E_GRANDCHILD_PID\"; while :; do sleep 1; done' & while :; do sleep 0.1; done",
+    );
+    wait_for_marker_pids(&marker, 1);
+    signal_process(child.id(), "KILL");
+    let _ = child.wait_with_output();
+    assert_marked_descendants_reaped(&marker);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn linux_no_daemon_sigkill_of_aw_reaps_descendant_after_middle_exit() {
+    let root = watchdog_test_root("middle-exit");
+    let marker = root.join("descendants.pid");
+    let child = start_no_daemon_watchdog_run(
+        &marker,
+        "(setsid sh -c 'echo $$ >> \"$AW_E2E_GRANDCHILD_PID\"; while :; do sleep 1; done' & exit 0) & while :; do sleep 0.1; done",
+    );
+    wait_for_marker_pids(&marker, 1);
+    sleep(Duration::from_millis(100));
+    signal_process(child.id(), "KILL");
+    let _ = child.wait_with_output();
+    assert_marked_descendants_reaped(&marker);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn linux_no_daemon_sigkill_of_aw_reaps_bounded_forking_descendants() {
+    let root = watchdog_test_root("bounded-forks");
+    let marker = root.join("descendants.pid");
+    let child = start_no_daemon_watchdog_run(
+        &marker,
+        "i=0; while [ \"$i\" -lt 32 ]; do sh -c 'echo $$ >> \"$AW_E2E_GRANDCHILD_PID\"; while :; do sleep 1; done' & i=$((i + 1)); sleep 0.05; done; while :; do sleep 0.1; done",
+    );
+    wait_for_marker_pids(&marker, 4);
+    signal_process(child.id(), "KILL");
+    let _ = child.wait_with_output();
+    assert_marked_descendants_reaped(&marker);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// Root daemon (via `sudo -n`), this test's account as the caller: the

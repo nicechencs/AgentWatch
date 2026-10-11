@@ -264,6 +264,7 @@ fn spawn_inner(
         // never produce EOF because the child would still own a writer.
         ffi::close_fd(std::os::fd::AsRawFd::as_raw_fd(&gate_write));
         ffi::child_take_foreground(&prepared);
+        ffi::child_restore_terminal_signal_defaults(&prepared);
         ffi::child_hold(&prepared);
     }
     ffi::set_own_group(pid);
@@ -640,6 +641,41 @@ mod ffi {
         report_errno(prepared.report, errno_now());
         wait_for_release(prepared.gate_read);
         exit_step(GateStep::Terminal);
+    }
+
+    /// A process launched from a test runner can inherit ignored terminal
+    /// signals. `execve` preserves that disposition, so reset them after the
+    /// foreground handoff and before the target can run. This is deliberately
+    /// limited to terminal launches: non-terminal callers may intentionally
+    /// arrange their own signal handling.
+    pub(super) fn child_restore_terminal_signal_defaults(prepared: &Prepared) {
+        if !prepared.stdin_is_tty {
+            return;
+        }
+        for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP] {
+            if set_default_disposition(signal) {
+                continue;
+            }
+            report_errno(prepared.report, errno_now());
+            wait_for_release(prepared.gate_read);
+            exit_step(GateStep::Terminal);
+        }
+    }
+
+    fn set_default_disposition(signal: libc::c_int) -> bool {
+        let mut action = unsafe {
+            // SAFETY: the structure is initialized before `sigaction` reads
+            // it, and only this child's signal disposition is changed.
+            std::mem::MaybeUninit::<libc::sigaction>::zeroed().assume_init()
+        };
+        unsafe {
+            // SAFETY: `action` is writable stack storage. `sigaction` is an
+            // async-signal-safe POSIX call, so it is valid after `fork`.
+            libc::sigemptyset(&mut action.sa_mask) == 0 && {
+                action.sa_sigaction = libc::SIG_DFL;
+                libc::sigaction(signal, &action, std::ptr::null_mut()) == 0
+            }
+        }
     }
 
     /// Close an inherited descriptor in the forked child without invoking a

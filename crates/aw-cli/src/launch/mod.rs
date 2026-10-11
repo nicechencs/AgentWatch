@@ -24,6 +24,12 @@ mod unix_linux;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) mod terminal;
 
+// A non-interactive Linux `aw run` is supervised by a re-exec'd subreaper.
+// Keep it separate from the terminal layer: an interactive target has to stay
+// in the terminal session in order to be made foreground.
+#[cfg(target_os = "linux")]
+pub(crate) mod watchdog;
+
 /// Present only on Linux. [`unix_linux::LocalCgroupHost`] creates a cgroup v2
 /// session directory when the caller is delegated, and refuses otherwise.
 #[cfg(target_os = "linux")]

@@ -49,6 +49,14 @@ pub fn unix_program_candidates(program: &str, search_path: Option<&str>) -> Vec<
 mod windows;
 #[cfg(target_os = "linux")]
 use linux::CurrentPlatform;
+/// Linux-only lifecycle primitives for the CLI-private launch watchdog.
+///
+/// They are intentionally not part of [`Platform`]: daemon-created and
+/// released programs must never be wrapped by this cleanup mechanism.
+#[cfg(target_os = "linux")]
+pub use linux::{
+    cleanup_watchdog_descendants, prepare_watchdog, take_watchdog_control, WatchdogPrepareError,
+};
 #[cfg(target_os = "macos")]
 use macos::CurrentPlatform;
 #[cfg(target_os = "windows")]

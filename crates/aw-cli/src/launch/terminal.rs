@@ -313,11 +313,13 @@ mod tests {
             std::process::id(),
             Instant::now().elapsed().as_nanos()
         ));
-        let mut command = std::process::Command::new("sh");
+        let mut command = std::process::Command::new("python3");
         command.args([
             "-c",
-            "sleep 300 & echo $! > \"$1\"; wait",
-            "aw-terminal-test",
+            // Cargo's test harness can inherit SIGINT ignored. Reset it in
+            // the direct-child fixture so this test exercises forwarding,
+            // not inherited target disposition.
+            "import signal, subprocess, sys\nsignal.signal(signal.SIGINT, signal.SIG_DFL)\nchild = subprocess.Popen(['sleep', '300'])\nopen(sys.argv[1], 'w').write(str(child.pid))\nchild.wait()",
             &marker.to_string_lossy(),
         ]);
         command.process_group(0);

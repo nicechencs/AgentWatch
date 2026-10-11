@@ -565,6 +565,47 @@ impl SpawnedChild for PlatformGatedChild {
     }
 }
 
+/// Linux's non-terminal CLI-created root is held by the private watchdog until
+/// daemon adoption. The daemon records the real program pid; it never owns the
+/// watchdog's cleanup boundary.
+#[cfg(target_os = "linux")]
+struct LinuxWatchdogChild {
+    watchdog: crate::launch::watchdog::Watchdog,
+    program: String,
+    cwd: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl SpawnedChild for LinuxWatchdogChild {
+    fn pid(&self) -> u32 {
+        self.watchdog.pid()
+    }
+
+    fn wait(&mut self) -> Result<i32, String> {
+        self.watchdog
+            .wait()
+            .map_err(|_| "等待程序结束失败".to_owned())
+    }
+
+    fn release(&mut self) -> Result<(), (&'static str, String)> {
+        self.watchdog.release().map_err(|error| match error {
+            crate::launch::watchdog::WatchdogError::Spawn(failure) => platform_spawn_error(
+                &self.program,
+                self.cwd.as_deref(),
+                PlatformError::Spawn(failure),
+            ),
+            crate::launch::watchdog::WatchdogError::Unavailable => (
+                "spawn_failed",
+                "程序启动到一半出错，已经结束，没有运行：无法完成启动".to_owned(),
+            ),
+        })
+    }
+
+    fn kill_and_reap(&mut self) {
+        self.watchdog.abort();
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn platform_child_error(error: PlatformError) -> (&'static str, String) {
     match error {
@@ -710,6 +751,22 @@ impl Spawner for CommandSpawner {
             let Some((program, args)) = spec.command.split_first() else {
                 return Err(("spawn_failed", "程序名为空".to_owned()));
             };
+            if crate::launch::watchdog::should_wrap() {
+                return crate::launch::watchdog::Watchdog::spawn(spec)
+                    .map(|watchdog| {
+                        Box::new(LinuxWatchdogChild {
+                            watchdog,
+                            program: program.clone(),
+                            cwd: spec.cwd.clone(),
+                        }) as Box<dyn SpawnedChild>
+                    })
+                    .map_err(|_| {
+                        (
+                            "spawn_failed",
+                            "程序启动到一半出错，已经结束，没有运行：无法完成启动".to_owned(),
+                        )
+                    });
+            }
             // The program name is not resolved here. The hold stage's parent
             // only builds candidate strings; the child tries them after it has
             // switched identity, so this process never stats a PATH directory.

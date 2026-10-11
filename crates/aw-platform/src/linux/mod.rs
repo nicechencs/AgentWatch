@@ -11,6 +11,12 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
+mod watchdog;
+
+pub use watchdog::{
+    cleanup_watchdog_descendants, prepare_watchdog, take_watchdog_control, WatchdogPrepareError,
+};
+
 pub(crate) struct CurrentPlatform;
 
 fn no(capability: &'static str) -> PlatformError {

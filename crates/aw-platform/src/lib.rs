@@ -590,6 +590,13 @@ pub fn is_reserved_env_name(name: &str, case_insensitive: bool) -> bool {
     })
 }
 
+/// Whether the host platform compares environment-variable names without
+/// case. Launch routes use this instead of carrying an OS branch themselves.
+#[must_use]
+pub const fn environment_names_are_case_insensitive() -> bool {
+    cfg!(windows)
+}
+
 /// Windows environment names are case-insensitive, including the reserved
 /// names that requests may not replace.
 #[cfg(windows)]

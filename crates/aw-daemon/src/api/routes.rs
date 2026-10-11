@@ -3996,6 +3996,168 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The route's peer identity normally comes from SO_PEERCRED. This test
+    /// injects a different uid through a cfg(test)-only hook because the CI
+    /// worker need not have a second usable local account. The release binary
+    /// has no injection path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn non_root_daemon_refuses_an_injected_other_peer_uid() {
+        if nix::unistd::geteuid().as_raw() == 0 {
+            return;
+        }
+        let (dir, db) = seeded_db("other-peer", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let me: u32 = crate::sample::current_user_id()
+            .parse()
+            .expect("current Unix uid");
+        let other = if me == 1 { 2 } else { 1 };
+        let token = token_for(&mut state, &me.to_string(), false);
+        crate::api::watch_routes::set_test_linux_launch_peer_uid(Some(other));
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["true"]}"#,
+        );
+        crate::api::watch_routes::set_test_linux_launch_peer_uid(None);
+        assert_eq!(status, 403, "{body}");
+        assert_eq!(body["error"]["code"], "launch_other_user");
+        assert_eq!(
+            body["error"]["message"],
+            format!(
+                "这个后台是「{me}」自己运行的，只能替「{me}」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。"
+            )
+        );
+        let rows: i64 = aw_store::open_connection(&db)
+            .and_then(|c| c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)))
+            .expect("count");
+        assert_eq!(rows, 0, "a refused peer creates no session");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn windows_launch_refuses_case_insensitive_reserved_environment_names() {
+        let (dir, db) = seeded_db("windows-reserved-env", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &crate::sample::current_user_id(), false);
+        for name in ["Path", "path", "PATH", "Home"] {
+            let body = format!(
+                r#"{{"mode":"launch","argv":["cmd","/c","exit 0"],"env":{{"{name}":"value"}}}}"#
+            );
+            let (status, response) = post(&mut state, &token, "/api/v1/sessions", &body);
+            assert_eq!(status, 400, "{name}: {response}");
+            assert_eq!(response["error"]["code"], "env_reserved");
+            assert_eq!(response["error"]["detail"]["name"], name);
+        }
+        let rows: i64 = aw_store::open_connection(&db)
+            .and_then(|c| c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)))
+            .expect("count");
+        assert_eq!(rows, 0, "a refused launch writes no session");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A root caller is already the root daemon's own account. This must take
+    /// the direct exact-environment path, not the helper path that rejects a
+    /// uid-zero switch request. CI selects this ignored test with
+    /// `root_daemon`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root: exercises a root daemon launching for root"]
+    #[allow(clippy::expect_used)]
+    fn root_daemon_launches_its_own_account_with_a_clean_environment() {
+        assert_eq!(nix::unistd::geteuid().as_raw(), 0, "run this test as root");
+        let (dir, db) = seeded_db("root-daemon-self", "");
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, "0", true);
+        let (status, body) = post(
+            &mut state,
+            &token,
+            "/api/v1/sessions",
+            r#"{"mode":"launch","argv":["sleep","5"],"cwd":"/"}"#,
+        );
+        assert_eq!(status, 201, "{body}");
+        let pid = body["root_pid"].as_u64().expect("root pid") as u32;
+        assert_eq!(proc_uids(pid as u64), vec![0; 4]);
+
+        let root = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(0))
+            .expect("root lookup")
+            .expect("root account");
+        let env = std::fs::read(format!("/proc/{pid}/environ")).expect("root child environment");
+        let mut got: Vec<String> = env
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| String::from_utf8_lossy(entry).into_owned())
+            .collect();
+        got.sort();
+        let mut want = vec![
+            format!("HOME={}", root.dir.display()),
+            format!("USER={}", root.name),
+            format!("LOGNAME={}", root.name),
+            format!("SHELL={}", root.shell.display()),
+            format!("PATH={}", aw_platform::unix_default_path()),
+        ];
+        want.sort();
+        assert_eq!(
+            got, want,
+            "root same-account launch has the base environment"
+        );
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Linux helper does not inspect a root-only directory before it has
+    /// switched to the caller. Whether a program was present there therefore
+    /// produces the same caller-visible result as when it is absent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root and a normal account"]
+    #[allow(clippy::expect_used)]
+    fn root_daemon_helper_does_not_distinguish_a_program_in_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(nix::unistd::geteuid().as_raw(), 0, "run this test as root");
+        let nobody = nix::unistd::User::from_name("nobody")
+            .expect("nobody lookup")
+            .expect("this test needs the nobody account");
+        let (dir, db) = seeded_db("hidden-helper", "");
+        let hidden = dir.join("root-only");
+        std::fs::create_dir(&hidden).expect("root-only directory");
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700))
+            .expect("root-only directory permissions");
+        let program = hidden.join("program");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").expect("hidden program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("hidden program permissions");
+
+        let mut state = ApiState::new(1_000);
+        state.query = super::StoreQuery::open_path(db.clone());
+        let token = token_for(&mut state, &nobody.uid.as_raw().to_string(), false);
+        let body = format!(
+            r#"{{"mode":"launch","argv":["{}"],"cwd":"/"}}"#,
+            program.display()
+        );
+        let present = post(&mut state, &token, "/api/v1/sessions", &body);
+        std::fs::remove_file(&program).expect("remove hidden program");
+        let absent = post(&mut state, &token, "/api/v1/sessions", &body);
+
+        assert_eq!(present.0, 400, "present: {}", present.1);
+        assert_eq!(absent.0, 400, "absent: {}", absent.1);
+        assert_eq!(present.1["error"]["code"], "program_not_permitted");
+        assert_eq!(present.1["error"]["code"], absent.1["error"]["code"]);
+        assert_eq!(present.1["error"]["message"], absent.1["error"]["message"]);
+        assert_eq!(session_count(&db), 0, "failed launches write no session");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A `uid` / `user` in the body never chooses the account: the program
     /// runs as the verified caller.
     #[cfg(target_os = "linux")]

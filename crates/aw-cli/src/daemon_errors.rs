@@ -129,10 +129,10 @@ const ROWS: &[Row] = &[
     },
     Row {
         code: "launch_other_user",
-        zh: "后台以普通账户运行，不能为其他账户启动程序",
-        en: Some(
-            "the service runs under an ordinary account and cannot start programs for another account",
-        ),
+        // The daemon names the actual daemon owner in its fixed Chinese
+        // sentence, so this row is only the code-table fallback.
+        zh: "这个后台只能替它自己的账户启动程序，已拒绝",
+        en: None,
     },
     Row {
         code: "drop_failed",
@@ -319,7 +319,7 @@ pub(crate) fn write_status(
     // sentence again would name the variable twice.
     // Both messages already name the thing they are about. Showing the stock
     // line and then the same sentence again would name it twice.
-    if code == "env_reserved" || code == "cwd_not_found" {
+    if code == "env_reserved" || code == "cwd_not_found" || code == "launch_other_user" {
         return f.write_str(message);
     }
     let Some(row) = ROWS.iter().find(|row| row.code == code) else {
@@ -473,6 +473,18 @@ mod tests {
     fn unknown_code_keeps_the_code_status_and_message() {
         let text = render(418, Some("teapot"), "short and stout");
         assert_eq!(text, "后台返回错误 teapot（HTTP 418）：short and stout");
+    }
+
+    #[test]
+    fn other_user_launch_keeps_the_daemon_owner_sentence() {
+        assert_eq!(
+            render(
+                403,
+                Some("launch_other_user"),
+                "这个后台是「1000」自己运行的，只能替「1000」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。",
+            ),
+            "这个后台是「1000」自己运行的，只能替「1000」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。"
+        );
     }
 
     #[test]

@@ -92,7 +92,9 @@ pub(crate) fn identity_for(
         return Err(error_response(
             403,
             "launch_other_user",
-            "the service runs under an ordinary account and cannot start programs for another account",
+            &format!(
+                "这个后台是「{daemon_uid}」自己运行的，只能替「{daemon_uid}」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。"
+            ),
         ));
     }
     lookup(uid).map(Some)
@@ -185,18 +187,9 @@ pub(crate) fn own_account_of_self() -> Result<Identity, ApiResponse> {
     lookup(nix::unistd::getuid().as_raw())
 }
 
-/// Names a launch request may not set. Each one is filled from the target
-/// account (`HOME`/`USER`/`LOGNAME`/`SHELL`) or from the fixed base path
-/// (`PATH`); letting the request replace them would make the "built from
-/// scratch" environment whatever the caller wrote. Compared exactly: on Unix
-/// environment names are case-sensitive, so `Home` is a different variable and
-/// is allowed through.
-#[cfg(unix)]
-const RESERVED_ENV: [&str; 5] = ["HOME", "USER", "LOGNAME", "SHELL", "PATH"];
-
-/// A request that names one of [`RESERVED_ENV`]. The launch is refused rather
-/// than started with the name silently dropped or quietly overridden.
-#[cfg(unix)]
+/// A request that names one of the account-base environment variables. The
+/// launch is refused rather than started with the name silently dropped or
+/// quietly overridden.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ReservedEnvVar {
     pub name: String,
@@ -204,19 +197,18 @@ pub(crate) struct ReservedEnvVar {
 
 /// The first reserved name in `extra`, if the request sets one. `None` when
 /// every name is one the request is allowed to add.
-#[cfg(unix)]
 pub(crate) fn reserved_env_var(extra: &[(String, String)]) -> Option<ReservedEnvVar> {
     extra.iter().find_map(|(key, _)| {
-        RESERVED_ENV
-            .iter()
-            .any(|reserved| reserved == key)
-            .then(|| ReservedEnvVar { name: key.clone() })
+        aw_platform::is_reserved_env_name(
+            key,
+            aw_platform::environment_names_are_case_insensitive(),
+        )
+        .then(|| ReservedEnvVar { name: key.clone() })
     })
 }
 
 /// 400 for a launch request that sets a reserved variable. The sentence names
 /// the variable; the machine code carries it again under `detail.name`.
-#[cfg(unix)]
 pub(crate) fn reserved_env_response(name: &str) -> ApiResponse {
     let mut response = error_response(
         400,
@@ -250,7 +242,10 @@ fn base_env(who: &Identity, extra: &[(String, String)]) -> Vec<(String, String)>
     for (key, val) in extra {
         // A reserved name never replaces the account's value. The route refuses
         // the request before it gets here; skipping is the backstop.
-        if RESERVED_ENV.iter().any(|reserved| reserved == key) {
+        if aw_platform::is_reserved_env_name(
+            key,
+            aw_platform::environment_names_are_case_insensitive(),
+        ) {
             continue;
         }
         env.retain(|(k, _)| k != key);
@@ -680,10 +675,34 @@ fn platform_spawn_error(error: aw_platform::PlatformError) -> SpawnAsError {
     }
 }
 
-/// After spawn: real, effective, saved and filesystem uid/gid of `pid` are all
-/// `who`'s, and its group list is exactly `who.groups`. Linux reads `/proc`.
+/// After a helper spawn: real, effective, saved and filesystem uid/gid of
+/// `pid` are all `who`'s, and its group list is exactly `who.groups`. Linux
+/// reads `/proc`.
 #[cfg(target_os = "linux")]
 pub(crate) fn verify_dropped(pid: u32, who: &Identity) -> bool {
+    verify_identity(pid, who.uid, who.gid, &who.groups)
+}
+
+/// After a same-account direct spawn, verify the child retained this daemon's
+/// active identity. In particular, its groups are compared with `getgroups`,
+/// not a fresh account-database lookup: the latter may lag a live session or
+/// differ under `sg` and containers.
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_dropped_as_self(pid: u32) -> bool {
+    let Ok(groups) = nix::unistd::getgroups() else {
+        return false;
+    };
+    let groups: Vec<u32> = groups.into_iter().map(|group| group.as_raw()).collect();
+    verify_identity(
+        pid,
+        nix::unistd::getuid().as_raw(),
+        nix::unistd::getgid().as_raw(),
+        &groups,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn verify_identity(pid: u32, uid: u32, gid: u32, expected_groups: &[u32]) -> bool {
     let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
         return false;
     };
@@ -704,15 +723,15 @@ pub(crate) fn verify_dropped(pid: u32, who: &Identity) -> bool {
     };
     let groups_ok = ids("Groups:").is_some_and(|groups| {
         // The kernel lists supplementary groups only; the primary may be absent.
-        let mut want = who.groups.clone();
+        let mut want = expected_groups.to_vec();
         let mut have = groups;
-        if !have.contains(&who.gid) {
-            have.push(who.gid);
+        if !have.contains(&gid) {
+            have.push(gid);
         }
-        want.push(who.gid);
+        want.push(gid);
         set(have) == set(want)
     });
-    all(ids("Uid:"), who.uid) && all(ids("Gid:"), who.gid) && groups_ok
+    all(ids("Uid:"), uid) && all(ids("Gid:"), gid) && groups_ok
 }
 
 #[cfg(test)]
@@ -1057,6 +1076,23 @@ mod tests {
         assert!(super::reserved_env_var(&[("AW_RV".to_owned(), "1".to_owned())]).is_none());
         assert!(super::reserved_env_var(&[("Home".to_owned(), "/tmp".to_owned())]).is_none());
         assert!(super::reserved_env_var(&[("Path".to_owned(), "/bin".to_owned())]).is_none());
+    }
+
+    /// Windows environment keys are case-insensitive. Keep the spelling the
+    /// caller supplied so the response can identify the rejected request.
+    #[cfg(windows)]
+    #[test]
+    fn windows_reserved_env_names_are_case_insensitive_and_named() {
+        for name in ["Path", "path", "PATH", "Home"] {
+            let found = super::reserved_env_var(&[(name.to_owned(), "value".to_owned())]);
+            assert_eq!(found.map(|reserved| reserved.name), Some(name.to_owned()));
+            let response = super::reserved_env_response(name);
+            let body: serde_json::Value = serde_json::from_slice(&response.body).expect("json");
+            assert_eq!(response.status, 400);
+            assert_eq!(body["error"]["code"], "env_reserved");
+            assert_eq!(body["error"]["detail"]["name"], name);
+        }
+        assert!(super::reserved_env_var(&[("LANG".to_owned(), "x".to_owned())]).is_none());
     }
 
     /// A bare `sh` is a candidate list, not a failure. This test is not root, so

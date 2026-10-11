@@ -57,4 +57,9 @@ describe("error text", () => {
       expect(describeError(new ApiError(403, { error: { code, message: "developer detail" } }, "x"), t)).toBe(expected);
     }
   });
+
+  it("keeps the named daemon owner in a same-user launch refusal", () => {
+    const message = "这个后台是「1000」自己运行的，只能替「1000」启动程序，已拒绝。请用你自己运行的后台，或者用管理员运行的后台。";
+    expect(describeError(new ApiError(403, { error: { code: "launch_other_user", message } }, "x"), t)).toBe(message);
+  });
 });

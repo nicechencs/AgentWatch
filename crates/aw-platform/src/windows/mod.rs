@@ -1277,8 +1277,8 @@ fn command_line(command: &[String]) -> Result<Vec<u16>, PlatformError> {
         .collect())
 }
 
-/// Build an environment block for the target only.  This buffer is never
-/// sent to a daemon, logged, or persisted.
+/// Build an inherited environment block for the target only. This buffer is
+/// never sent to a daemon, logged, or persisted.
 fn environment(extra: &[(String, String)]) -> Vec<u16> {
     environment_from(std::env::vars_os(), extra)
 }
@@ -2151,7 +2151,16 @@ impl Platform for CurrentPlatform {
             return Err(no("spawn_suspended_for_other_user"));
         }
         let mut command = command_line(&request.command)?;
-        let mut env = environment(&request.env);
+        // Exact starts from no inherited name at all. `environment_from` sorts
+        // and deduplicates keys case-insensitively for the Unicode block that
+        // CreateProcessW receives; Inherit intentionally retains its existing
+        // process-environment behavior.
+        let mut env = match request.env_source {
+            crate::EnvSource::Exact => {
+                environment_from(std::iter::empty::<(OsString, OsString)>(), &request.env)
+            }
+            crate::EnvSource::Inherit => environment(&request.env),
+        };
         let inherited = InheritedStdHandles::for_current_process()?;
         let attributes = AttributeList::with_handles(&inherited.handles)?;
         // SAFETY: STARTUPINFOEXW is documented as zero-initialized before cb is set.
@@ -3346,5 +3355,68 @@ mod tests {
             .expect("held Windows child");
         let released = held.release().expect("released child");
         assert_eq!(released.wait().expect("reap child"), ReapOutcome::Exited(0));
+    }
+
+    /// `Exact` gives CreateProcessW only the request's names. Re-executing the
+    /// test binary avoids a shell adding its own variables before recording
+    /// the child environment.
+    #[test]
+    fn exact_environment_contains_only_request_values() {
+        let caller = IdentifiedCaller::current_user().expect("current user");
+        let dir = std::env::temp_dir().join(format!("aw-windows-exact-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("output directory");
+        let output = dir.join("environment.txt");
+        let request = SpawnRequest {
+            command: vec![
+                std::env::current_exe()
+                    .expect("test executable")
+                    .to_string_lossy()
+                    .into_owned(),
+                "--exact".to_owned(),
+                "windows::tests::exact_environment_child_records_values".to_owned(),
+                "--nocapture".to_owned(),
+            ],
+            cwd: None,
+            env: vec![
+                (
+                    "AW_EXACT_ENV_OUTPUT".to_owned(),
+                    output.to_string_lossy().into_owned(),
+                ),
+                ("aw_exact_env_value".to_owned(), "first".to_owned()),
+                ("AW_EXACT_ENV_VALUE".to_owned(), "only-this".to_owned()),
+            ],
+            env_source: crate::EnvSource::Exact,
+        };
+        let held = platform()
+            .spawn_suspended(&caller, &request)
+            .expect("held Windows child");
+        let released = held.release().expect("released child");
+        assert_eq!(released.wait().expect("reap child"), ReapOutcome::Exited(0));
+
+        let mut got: Vec<String> = std::fs::read_to_string(&output)
+            .expect("child environment")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        got.sort();
+        let mut want = vec![
+            format!("AW_EXACT_ENV_OUTPUT={}", output.display()),
+            "AW_EXACT_ENV_VALUE=only-this".to_owned(),
+        ];
+        want.sort();
+        assert_eq!(got, want, "Exact child environment differs from request");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exact_environment_child_records_values() {
+        let Ok(output) = std::env::var("AW_EXACT_ENV_OUTPUT") else {
+            return;
+        };
+        let mut values: Vec<String> = std::env::vars()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        values.sort();
+        std::fs::write(output, values.join("\n")).expect("write child environment");
     }
 }

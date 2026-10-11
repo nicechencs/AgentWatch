@@ -71,9 +71,14 @@ struct Prepared {
     /// name was bare and no absolute PATH entry survived the skip rules.
     program_paths: Vec<std::ffi::CString>,
     argv: Vec<std::ffi::CString>,
+    /// NUL-terminated `execve` argv pointers. Built in the parent so the
+    /// post-fork child only indexes preallocated memory.
+    argv_pointers: Vec<*const libc::c_char>,
     /// `NAME=value`, applied only at `execve`. The child reads these through
     /// the pointer array built here; it never reads the process environment.
-    env: Vec<std::ffi::CString>,
+    _env: Vec<std::ffi::CString>,
+    /// NUL-terminated `execve` environment pointers, also built before fork.
+    env_pointers: Vec<*const libc::c_char>,
     /// Read end of the gate pipe. Closed in the child before exec.
     gate_read: std::os::fd::RawFd,
     /// Write end of the failure pipe. The child writes one record here and
@@ -176,6 +181,18 @@ pub(crate) fn spawn(
             "argument contains NUL",
         )?);
     }
+    // `execve` takes pointer arrays rather than Rust vectors of strings. Build
+    // both arrays before fork: after fork the child must not allocate.
+    let argv_pointers = argv
+        .iter()
+        .map(|arg| arg.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    let env_pointers = env
+        .iter()
+        .map(|entry| entry.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
     // Held across pipe creation and fork. Both ends are CLOEXEC before the
     // lock is released, so no other fork of this process inherits them.
     let _pipe_lock = PIPE_LOCK
@@ -188,7 +205,9 @@ pub(crate) fn spawn(
         cwd,
         program_paths,
         argv,
-        env,
+        argv_pointers,
+        _env: env,
+        env_pointers,
         gate_read: std::os::fd::AsRawFd::as_raw_fd(&gate_read),
         report: std::os::fd::AsRawFd::as_raw_fd(&report_write),
     };
@@ -212,8 +231,8 @@ pub(crate) fn spawn(
     ffi::set_own_group(pid);
     // Parent. The child has its own copy of the read end.
     drop(gate_read);
-    drop(_pipe_lock);
     drop(report_write);
+    drop(_pipe_lock);
     Ok(Box::new(MacHeld {
         pid: Some(pid as u32),
         gate: Some(gate_write),
@@ -731,11 +750,6 @@ mod ffi {
             // for a bare name whose PATH produced nothing.
             report_and_exit(prepared.report, super::FailStep::Exec, libc::ENOENT);
         }
-        let mut argv: Vec<*const libc::c_char> =
-            prepared.argv.iter().map(|arg| arg.as_ptr()).collect();
-        argv.push(std::ptr::null());
-        let mut env: Vec<*const libc::c_char> = prepared.env.iter().map(|e| e.as_ptr()).collect();
-        env.push(std::ptr::null());
         let mut saw_eacces = false;
         let mut last = libc::ENOENT;
         for path in &prepared.program_paths {
@@ -743,8 +757,12 @@ mod ffi {
                 // SAFETY: both arrays are NULL-terminated and point at strings
                 // allocated in the parent, which outlive this call. `path` is
                 // one of those strings. `execve` replaces the process; it only
-                // returns on failure, and no allocation happens between tries.
-                libc::execve(path.as_ptr(), argv.as_ptr(), env.as_ptr());
+                // returns on failure, and this child does not allocate.
+                libc::execve(
+                    path.as_ptr(),
+                    prepared.argv_pointers.as_ptr(),
+                    prepared.env_pointers.as_ptr(),
+                );
             }
             let errno = errno_now();
             if try_next(errno) {
@@ -1149,6 +1167,72 @@ mod tests {
                 "the failed child is still around: {text}"
             );
         }
+    }
+
+    /// The root hold path must not reveal whether a program exists below a
+    /// root-owned 0700 directory. The child switches to `nobody` before it
+    /// tries either form of the identical absolute candidate.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root and a normal account"]
+    fn root_hold_does_not_distinguish_a_program_in_a_private_directory() {
+        use crate::{
+            EnvSource, IdentifiedCaller, Owner, PeerIdentity, PlatformError, SpawnRequest,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(nix::unistd::geteuid().as_raw(), 0, "run this test as root");
+        let nobody = nix::unistd::User::from_name("nobody")
+            .expect("nobody lookup")
+            .expect("this test needs the nobody account");
+        let uid = nobody.uid.as_raw();
+        let gid = nobody.gid.as_raw();
+        let caller = IdentifiedCaller::from_peer(PeerIdentity::new(
+            Owner::Unix {
+                ruid: uid,
+                euid: uid,
+                suid: uid,
+                rgid: gid,
+                egid: gid,
+                sgid: gid,
+                groups: Some(vec![gid]),
+            },
+            None,
+        ));
+        let dir = private_dir("root-hidden");
+        let hidden = dir.join("root-only");
+        std::fs::create_dir(&hidden).expect("root-only directory");
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700))
+            .expect("root-only directory permissions");
+        let program = hidden.join("program");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").expect("hidden program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("hidden program permissions");
+
+        let attempt = |path: &std::path::Path| {
+            let request = SpawnRequest {
+                command: vec![path.to_string_lossy().into_owned()],
+                cwd: Some(std::path::PathBuf::from("/")),
+                env: Vec::new(),
+                env_source: EnvSource::Exact,
+            };
+            let held = super::spawn(&caller, &request).expect("held child");
+            let error = match held.release() {
+                Err(error) => error,
+                Ok(_) => panic!("inaccessible program must fail"),
+            };
+            let PlatformError::Io(error) = error else {
+                panic!("expected child exec error");
+            };
+            (error.kind(), error.to_string())
+        };
+
+        let present = attempt(&program);
+        std::fs::remove_file(&program).expect("remove hidden program");
+        let absent = attempt(&program);
+        assert_eq!(present.0, std::io::ErrorKind::PermissionDenied);
+        assert_eq!(present, absent, "presence below 0700 changed the result");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A working directory that does not exist fails at `chdir`, which is a

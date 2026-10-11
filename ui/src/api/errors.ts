@@ -66,6 +66,9 @@ export function describeError(error: unknown, t: T): string {
   if (error instanceof ApiError) {
     const coded = CODE_TEXT[error.code];
     if (coded) {
+      if (error.code === "launch_other_user" && error.message.startsWith("这个后台是「")) {
+        return error.message;
+      }
       if (error.code === "db_busy") {
         const waited = /\bWaited\s+(\d+)\s+s\b/u.exec(error.message)?.[1] ?? "0";
         return t(coded, { seconds: waited });

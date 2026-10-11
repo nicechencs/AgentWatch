@@ -124,6 +124,32 @@ fn daemon_uid() -> u32 {
     }
 }
 
+/// Linux socket callers obtain `user_id` from `SO_PEERCRED`; a UI token keeps
+/// the account bound to the peer that received it. The route uses that value
+/// to ensure a non-root daemon only launches for its own uid, never an account
+/// reconstructed from the user database.
+#[cfg(target_os = "linux")]
+fn linux_launch_peer_user_id(caller: &Caller) -> String {
+    #[cfg(test)]
+    if let Some(uid) = TEST_LINUX_LAUNCH_PEER_UID.with(std::cell::Cell::get) {
+        return uid.to_string();
+    }
+    caller.user_id.clone()
+}
+
+// Route tests cannot create a second Unix socket user on every CI host. This
+// test-only override stands in for the uid that SO_PEERCRED supplied; it is not
+// compiled into non-test binaries and no request field can affect it.
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static TEST_LINUX_LAUNCH_PEER_UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn set_test_linux_launch_peer_uid(uid: Option<u32>) {
+    TEST_LINUX_LAUNCH_PEER_UID.with(|slot| slot.set(uid));
+}
+
 fn collector_available() -> Result<(), ApiResponse> {
     let available = |capability| {
         aw_platform::platform().capability(capability) == aw_platform::CapabilityStatus::Available
@@ -386,6 +412,22 @@ fn create_inner(
             Ok(response)
         }
         Some("launch") => {
+            let env: Vec<(String, String)> = value
+                .get("env")
+                .and_then(Value::as_object)
+                .map(|env| {
+                    env.iter()
+                        .filter_map(|(key, val)| val.as_str().map(|v| (key.clone(), v.to_owned())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // HOME/USER/LOGNAME/SHELL/PATH come from the target account and the
+            // fixed base path. A request that sets one is refused, not started
+            // with the name dropped or overridden. The platform owns whether
+            // those names compare case-sensitively.
+            if let Some(reserved) = super::launch_as::reserved_env_var(&env) {
+                return Err(super::launch_as::reserved_env_response(&reserved.name));
+            }
             // App/API launch creation has no Windows token-to-user launch path
             // yet. `aw run` is different: its CLI creates a held child as the
             // current user and this daemon only adopts it through `/adopt`.
@@ -400,10 +442,14 @@ fn create_inner(
             #[cfg(not(windows))]
             {
                 let argv = argv_field(&value)?;
-                collector_available()?;
                 // Whose account: only the OS-verified caller (see `launch_as`).
                 // A `uid` / `user` in the body is never read.
-                let who = super::launch_as::identity_for(&caller.user_id, daemon_uid())?;
+                #[cfg(target_os = "linux")]
+                let caller_user_id = linux_launch_peer_user_id(caller);
+                #[cfg(not(target_os = "linux"))]
+                let caller_user_id = caller.user_id.clone();
+                let who = super::launch_as::identity_for(&caller_user_id, daemon_uid())?;
+                collector_available()?;
                 let cwd = opt_text(&value, "cwd");
                 // A relative working directory would be resolved against the
                 // daemon's own directory. The caller makes it absolute before
@@ -416,24 +462,6 @@ fn create_inner(
                             &format!("找不到工作目录「{dir}」"),
                         ));
                     }
-                }
-                let env: Vec<(String, String)> = value
-                    .get("env")
-                    .and_then(Value::as_object)
-                    .map(|env| {
-                        env.iter()
-                            .filter_map(|(key, val)| {
-                                val.as_str().map(|v| (key.clone(), v.to_owned()))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                // HOME/USER/LOGNAME/SHELL/PATH come from the target account and the
-                // fixed base path. A request that sets one is refused, not started
-                // with the name dropped or overridden.
-                #[cfg(unix)]
-                if let Some(reserved) = super::launch_as::reserved_env_var(&env) {
-                    return Err(super::launch_as::reserved_env_response(&reserved.name));
                 }
                 // Linux and macOS both map `SpawnAsError::Drop` here. Windows never
                 // reaches it: a different account is refused before spawn.
@@ -499,21 +527,22 @@ fn create_inner(
                         (child.id(), child)
                     }
                 };
-                // Both branches go through the helper, which switches even when the
-                // caller is this account. Check the result either way: a child
-                // that is not the caller's account is killed rather than recorded.
+                // A root daemon's other-account branch uses the helper and is
+                // checked against that account's login groups. A same-account
+                // launch is direct: it must retain the daemon's live uid, gid,
+                // and groups rather than a fresh `getgrouplist` lookup.
                 #[cfg(target_os = "linux")]
                 {
-                    let account = match &who {
-                        Some(who) => who.clone(),
-                        None => super::launch_as::own_account_of_self()?,
+                    let dropped = match &who {
+                        Some(who) => super::launch_as::verify_dropped(pid, who),
+                        None => super::launch_as::verify_dropped_as_self(pid),
                     };
-                    if !super::launch_as::verify_dropped(pid, &account) {
+                    if !dropped {
                         let _ = child.kill();
                         let _ = child.wait();
                         tracing::error!(
                             pid,
-                            uid = account.uid,
+                            uid = who.as_ref().map_or_else(daemon_uid, |account| account.uid),
                             "launched child did not drop to the caller; killed"
                         );
                         return Err(error_response(
@@ -569,9 +598,9 @@ fn account_of(
 /// from scratch for that account (`base_env`): a daemon that happens to be the
 /// caller must not hand over its own process environment.
 ///
-/// A root daemon still goes through the helper, which switches and checks. A
-/// daemon that is not root cannot `setgroups` even to its own groups, so it
-/// execs directly; it is already the right account.
+/// This path never switches accounts, including root calling a root daemon.
+/// It starts with the daemon's active uid, gid, and groups, while `base_env`
+/// still builds the target environment from scratch.
 #[cfg(target_os = "linux")]
 fn spawn_as_self(
     argv: &[String],
@@ -579,22 +608,7 @@ fn spawn_as_self(
     env: &[(String, String)],
 ) -> Result<std::process::Child, ApiResponse> {
     let who = super::launch_as::own_account_of_self()?;
-    if nix::unistd::geteuid().as_raw() != 0 {
-        return super::launch_as::spawn_exact(&who, argv, cwd, env).map_err(|err| match err {
-            super::launch_as::SpawnAsError::Program { step, error } => {
-                spawn_error(step, cwd, argv, &error)
-            }
-            super::launch_as::SpawnAsError::Drop(step) => {
-                tracing::error!(step, "same-account launch failed");
-                error_response(
-                    500,
-                    "drop_failed",
-                    "the program did not switch to the caller's account and was stopped",
-                )
-            }
-        });
-    }
-    super::launch_as::spawn_as(&who, argv, cwd, env).map_err(|err| match err {
+    super::launch_as::spawn_exact(&who, argv, cwd, env).map_err(|err| match err {
         super::launch_as::SpawnAsError::Program { step, error } => {
             spawn_error(step, cwd, argv, &error)
         }

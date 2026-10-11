@@ -504,6 +504,7 @@ const fn capability_text(capability: PlatformCapability, status: CapabilityStatu
 const fn capability_status_text(status: CapabilityStatus) -> &'static str {
     match status {
         CapabilityStatus::Available => "可用",
+        CapabilityStatus::Unavailable => "当前不可用",
         CapabilityStatus::NotInThisBuild => "本版本未接入",
         CapabilityStatus::NotSupportedOnThisOs => "这个系统不支持",
     }

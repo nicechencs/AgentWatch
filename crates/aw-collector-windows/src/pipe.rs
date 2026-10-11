@@ -55,13 +55,14 @@ pub fn is_admin(sid: &str, elevated: bool) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub use imp::{create_server, pipe_sddl};
+pub use imp::{create_server, flush_server, pipe_sddl};
 
 #[cfg(target_os = "windows")]
 mod imp {
     use std::ffi::{c_void, OsStr};
     use std::io;
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::RawHandle;
 
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     use windows::core::{PCWSTR, PWSTR};
@@ -73,6 +74,7 @@ mod imp {
     use windows::Win32::Security::{
         LookupAccountNameW, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SID_NAME_USE,
     };
+    use windows::Win32::Storage::FileSystem::FlushFileBuffers;
 
     use super::{sddl_for, USERS_GROUP};
 
@@ -184,6 +186,16 @@ mod imp {
         // SAFETY: `descriptor` was LocalAlloc'd by the conversion above.
         let _ = unsafe { LocalFree(HLOCAL(descriptor.0)) };
         created
+    }
+
+    /// Commit a connected server pipe's buffered reply before disconnecting
+    /// that one-request instance. `DisconnectNamedPipe` otherwise may discard
+    /// a response while the client is still reading it.
+    pub fn flush_server(handle: RawHandle) -> io::Result<()> {
+        // SAFETY: `handle` is the live server end of a connected named pipe;
+        // the IPC server retains ownership for the duration of this call.
+        unsafe { FlushFileBuffers(windows::Win32::Foundation::HANDLE(handle as isize)) }
+            .map_err(os_err)
     }
 }
 

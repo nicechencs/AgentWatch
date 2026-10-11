@@ -39,6 +39,9 @@ pub(crate) enum QueryError {
     NoSessions,
     /// The daemon authenticated the caller but did not authorize this action.
     Permission { detail: String },
+    /// The local channel could not establish a trustworthy peer identity.
+    /// This preserves the fixed IPC failure wording. Exit 4.
+    IdentityFailure { detail: String, code: &'static str },
     /// `--group-by` / `--sort` / a time bound the command refused.
     BadArgument { detail: String },
     /// No query source is available. The message says why; it is not a fake empty list.
@@ -51,6 +54,7 @@ impl std::fmt::Display for QueryError {
             Self::NotFound { session } => write!(f, "找不到会话「{session}」"),
             Self::NoSessions => write!(f, "你还没有会话"),
             Self::Permission { detail } => write!(f, "{detail}"),
+            Self::IdentityFailure { detail, .. } => write!(f, "{detail}"),
             Self::BadArgument { detail } => write!(f, "{detail}"),
             Self::Unavailable { detail } => write!(f, "{detail}"),
         }

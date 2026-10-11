@@ -133,6 +133,9 @@ pub enum ClientError {
     Unreachable { detail: String },
     /// The socket or pipe exists but this account may not open it. Exit 4.
     Forbidden { detail: String },
+    /// The Windows pipe was opened, but the server was not LocalSystem or the
+    /// current user. The client sent no request bytes. Exit 4.
+    UntrustedServer { detail: String },
     /// The exchange failed after connect. Exit 1.
     Transport { detail: String },
     /// The daemon answered with a non-success status.
@@ -157,6 +160,9 @@ impl fmt::Display for ClientError {
                 f,
                 "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。详情：{detail}"
             ),
+            Self::UntrustedServer { .. } => f.write_str(
+                "连上的不是 AgentWatch 后台（管道被别的程序占用），已停止发送。",
+            ),
             Self::Transport { detail } => write!(f, "向后台发请求失败：{detail}"),
             Self::Status {
                 status,
@@ -170,12 +176,25 @@ impl fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 impl ClientError {
+    /// Stable code for an IPC peer identity failure whose human message must
+    /// survive command-specific error wrappers unchanged.
+    #[must_use]
+    pub(crate) fn identity_failure_code(&self) -> Option<&'static str> {
+        match self {
+            Self::UntrustedServer { .. } => Some("daemon_untrusted_server"),
+            Self::Status { code, .. } if code.as_deref() == Some("unidentified_peer") => {
+                Some("unidentified_peer")
+            }
+            _ => None,
+        }
+    }
+
     /// Exit code for this failure.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Unreachable { .. } => exit::UNREACHABLE,
-            Self::Forbidden { .. } => exit::PERMISSION,
+            Self::Forbidden { .. } | Self::UntrustedServer { .. } => exit::PERMISSION,
             Self::Transport { .. } => exit::GENERAL,
             Self::Status { status, .. } => from_http_status(*status),
         }
@@ -365,6 +384,7 @@ fn local_exchange(
         .map_err(|err| match err {
             DialError::Unreachable(detail) => ClientError::Unreachable { detail },
             DialError::Forbidden(detail) => ClientError::Forbidden { detail },
+            DialError::UntrustedServer(detail) => ClientError::UntrustedServer { detail },
             other => ClientError::Transport {
                 detail: other.to_string(),
             },
@@ -599,6 +619,21 @@ mod tests {
             "{text}"
         );
         assert!(text.contains(detail), "{text}");
+    }
+
+    #[test]
+    fn unidentified_peer_is_the_fixed_permission_failure() {
+        let err = ClientError::Status {
+            status: 403,
+            code: Some("unidentified_peer".to_owned()),
+            message: "pipe client could not be identified".to_owned(),
+        };
+        assert_eq!(err.exit_code(), exit::PERMISSION);
+        assert_eq!(err.identity_failure_code(), Some("unidentified_peer"));
+        assert_eq!(
+            err.to_string(),
+            "后台认不出你是哪个用户，已拒绝这次请求。请确认 `aw` 和后台是同一个版本，还不行就重启后台。"
+        );
     }
 
     /// The bug: socket endpoints were refused before any dial, so `aw` could

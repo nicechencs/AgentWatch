@@ -198,6 +198,9 @@ pub enum DialError {
     Unreachable(String),
     /// The socket or pipe exists but this user may not open it.
     Forbidden(String),
+    /// A Windows named pipe opened, but its server process was neither
+    /// LocalSystem nor this client user. No request bytes were sent.
+    UntrustedServer(String),
     /// Every pipe instance stayed busy for [`BUSY_RETRY`].
     Busy(String),
     /// No complete response within the timeout.
@@ -213,6 +216,7 @@ impl DialError {
         match self {
             Self::Unreachable(_) => "daemon_unreachable",
             Self::Forbidden(_) => "daemon_forbidden",
+            Self::UntrustedServer(_) => "daemon_untrusted_server",
             Self::Busy(_) => "daemon_busy",
             Self::Timeout(_) => "daemon_timeout",
             Self::Broken(_) => "channel_broken",
@@ -225,6 +229,7 @@ impl DialError {
         match self {
             Self::Unreachable(d)
             | Self::Forbidden(d)
+            | Self::UntrustedServer(d)
             | Self::Busy(d)
             | Self::Timeout(d)
             | Self::Broken(d) => d,
@@ -240,9 +245,12 @@ impl DialError {
             Self::Forbidden(_) => {
                 "AgentWatch 服务在运行，但当前账户没有连接权限。请让管理员把你加入 agentwatch 组（Windows 为 AgentWatch Users 组）。".to_owned()
             }
+            Self::UntrustedServer(_) => {
+                "连上的不是 AgentWatch 后台（管道被别的程序占用），已停止发送。".to_owned()
+            }
             Self::Busy(_) => "AgentWatch 服务正忙，请稍后重试。".to_owned(),
             Self::Timeout(_) => "AgentWatch 服务没有及时响应，请重试。".to_owned(),
-            Self::Broken(_) => "与 AgentWatch 服务的连接中断了，请重试。".to_owned(),
+            Self::Broken(_) => "跟后台的连接断了，请再试一次。".to_owned(),
         }
     }
 }
@@ -524,12 +532,22 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
 
     use super::{classify, roundtrip, DialError, BUSY_RETRY};
+
+    // `OpenOptionsExt::security_qos_flags` adds `SECURITY_SQOS_PRESENT` for
+    // CreateFileW. Without an explicit level, Rust's file open defaults to
+    // anonymous SQOS, so a LocalSystem pipe server cannot read the connected
+    // client's token. Identification is deliberately the maximum here: the
+    // server can inspect the SID/elevation/integrity, but can never act as the
+    // client.
+    const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 
     pub(super) fn exchange_raw(
         path: &Path,
@@ -543,9 +561,18 @@ mod platform {
             match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
+                .security_qos_flags(SECURITY_IDENTIFICATION)
                 .open(path)
             {
-                Ok(pipe) => break pipe,
+                Ok(pipe) => {
+                    // `CreateFileW` has connected us to one concrete server
+                    // instance. Validate that process before any request byte
+                    // leaves this client: the public pipe name can be claimed
+                    // while agentwatchd is stopped or restarting.
+                    aw_platform::verify_pipe_server(pipe.as_raw_handle())
+                        .map_err(|err| DialError::UntrustedServer(err.to_string()))?;
+                    break pipe;
+                }
                 Err(err) => {
                     let class = classify(&err, path);
                     if matches!(class, DialError::Busy(_)) && started.elapsed() < BUSY_RETRY {
@@ -564,7 +591,15 @@ mod platform {
         thread::Builder::new()
             .name("aw-channel-pipe".to_owned())
             .spawn(move || {
-                let _ = tx.send(roundtrip(&mut pipe, &bytes));
+                let result = roundtrip(&mut pipe, &bytes);
+                if result.is_ok() {
+                    // A complete reply means the server accepted the request
+                    // after its own peer-identification check. This runtime
+                    // fact feeds `aw doctor`; do not claim availability just
+                    // because the Win32 APIs compiled.
+                    aw_platform::note_pipe_peer_identification();
+                }
+                let _ = tx.send(result);
             })
             .map_err(|err| DialError::Broken(format!("helper thread: {err}")))?;
         match rx.recv_timeout(timeout) {
@@ -704,6 +739,16 @@ mod tests {
         if cfg!(windows) {
             assert_eq!(busy.code(), "daemon_busy");
         }
+    }
+
+    #[test]
+    fn untrusted_pipe_server_has_a_distinct_error_and_no_send_message() {
+        let err = DialError::UntrustedServer("unexpected server SID".to_owned());
+        assert_eq!(err.code(), "daemon_untrusted_server");
+        assert_eq!(
+            err.plain(),
+            "连上的不是 AgentWatch 后台（管道被别的程序占用），已停止发送。"
+        );
     }
 
     #[test]

@@ -134,10 +134,12 @@ P3-WIN-01（2026-10-08）没有在本机或 CI 上订阅 `Microsoft-Windows-PktM
 有 Windows 条件测试断言退出码保持为 7。`--env` 只构成子进程环境块，不发送到
 daemon、日志或数据库。【未在真机验证】
 
-命名管道创建时设置显式 DACL 并拒绝远程客户端。daemon 通过
-`aw_platform::identify_pipe_peer`（客户端 PID、管道模拟和线程令牌）取得 SID、
-提权状态与完整性级别；不能取得时返回 `PeerNotIdentified`，绝不使用服务账户
-身份。`aw run` 由 CLI 以当前用户创建挂起目标，daemon 只通过 `/adopt` 接管并由
+命名管道创建时设置显式 DACL 并拒绝远程客户端。客户端以
+`SECURITY_IDENTIFICATION` 打开管道，并在发送前核对服务端进程令牌是 SYSTEM 或
+当前用户，防止后台未运行时同名管道被抢占。daemon 通过
+`aw_platform::identify_pipe_peer`（先读首个请求字节，再模拟客户端并在同一同步区间
+读取线程令牌、立即还原）取得 SID、提权状态与完整性级别；不能取得时返回
+`PeerNotIdentified`，绝不使用服务账户身份。`aw run` 由 CLI 以当前用户创建挂起目标，daemon 只通过 `/adopt` 接管并由
 CLI 放行。App 的「新建会话 / 后台直接启动」在 Windows 当前明确返回 503；尚未接入
 `CreateProcessAsUserW`，不能据此宣称服务可以代表普通用户启动程序。
 

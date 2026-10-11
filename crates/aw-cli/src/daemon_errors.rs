@@ -93,7 +93,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         code: "unidentified_peer",
-        zh: "无法识别管道另一端的调用者",
+        zh: "后台认不出你是哪个用户，已拒绝这次请求。请确认 `aw` 和后台是同一个版本，还不行就重启后台。",
         en: Some("pipe client could not be identified"),
     },
     Row {

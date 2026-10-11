@@ -63,11 +63,18 @@ pub(crate) fn daemon_stop(
     wait: Duration,
     json: bool,
 ) -> Outcome {
-    if health(endpoint, open()).is_none() {
-        return ok(state_line("stopped", "没有运行", endpoint, json));
+    match health(endpoint, open()) {
+        Ok(_) => {}
+        Err(crate::client::ClientError::Unreachable { .. }) => {
+            return ok(state_line("stopped", "没有运行", endpoint, json));
+        }
+        Err(err) => return client_error(&err, endpoint, json),
     }
     let mut client = Client::new(endpoint.clone(), open());
     if let Err(err) = client.call(&ApiRequest::post_json("/api/v1/daemon/stop", &json!({}))) {
+        if err.identity_failure_code().is_some() {
+            return client_error(&err, endpoint, json);
+        }
         if is_permission_error(&err) {
             return error_outcome(
                 exit::PERMISSION,
@@ -80,8 +87,19 @@ pub(crate) fn daemon_stop(
     }
     let mut waited = Duration::ZERO;
     loop {
-        if health(endpoint, open()).is_none() {
-            return ok(state_line("stopped", "后台已停止", endpoint, json));
+        match health(endpoint, open()) {
+            Err(crate::client::ClientError::Unreachable { .. }) => {
+                return ok(state_line("stopped", "后台已停止", endpoint, json));
+            }
+            Ok(_) => {}
+            // An identity refusal is an answer, not a stop in progress.
+            Err(err) if err.identity_failure_code().is_some() => {
+                return client_error(&err, endpoint, json);
+            }
+            // A reset or half-closed connection while the old daemon tears
+            // down is still "stopping": keep polling until it is unreachable
+            // or the wait runs out (which is reported, never claimed stopped).
+            Err(_) => {}
         }
         if waited >= wait {
             return error_outcome(
@@ -207,7 +225,9 @@ fn fetch(
     let reply = client
         .call(&ApiRequest::get_query("/api/v1/daemon/logs", query))
         .map_err(|err| {
-            if is_permission_error(&err) {
+            if err.identity_failure_code().is_some() {
+                client_error(&err, endpoint, json)
+            } else if is_permission_error(&err) {
                 error_outcome(
                     exit::PERMISSION,
                     "permission",
@@ -232,6 +252,7 @@ fn is_permission_error(error: &crate::client::ClientError) -> bool {
     matches!(
         error,
         crate::client::ClientError::Forbidden { .. }
+            | crate::client::ClientError::UntrustedServer { .. }
             | crate::client::ClientError::Status {
                 status: 401 | 403,
                 ..

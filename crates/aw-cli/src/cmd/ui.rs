@@ -251,8 +251,13 @@ pub(crate) fn daemon_start(
     wait: Duration,
     json: bool,
 ) -> Outcome {
-    if let Some(version) = health(endpoint, open()) {
-        return running_outcome(endpoint, &version, Some("已在运行"), json);
+    match health(endpoint, open()) {
+        Ok(version) => return running_outcome(endpoint, &version, Some("已在运行"), json),
+        // Identity refusals and an untrusted server are answers; report them.
+        Err(err) if is_refusal(&err) => return client_error(&err, endpoint, json),
+        // Unreachable, or a connection reset while an old daemon tears down:
+        // nothing usable is answering, so start one (its lock settles races).
+        Err(_) => {}
     }
     let pid = match starter.start() {
         Ok(pid) => pid,
@@ -260,9 +265,17 @@ pub(crate) fn daemon_start(
     };
     let mut waited = Duration::ZERO;
     loop {
-        if let Some(version) = health(endpoint, open()) {
-            let note = format!("已启动 PID {pid}");
-            return running_outcome(endpoint, &version, Some(&note), json);
+        match health(endpoint, open()) {
+            Ok(version) => {
+                let note = format!("已启动 PID {pid}");
+                return running_outcome(endpoint, &version, Some(&note), json);
+            }
+            Err(err) if is_refusal(&err) => {
+                starter.abort();
+                return client_error(&err, endpoint, json);
+            }
+            // Not up yet (unreachable or reset mid-start): keep polling.
+            Err(_) => {}
         }
         if let Some(reason) = starter.exited() {
             return error_outcome(
@@ -291,15 +304,22 @@ pub(crate) fn daemon_start(
     }
 }
 
-pub(crate) fn health(endpoint: &Endpoint, transport: Box<dyn Transport>) -> Option<String> {
+/// The daemon answered, but refused us or is not the daemon: never treated as
+/// "not running yet".
+fn is_refusal(err: &ClientError) -> bool {
+    err.identity_failure_code().is_some() || matches!(err, ClientError::UntrustedServer { .. })
+}
+
+pub(crate) fn health(
+    endpoint: &Endpoint,
+    transport: Box<dyn Transport>,
+) -> Result<String, ClientError> {
     let mut client = Client::new(endpoint.clone(), transport);
-    let reply = client.call(&ApiRequest::get("/health")).ok()?;
-    Some(
-        reply
-            .json()
-            .and_then(|v| v.get("version").and_then(Value::as_str).map(str::to_owned))
-            .unwrap_or_default(),
-    )
+    let reply = client.call(&ApiRequest::get("/health"))?;
+    Ok(reply
+        .json()
+        .and_then(|v| v.get("version").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_default())
 }
 
 fn running_outcome(endpoint: &Endpoint, version: &str, note: Option<&str>, json: bool) -> Outcome {
@@ -325,6 +345,7 @@ pub(crate) fn client_error(err: &ClientError, endpoint: &Endpoint, json: bool) -
     let machine = match err {
         ClientError::Unreachable { .. } => "unreachable",
         ClientError::Forbidden { .. } => "forbidden",
+        ClientError::UntrustedServer { .. } => "daemon_untrusted_server",
         ClientError::Transport { .. } => "transport",
         ClientError::Status { .. } => "status",
     };

@@ -19,9 +19,9 @@
 - daemon 启动时先对 `<socket>.lock` 加 `flock`（独占、非阻塞，整个运行期持有）；拿不到锁说明另一个 daemon 正在启动或运行，本进程报 `internal channel ... is in use` 退出（退出码非 0）。拿到锁后才处理已有文件：用 lstat 看，不是 socket（含符号链接）一律不动并报错；能连上 = 有活 daemon，退出；连接被拒且属主是 daemon 自己的 uid，才删掉重绑；属主是别的 uid 不删（非 root daemon 于是改用按用户路径）。
 - 权限：存在 `agentwatch` 组时 socket 为 `root:agentwatch 0660`；没有该组时为 `0666`，任何本机账户都能连，但每个请求都按对端 uid 判身份（普通用户只看自己的会话）。所以 root 跑的 daemon 普通用户的桌面 App 也连得上。
 - 对端身份：Linux 用 `SO_PEERCRED`，macOS 用 `getpeereid`（即 `LOCAL_PEERCRED` 的 uid）；uid 0 为管理员；认不出连接方就拒绝。
-- Windows：`agentwatchd` 在 `\\.\pipe\agentwatch-api` 上监听（tokio 命名管道），报文同上。管道带显式 DACL（`crates/aw-collector-windows/src/pipe.rs`）：SYSTEM、Administrators、管道属主完全控制；`AgentWatch Users` 组（不存在时退到交互用户 `IU`）可读写但不能新建管道实例。客户端身份按 `GetNamedPipeClientProcessId` → 进程令牌取 SID；令牌已提权或为 LocalSystem 才是管理员。取不到身份的连接直接 403。
+- Windows：`agentwatchd` 在 `\\.\pipe\agentwatch-api` 上监听（tokio 命名管道），报文同上。管道带显式 DACL（`crates/aw-collector-windows/src/pipe.rs`）：SYSTEM、Administrators、管道属主完全控制；`AgentWatch Users` 组（不存在时退到交互用户 `IU`）可读写但不能新建管道实例。客户端以 `SECURITY_IDENTIFICATION` 打开管道，并在发送前用 `GetNamedPipeServerProcessId` 验证服务端令牌是 SYSTEM 或当前用户，避免在后台重启空窗向抢占同名管道的进程发送请求。服务端先读到首个请求字节才 `ImpersonateNamedPipeClient`，在同一同步区间读取线程令牌并立即 `RevertToSelf`；客户端身份按 `GetNamedPipeClientProcessId` → 进程令牌取 SID；令牌已提权或为 LocalSystem 才是管理员。取不到身份的连接直接 403。
 - 只走内部通道的 daemon 控制：`POST /api/v1/daemon/stop`（`aw daemon stop` / `restart`）和 `GET /api/v1/daemon/logs?tail=N|offset=B`（`aw daemon logs [-n N] [-f]`），只允许管理员或 daemon 自己的账户。`POST /api/v1/auth/ui-ticket` 的回复在内部通道上多带 `http_port`：HTTP 监听实际绑定的端口，`0` 表示 HTTP 关闭。
-- 客户端错误分类（`aw_channel::DialError`）：只有"不存在 / 连接被拒"算服务没运行（`daemon_unreachable`，`aw` 退出码 3）；权限不足单独报（`daemon_forbidden`，退出码 4）；管道实例全忙短暂重试 2 秒（`daemon_busy`）；超时 `daemon_timeout`。
+- 客户端错误分类（`aw_channel::DialError`）：只有"不存在 / 连接被拒"算服务没运行（`daemon_unreachable`，`aw` 退出码 3）；权限不足单独报（`daemon_forbidden`，退出码 4）；Windows 管道服务端令牌不可信为 `daemon_untrusted_server`（退出码 4，且不发送请求）；管道实例全忙短暂重试 2 秒（`daemon_busy`）；超时 `daemon_timeout`。
 - `aw daemon start` 在通道无响应时拉起 `agentwatchd --foreground`（`AW_DAEMON_CONFIG` 作为 `--config` 传入）并等待 `/health`；子进程提前退出会直接报出；等不到就把拉起的进程停掉再报错，不留孤儿进程。不注册系统服务。
 
 CLI 和 UI 请求到达后走同一套 axum 路由。传输层不同，但请求体和响应体完全一致。

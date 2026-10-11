@@ -9,6 +9,7 @@ use std::ffi::{c_void, OsStr, OsString};
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use windows::core::{Error, PWSTR};
 use windows::Win32::Foundation::{
@@ -32,7 +33,9 @@ use windows::Win32::System::JobObjects::{
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
-use windows::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
+use windows::Win32::System::Pipes::{
+    GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, ImpersonateNamedPipeClient,
+};
 use windows::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
 use windows::Win32::System::SystemServices::{
     SECURITY_MANDATORY_HIGH_RID, SECURITY_MANDATORY_LOW_RID, SECURITY_MANDATORY_MEDIUM_RID,
@@ -49,6 +52,17 @@ use windows::Win32::System::Threading::{
 };
 
 pub(crate) struct CurrentPlatform;
+
+/// `aw doctor` reports peer identification as available only after a real
+/// named-pipe exchange has successfully read a client token.  A compiled API
+/// alone is not evidence that the service can identify its callers.
+static PIPE_PEER_IDENTIFICATION_WORKS: AtomicBool = AtomicBool::new(false);
+
+const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+
+pub fn note_pipe_peer_identification() {
+    PIPE_PEER_IDENTIFICATION_WORKS.store(true, Ordering::Release);
+}
 
 fn no(capability: &'static str) -> PlatformError {
     PlatformError::Unsupported {
@@ -749,34 +763,131 @@ pub fn identify_pipe_peer(
             reason: "named-pipe client process id is unavailable",
         }
     })?;
-    // Use the pipe server's impersonation rather than a daemon account token.
-    // SAFETY: the pipe is connected; RevertToSelf below always ends this scope.
-    #[allow(unsafe_code)]
-    unsafe { ImpersonateNamedPipeClient(pipe) }.map_err(|_| PlatformError::PeerNotIdentified {
-        reason: "named-pipe client impersonation failed",
-    })?;
+    // Keep impersonation synchronous and as small as possible. In particular,
+    // do not await while this thread has the client token. `Drop` is also the
+    // error path for OpenThreadToken, so RevertToSelf is never skipped.
+    let mut impersonation = PipeImpersonation::begin(pipe)?;
     let mut token = HANDLE::default();
-    // SAFETY: while impersonating, the current thread has the client token.
+    // SAFETY: while `impersonation` is live, the current thread has the
+    // connected client's token and `token` is writable output storage.
     #[allow(unsafe_code)]
     let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut token) };
-    // SAFETY: paired with the successful impersonation above, regardless of token open result.
-    #[allow(unsafe_code)]
-    let reverted = unsafe { RevertToSelf() };
-    if opened.is_err() || reverted.is_err() {
-        if opened.is_ok() {
-            close(token);
-        }
+    // Revert before doing any work with the duplicated token. If Windows
+    // refuses to revert, continuing this IPC thread would run future requests
+    // as the client, so `PipeImpersonation` terminates the process instead.
+    impersonation.revert_or_abort();
+    if opened.is_err() {
         return Err(PlatformError::PeerNotIdentified {
             reason: "named-pipe client token is unavailable",
         });
     }
     let owner = owner_for_token(token);
     close(token);
-    owner
+    let peer = owner
         .map(|owner| PeerIdentity::new(owner, Some(pid)))
         .ok_or(PlatformError::PeerNotIdentified {
             reason: "named-pipe client token ownership is unavailable",
-        })
+        })?;
+    note_pipe_peer_identification();
+    Ok(peer)
+}
+
+/// An impersonation scope for one pipe request. `RevertToSelf` failure is
+/// process-fatal: Windows leaves the thread impersonating, and this daemon's
+/// IPC runtime may otherwise accept a later request on that same thread.
+struct PipeImpersonation {
+    active: bool,
+}
+
+impl PipeImpersonation {
+    fn begin(pipe: HANDLE) -> Result<Self, PlatformError> {
+        // SAFETY: `pipe` is the connected server end supplied by the IPC
+        // listener, after it has read request bytes from this client.
+        #[allow(unsafe_code)]
+        unsafe { ImpersonateNamedPipeClient(pipe) }.map_err(|_| {
+            PlatformError::PeerNotIdentified {
+                reason: "named-pipe client impersonation failed",
+            }
+        })?;
+        Ok(Self { active: true })
+    }
+
+    fn revert_or_abort(&mut self) {
+        if !self.active {
+            return;
+        }
+        // SAFETY: a successful `begin` above impersonated this current thread.
+        #[allow(unsafe_code)]
+        let reverted = unsafe { RevertToSelf() };
+        if reverted.is_err() {
+            // There is no safe way to return to the tokio IPC thread while it
+            // may still be running as a client. The service manager restarts a
+            // service process; a foreground daemon exits rather than serving
+            // with the wrong token.
+            eprintln!("agentwatch: RevertToSelf failed; aborting the process");
+            std::process::abort();
+        }
+        self.active = false;
+    }
+}
+
+impl Drop for PipeImpersonation {
+    fn drop(&mut self) {
+        self.revert_or_abort();
+    }
+}
+
+/// Verify the process that owns the connected server end of a client pipe.
+/// Only LocalSystem and the current user's SID are valid daemon identities.
+/// The caller turns every failure into a local refusal before sending bytes.
+pub fn verify_pipe_server(handle: std::os::windows::io::RawHandle) -> Result<(), PlatformError> {
+    let pipe = HANDLE(handle as isize);
+    let mut pid = 0_u32;
+    // SAFETY: `handle` is the connected client end just returned by CreateFileW.
+    #[allow(unsafe_code)]
+    unsafe { GetNamedPipeServerProcessId(pipe, &mut pid) }.map_err(|_| {
+        PlatformError::PeerNotIdentified {
+            reason: "named-pipe server process id is unavailable",
+        }
+    })?;
+    if pid == 0 {
+        return Err(PlatformError::PeerNotIdentified {
+            reason: "named-pipe server process id is invalid",
+        });
+    }
+    // SAFETY: `pid` came from the kernel for this connected pipe. The returned
+    // handle is closed below on every path after this call succeeds.
+    #[allow(unsafe_code)]
+    let process =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.map_err(io_error)?;
+    let server = owner_for_process(process);
+    close(process);
+    let Some(Owner::Windows {
+        sid: server_sid, ..
+    }) = server
+    else {
+        return Err(PlatformError::PeerNotIdentified {
+            reason: "named-pipe server token ownership is unavailable",
+        });
+    };
+    let Owner::Windows {
+        sid: current_sid, ..
+    } = CurrentPlatform.current_owner()?
+    else {
+        return Err(PlatformError::PeerNotIdentified {
+            reason: "current process token ownership is unavailable",
+        });
+    };
+    if trusted_pipe_server_sid(&server_sid, &current_sid) {
+        return Ok(());
+    }
+    Err(PlatformError::PeerNotIdentified {
+        reason: "named-pipe server is neither LocalSystem nor the current user",
+    })
+}
+
+fn trusted_pipe_server_sid(server_sid: &str, current_sid: &str) -> bool {
+    server_sid == LOCAL_SYSTEM_SID || server_sid == current_sid
 }
 
 impl Platform for CurrentPlatform {
@@ -795,8 +906,14 @@ impl Platform for CurrentPlatform {
             Capability::SpawnSuspended
             | Capability::ProcessIdentity
             | Capability::ProcessTable
-            | Capability::PeerIdentity
             | Capability::ExitCode => CapabilityStatus::Available,
+            Capability::PeerIdentity => {
+                if PIPE_PEER_IDENTIFICATION_WORKS.load(Ordering::Acquire) {
+                    CapabilityStatus::Available
+                } else {
+                    CapabilityStatus::Unavailable
+                }
+            }
             // The platform primitive can validate a pipe peer's token, but the
             // daemon has not wired its launch API to that primitive yet.
             Capability::SpawnAsCaller | Capability::SecureDataDir => {
@@ -989,7 +1106,7 @@ pub fn os_version() -> Option<String> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{close, environment_from, CurrentPlatform};
+    use super::{close, environment_from, trusted_pipe_server_sid, CurrentPlatform};
     use crate::{
         platform, Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner,
         PeerIdentity, Platform, PlatformError, ReapOutcome, SpawnRequest, UnsupportedKind,
@@ -1013,6 +1130,14 @@ mod tests {
             CurrentPlatform.capability(Capability::SpawnAsCaller),
             CapabilityStatus::NotInThisBuild
         );
+    }
+
+    #[test]
+    fn pipe_server_must_be_system_or_this_user() {
+        let user = "S-1-5-21-10-20-30-1001";
+        assert!(trusted_pipe_server_sid("S-1-5-18", user));
+        assert!(trusted_pipe_server_sid(user, user));
+        assert!(!trusted_pipe_server_sid("S-1-5-21-10-20-30-1002", user));
     }
 
     #[test]

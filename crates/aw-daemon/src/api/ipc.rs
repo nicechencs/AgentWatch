@@ -473,7 +473,7 @@ mod pipe {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
-    use aw_collector_windows::pipe::{create_server, is_admin, pipe_sddl};
+    use aw_collector_windows::pipe::{create_server, flush_server, is_admin, pipe_sddl};
     use aw_platform::{identify_pipe_peer, Owner};
     use tokio::net::windows::named_pipe::NamedPipeServer;
 
@@ -587,30 +587,6 @@ mod pipe {
         state: SharedState,
         control: Arc<Control>,
     ) -> io::Result<()> {
-        let caller = match identify_pipe_peer(pipe.as_raw_handle()) {
-            Ok(peer) => match peer.owner() {
-                Owner::Windows { sid, elevated, .. } => {
-                    let admin = is_admin(sid, *elevated);
-                    Caller {
-                        user_id: sid.clone(),
-                        admin,
-                        peer: Some(peer),
-                    }
-                }
-                Owner::Unix { .. } => unreachable!("Windows pipe peer has a Windows owner"),
-            },
-            Err(err) => {
-                tracing::warn!(target: "aw_daemon::ipc", error = %err, "pipe client not identified");
-                let response = error_response(
-                    403,
-                    "unidentified_peer",
-                    "pipe client could not be identified",
-                );
-                write_all(&pipe, &response_bytes(&response)).await?;
-                // Dropped, not disconnected: see the end of `serve`.
-                return Ok(());
-            }
-        };
         let mut collected = Vec::new();
         let mut buf = vec![0_u8; 8 * 1024];
         let request = loop {
@@ -625,7 +601,8 @@ mod pipe {
                     if collected.len() > MAX_REQUEST {
                         let response =
                             error_response(413, "payload_too_large", "request body exceeds 64 KiB");
-                        return write_all(&pipe, &response_bytes(&response)).await;
+                        write_all(&pipe, &response_bytes(&response)).await?;
+                        return finish(&pipe).await;
                     }
                     if let Some(req) = parse_request(&collected, 0) {
                         break req;
@@ -635,6 +612,44 @@ mod pipe {
                 Err(err) => return Err(err),
             }
         };
+        // Windows does not allow a pipe server to impersonate a client until
+        // the server has read data from that client. This happens after the
+        // complete first request is available, but before any route or caller
+        // data is used. `identify_pipe_peer` is synchronous and reverts before
+        // returning, so this async task never awaits while impersonating.
+        let caller = match identify_pipe_peer(pipe.as_raw_handle()) {
+            Ok(peer) => match peer.owner() {
+                Owner::Windows { sid, elevated, .. } => {
+                    let user_id = sid.clone();
+                    let admin = is_admin(sid, *elevated);
+                    Caller {
+                        user_id,
+                        admin,
+                        peer: Some(peer),
+                    }
+                }
+                Owner::Unix { .. } => {
+                    tracing::error!(target: "aw_daemon::ipc", "Windows pipe returned a Unix peer owner");
+                    let response = error_response(
+                        403,
+                        "unidentified_peer",
+                        "pipe client could not be identified",
+                    );
+                    write_all(&pipe, &response_bytes(&response)).await?;
+                    return finish(&pipe).await;
+                }
+            },
+            Err(err) => {
+                tracing::warn!(target: "aw_daemon::ipc", error = %err, "pipe client not identified");
+                let response = error_response(
+                    403,
+                    "unidentified_peer",
+                    "pipe client could not be identified",
+                );
+                write_all(&pipe, &response_bytes(&response)).await?;
+                return finish(&pipe).await;
+            }
+        };
         // Routes are synchronous (SQLite); off the runtime thread so one slow
         // request (a large export) does not stall every other pipe client.
         let response =
@@ -642,15 +657,7 @@ mod pipe {
                 .await
                 .unwrap_or_else(|_| error_response(500, "internal", "request handler failed"));
         write_all(&pipe, &response_bytes(&response)).await?;
-        // Do not call `disconnect` (DisconnectNamedPipe) here: it throws away
-        // whatever the client has not read yet, and the client's read then
-        // fails with ERROR_PIPE_NOT_CONNECTED ("uncategorized error"), which
-        // made the pipe test fail on Windows CI. Dropping the instance closes
-        // the server handle; the client reads the buffered reply and then sees
-        // ERROR_BROKEN_PIPE, which std reports as end of file. Each instance
-        // serves one connection, so nothing reuses it.
-        drop(pipe);
-        Ok(())
+        finish(&pipe).await
     }
 
     async fn write_all(pipe: &NamedPipeServer, mut bytes: &[u8]) -> io::Result<()> {
@@ -663,6 +670,23 @@ mod pipe {
             }
         }
         Ok(())
+    }
+
+    /// Finish this one-request pipe instance. Flushing is blocking on Windows
+    /// (it waits until the client reads the buffered reply), so keep it off the
+    /// current-thread accept runtime. Always disconnect afterwards; a dropped
+    /// handle alone made later clients intermittently see a broken pipe.
+    async fn finish(pipe: &NamedPipeServer) -> io::Result<()> {
+        let raw = pipe.as_raw_handle() as usize;
+        let flushed = tokio::task::spawn_blocking(move || {
+            // SAFETY: `raw` came from `pipe`, which remains borrowed and alive
+            // until the blocking operation has completed.
+            flush_server(raw as std::os::windows::io::RawHandle)
+        })
+        .await
+        .map_err(|_| io::Error::other("named-pipe flush task failed"))?;
+        let disconnected = pipe.disconnect();
+        flushed.and(disconnected)
     }
 }
 

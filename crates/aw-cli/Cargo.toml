@@ -55,6 +55,11 @@ nix = { version = "0.30", default-features = false, features = ["fs", "process",
 # insta is MIT OR Apache-2.0. Same pin as aw-core. Snapshots record `aw --help`.
 insta = { version = "1.49.0", default-features = false }
 
+[target.'cfg(windows)'.dev-dependencies]
+# The Windows integration test hosts a real temporary named pipe and spawns
+# the built `aw` binary through its normal aw-channel client path.
+tokio = { workspace = true }
+
 # Unsafe code is denied crate-wide. The Unix `pre_exec` gate is the sole
 # documented exception; Windows FFI is confined to `aw-platform`.
 [lints.rust]

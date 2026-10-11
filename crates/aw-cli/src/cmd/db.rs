@@ -264,6 +264,9 @@ pub(crate) enum DbApiError {
     Failed { detail: String },
     /// Authenticated and refused. Exit 4.
     Forbidden { detail: String },
+    /// The local channel could not establish a trustworthy peer identity.
+    /// This preserves the fixed IPC failure wording. Exit 4.
+    IdentityFailure { detail: String, code: &'static str },
 }
 
 impl std::fmt::Display for DbApiError {
@@ -272,6 +275,7 @@ impl std::fmt::Display for DbApiError {
             Self::Unreachable { detail } => write!(f, "{detail}"),
             Self::Failed { detail } => write!(f, "{detail}"),
             Self::Forbidden { detail } => write!(f, "{detail}"),
+            Self::IdentityFailure { detail, .. } => write!(f, "{detail}"),
         }
     }
 }
@@ -589,11 +593,18 @@ fn opt_db_u64(value: &serde_json::Value, name: &str) -> Result<Option<u64>, DbAp
 }
 
 fn client_to_db(err: crate::client::ClientError) -> DbApiError {
+    if let Some(code) = err.identity_failure_code() {
+        return DbApiError::IdentityFailure {
+            detail: clip_db(&err.to_string()),
+            code,
+        };
+    }
     match &err {
         crate::client::ClientError::Unreachable { .. } => DbApiError::Unreachable {
             detail: clip_db(&err.to_string()),
         },
         crate::client::ClientError::Forbidden { .. }
+        | crate::client::ClientError::UntrustedServer { .. }
         | crate::client::ClientError::Status {
             status: 401 | 403, ..
         } => DbApiError::Forbidden {
@@ -743,6 +754,7 @@ fn api_error(err: DbApiError, json: bool) -> Outcome {
     let (code, machine) = match &err {
         DbApiError::Unreachable { .. } => (exit::UNREACHABLE, "unreachable"),
         DbApiError::Forbidden { .. } => (exit::PERMISSION, "permission"),
+        DbApiError::IdentityFailure { code, .. } => (exit::PERMISSION, *code),
         DbApiError::Failed { .. } => (exit::GENERAL, "db"),
     };
     super::error_outcome(code, machine, &err.to_string(), json)

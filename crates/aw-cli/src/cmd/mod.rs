@@ -1143,6 +1143,7 @@ fn client_outcome(err: ClientError, endpoint: &Endpoint, json: bool) -> Outcome 
     let machine = match &err {
         ClientError::Unreachable { .. } => "unreachable",
         ClientError::Forbidden { .. } => "forbidden",
+        ClientError::UntrustedServer { .. } => "daemon_untrusted_server",
         ClientError::Transport { .. } => "transport",
         ClientError::Status { status, .. } => match *status {
             401 => "unauthorized",

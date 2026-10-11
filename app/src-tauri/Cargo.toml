@@ -25,7 +25,8 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Shared internal-channel client (same as `aw`): path order, error classes,
-# pipe-busy retry, timeouts. std only.
+# pipe-busy retry, timeouts, identification QoS, and Windows server-token
+# verification before request bytes are sent.
 aw-channel = { path = "../../crates/aw-channel" }
 
 [features]

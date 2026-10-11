@@ -429,6 +429,12 @@ fn client_to_query(err: ClientError) -> QueryError {
 /// [`client_to_query`], but a 404 names `key` — what the user typed — instead
 /// of the daemon's English message.
 fn client_to_query_for(err: &ClientError, key: Option<&str>) -> QueryError {
+    if let Some(code) = err.identity_failure_code() {
+        return QueryError::IdentityFailure {
+            detail: clip(&err.to_string()),
+            code,
+        };
+    }
     match err {
         ClientError::Status {
             status: 404,
@@ -444,6 +450,7 @@ fn client_to_query_for(err: &ClientError, key: Option<&str>) -> QueryError {
             detail: clip(&err.to_string()),
         },
         ClientError::Forbidden { .. }
+        | ClientError::UntrustedServer { .. }
         | ClientError::Status {
             status: 401 | 403, ..
         } => QueryError::Permission {

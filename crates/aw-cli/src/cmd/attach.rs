@@ -98,6 +98,9 @@ pub(crate) enum ControlError {
     Unreachable { detail: String },
     /// The local channel denied the caller before an HTTP response.
     Forbidden { detail: String },
+    /// A process other than LocalSystem or the current user owned the opened
+    /// Windows pipe. No request bytes were sent.
+    UntrustedServer { detail: String },
     /// The request or response transport failed.
     Transport { detail: String },
     /// The daemon returned a non-success HTTP status.
@@ -121,6 +124,9 @@ impl std::fmt::Display for ControlError {
                 f,
                 "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。详情：{detail}"
             ),
+            Self::UntrustedServer { .. } => {
+                f.write_str("连上的不是 AgentWatch 后台（管道被别的程序占用），已停止发送。")
+            }
             Self::Transport { detail } => write!(f, "向后台发请求失败：{detail}"),
             Self::Status {
                 status,
@@ -139,6 +145,7 @@ impl From<ClientError> for ControlError {
         match error {
             ClientError::Unreachable { detail } => Self::Unreachable { detail },
             ClientError::Forbidden { detail } => Self::Forbidden { detail },
+            ClientError::UntrustedServer { detail } => Self::UntrustedServer { detail },
             ClientError::Transport { detail } => Self::Transport { detail },
             ClientError::Status {
                 status,
@@ -159,7 +166,7 @@ impl ControlError {
     pub(crate) fn exit_code(&self) -> i32 {
         match self {
             Self::Unreachable { .. } => exit::UNREACHABLE,
-            Self::Forbidden { .. } => exit::PERMISSION,
+            Self::Forbidden { .. } | Self::UntrustedServer { .. } => exit::PERMISSION,
             Self::Transport { .. } | Self::BadReply { .. } => exit::GENERAL,
             Self::Status { status, .. } => exit::from_http_status(*status),
         }
@@ -175,6 +182,7 @@ impl ControlError {
         match self {
             Self::Unreachable { .. } => "unreachable",
             Self::Forbidden { .. } => "forbidden",
+            Self::UntrustedServer { .. } => "daemon_untrusted_server",
             Self::Status { code, status, .. } => code.as_deref().unwrap_or(match *status {
                 401 => "unauthorized",
                 403 => "forbidden",

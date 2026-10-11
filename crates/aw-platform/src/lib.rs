@@ -298,6 +298,9 @@ impl Capability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityStatus {
     Available,
+    /// The primitive is compiled in, but its required runtime check has not
+    /// succeeded in this daemon yet.
+    Unavailable,
     NotInThisBuild,
     NotSupportedOnThisOs,
 }
@@ -349,6 +352,23 @@ pub fn identify_pipe_peer(
     handle: std::os::windows::io::RawHandle,
 ) -> Result<PeerIdentity, PlatformError> {
     windows::identify_pipe_peer(handle)
+}
+
+/// Refuse a Windows named-pipe server unless its process token is LocalSystem
+/// or the same user as this client. This is the client-side half of protecting
+/// the well-known pipe name from a process that claimed it while the daemon
+/// was stopped.
+#[cfg(windows)]
+pub fn verify_pipe_server(handle: std::os::windows::io::RawHandle) -> Result<(), PlatformError> {
+    windows::verify_pipe_server(handle)
+}
+
+/// Record that a complete Windows named-pipe request made the round trip after
+/// the peer checks. `aw doctor` uses this runtime fact rather than advertising
+/// peer identification merely because this build contains the API.
+#[cfg(windows)]
+pub fn note_pipe_peer_identification() {
+    windows::note_pipe_peer_identification();
 }
 
 #[cfg(test)]

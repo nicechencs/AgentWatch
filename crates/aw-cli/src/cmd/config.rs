@@ -38,6 +38,9 @@ pub(crate) enum ConfigError {
     Failed { detail: String },
     /// Authenticated and refused. Exit 4.
     Forbidden { detail: String },
+    /// The local channel could not establish a trustworthy peer identity.
+    /// This preserves the fixed IPC failure wording. Exit 4.
+    IdentityFailure { detail: String, code: &'static str },
     /// The value does not match the schema. Exit 2.
     Invalid { detail: String },
 }
@@ -48,6 +51,7 @@ impl std::fmt::Display for ConfigError {
             Self::Unreachable { detail }
             | Self::Failed { detail }
             | Self::Forbidden { detail }
+            | Self::IdentityFailure { detail, .. }
             | Self::Invalid { detail } => write!(f, "{detail}"),
         }
     }
@@ -217,11 +221,18 @@ fn lookup_key(root: &Value, key: &str) -> Result<Value, ConfigError> {
 }
 
 fn client_to_config(err: crate::client::ClientError) -> ConfigError {
+    if let Some(code) = err.identity_failure_code() {
+        return ConfigError::IdentityFailure {
+            detail: clip_config(&err.to_string()),
+            code,
+        };
+    }
     match &err {
         crate::client::ClientError::Unreachable { .. } => ConfigError::Unreachable {
             detail: clip_config(&err.to_string()),
         },
         crate::client::ClientError::Forbidden { .. }
+        | crate::client::ClientError::UntrustedServer { .. }
         | crate::client::ClientError::Status {
             status: 401 | 403, ..
         } => ConfigError::Forbidden {
@@ -475,6 +486,7 @@ fn config_error(err: ConfigError, json_mode: bool) -> Outcome {
     let (code, machine) = match &err {
         ConfigError::Unreachable { .. } => (exit::UNREACHABLE, "unreachable"),
         ConfigError::Forbidden { .. } => (exit::PERMISSION, "permission"),
+        ConfigError::IdentityFailure { code, .. } => (exit::PERMISSION, *code),
         ConfigError::Invalid { .. } => (exit::USAGE, "usage"),
         ConfigError::Failed { .. } => (exit::GENERAL, "config"),
     };

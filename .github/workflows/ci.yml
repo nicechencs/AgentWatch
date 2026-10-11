@@ -39,7 +39,7 @@ jobs:
         shell: bash
         run: scripts/check-daemon-current-user.sh
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
       # macOS: these two crates' tests must actually run. `cargo test
       # --workspace` above includes them; this step prints their names so a
       # green log shows macos::launch::tests, macos::tests and macos::spawn::tests

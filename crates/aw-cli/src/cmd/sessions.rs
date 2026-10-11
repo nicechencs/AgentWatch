@@ -217,6 +217,7 @@ pub(crate) fn query_outcome(err: QueryError, json: bool) -> Outcome {
         QueryError::NotFound { .. } => (exit::NOT_FOUND, "not_found"),
         QueryError::NoSessions => (exit::NOT_FOUND, "no_sessions"),
         QueryError::Permission { .. } => (exit::PERMISSION, "permission_denied"),
+        QueryError::IdentityFailure { code, .. } => (exit::PERMISSION, *code),
         QueryError::BadArgument { .. } => (exit::USAGE, "usage"),
         QueryError::Unavailable { .. } => (exit::GENERAL, "not_connected"),
     };

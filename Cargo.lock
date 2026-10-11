@@ -67,6 +67,9 @@ dependencies = [
 [[package]]
 name = "aw-channel"
 version = "0.1.0"
+dependencies = [
+ "aw-platform",
+]
 
 [[package]]
 name = "aw-cli"
@@ -87,6 +90,7 @@ dependencies = [
  "nix",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

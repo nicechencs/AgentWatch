@@ -14,8 +14,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: desktop-${{ github.ref }}
-  cancel-in-progress: true
+  # Pull requests: a new push drops the previous run on the same ref.
+  # Pushes and manual workflow_dispatch runs never cancel each other: each
+  # gets its own group (run_id), so every dispatched dev tip keeps a result.
+  group: desktop-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   app:

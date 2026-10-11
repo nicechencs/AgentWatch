@@ -292,6 +292,9 @@ mod unix {
             // the other's fresh socket as stale and delete it.
             let lock = take_lock(path)?;
             clear_stale(path)?;
+            if let Some(reason) = aw_channel::socket_path_too_long(path) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+            }
             let listener = UnixListener::bind(path)?;
             let grouped = set_group(path);
             fs::set_permissions(path, fs::Permissions::from_mode(socket_mode(grouped)))?;

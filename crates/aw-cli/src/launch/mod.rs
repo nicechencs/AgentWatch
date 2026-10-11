@@ -1,22 +1,14 @@
 //! Platform launchers for `aw run` (P1-WIN-04, P1-CLI-02).
 //!
 //! Windows launch lives in `aw-platform`, so this crate has no Win32 FFI.
-//! macOS uses [`unix_macos`] (cfg-gated); that launcher
-//! spawns with `Command` and does not claim suspension. Linux production uses
+//! macOS `aw run` starts through `aw-platform` (`POSIX_SPAWN_START_SUSPENDED`),
+//! not through this module. Linux production uses
 //! [`unix_linux::LocalCgroupHost`] (cfg-gated): a delegated cgroup v2 directory,
 //! or a structured error and no child. [`UnsupportedUnixLauncher`] remains the
 //! production value on every other non-Windows target.
 //!
 //! Ctrl-C forwarding lives on the launcher trait (`forward_interrupt`). Tests
 //! pass a fake and never send a real signal.
-
-// P1-MAC-03. macOS `aw run` needs [`unix_macos::production`], which does not
-// exist on other targets, so the module is cfg-gated to macOS. Linux is the
-// `unix_linux` module below, also cfg-gated.
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-#[path = "unix_macos.rs"]
-mod unix_macos;
 
 // Linux production `aw run` uses [`unix_linux::LocalCgroupHost`]. The module is
 // cfg-gated so non-Linux builds do not compile the host. [`UnverifiedCgroupLaunch`]
@@ -25,12 +17,6 @@ mod unix_macos;
 #[allow(dead_code)]
 #[path = "unix_linux.rs"]
 mod unix_linux;
-
-/// Present only on macOS. [`unix_macos::production`] spawns with `Command` and
-/// records that suspension was not applied. It does not claim E1 scope.
-#[cfg(target_os = "macos")]
-#[allow(unused_imports)]
-pub use unix_macos::{launch_command, production};
 
 /// Present only on Linux. [`unix_linux::LocalCgroupHost`] creates a cgroup v2
 /// session directory when the caller is delegated, and refuses otherwise.
@@ -164,7 +150,7 @@ impl<T: UnixLauncher + ?Sized> UnixLauncher for &mut T {
 /// Production launcher for non-Windows targets. Starts nothing.
 ///
 /// The real process launcher is P1-LNX-04 (`launch/unix_linux.rs`) and
-/// P1-MAC-03 (`launch/unix_macos.rs`). Those modules are not compiled here.
+/// P1-MAC-03 (`aw-platform` on macOS). The macOS module is not compiled here.
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 pub struct UnsupportedUnixLauncher;

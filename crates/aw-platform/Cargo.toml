@@ -15,10 +15,13 @@ nix = { version = "0.30", default-features = false, features = ["fs", "process",
 aw-collector-linux = { path = "../aw-collector-linux" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# `getpeereid` and `LOCAL_PEERPID` provide authenticated Unix-socket peer
-# credentials without an FFI boundary in this crate.
-nix = { version = "0.30", default-features = false, features = ["user", "socket"] }
 aw-collector-macos = { path = "../aw-collector-macos" }
+# libc 0.2.189 is already in Cargo.lock (via sysinfo). Pinned so `--locked`
+# resolves it. Used for proc_pidinfo / proc_listallpids / posix_spawn FFI.
+libc = "=0.2.189"
+# getpeereid and LOCAL_PEERPID. `user` + `socket` are the features aw-daemon
+# already enables; no new crate version.
+nix = { version = "0.30", default-features = false, features = ["user", "socket"] }
 
 [target.'cfg(windows)'.dependencies]
 aw-collector-windows = { path = "../aw-collector-windows" }
@@ -34,10 +37,13 @@ windows = { version = "=0.57.0", features = [
     "Win32_System_Threading",
 ] }
 
-[lints]
+# Not `workspace = true`. Inheriting the workspace table forces
+# `--forbid=unsafe_code` on the rustc command line, and a command-line forbid
+# cannot be relaxed by `#![deny]` / `#[allow]` (rust-lang/cargo#13157). The
+# workspace lint table is unchanged. This crate restates the clippy lints and
+# sets `unsafe_code` to deny, which the Windows and macOS FFI modules opt out
+# of. Same approach as aw-collector-windows.
 [lints.rust]
-# The Windows implementation has narrowly-scoped, documented FFI exceptions.
-# `forbid` cannot be relaxed in that child module.
 unsafe_code = "deny"
 
 [lints.clippy]

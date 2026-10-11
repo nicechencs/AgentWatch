@@ -1,6 +1,9 @@
 //! Explicit operating-system boundary for AgentWatch shared code.
-// OS modules retain narrowly-scoped, documented FFI exceptions.  Shared code
-// remains unsafe-free.
+//!
+//! `unsafe_code` is `deny`, not the workspace `forbid`: a `forbid` cannot be
+//! relaxed, and the Windows and macOS modules need FFI. Those modules are the
+//! only places that opt back in (`#[allow(unsafe_code)]`), and every call
+//! there has a `SAFETY` comment. Shared code in this file stays safe.
 #![deny(unsafe_code)]
 
 /// OS-independent Windows Job launch state machine.
@@ -16,6 +19,8 @@ use std::path::{Path, PathBuf};
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::gate_main;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "linux")]
@@ -24,6 +29,25 @@ use linux::CurrentPlatform;
 use macos::CurrentPlatform;
 #[cfg(target_os = "windows")]
 use windows::CurrentPlatform;
+
+/// Operating system version for `aw doctor`. `None` when this build cannot read
+/// it; the caller prints 「不可得」 and never an empty string.
+#[must_use]
+pub fn os_version() -> Option<String> {
+    os_version_of()
+}
+#[cfg(target_os = "linux")]
+fn os_version_of() -> Option<String> {
+    linux::os_version()
+}
+#[cfg(target_os = "macos")]
+fn os_version_of() -> Option<String> {
+    macos::os_version()
+}
+#[cfg(target_os = "windows")]
+fn os_version_of() -> Option<String> {
+    windows::os_version()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedKind {
@@ -217,6 +241,25 @@ pub struct IdentifiedCaller {
 impl IdentifiedCaller {
     pub fn from_peer(peer: PeerIdentity) -> Self {
         Self { owner: peer.owner }
+    }
+
+    /// A caller the operating system already authenticated, named by its
+    /// account rather than by a connection. The daemon uses this for a peer
+    /// whose uid and gid `getpeereid` returned. It is not a request field:
+    /// callers must pass only ids the OS gave them.
+    pub fn from_unix_ids(uid: u32, gid: u32) -> Self {
+        Self {
+            owner: Owner::Unix {
+                ruid: uid,
+                euid: uid,
+                suid: uid,
+                rgid: gid,
+                egid: gid,
+                sgid: gid,
+                // getpeereid reports one gid, not the supplementary list.
+                groups: None,
+            },
+        }
     }
     pub fn current_user() -> Result<Self, PlatformError> {
         Ok(Self {

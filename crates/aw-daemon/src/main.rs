@@ -98,6 +98,13 @@ fn dispatch(args: impl IntoIterator<Item = String>) -> Result<ExitCode, CliError
     if args[0] == api::LAUNCH_AS_HELPER_ARG {
         return Ok(api::launch_as_helper());
     }
+    // Internal: macOS suspended-launch gate. Switches to the caller, then execs.
+    // argv carries the account, never a secret; a failure exits 125 and does
+    // not exec. See `aw_platform::gate_main`.
+    #[cfg(target_os = "macos")]
+    if args[0] == "aw-mac-gate" {
+        aw_platform::gate_main();
+    }
 
     let mut foreground = false;
     let mut log_probe = false;

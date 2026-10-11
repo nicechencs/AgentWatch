@@ -255,6 +255,58 @@ impl std::fmt::Display for DialError {
 
 impl std::error::Error for DialError {}
 
+/// This OS's socket path limit, in bytes. `None` where a path has no such
+/// limit. The number lives in the OS module below; this function only picks it.
+fn socket_limit() -> Option<usize> {
+    os_path::socket_path_limit()
+}
+
+/// `Some` with a Chinese explanation when `path` is at least `limit` bytes.
+/// Names the limit and the actual length, so the failure is not reported as a
+/// bare `os error 22` / `invalid argument`. `None` when `limit` is `None`
+/// (this OS has no such limit) or the path is short enough.
+///
+/// Rust's standard library rejects an over-long path itself, before any
+/// syscall, as `ErrorKind::InvalidInput` ("path must be shorter than
+/// SUN_LEN"). A real `EINVAL` (errno 22) only appears when something else
+/// passes the path through. Both look like "invalid argument"; this check
+/// says which one it is. The limit comes from [`socket_limit`]: 104 on macOS,
+/// 108 on Linux, none on Windows.
+#[must_use]
+pub fn socket_path_too_long(path: &Path) -> Option<String> {
+    let limit = socket_limit()?;
+    let len = path.as_os_str().len();
+    if len < limit {
+        return None;
+    }
+    Some(format!(
+        "unusable socket path（套接字路径太长：{len} 字节，这个系统的上限是 {limit} 字节（不含结尾的空字节））"
+    ))
+}
+
+/// Per-OS socket path limit. The number is the only thing that differs; the
+/// check and the message live above and are shared.
+mod os_path {
+    /// macOS `sockaddr_un.sun_path` is 104 bytes. A path of that length or
+    /// longer cannot be bound or connected.
+    #[cfg(target_os = "macos")]
+    pub(super) fn socket_path_limit() -> Option<usize> {
+        Some(104)
+    }
+
+    /// Linux `sockaddr_un.sun_path` is 108 bytes.
+    #[cfg(target_os = "linux")]
+    pub(super) fn socket_path_limit() -> Option<usize> {
+        Some(108)
+    }
+
+    /// Windows named pipes have no byte limit of this kind.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn socket_path_limit() -> Option<usize> {
+        None
+    }
+}
+
 /// A fresh, short scratch directory for tests that bind sockets. Unix
 /// socket paths are limited (`SUN_LEN`: 104 bytes on macOS, 108 on Linux)
 /// and macOS temp dirs (`/var/folders/...`) are already long, so on Unix this
@@ -448,13 +500,19 @@ mod platform {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{classify, roundtrip, DialError};
+    use super::{classify, roundtrip, socket_path_too_long, DialError};
 
     pub(super) fn exchange_raw(
         path: &Path,
         request: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, DialError> {
+        if let Some(reason) = socket_path_too_long(path) {
+            return Err(DialError::Unreachable(format!(
+                "{}: unusable socket path ({reason})",
+                path.display()
+            )));
+        }
         let mut stream = UnixStream::connect(path).map_err(|err| classify(&err, path))?;
         let _ = stream.set_read_timeout(Some(timeout));
         let _ = stream.set_write_timeout(Some(timeout));
@@ -848,6 +906,16 @@ mod fallback_tests {
         let err = exchange_first(&order, b"", TIMEOUT).unwrap_err();
         assert_eq!(err.code(), "daemon_forbidden", "{err}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn too_long_message_names_the_limit_and_the_length() {
+        let path = PathBuf::from(format!("/tmp/{}", "x".repeat(120)));
+        let len = path.as_os_str().len();
+        let reason = super::socket_path_too_long(&path).expect("too long");
+        assert!(reason.contains(&len.to_string()), "{reason}");
+        assert!(reason.contains("上限"), "{reason}");
+        assert!(super::socket_path_too_long(std::path::Path::new("/tmp/short.sock")).is_none());
     }
 
     /// macOS SUN_LEN is 104, Linux 108: a longer path cannot be dialled.

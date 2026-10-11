@@ -2,11 +2,13 @@
 //!
 //! `--no-daemon` starts the target as the calling user through an injected
 //! [`Launcher`], then prints a session summary. The default daemon path first
-//! records `/sessions/run`, starts the child held (at a Unix pipe gate or with
-//! Windows `CREATE_SUSPENDED`), and hands it over through `/adopt` before
-//! releasing it. On Windows `aw-platform` owns the suspended Job and process
-//! handles; release returns the sole reap handle. On macOS it spawns with `Command` and says suspension was not
-//! applied. On Linux [`launch::LocalCgroupHost`] places the child in a delegated
+//! records `/sessions/run`, starts the child held (Linux and macOS through
+//! `aw-platform`'s suspended spawn, Windows through `aw-platform`'s suspended
+//! Job), and hands it over through `/adopt` before releasing it. On Windows
+//! `aw-platform` owns the suspended Job and process handles; release returns
+//! the sole reap handle. On macOS the suspended start lives in `aw-platform`
+//! and has not been run on a real Mac. On Linux [`launch::LocalCgroupHost`]
+//! places the child in a delegated
 //! cgroup v2 directory, or returns an error and starts nothing. Tests pass a
 //! fake and assert the target's exit code comes back unchanged.
 //!
@@ -26,25 +28,13 @@
 //! the launcher. They are not written to stdout, stderr, or an error string.
 
 use std::io::{self, Write};
-#[cfg(target_os = "macos")]
-use std::os::fd::{AsRawFd, OwnedFd};
-#[cfg(target_os = "macos")]
-use std::os::unix::process::CommandExt;
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(unix, windows)))]
 use std::process::{Child, Command};
 
 #[cfg(any(target_os = "linux", windows))]
 use aw_platform::{
     platform, HeldChild, IdentifiedCaller, PlatformError, ReapOutcome, ReleasedChild, SpawnRequest,
 };
-
-#[cfg(target_os = "macos")]
-use nix::fcntl::{fcntl, FcntlArg, FdFlag};
-#[cfg(target_os = "macos")]
-use nix::unistd::pipe;
-#[cfg(target_os = "macos")]
-use nix::unistd::write;
-
 use aw_proxy::{plan_injection, Injection, ProxyOnReject};
 
 use serde_json::{json, Value};
@@ -337,103 +327,73 @@ impl SpawnedChild for ProcessChild {
     }
 }
 
-/// The shell reads the gate from fd 3 and closes it before `exec`ing the
-/// target. Both pipe ends begin close-on-exec; [`keep_gate_read_fd_for_child`]
-/// creates fd 3 without that flag only in the shell child.
+/// macOS `aw run` child. `aw-platform` starts it with
+/// `POSIX_SPAWN_START_SUSPENDED` and holds the watchdog pipe, so this CLI is
+/// the creator: dropping the hold before `release` kills the program. After
+/// `release` the returned handle reaps only this child. 【待验证】not run on a
+/// real Mac.
 #[cfg(target_os = "macos")]
-const GATE_SHELL: &str = r#"IFS= read -r _ <&3 || exit 125; exec 3<&-; exec "$@""#;
-
-/// Descriptor reserved for the gate in the shell child. It is closed before
-/// the shell reaches the target `exec`.
-#[cfg(target_os = "macos")]
-const GATE_FD: i32 = 3;
-
-/// Create a gate pipe whose descriptors are close-on-exec from birth whenever
-/// the platform supports `pipe2`. macOS has no `pipe2`, so set the flag on
-/// both descriptors before either can be handed to a child.
-#[cfg(target_os = "macos")]
-fn gate_pipe() -> nix::Result<(OwnedFd, OwnedFd)> {
-    let (read_fd, write_fd) = pipe()?;
-    set_cloexec(&read_fd)?;
-    set_cloexec(&write_fd)?;
-    Ok((read_fd, write_fd))
+struct PlatformChild {
+    held: Option<Box<dyn aw_platform::HeldChild>>,
+    released: Option<Box<dyn aw_platform::ReleasedChild>>,
 }
 
 #[cfg(target_os = "macos")]
-fn set_cloexec(fd: &OwnedFd) -> nix::Result<()> {
-    let flags = fcntl(fd, FcntlArg::F_GETFD)?;
-    let flags = FdFlag::from_bits_truncate(flags) | FdFlag::FD_CLOEXEC;
-    fcntl(fd, FcntlArg::F_SETFD(flags)).map(drop)
-}
-
-/// Keep the read end available to the gate shell as fd 3. The original read
-/// descriptor remains close-on-exec, so only fd 3 is inherited; the shell
-/// closes it before starting the target.
-#[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-fn keep_gate_read_fd_for_child(command: &mut Command, read_fd: OwnedFd) {
-    // SAFETY: The closure runs only between fork and exec. It invokes only
-    // `dup2` and, when the source is already fd 3, `fcntl(F_SETFD)`, which are
-    // async-signal-safe. The duplicated OwnedFd is intentionally forgotten so
-    // fd 3 stays open until the shell executes; no parent descriptor is
-    // changed because this runs in the child.
-    unsafe {
-        command.pre_exec(move || {
-            let duplicated =
-                nix::unistd::dup2_raw(&read_fd, GATE_FD).map_err(std::io::Error::from)?;
-            std::mem::forget(duplicated);
-            if read_fd.as_raw_fd() == GATE_FD {
-                let flags = fcntl(&read_fd, FcntlArg::F_GETFD).map_err(std::io::Error::from)?;
-                let flags = FdFlag::from_bits_truncate(flags) & !FdFlag::FD_CLOEXEC;
-                fcntl(&read_fd, FcntlArg::F_SETFD(flags)).map_err(std::io::Error::from)?;
-            }
-            Ok(())
-        });
+impl PlatformChild {
+    fn fail(error: &aw_platform::PlatformError) -> String {
+        match error {
+            aw_platform::PlatformError::Io(inner) => spawn_error_text(inner),
+            other => format!("无法启动程序（spawn_failed，{other}）"),
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
-struct GatedChild {
-    child: Child,
-    release_fd: Option<OwnedFd>,
-}
-
-#[cfg(target_os = "macos")]
-impl SpawnedChild for GatedChild {
+impl SpawnedChild for PlatformChild {
     fn pid(&self) -> u32 {
-        self.child.id()
+        self.held
+            .as_ref()
+            .map(|child| child.pid())
+            .or_else(|| self.released.as_ref().map(|child| child.pid()))
+            .unwrap_or(0)
     }
 
     fn wait(&mut self) -> Result<i32, String> {
-        self.child
-            .wait()
-            .map(|status| status.code().unwrap_or(exit::GENERAL))
-            .map_err(|error| wait_error_text(&error))
+        let Some(child) = self.released.take() else {
+            return Err("程序还被挂住，不能等待它结束".to_owned());
+        };
+        match child.wait() {
+            Ok(aw_platform::ReapOutcome::Exited(code)) => Ok(code),
+            // A signal death has no exit code. That is not success.
+            Ok(aw_platform::ReapOutcome::Signaled(_)) => Ok(exit::GENERAL),
+            Ok(aw_platform::ReapOutcome::StillRunning) => {
+                Err("等待结束，但程序仍在运行".to_owned())
+            }
+            Err(aw_platform::PlatformError::Io(error)) => Err(wait_error_text(&error)),
+            Err(error) => Err(format!("等待程序结束失败（{error}）")),
+        }
     }
 
     fn release(&mut self) -> Result<(), String> {
-        let Some(fd) = self.release_fd.take() else {
+        let Some(held) = self.held.take() else {
             return Ok(());
         };
-        let mut remaining = &b"1\n"[..];
-        while !remaining.is_empty() {
-            match write(&fd, remaining) {
-                Ok(0) => return Err("启动闸门未写入任何数据".to_owned()),
-                Ok(written) => remaining = &remaining[written..],
-                Err(error) => {
-                    return Err(format!("无法释放启动闸门（系统错误码 {}）", error as i32));
-                }
+        match held.release() {
+            Ok(released) => {
+                self.released = Some(released);
+                Ok(())
             }
+            Err(error) => Err(Self::fail(&error)),
         }
-        Ok(())
     }
 
     fn kill_and_reap(&mut self) {
-        // Drop the write end before reaping. If a signal races with the shell,
-        // EOF makes it choose exit 125 rather than reaching the target exec.
-        self.release_fd.take();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut held) = self.held.take() {
+            let _ = held.abort();
+        }
+        if let Some(mut released) = self.released.take() {
+            let _ = released.try_reap();
+        }
     }
 }
 
@@ -530,10 +490,8 @@ impl Spawner for CommandSpawner {
             let Some((program, args)) = spec.command.split_first() else {
                 return Err("程序名为空".to_owned());
             };
-            // The gate shell's own `exec` would report a missing program in
-            // English (`exec: not found`) after the session was adopted. Resolve
-            // it here, the way exec would, and fail with the Chinese message
-            // before anything runs; the caller then discards the session.
+            // Same pre-flight as Linux: a missing program fails in Chinese
+            // before the daemon has adopted the session.
             let path_env = spec
                 .env
                 .iter()
@@ -543,21 +501,21 @@ impl Spawner for CommandSpawner {
                 .or_else(|| std::env::var("PATH").ok());
             let resolved = resolve_program(program, path_env.as_deref(), spec.cwd.as_deref())
                 .map_err(|error| spawn_error_text(&error))?;
-            let program = &resolved;
-            let (read_fd, write_fd) = gate_pipe().map_err(nix_spawn_error_text)?;
-            let mut command = Command::new("/bin/sh");
-            command
-                .arg("-c")
-                .arg(GATE_SHELL)
-                .arg("aw-run")
-                .arg(program)
-                .args(args);
-            configure_command(&mut command, spec);
-            keep_gate_read_fd_for_child(&mut command, read_fd);
-            let child = command.spawn().map_err(|error| spawn_error_text(&error))?;
-            Ok(Box::new(GatedChild {
-                child,
-                release_fd: Some(write_fd),
+            let caller = aw_platform::IdentifiedCaller::current_user()
+                .map_err(|error| format!("无法确认当前用户（spawn_failed，{error}）"))?;
+            let request = aw_platform::SpawnRequest {
+                command: std::iter::once(resolved)
+                    .chain(args.iter().cloned())
+                    .collect(),
+                cwd: spec.cwd.clone().map(std::path::PathBuf::from),
+                env: spec.env.clone(),
+            };
+            let held = aw_platform::platform()
+                .spawn_suspended(&caller, &request)
+                .map_err(|error| PlatformChild::fail(&error))?;
+            Ok(Box::new(PlatformChild {
+                held: Some(held),
+                released: None,
             }))
         }
         #[cfg(windows)]
@@ -657,11 +615,6 @@ fn configure_command(command: &mut Command, spec: &RunSpec) {
     for (key, value) in &spec.env {
         command.env(key, value);
     }
-}
-
-#[cfg(target_os = "macos")]
-fn nix_spawn_error_text(error: nix::errno::Errno) -> String {
-    spawn_error_text(&std::io::Error::from_raw_os_error(error as i32))
 }
 
 /// Windows production launcher. `aw-platform` holds the target in a Job until
@@ -875,10 +828,10 @@ impl Launcher for PlatformLauncher {
 
 /// macOS production launcher.
 ///
-/// [`launch::production`] spawns the child with `Command`. Suspension is not
-/// applied: `POSIX_SPAWN_START_SUSPENDED` is not available without `unsafe` or
-/// an extra crate. The returned note says so. This is not E1 scope, and
-/// grandchild tracking is left to the collector.
+/// `aw-platform` starts the child with `POSIX_SPAWN_START_SUSPENDED` as the
+/// current user and releases it here. `--no-daemon` waits for it; there is no
+/// daemon to adopt. 【待验证】not run on a real Mac. Grandchild tracking is
+/// left to the collector.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 pub(crate) struct PlatformLauncher;
@@ -886,18 +839,21 @@ pub(crate) struct PlatformLauncher;
 #[cfg(target_os = "macos")]
 impl Launcher for PlatformLauncher {
     fn launch(&mut self, spec: &RunSpec) -> Result<Launched, LaunchDispatchError> {
-        let mut api = launch::production();
-        let (code, pid, note, sampling) =
-            launch::launch_command(&mut api, spec.command.clone(), spec.no_daemon).map_err(
-                |err| LaunchDispatchError::NotImplemented {
-                    detail: err.to_string(),
-                },
-            )?;
+        let mut child = CommandSpawner
+            .spawn(spec)
+            .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
+        let pid = child.pid();
+        child
+            .release()
+            .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
+        let code = child
+            .wait()
+            .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
         Ok(Launched {
             code,
             pid,
-            note,
-            sampling,
+            note: None,
+            sampling: spec.no_daemon,
         })
     }
 

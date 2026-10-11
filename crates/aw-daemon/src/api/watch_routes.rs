@@ -1,5 +1,5 @@
 //! `POST /sessions` (attach / launch), `POST /sessions/run`,
-//! `POST /sessions/{sid}/adopt`, `POST /sessions/{sid}/attach`.
+//! `POST /sessions/{sid}/adopt`, `POST /sessions/{sid}/attach`, and discard.
 //!
 //! Each inserts or finds the `sessions` row and queues a
 //! [`WatchRequest::Start`] for the foreground loop ([`crate::watch`]), which
@@ -15,6 +15,7 @@
 //!   and a process table to the sampler; otherwise it answers 503
 //!   `collector_unavailable` and creates nothing.
 
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 
 use super::auth::{random_secret, Caller};
@@ -122,6 +123,32 @@ fn daemon_uid() -> u32 {
     {
         u32::MAX
     }
+}
+
+/// Linux socket callers obtain `user_id` from `SO_PEERCRED`; a UI token keeps
+/// the account bound to the peer that received it. The route uses that value
+/// to ensure a non-root daemon only launches for its own uid, never an account
+/// reconstructed from the user database.
+#[cfg(target_os = "linux")]
+fn linux_launch_peer_user_id(caller: &Caller) -> String {
+    #[cfg(test)]
+    if let Some(uid) = TEST_LINUX_LAUNCH_PEER_UID.with(std::cell::Cell::get) {
+        return uid.to_string();
+    }
+    caller.user_id.clone()
+}
+
+// Route tests cannot create a second Unix socket user on every CI host. This
+// test-only override stands in for the uid that SO_PEERCRED supplied; it is not
+// compiled into non-test binaries and no request field can affect it.
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static TEST_LINUX_LAUNCH_PEER_UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn set_test_linux_launch_peer_uid(uid: Option<u32>) {
+    TEST_LINUX_LAUNCH_PEER_UID.with(|slot| slot.set(uid));
 }
 
 fn collector_available() -> Result<(), ApiResponse> {
@@ -386,6 +413,22 @@ fn create_inner(
             Ok(response)
         }
         Some("launch") => {
+            let env: Vec<(String, String)> = value
+                .get("env")
+                .and_then(Value::as_object)
+                .map(|env| {
+                    env.iter()
+                        .filter_map(|(key, val)| val.as_str().map(|v| (key.clone(), v.to_owned())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // HOME/USER/LOGNAME/SHELL/PATH come from the target account and the
+            // fixed base path. A request that sets one is refused, not started
+            // with the name dropped or overridden. The platform owns whether
+            // those names compare case-sensitively.
+            if let Some(reserved) = super::launch_as::reserved_env_var(&env) {
+                return Err(super::launch_as::reserved_env_response(&reserved.name));
+            }
             // App/API launch creation has no Windows token-to-user launch path
             // yet. `aw run` is different: its CLI creates a held child as the
             // current user and this daemon only adopts it through `/adopt`.
@@ -400,10 +443,14 @@ fn create_inner(
             #[cfg(not(windows))]
             {
                 let argv = argv_field(&value)?;
-                collector_available()?;
                 // Whose account: only the OS-verified caller (see `launch_as`).
                 // A `uid` / `user` in the body is never read.
-                let who = super::launch_as::identity_for(&caller.user_id, daemon_uid())?;
+                #[cfg(target_os = "linux")]
+                let caller_user_id = linux_launch_peer_user_id(caller);
+                #[cfg(not(target_os = "linux"))]
+                let caller_user_id = caller.user_id.clone();
+                let who = super::launch_as::identity_for(&caller_user_id, daemon_uid())?;
+                collector_available()?;
                 let cwd = opt_text(&value, "cwd");
                 // A relative working directory would be resolved against the
                 // daemon's own directory. The caller makes it absolute before
@@ -416,24 +463,6 @@ fn create_inner(
                             &format!("找不到工作目录「{dir}」"),
                         ));
                     }
-                }
-                let env: Vec<(String, String)> = value
-                    .get("env")
-                    .and_then(Value::as_object)
-                    .map(|env| {
-                        env.iter()
-                            .filter_map(|(key, val)| {
-                                val.as_str().map(|v| (key.clone(), v.to_owned()))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                // HOME/USER/LOGNAME/SHELL/PATH come from the target account and the
-                // fixed base path. A request that sets one is refused, not started
-                // with the name dropped or overridden.
-                #[cfg(unix)]
-                if let Some(reserved) = super::launch_as::reserved_env_var(&env) {
-                    return Err(super::launch_as::reserved_env_response(&reserved.name));
                 }
                 // Linux and macOS both map `SpawnAsError::Drop` here. Windows never
                 // reaches it: a different account is refused before spawn.
@@ -469,6 +498,9 @@ fn create_inner(
                         super::launch_as::SpawnAsError::Program { step, error } => {
                             spawn_error(step, cwd.as_deref(), &argv, &error)
                         }
+                        super::launch_as::SpawnAsError::TypedProgram(kind) => {
+                            typed_spawn_error(kind, cwd.as_deref(), &argv)
+                        }
                         super::launch_as::SpawnAsError::Drop(step) => {
                             drop_failed(caller.user_id.parse().unwrap_or(0), &step)
                         }
@@ -485,6 +517,9 @@ fn create_inner(
                                 super::launch_as::SpawnAsError::Program { step, error } => {
                                     spawn_error(step, cwd.as_deref(), &argv, &error)
                                 }
+                                super::launch_as::SpawnAsError::TypedProgram(kind) => {
+                                    typed_spawn_error(kind, cwd.as_deref(), &argv)
+                                }
                                 super::launch_as::SpawnAsError::Drop(step) => {
                                     drop_failed(who.uid, &step)
                                 }
@@ -499,21 +534,22 @@ fn create_inner(
                         (child.id(), child)
                     }
                 };
-                // Both branches go through the helper, which switches even when the
-                // caller is this account. Check the result either way: a child
-                // that is not the caller's account is killed rather than recorded.
+                // A root daemon's other-account branch uses the helper and is
+                // checked against that account's login groups. A same-account
+                // launch is direct: it must retain the daemon's live uid, gid,
+                // and groups rather than a fresh `getgrouplist` lookup.
                 #[cfg(target_os = "linux")]
                 {
-                    let account = match &who {
-                        Some(who) => who.clone(),
-                        None => super::launch_as::own_account_of_self()?,
+                    let dropped = match &who {
+                        Some(who) => super::launch_as::verify_dropped(pid, who),
+                        None => super::launch_as::verify_dropped_as_self(pid),
                     };
-                    if !super::launch_as::verify_dropped(pid, &account) {
+                    if !dropped {
                         let _ = child.kill();
                         let _ = child.wait();
                         tracing::error!(
                             pid,
-                            uid = account.uid,
+                            uid = who.as_ref().map_or_else(daemon_uid, |account| account.uid),
                             "launched child did not drop to the caller; killed"
                         );
                         return Err(error_response(
@@ -569,9 +605,9 @@ fn account_of(
 /// from scratch for that account (`base_env`): a daemon that happens to be the
 /// caller must not hand over its own process environment.
 ///
-/// A root daemon still goes through the helper, which switches and checks. A
-/// daemon that is not root cannot `setgroups` even to its own groups, so it
-/// execs directly; it is already the right account.
+/// This path never switches accounts, including root calling a root daemon.
+/// It starts with the daemon's active uid, gid, and groups, while `base_env`
+/// still builds the target environment from scratch.
 #[cfg(target_os = "linux")]
 fn spawn_as_self(
     argv: &[String],
@@ -579,25 +615,11 @@ fn spawn_as_self(
     env: &[(String, String)],
 ) -> Result<std::process::Child, ApiResponse> {
     let who = super::launch_as::own_account_of_self()?;
-    if nix::unistd::geteuid().as_raw() != 0 {
-        return super::launch_as::spawn_exact(&who, argv, cwd, env).map_err(|err| match err {
-            super::launch_as::SpawnAsError::Program { step, error } => {
-                spawn_error(step, cwd, argv, &error)
-            }
-            super::launch_as::SpawnAsError::Drop(step) => {
-                tracing::error!(step, "same-account launch failed");
-                error_response(
-                    500,
-                    "drop_failed",
-                    "the program did not switch to the caller's account and was stopped",
-                )
-            }
-        });
-    }
-    super::launch_as::spawn_as(&who, argv, cwd, env).map_err(|err| match err {
+    super::launch_as::spawn_exact(&who, argv, cwd, env).map_err(|err| match err {
         super::launch_as::SpawnAsError::Program { step, error } => {
             spawn_error(step, cwd, argv, &error)
         }
+        super::launch_as::SpawnAsError::TypedProgram(kind) => typed_spawn_error(kind, cwd, argv),
         super::launch_as::SpawnAsError::Drop(step) => {
             tracing::error!(step, "same-account launch failed");
             error_response(
@@ -795,6 +817,80 @@ pub(super) fn record_exit(
     }
 }
 
+/// `POST /sessions/{sid}/discard` removes a launch that failed before `exec`.
+///
+/// The CLI reaches this only after it adopted a held child and its close-on-exec
+/// report says `chdir` or `execve` failed.  The caller must own the session and
+/// the transaction refuses any process other than the adopted root, so a
+/// normal recorded session can never be erased through this narrow cleanup.
+pub(super) fn discard(state: &mut ApiState, caller: &Caller, sid: &str) -> ApiResponse {
+    let mut inner = || -> Result<ApiResponse, ApiResponse> {
+        let path = db_path(state)?;
+        require_writable_database(&path)?;
+        let mut conn = aw_store::open_connection(&path)
+            .map_err(|_| error_response(500, "store", "cannot open the database"))?;
+        let tx = conn
+            .transaction()
+            .map_err(|_| error_response(500, "store", "cannot begin session discard"))?;
+        let row: Option<(i64, String, Option<i64>)> = tx
+            .query_row(
+                "SELECT id, user_id, root_proc_uid FROM sessions WHERE public_id = ?1",
+                [sid],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| error_response(500, "store", "cannot inspect the failed session"))?;
+        let Some((db_id, owner, root_proc_uid)) = row else {
+            return Err(error_response(404, "not_found", "session not found"));
+        };
+        // This cleanup is intentionally stricter than ordinary stop/delete:
+        // an administrator cannot discard another caller's failed launch.
+        if owner != caller.user_id {
+            return Err(error_response(404, "not_found", "session not found"));
+        }
+        let extra_processes: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM processes \
+                 WHERE session_id = ?1 AND (?2 IS NULL OR proc_uid != ?2)",
+                rusqlite::params![db_id, root_proc_uid],
+                |row| row.get(0),
+            )
+            .map_err(|_| error_response(500, "store", "cannot inspect session processes"))?;
+        if extra_processes != 0 {
+            return Err(error_response(
+                409,
+                "discard_not_empty",
+                "the launch already recorded a process beyond its root",
+            ));
+        }
+        // `processes` and all other session tables use ON DELETE CASCADE.  The
+        // session row and its root row therefore disappear in this one SQLite
+        // transaction; no empty session can be observed after commit.
+        tx.execute("DELETE FROM sessions WHERE id = ?1", [db_id])
+            .map_err(|_| error_response(500, "store", "cannot discard the failed session"))?;
+        tx.commit()
+            .map_err(|_| error_response(500, "store", "cannot finish session discard"))?;
+
+        state.pending_launches.remove(sid);
+        state.pending_scans.remove(sid);
+        // The adopt route queued Start before the CLI releases its gate.  Do
+        // not let that queued sampler resurrect output after the row is gone.
+        state.watch_requests.retain(|request| {
+            !matches!(request, WatchRequest::Start { target, .. } if target.public_id == sid)
+        });
+        // If a foreground tick already consumed Start, stop the owned watcher
+        // before its next write.  A non-running id is harmless to the manager.
+        state.watch_requests.push(WatchRequest::Stop { db_id });
+        Ok(ApiResponse::json(
+            200,
+            &json!({ "id": sid, "discarded": true }),
+        ))
+    };
+    match inner() {
+        Ok(response) | Err(response) => response,
+    }
+}
+
 /// `POST /sessions/{sid}/attach` with `{pid}`: watch one more root in an open
 /// session the caller owns.
 pub(super) fn attach(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8]) -> ApiResponse {
@@ -974,11 +1070,9 @@ fn close_undelivered_session(state: &mut ApiState, public_id: &str) {
     state.undelivered_sessions.remove(public_id);
 }
 
-/// A failed `spawn` as an error the UI can word. The code says what went
-/// wrong (`program_not_found` covers a missing program and a missing working
-/// directory, which the OS reports alike); the message stays plain English for
-/// API callers. It used to be `spawn_failed` with the raw `ErrorKind` text
-/// ("entity not found"), which the page printed as is.
+/// A failed `spawn` as a reviewed API error. The hold/error pipe tells us
+/// whether `chdir` or `exec` failed, so the code and sentence always name the
+/// program or the requested directory rather than combining both causes.
 fn spawn_error(
     step: &str,
     cwd: Option<&str>,
@@ -993,7 +1087,7 @@ fn spawn_error(
         return match err.kind() {
             std::io::ErrorKind::PermissionDenied => error_response(
                 400,
-                "program_not_permitted",
+                "cwd_not_permitted",
                 &format!("没有权限进入工作目录「{dir}」，请换一个目录或检查权限。"),
             ),
             _ => error_response(400, "cwd_not_found", &format!("找不到工作目录「{dir}」")),
@@ -1015,9 +1109,44 @@ fn spawn_error(
     }
 }
 
+/// Map the close-on-exec pipe's typed failure to the API's stable code and the
+/// reviewed human wording without parsing a platform error string.
+fn typed_spawn_error(
+    failure: aw_platform::SpawnFailure,
+    cwd: Option<&str>,
+    argv: &[String],
+) -> ApiResponse {
+    let program = argv.first().map(String::as_str).unwrap_or("");
+    match failure {
+        aw_platform::SpawnFailure::ProgramNotFound => error_response(
+            400,
+            "program_not_found",
+            &format!("找不到程序「{program}」，请检查名字或路径"),
+        ),
+        aw_platform::SpawnFailure::ProgramNotPermitted => error_response(
+            400,
+            "program_not_permitted",
+            &format!("程序「{program}」没有执行权限，请检查文件权限后再试。"),
+        ),
+        aw_platform::SpawnFailure::CwdNotFound => error_response(
+            400,
+            "cwd_not_found",
+            &format!("找不到工作目录「{}」", cwd.unwrap_or(".")),
+        ),
+        aw_platform::SpawnFailure::CwdNotPermitted => error_response(
+            400,
+            "cwd_not_permitted",
+            &format!(
+                "没有权限进入工作目录「{}」，请换一个目录或检查权限。",
+                cwd.unwrap_or(".")
+            ),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod spawn_error_tests {
-    use super::spawn_error;
+    use super::{spawn_error, typed_spawn_error};
 
     fn code(kind: std::io::ErrorKind) -> String {
         let response = spawn_error(
@@ -1031,10 +1160,8 @@ mod spawn_error_tests {
         body["error"]["code"].as_str().unwrap_or("").to_owned()
     }
 
-    /// UI re-review #144 new-1: a wrong program showed
-    /// 「could not start the program: entity not found」.
     #[test]
-    fn spawn_failures_carry_a_code_the_ui_can_word() {
+    fn app_launch_route_reports_the_four_precise_spawn_sentences() {
         assert_eq!(code(std::io::ErrorKind::NotFound), "program_not_found");
         assert_eq!(
             code(std::io::ErrorKind::PermissionDenied),
@@ -1065,6 +1192,33 @@ mod spawn_error_tests {
             serde_json::from_slice(&missing_dir.body).unwrap_or(serde_json::Value::Null);
         assert_eq!(body["error"]["code"], "cwd_not_found");
         assert_eq!(body["error"]["message"], "找不到工作目录「/no/such/work」");
+
+        let denied_dir = spawn_error(
+            "chdir",
+            Some("/private/work"),
+            &["tool".to_owned()],
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&denied_dir.body).unwrap_or(serde_json::Value::Null);
+        assert_eq!(body["error"]["code"], "cwd_not_permitted");
+        assert_eq!(
+            body["error"]["message"],
+            "没有权限进入工作目录「/private/work」，请换一个目录或检查权限。"
+        );
+
+        let denied_program = typed_spawn_error(
+            aw_platform::SpawnFailure::ProgramNotPermitted,
+            None,
+            &["/private/tool".to_owned()],
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&denied_program.body).unwrap_or(serde_json::Value::Null);
+        assert_eq!(body["error"]["code"], "program_not_permitted");
+        assert_eq!(
+            body["error"]["message"],
+            "程序「/private/tool」没有执行权限，请检查文件权限后再试。"
+        );
     }
 }
 

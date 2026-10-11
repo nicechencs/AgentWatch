@@ -8,6 +8,9 @@ description = "AgentWatch operating-system boundary for launch, process identity
 
 [features]
 test-hold-delay = []
+# Public seams used only by downstream integration tests. Release dependency
+# graphs never enable this feature, so test hooks do not exist in binaries.
+test-support = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Already used by aw-daemon and present in Cargo.lock. It provides safe waitpid.

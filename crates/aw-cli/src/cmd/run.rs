@@ -49,7 +49,7 @@ use serde_json::{json, Value};
 use crate::exit;
 use crate::launch::{self, LaunchDispatchError, Launched, RunSpec, UnixLauncher};
 
-use super::attach::{BeginRunRequest, ControlError, DaemonSessions};
+use super::attach::{user_locale_env, BeginRunRequest, ControlError, DaemonSessions};
 use super::Outcome;
 
 /// Flags `aw run` acts on. Built by dispatch from the parsed command.
@@ -255,8 +255,10 @@ pub(crate) trait SpawnedChild {
     ///
     /// # Errors
     ///
-    /// The launch gate could not be released. The caller must reap the child.
-    fn release(&mut self) -> Result<(), String>;
+    /// The launch gate could not be released. The machine code distinguishes
+    /// a target/cwd error from a broken gate; the caller must reap any child it
+    /// still owns.
+    fn release(&mut self) -> Result<(), (&'static str, String)>;
 
     /// Stop and reap a child that the daemon refused to adopt.
     fn kill_and_reap(&mut self);
@@ -275,17 +277,20 @@ pub(crate) trait Spawner {
 
 /// Production caller-side spawner. It never creates a cgroup: the daemon
 /// records the adopted root pid and performs its own scope handling.
-/// Plain Chinese sentence for a failed spawn, by error kind. The matching
-/// machine code (`program_not_found`, `program_not_permitted`, `spawn_failed`)
-/// is [`spawn_error_code`] and is not part of this sentence. The program and
-/// its arguments are not repeated (they can carry secrets).
-pub(crate) fn spawn_error_text(error: &std::io::Error) -> String {
-    // The code and the OS number stay out of this sentence. The caller pairs
-    // it with `spawn_error_code` for the log and, with `--json`, `error.code`.
+/// Plain Chinese sentence for a target `exec` failure. Callers must check a
+/// requested working directory before calling this function: `Command` folds
+/// its `chdir` and `exec` failures into one `io::Error`, while the hold/error
+/// pipe carries the step explicitly. The program name, but never its arguments,
+/// is safe and useful to show.
+pub(crate) fn spawn_error_text(
+    program: &str,
+    _cwd: Option<&str>,
+    error: &std::io::Error,
+) -> String {
     match error.kind() {
-        std::io::ErrorKind::NotFound => "无法启动程序：找不到这个程序或工作目录".to_owned(),
+        std::io::ErrorKind::NotFound => format!("找不到程序「{program}」，请检查名字或路径"),
         std::io::ErrorKind::PermissionDenied => {
-            "无法启动程序：没有权限运行它或进入工作目录".to_owned()
+            format!("程序「{program}」没有执行权限，请检查文件权限后再试。")
         }
         _ => "无法启动程序：发生系统错误".to_owned(),
     }
@@ -300,16 +305,39 @@ pub(crate) fn spawn_error_code(error: &std::io::Error) -> &'static str {
     }
 }
 
-/// A lookup failure is the one launch error for which repeating the program
-/// name is useful and safe: it is not an argument or an environment value.
-/// Keep this wording identical on every platform, including Windows where
-/// CreateProcess performs the PATH lookup inside `aw-platform`.
-fn spawn_error_text_for(program: &str, error: &std::io::Error) -> String {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        format!("找不到程序「{program}」，请检查名字或路径")
-    } else {
-        spawn_error_text(error)
+/// The two working-directory outcomes. They are separate from program errors
+/// even when the operating system reports the same errno for both operations.
+fn cwd_error_text(cwd: &str, error: &std::io::Error) -> (&'static str, String) {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => (
+            "cwd_not_permitted",
+            format!("没有权限进入工作目录「{cwd}」，请换一个目录或检查权限。"),
+        ),
+        _ => ("cwd_not_found", format!("找不到工作目录「{cwd}」")),
     }
+}
+
+/// Check the directory before using a platform API whose spawn error does not
+/// identify whether `chdir` or `exec` failed. The held launch path does not
+/// need this preflight: its close-on-exec error pipe reports the real step.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn check_cwd(cwd: Option<&str>) -> Result<(), (&'static str, String)> {
+    let Some(cwd) = cwd else {
+        return Ok(());
+    };
+    match std::fs::metadata(cwd) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(("cwd_not_found", format!("找不到工作目录「{cwd}」"))),
+        Err(error) => Err(cwd_error_text(cwd, &error)),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn spawn_error(program: &str, cwd: Option<&str>, error: &std::io::Error) -> (&'static str, String) {
+    (
+        spawn_error_code(error),
+        spawn_error_text(program, cwd, error),
+    )
 }
 
 /// Plain Chinese sentence when waiting for the started program failed.
@@ -339,7 +367,7 @@ impl SpawnedChild for ProcessChild {
             .map_err(|error| wait_error_text(&error))
     }
 
-    fn release(&mut self) -> Result<(), String> {
+    fn release(&mut self) -> Result<(), (&'static str, String)> {
         Ok(())
     }
 
@@ -389,7 +417,7 @@ impl SpawnedChild for PlatformChild {
         }
     }
 
-    fn release(&mut self) -> Result<(), String> {
+    fn release(&mut self) -> Result<(), (&'static str, String)> {
         let Some(held) = self.held.take() else {
             return Ok(());
         };
@@ -400,7 +428,11 @@ impl SpawnedChild for PlatformChild {
             }
             // A lookup or cwd miss is reported by the child at release; use
             // the same sentence (with the program name) as Linux and Windows.
-            Err(error) => Err(platform_spawn_error(&self.program, self.cwd.as_deref(), error).1),
+            Err(error) => Err(platform_spawn_error(
+                &self.program,
+                self.cwd.as_deref(),
+                error,
+            )),
         }
     }
 
@@ -462,14 +494,14 @@ impl SpawnedChild for PlatformGatedChild {
         }
     }
 
-    fn release(&mut self) -> Result<(), String> {
+    fn release(&mut self) -> Result<(), (&'static str, String)> {
         let held = self
             .held
             .take()
-            .ok_or_else(|| "启动闸门已经放行".to_owned())?;
+            .ok_or_else(|| ("spawn_failed", "启动闸门已经放行".to_owned()))?;
         self.released =
             Some(held.release().map_err(|error| {
-                platform_spawn_error(&self.program, self.cwd.as_deref(), error).1
+                platform_spawn_error(&self.program, self.cwd.as_deref(), error)
             })?);
         Ok(())
     }
@@ -484,7 +516,14 @@ impl SpawnedChild for PlatformGatedChild {
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn platform_child_error(error: PlatformError) -> (&'static str, String) {
     match error {
-        PlatformError::Io(error) => (spawn_error_code(&error), spawn_error_text(&error)),
+        PlatformError::Spawn(kind) => (
+            kind.code(),
+            "程序启动到一半出错，已经结束，没有运行：无法完成启动".to_owned(),
+        ),
+        PlatformError::Io(error) => (
+            spawn_error_code(&error),
+            "程序启动到一半出错，已经结束，没有运行：无法完成启动".to_owned(),
+        ),
         PlatformError::Unsupported {
             kind: aw_platform::UnsupportedKind::NotInThisBuild,
             ..
@@ -514,11 +553,63 @@ fn platform_spawn_error(
     error: PlatformError,
 ) -> (&'static str, String) {
     match error {
+        PlatformError::Spawn(kind) => typed_spawn_error(program, cwd, kind),
         PlatformError::Io(error) => (
             spawn_step_code(&error),
             spawn_step_text(program, cwd, &error),
         ),
         other => platform_child_error(other),
+    }
+}
+
+#[cfg(windows)]
+fn platform_spawn_dispatch_error(
+    program: &str,
+    cwd: Option<&str>,
+    error: PlatformError,
+) -> LaunchDispatchError {
+    let (code, detail) = platform_spawn_error(program, cwd, error);
+    LaunchDispatchError::Spawn { code, detail }
+}
+
+#[cfg(target_os = "linux")]
+fn io_spawn_dispatch_error(
+    program: &str,
+    cwd: Option<&str>,
+    error: std::io::Error,
+) -> LaunchDispatchError {
+    let (code, detail) = spawn_error(program, cwd, &error);
+    LaunchDispatchError::Spawn { code, detail }
+}
+
+fn typed_spawn_error(
+    program: &str,
+    cwd: Option<&str>,
+    failure: aw_platform::SpawnFailure,
+) -> (&'static str, String) {
+    match failure {
+        aw_platform::SpawnFailure::ProgramNotFound => (
+            "program_not_found",
+            format!("找不到程序「{program}」，请检查名字或路径"),
+        ),
+        aw_platform::SpawnFailure::ProgramNotPermitted => (
+            "program_not_permitted",
+            format!("程序「{program}」没有执行权限，请检查文件权限后再试。"),
+        ),
+        aw_platform::SpawnFailure::CwdNotFound => (
+            "cwd_not_found",
+            format!("找不到工作目录「{}」", cwd.unwrap_or(".")),
+        ),
+        // The public API uses program_not_permitted for either execution or
+        // directory-entry denial only on older daemons. Keep the typed cause
+        // explicit for current CLI, App, and OpenAPI clients.
+        aw_platform::SpawnFailure::CwdNotPermitted => (
+            "cwd_not_permitted",
+            format!(
+                "没有权限进入工作目录「{}」，请换一个目录或检查权限。",
+                cwd.unwrap_or(".")
+            ),
+        ),
     }
 }
 
@@ -530,17 +621,12 @@ fn spawn_step_text(program: &str, cwd: Option<&str>, error: &std::io::Error) -> 
     let text = error.to_string();
     if text.starts_with("chdir:") {
         let dir = cwd.unwrap_or(".");
-        return match error.kind() {
-            std::io::ErrorKind::PermissionDenied => {
-                format!("没有权限进入工作目录「{dir}」，请换一个目录或检查权限。")
-            }
-            _ => format!("找不到工作目录「{dir}」"),
-        };
+        return cwd_error_text(dir, error).1;
     }
-    if text.starts_with("exec:") || error.kind() == std::io::ErrorKind::NotFound {
-        return spawn_error_text_for(program, &std::io::Error::from(std::io::ErrorKind::NotFound));
+    if text.starts_with("exec:") || matches!(error.kind(), std::io::ErrorKind::NotFound) {
+        return spawn_error_text(program, cwd, error);
     }
-    spawn_error_text(error)
+    spawn_error_text(program, cwd, error)
 }
 
 /// Machine code for a failed launch step. A `chdir` failure is `cwd_not_found`;
@@ -548,7 +634,7 @@ fn spawn_step_text(program: &str, cwd: Option<&str>, error: &std::io::Error) -> 
 fn spawn_step_code(error: &std::io::Error) -> &'static str {
     if error.to_string().starts_with("chdir:") {
         return match error.kind() {
-            std::io::ErrorKind::PermissionDenied => "program_not_permitted",
+            std::io::ErrorKind::PermissionDenied => "cwd_not_permitted",
             _ => "cwd_not_found",
         };
     }
@@ -649,18 +735,14 @@ impl Spawner for CommandSpawner {
             let Some((program, args)) = spec.command.split_first() else {
                 return Err(("spawn_failed", "程序名为空".to_owned()));
             };
+            check_cwd(spec.cwd.as_deref())?;
             let mut command = Command::new(program);
             command.args(args);
             configure_command(&mut command, spec);
             command
                 .spawn()
                 .map(|child| Box::new(ProcessChild { child }) as Box<dyn SpawnedChild>)
-                .map_err(|error| {
-                    (
-                        spawn_error_code(&error),
-                        spawn_error_text_for(program, &error),
-                    )
-                })
+                .map_err(|error| spawn_error(program, spec.cwd.as_deref(), &error))
         }
     }
 }
@@ -694,20 +776,14 @@ impl Launcher for PlatformLauncher {
             env: spec.env.clone(),
             env_source: aw_platform::EnvSource::Inherit,
         };
+        let program = spec.command.first().map(String::as_str).unwrap_or("");
         let held = platform()
             .spawn_suspended(&caller, &request)
-            .map_err(|error| LaunchDispatchError::Platform {
-                detail: match spec.command.first() {
-                    Some(program) => platform_spawn_error(program, spec.cwd.as_deref(), error).1,
-                    None => platform_child_error(error).1,
-                },
-            })?;
+            .map_err(|error| platform_spawn_dispatch_error(program, spec.cwd.as_deref(), error))?;
         let pid = held.pid();
         let released = held
             .release()
-            .map_err(|error| LaunchDispatchError::Platform {
-                detail: platform_child_error(error).1,
-            })?;
+            .map_err(|error| platform_spawn_dispatch_error(program, spec.cwd.as_deref(), error))?;
         let code = match released
             .wait()
             .map_err(|error| LaunchDispatchError::Platform {
@@ -817,6 +893,8 @@ fn launch_linux_with_started(
             detail: "启动命令为空".to_owned(),
         });
     };
+    check_cwd(spec.cwd.as_deref())
+        .map_err(|(code, detail)| LaunchDispatchError::Spawn { code, detail })?;
     let argv: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
     match attempt(
         std::ffi::OsStr::new(program),
@@ -850,15 +928,9 @@ fn launch_linux_with_started(
             for (key, value) in &spec.env {
                 child.env(key, value);
             }
-            let mut spawned =
-                child
-                    .spawn()
-                    .map_err(|error| LaunchDispatchError::NotImplemented {
-                        detail: format!(
-                            "{}；cgroup 不可用，已改按进程树跟踪，仍没能启动",
-                            spawn_error_text(&error)
-                        ),
-                    })?;
+            let mut spawned = child
+                .spawn()
+                .map_err(|error| io_spawn_dispatch_error(program, spec.cwd.as_deref(), error))?;
             let pid = spawned.id();
             started(pid);
             let status = spawned
@@ -877,6 +949,13 @@ fn launch_linux_with_started(
                 sampling: spec.no_daemon,
             })
         }
+        Err(launch::LinuxLaunchError::ForkFailed {
+            kind: Some(kind), ..
+        }) => Err(io_spawn_dispatch_error(
+            program,
+            spec.cwd.as_deref(),
+            std::io::Error::from(kind),
+        )),
         Err(err) => Err(LaunchDispatchError::NotImplemented {
             detail: err.to_string(),
         }),
@@ -939,13 +1018,13 @@ impl Launcher for PlatformLauncher {
         let forwarder = ProcessGroupForwarder::new()?;
         let mut child = CommandSpawner
             .spawn(spec)
-            .map_err(|(_code, detail)| LaunchDispatchError::NotImplemented { detail })?;
+            .map_err(|(code, detail)| LaunchDispatchError::Spawn { code, detail })?;
         let pid = child.pid();
         make_child_process_group(pid)?;
         forwarder.set_pid(pid);
         child
             .release()
-            .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
+            .map_err(|(code, detail)| LaunchDispatchError::Spawn { code, detail })?;
         let code = child
             .wait()
             .map_err(|detail| LaunchDispatchError::NotImplemented { detail })?;
@@ -1112,6 +1191,7 @@ pub(crate) fn run(
     let launched = match launcher.launch(&spec) {
         Ok(launched) => launched,
         Err(err) => {
+            let error_code = err.code().unwrap_or("launch");
             let code = if args.no_daemon {
                 exit::GENERAL
             } else if mentions_daemon(&err) {
@@ -1119,7 +1199,7 @@ pub(crate) fn run(
             } else {
                 exit::GENERAL
             };
-            return super::error_outcome(code, "launch", &err.to_string(), args.json);
+            return super::error_outcome(code, error_code, &err.to_string(), args.json);
         }
     };
 
@@ -1300,6 +1380,7 @@ pub(crate) fn daemon_run(
         cwd: spec.cwd.clone(),
         name: args.name.map(str::to_owned),
         agent: args.agent.map(str::to_owned),
+        env: user_locale_env(|name| std::env::var(name).ok()),
     };
     let launch = match sessions.begin_run(&request) {
         Ok(launch) => launch,
@@ -1316,9 +1397,10 @@ pub(crate) fn daemon_run(
         child.kill_and_reap();
         return daemon_error_outcome(error, args.json, true);
     }
-    if let Err(detail) = child.release() {
+    if let Err((code, detail)) = child.release() {
         child.kill_and_reap();
-        return super::error_outcome(exit::GENERAL, "gate_release_failed", &detail, args.json);
+        let _ = sessions.discard_run(&launch);
+        return super::error_outcome(exit::GENERAL, code, &detail, args.json);
     }
 
     let (pin_state, pin_warning) = if args.pin {
@@ -1816,6 +1898,7 @@ mod tests {
         pid: u32,
         code: i32,
         log: Rc<RefCell<Vec<&'static str>>>,
+        release: Option<(&'static str, String)>,
     }
 
     impl SpawnedChild for FakeChild {
@@ -1828,9 +1911,9 @@ mod tests {
             Ok(self.code)
         }
 
-        fn release(&mut self) -> Result<(), String> {
+        fn release(&mut self) -> Result<(), (&'static str, String)> {
             self.log.borrow_mut().push("release");
-            Ok(())
+            self.release.take().map_or(Ok(()), Err)
         }
 
         fn kill_and_reap(&mut self) {
@@ -1856,6 +1939,24 @@ mod tests {
                 pid: 71,
                 code: self.code,
                 log: Rc::clone(&self.log),
+                release: None,
+            }))
+        }
+    }
+
+    struct ReleaseFailSpawner {
+        log: Rc<RefCell<Vec<&'static str>>>,
+        release: (&'static str, String),
+    }
+
+    impl Spawner for ReleaseFailSpawner {
+        fn spawn(&mut self, _: &RunSpec) -> Result<Box<dyn SpawnedChild>, (&'static str, String)> {
+            self.log.borrow_mut().push("spawn");
+            Ok(Box::new(FakeChild {
+                pid: 71,
+                code: 0,
+                log: Rc::clone(&self.log),
+                release: Some(self.release.clone()),
             }))
         }
     }
@@ -1867,6 +1968,7 @@ mod tests {
         exit: Option<ControlError>,
         seen_begin: Option<BeginRunRequest>,
         stops: Vec<String>,
+        discards: Vec<String>,
     }
 
     impl FakeSessions {
@@ -1878,6 +1980,7 @@ mod tests {
                 exit: None,
                 seen_begin: None,
                 stops: Vec::new(),
+                discards: Vec::new(),
             }
         }
     }
@@ -1909,6 +2012,12 @@ mod tests {
                 Some(error) => Err(error),
                 None => Ok(()),
             }
+        }
+
+        fn discard_run(&mut self, session: &LaunchSession) -> Result<(), ControlError> {
+            self.log.borrow_mut().push("discard");
+            self.discards.push(session.public_id.clone());
+            Ok(())
         }
 
         fn attach(&mut self, _: &AttachRequest) -> Result<SessionHandle, ControlError> {
@@ -2537,6 +2646,7 @@ mod tests {
         for after in [
             E::ForkFailed {
                 detail: "x".to_owned(),
+                kind: None,
             },
             E::WriteProcsFailed {
                 detail: "x".to_owned(),
@@ -2823,7 +2933,7 @@ mod tests {
                             return;
                         }
                     };
-                    if let Err(message) = child.release() {
+                    if let Err((_, message)) = child.release() {
                         failures
                             .lock()
                             .expect("failures")
@@ -2911,8 +3021,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn missing_or_non_executable_program_fails_in_chinese_before_spawn() {
-        use super::{spawn_error_text_for, CommandSpawner, Spawner};
+    fn no_daemon_spawn_failures_are_each_precise() {
+        use super::{typed_spawn_error, CommandSpawner, Spawner};
         use crate::launch::RunSpec;
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("aw-resolve-{}", std::process::id()));
@@ -2957,42 +3067,78 @@ mod tests {
         let mut spawned = CommandSpawner
             .spawn(&spec)
             .expect("the parent holds the child; the miss is reported at release");
-        let error = spawned.release().expect_err("a missing program");
-        assert_eq!(
-            error,
-            spawn_error_text_for(
-                "aw-no-such-prog-xyz",
-                &std::io::Error::from(std::io::ErrorKind::NotFound)
-            )
-        );
+        let (code, error) = spawned.release().expect_err("a missing program");
+        assert_eq!(code, "program_not_found");
+        assert_eq!(error, "找不到程序「aw-no-such-prog-xyz」，请检查名字或路径");
         assert!(!error.contains("not found"), "{error}");
         assert!(
             error.contains("找不到程序「aw-no-such-prog-xyz」"),
             "{error}"
         );
+
+        let non_executable = RunSpec {
+            command: vec![plain.to_string_lossy().into_owned()],
+            cwd: None,
+            env: Vec::new(),
+            no_follow_children: false,
+            allow_breakaway: false,
+            no_daemon: false,
+        };
+        let mut spawned = CommandSpawner
+            .spawn(&non_executable)
+            .expect("the parent holds the child; permission is reported at release");
+        let (code, error) = spawned.release().expect_err("a non-executable program");
+        assert_eq!(code, "program_not_permitted");
+        assert_eq!(
+            error,
+            format!(
+                "程序「{}」没有执行权限，请检查文件权限后再试。",
+                plain.display()
+            )
+        );
+
+        for (failure, cwd, expected_code, expected) in [
+            (
+                aw_platform::SpawnFailure::CwdNotFound,
+                "/no/such/work",
+                "cwd_not_found",
+                "找不到工作目录「/no/such/work」",
+            ),
+            (
+                aw_platform::SpawnFailure::CwdNotPermitted,
+                "/private/work",
+                "cwd_not_permitted",
+                "没有权限进入工作目录「/private/work」，请换一个目录或检查权限。",
+            ),
+        ] {
+            assert_eq!(
+                typed_spawn_error("tool", Some(cwd), failure),
+                (expected_code, expected.to_owned())
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn spawn_errors_are_plain_chinese_by_kind() {
+    fn spawn_errors_are_precise_for_the_program_or_directory() {
         use std::io::{Error, ErrorKind};
-        let not_found = super::spawn_error_text(&Error::from(ErrorKind::NotFound));
-        assert!(not_found.contains("找不到"));
+        let not_found = super::spawn_error_text("npm", None, &Error::from(ErrorKind::NotFound));
+        assert_eq!(not_found, "找不到程序「npm」，请检查名字或路径");
         assert_eq!(
             super::spawn_error_code(&Error::from(ErrorKind::NotFound)),
             "program_not_found"
         );
+        let denied =
+            super::spawn_error_text("/tmp/npm", None, &Error::from(ErrorKind::PermissionDenied));
         assert_eq!(
-            super::spawn_error_text_for("npm", &Error::from(ErrorKind::NotFound)),
-            "找不到程序「npm」，请检查名字或路径"
+            denied,
+            "程序「/tmp/npm」没有执行权限，请检查文件权限后再试。"
         );
-        let denied = super::spawn_error_text(&Error::from(ErrorKind::PermissionDenied));
-        assert!(denied.contains("没有权限"));
         assert_eq!(
             super::spawn_error_code(&Error::from(ErrorKind::PermissionDenied)),
             "program_not_permitted"
         );
-        let other = super::spawn_error_text(&Error::from_raw_os_error(7));
+        let other = super::spawn_error_text("npm", None, &Error::from_raw_os_error(7));
         assert_eq!(other, "无法启动程序：发生系统错误");
         assert_eq!(
             super::spawn_error_code(&Error::from_raw_os_error(7)),
@@ -3022,7 +3168,11 @@ mod tests {
             code: 0,
             fail: Some((
                 "spawn_failed",
-                super::spawn_error_text(&std::io::Error::from(std::io::ErrorKind::NotFound)),
+                super::spawn_error_text(
+                    "private-tool",
+                    None,
+                    &std::io::Error::from(std::io::ErrorKind::Other),
+                ),
             )),
         };
         let mut parsed = args(&command);
@@ -3041,6 +3191,52 @@ mod tests {
         assert_eq!(body["error"]["code"], "spawn_failed");
         assert!(!text.contains("private-tool"), "{text}");
         assert!(!text.contains("--secret"), "{text}");
+    }
+
+    #[test]
+    fn daemon_backed_run_reports_the_four_precise_spawn_sentences() {
+        for (code, expected) in [
+            (
+                "program_not_found",
+                "找不到程序「private-tool」，请检查名字或路径",
+            ),
+            ("cwd_not_found", "找不到工作目录「/no/such/work」"),
+            (
+                "program_not_permitted",
+                "程序「private-tool」没有执行权限，请检查文件权限后再试。",
+            ),
+            (
+                "cwd_not_permitted",
+                "没有权限进入工作目录「/private/work」，请换一个目录或检查权限。",
+            ),
+        ] {
+            let command = vec!["private-tool".to_owned()];
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let mut sessions = FakeSessions::new(Rc::clone(&log));
+            let mut spawner = ReleaseFailSpawner {
+                log: Rc::clone(&log),
+                release: (code, expected.to_owned()),
+            };
+            let mut parsed = args(&command);
+            parsed.json = true;
+            let outcome = daemon_run(
+                &parsed,
+                none(),
+                &mut sessions,
+                &mut spawner,
+                &mut EmptySummary,
+            );
+            assert_eq!(outcome.code, exit::GENERAL, "{code}");
+            assert_eq!(sessions.discards, vec!["s-daemon".to_owned()], "{code}");
+            assert_eq!(
+                *log.borrow(),
+                vec!["begin", "spawn", "adopt", "release", "kill", "discard"],
+                "{code}"
+            );
+            let body: serde_json::Value = serde_json::from_slice(&outcome.stderr).expect("json");
+            assert_eq!(body["error"]["code"], code, "{code}");
+            assert_eq!(body["error"]["message"], expected, "{code}");
+        }
     }
 
     #[test]
@@ -3116,6 +3312,47 @@ mod tests {
         assert_eq!(outcome.code, 7);
         assert!(sessions.seen_begin.is_none());
         assert!(sessions.stops.is_empty());
+    }
+
+    #[test]
+    fn no_daemon_preserves_the_four_precise_spawn_sentences() {
+        for (code, expected) in [
+            ("program_not_found", "找不到程序「tool」，请检查名字或路径"),
+            ("cwd_not_found", "找不到工作目录「/no/such/work」"),
+            (
+                "program_not_permitted",
+                "程序「/private/tool」没有执行权限，请检查文件权限后再试。",
+            ),
+            (
+                "cwd_not_permitted",
+                "没有权限进入工作目录「/private/work」，请换一个目录或检查权限。",
+            ),
+        ] {
+            let command = vec!["tool".to_owned()];
+            let mut parsed = args(&command);
+            parsed.no_daemon = true;
+            parsed.json = true;
+            let mut launcher = FakeLaunch {
+                code: 0,
+                sampling_seen: None,
+                forwarded: Vec::new(),
+                env_len: None,
+                fail: Some(LaunchDispatchError::Spawn {
+                    code,
+                    detail: expected.to_owned(),
+                }),
+            };
+            let outcome = run(
+                &parsed,
+                none(),
+                &mut UnixAdapter(&mut launcher),
+                &mut EmptySummary,
+            );
+            let body: serde_json::Value = serde_json::from_slice(&outcome.stderr).expect("json");
+            assert_eq!(outcome.code, exit::GENERAL, "{code}");
+            assert_eq!(body["error"]["code"], code, "{code}");
+            assert_eq!(body["error"]["message"], expected, "{code}");
+        }
     }
 
     #[cfg(windows)]

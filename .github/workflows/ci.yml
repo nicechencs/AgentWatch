@@ -56,11 +56,15 @@ jobs:
           cargo build --release -p aw-cli --bin aw
           dir="$RUNNER_TEMP/aw-purge-release-check"
           mkdir -p "$dir/nested" && echo keep > "$dir/nested/keep"
-          if target/release/aw daemon uninstall --purge --data-dir "$dir"; then
-            echo "release aw accepted --data-dir"; exit 1
-          fi
+          stderr="$RUNNER_TEMP/aw-purge-release-check.stderr"
+          set +e
+          target/release/aw daemon uninstall --purge --data-dir "$dir" 2>"$stderr"
+          rc=$?
+          set -e
+          [ "$rc" -eq 2 ] || { cat "$stderr"; echo "release aw returned $rc, expected 2"; exit 1; }
+          grep -F '没有「--data-dir」这个参数，用 `aw daemon uninstall --help` 可以看全部参数。' "$stderr"
           test -f "$dir/nested/keep" || { echo "release aw deleted the directory"; exit 1; }
-          echo "release aw rejected --data-dir; directory kept"
+          echo "release aw rejected --data-dir with usage status; directory kept"
       # macOS: these two crates' tests must actually run. `cargo test
       # --workspace` above includes them; this step prints their names so a
       # green log shows macos::launch::tests, macos::tests and macos::spawn::tests
@@ -79,6 +83,8 @@ jobs:
           # aw-daemon has no lib target; these ignored launch_as tests live in
           # the agentwatchd binary's api/routes module.
           sudo -E env "PATH=$PATH" "CARGO_HOME=$cargo_home" "RUSTUP_HOME=$rustup_home" "$cargo_bin" test -p aw-daemon --bin agentwatchd -- --ignored launch_as_root
+          sudo -E env "PATH=$PATH" "CARGO_HOME=$cargo_home" "RUSTUP_HOME=$rustup_home" "$cargo_bin" test -p aw-daemon --bin agentwatchd -- --ignored root_daemon
+          sudo -E env "PATH=$PATH" "CARGO_HOME=$cargo_home" "RUSTUP_HOME=$rustup_home" "$cargo_bin" test -p aw-platform --lib -- --ignored root_hold
 
   ui:
     name: ui

@@ -98,7 +98,7 @@
        - 程序名是绝对路径：只有它自己一个候选；
        - 程序名带 `/` 但不是绝对路径（`./x`、`bin/x`）：候选是「目标的绝对工作目录 + 名字」这一个，不再查 PATH（子进程是先 chdir 再 execve，但这里拼成绝对路径，不依赖 chdir 有没有成功）；
        - 程序名不带 `/`：把 PATH 按 `:` 拆开，**空项、`.`、所有相对目录项一律跳过**（不当成当前目录，防「工作目录里放一个同名程序就被运行」），剩下的绝对目录每项拼上程序名，做成 C 字符串数组在 fork 之前备好；一项都不剩时直接报 `program_not_found`，不 fork。
-     - **子进程在切完身份之后挨个 `execve`**：返回 ENOENT/ENOTDIR 就试下一个；EACCES 记下来接着试；全都失败时，报错管道写「找不到程序」（全是 ENOENT/ENOTDIR）或「没有权限」（碰到过 EACCES），父进程回 400 `program_not_found` 或 403 `program_not_permitted`（都是 `daemon_errors.rs` 里已有的码，码名不改；不再静默 127）。`program_not_permitted` 按 UI-147-wording.md 14:30 补拆成程序、工作目录两句（码名不改，按报错管道里失败的那一步选句，见 B1 码表）。
+       - **子进程在切完身份之后挨个 `execve`**：返回 ENOENT/ENOTDIR 就试下一个；EACCES 记下来接着试；全都失败时，报错管道写「找不到程序」（全是 ENOENT/ENOTDIR）或「没有权限」（碰到过 EACCES），父进程回 400 `program_not_found` 或 403 `program_not_permitted`（不再静默 127）。程序执行与进入工作目录分别用 `program_not_permitted`、`cwd_not_permitted`，按报错管道里失败的那一步选句（见 B1 码表）。
      - **root 后台从不以 root 身份去看调用方的目录**：要改的是 **macOS root 后台**走的 `hold.rs:141` / `hold.rs:201-224` `resolve_program`：它在父进程里（root 身份）按 PATH 找文件，会让 root 替调用方去看它自己看不了的目录（能用来探测别人目录里有没有某个文件），也会在「找的时候」和「exec 的时候」之间被换掉。改掉后所有判断都在目标用户身份下由内核做。**这一处提前到第 0a 步**，不等第 4 步。Linux 的 root helper（`launch_as.rs:344-356`）已经是切完身份才用 `Command::exec` 按 PATH 找程序，原来就是对的，**只补反向测试**；Linux 上 `hold.rs` 只被 `aw run` 以用户自己的身份调用，碰不到 root。
      - **Windows**：同一个查找函数的 Windows 版。程序名没有后缀时按 PATHEXT 补后缀；**后台替人起的程序 PATHEXT 用固定的默认值 `.COM;.EXE;.BAT;.CMD`**，不用请求里给的，也不用后台自己的环境；PATH 同样跳过空项、`.` 和相对项，不先查当前目录（不照 `CreateProcess` 的默认顺序，也不用 `SearchPathW` 的「先当前目录」）。查到的是 `.cmd`/`.bat` 时**必须**走 `cmd.exe /c`（`cmd.exe` 用 `GetSystemDirectoryW` 拼出的绝对路径，不搜索，也不读请求或环境里的 `ComSpec`），参数按规矩 10 逐个转义；**参数里有 CR 或 LF 就拒绝**（`cmd` 没法安全转义换行，345d216 已经这样做，这里写成规矩）。
      - 测试：
@@ -525,7 +525,7 @@
 | `db_read_only_newer` | | 后台 | 409 | 1 | 这份记录是更新版本的 AgentWatch 写的，现在只能查看，不能新建或修改。请升级 AgentWatch。 |
 | `program_not_found` | | 后台 / CLI | 400 | 6 | 找不到程序「{名}」，请检查名字或路径 |
 | `program_not_permitted` | | 后台 / CLI（报错管道，失败在 execve） | 403 | 4 | 程序「{路径}」没有执行权限，请检查文件权限后再试。 |
-| `program_not_permitted` | | 后台 / CLI（报错管道，失败在 chdir） | 403 | 4 | 没有权限进入工作目录「{路径}」，请换一个目录或检查权限。 |
+| `cwd_not_permitted` | 新 | 后台 / CLI（报错管道，失败在 chdir） | 403 | 4 | 没有权限进入工作目录「{路径}」，请换一个目录或检查权限。 |
 | `env_reserved` | 新 | 后台（替人起程序时，请求带了基础变量） | 400 | 2 | 环境变量「{名}」由系统按你的账户来填，不能在请求里改。请去掉这个变量再试。 |
 | `cwd_not_found` | 新 | 后台 / CLI（报错管道，A1 规矩 3） | 400 | 6 | 找不到工作目录「{路径}」 |
 | `owner_user_not_found` | 新 | 后台 | 400 | 2 | 找不到用户「{名}」，没有做任何改动。 |
@@ -867,6 +867,7 @@
 - **后台起的程序**（App 新建会话、以 root 起再切到用户，三个系统）：环境变量从零构造，**正好是「基础集合 + 请求给的变量」**，绝不继承后台自己的环境，也不是「先复制再删」。测试比对这个完整集合，不只是「没有密钥」。
   - **Unix 基础集合**：HOME、USER、LOGNAME、SHELL（来自目标用户的账户，fork 前用 `getpwuid_r` 取好）和固定的 PATH（`DEFAULT_PATH`）。
   - **Windows 基础集合**：从目标用户的账户配置取（`CreateEnvironmentBlock(令牌, bInherit = FALSE)`，只留下面这些名字，别的丢掉）：`SystemRoot`、`windir`、`SystemDrive`、`ComSpec`（用 `GetSystemDirectoryW` 拼成 `…\cmd.exe`）、`PATHEXT`（固定 `.COM;.EXE;.BAT;.CMD`）、`TEMP`/`TMP`、`USERPROFILE`、`USERNAME`、`USERDOMAIN`、`HOMEDRIVE`/`HOMEPATH`、`APPDATA`、`LOCALAPPDATA`、`ProgramData`、`ProgramFiles`、固定的系统 `Path`（`%SystemRoot%\system32;%SystemRoot%;%SystemRoot%\System32\Wbem;%SystemRoot%\System32\WindowsPowerShell\v1.0\`）。
+  - **Windows 请求保留名**：比较不分大小写，且与代码中的账户基础环境一一对应：`SystemRoot`、`windir`、`SystemDrive`、`ComSpec`、`PATHEXT`、`TEMP`、`TMP`、`USERPROFILE`、`USERNAME`、`USERDOMAIN`、`HOMEDRIVE`、`HOMEPATH`、`APPDATA`、`LOCALAPPDATA`、`ProgramData`、`ProgramFiles`、`Path`。因此 `PATH`、`path` 等同于 `Path`，也一律拒绝。
   - **LANG、LC_ALL、TZ**：**不从后台继承**（dev `launch_as.rs:184-187` 现在会把后台的这三个带过去，第 0a 步删掉）。客户端（CLI、App）把用户自己的这三个放进请求里带过来，它们**不是保留变量**，可以给。所以完整集合 = 基础集合 + 请求给的变量（通常就包括这三个）。
   - **保留变量**：请求里给了基础集合里的任何一个名字就拒绝（PM 14:30 定），回 400 `env_reserved`，一个程序都不起：「环境变量「{名}」由系统按你的账户来填，不能在请求里改。请去掉这个变量再试。」。Unix 是那 5 个，按原样比；**Windows 是上面那一组，比较时不分大小写**（`Path`、`PATH`、`path` 是同一个变量）。dev `launch_as.rs:186-194` `base_env` 现在是让请求覆盖，第 0a 步改。测试：每个保留名各一条（Windows 加三种大小写），都是 400、没有起任何进程。查找程序用的 PATH 因此永远是固定的（A1 规矩 4）。
   - macOS 走 `hold.rs` 的那条路同样适用：`SpawnRequest.inherit_env = false`（第 0a 步⑥）。

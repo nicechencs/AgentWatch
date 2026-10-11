@@ -347,7 +347,7 @@ mod os_path {
 /// and macOS temp dirs (`/var/folders/...`) are already long, so on Unix this
 /// is `/tmp/aw-<pid>-<seq>` (`tag` is ignored there; elsewhere it names the
 /// dir under the OS temp dir). Callers remove it. Not for production.
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub fn short_temp_dir(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -519,8 +519,7 @@ pub fn open_pipe_client(path: &Path) -> Result<std::fs::File, DialError> {
 
 /// Test hook for a connected pipe whose trusted owners are intentionally
 /// overridden. Production callers must use [`open_pipe_client`].
-#[cfg(windows)]
-#[doc(hidden)]
+#[cfg(all(windows, any(test, feature = "test-support")))]
 pub fn open_pipe_client_with_trusted_owners(
     path: &Path,
     trusted_owners: &[&str],
@@ -530,8 +529,7 @@ pub fn open_pipe_client_with_trusted_owners(
 
 /// Test hook for a connected pipe with an injected AgentWatch service state.
 /// Production callers must use [`open_pipe_client`], which reads the SCM.
-#[cfg(windows)]
-#[doc(hidden)]
+#[cfg(all(windows, any(test, feature = "test-support")))]
 pub fn open_pipe_client_with_service_status_for_test(
     path: &Path,
     service_status: &aw_platform::PipeServiceStatus,
@@ -542,16 +540,14 @@ pub fn open_pipe_client_with_service_status_for_test(
 /// Opens a Windows pipe at `SECURITY_ANONYMOUS` for daemon integration tests.
 /// It still checks the server owner before returning the handle. Product code
 /// must use [`open_pipe_client`], which always uses identification SQOS.
-#[cfg(windows)]
-#[doc(hidden)]
+#[cfg(all(windows, any(test, feature = "test-support")))]
 pub fn open_anonymous_pipe_client_for_test(path: &Path) -> Result<std::fs::File, DialError> {
     platform::open_pipe_client_with_qos(path, 0, None, None)
 }
 
 /// Test-only exchange that follows the production pipe-open path while using
 /// an injected AgentWatch service state.
-#[cfg(windows)]
-#[doc(hidden)]
+#[cfg(all(windows, any(test, feature = "test-support")))]
 pub fn exchange_raw_with_service_status_for_test(
     path: &Path,
     request: &[u8],
@@ -1343,6 +1339,71 @@ mod windows_pipe_owner_tests {
                 .join()
                 .expect("client thread")
                 .expect_err("must refuse");
+            assert!(matches!(error, DialError::UntrustedServer(_)), "{error}");
+
+            if connected_to_first {
+                assert_no_request_bytes(&first).await;
+                assert!(
+                    timeout(Duration::from_millis(200), second.connect())
+                        .await
+                        .is_err(),
+                    "client retried a second same-user pipe instance"
+                );
+            } else {
+                assert_no_request_bytes(&second).await;
+                assert!(
+                    timeout(Duration::from_millis(200), first.connect())
+                        .await
+                        .is_err(),
+                    "client retried a second same-user pipe instance"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn service_query_failure_refuses_a_same_user_server_without_sending_or_falling_back() {
+        let _lock = PIPE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime().block_on(async {
+            let path = PathBuf::from(WINDOWS_PIPE);
+            let sddl = pipe_sddl().expect("current-user pipe SDDL");
+            let first = create_server(OsStr::new(WINDOWS_PIPE), true, &sddl)
+                .expect("fake server owns the public pipe first");
+            let second = create_server(OsStr::new(WINDOWS_PIPE), false, &sddl)
+                .expect("second fake pipe instance");
+            let status = PipeServiceStatus::QueryFailed {
+                operation: "OpenSCManagerW",
+                win32_error: 5,
+            };
+            let request = b"must-not-reach-the-fake-server".to_vec();
+            let client = thread::spawn(move || {
+                exchange_raw_with_service_status_for_test(
+                    &path,
+                    &request,
+                    Duration::from_secs(1),
+                    &status,
+                )
+            });
+
+            let first_connection = first.connect();
+            let second_connection = second.connect();
+            tokio::pin!(first_connection, second_connection);
+            let connected_to_first = tokio::select! {
+                result = &mut first_connection => {
+                    result.expect("first fake server connection");
+                    true
+                }
+                result = &mut second_connection => {
+                    result.expect("second fake server connection");
+                    false
+                }
+            };
+            let error = client
+                .join()
+                .expect("client thread")
+                .expect_err("must refuse when SCM status is unavailable");
             assert!(matches!(error, DialError::UntrustedServer(_)), "{error}");
 
             if connected_to_first {

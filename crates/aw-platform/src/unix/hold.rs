@@ -38,7 +38,8 @@
 //! `waitpid`. 【待验证】not run on a real Mac.
 
 use crate::{
-    HeldChild, IdentifiedCaller, Owner, PlatformError, ReapOutcome, ReleasedChild, SpawnRequest,
+    HeldChild, IdentifiedCaller, Owner, PlatformError, ReapOutcome, ReleasedChild, SpawnFailure,
+    SpawnRequest,
 };
 
 /// Exit codes of the hold stage, one per step. A clean exit is never one of
@@ -71,11 +72,19 @@ struct Prepared {
     /// name was bare and no absolute PATH entry survived the skip rules.
     program_paths: Vec<std::ffi::CString>,
     argv: Vec<std::ffi::CString>,
+    /// NUL-terminated `execve` argv pointers. Built in the parent so the
+    /// post-fork child only indexes preallocated memory.
+    argv_pointers: Vec<*const libc::c_char>,
     /// `NAME=value`, applied only at `execve`. The child reads these through
     /// the pointer array built here; it never reads the process environment.
-    env: Vec<std::ffi::CString>,
+    _env: Vec<std::ffi::CString>,
+    /// NUL-terminated `execve` environment pointers, also built before fork.
+    env_pointers: Vec<*const libc::c_char>,
     /// Read end of the gate pipe. Closed in the child before exec.
     gate_read: std::os::fd::RawFd,
+    /// Test-only stdout capture. Production launchers leave this `None`; the
+    /// target otherwise inherits the caller's standard output unchanged.
+    stdout: Option<std::os::fd::RawFd>,
     /// Write end of the failure pipe. The child writes one record here and
     /// `_exit`s; a successful `execve` closes it (it is `CLOEXEC`) and the parent
     /// sees EOF. The parent keeps the read end.
@@ -91,6 +100,23 @@ struct PreparedSwitch {
 pub(crate) fn spawn(
     caller: &IdentifiedCaller,
     request: &SpawnRequest,
+) -> Result<Box<dyn HeldChild>, PlatformError> {
+    spawn_inner(caller, request, None)
+}
+
+#[cfg(test)]
+fn spawn_capturing_stdout(
+    caller: &IdentifiedCaller,
+    request: &SpawnRequest,
+    stdout: std::os::fd::OwnedFd,
+) -> Result<Box<dyn HeldChild>, PlatformError> {
+    spawn_inner(caller, request, Some(stdout))
+}
+
+fn spawn_inner(
+    caller: &IdentifiedCaller,
+    request: &SpawnRequest,
+    stdout: Option<std::os::fd::OwnedFd>,
 ) -> Result<Box<dyn HeldChild>, PlatformError> {
     let Owner::Unix {
         euid, egid, groups, ..
@@ -176,6 +202,18 @@ pub(crate) fn spawn(
             "argument contains NUL",
         )?);
     }
+    // `execve` takes pointer arrays rather than Rust vectors of strings. Build
+    // both arrays before fork: after fork the child must not allocate.
+    let argv_pointers = argv
+        .iter()
+        .map(|arg| arg.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    let env_pointers = env
+        .iter()
+        .map(|entry| entry.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
     // Held across pipe creation and fork. Both ends are CLOEXEC before the
     // lock is released, so no other fork of this process inherits them.
     let _pipe_lock = PIPE_LOCK
@@ -188,8 +226,11 @@ pub(crate) fn spawn(
         cwd,
         program_paths,
         argv,
-        env,
+        argv_pointers,
+        _env: env,
+        env_pointers,
         gate_read: std::os::fd::AsRawFd::as_raw_fd(&gate_read),
+        stdout: stdout.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
         report: std::os::fd::AsRawFd::as_raw_fd(&report_write),
     };
     // SAFETY: the child calls only async-signal-safe functions, then `_exit`
@@ -212,8 +253,9 @@ pub(crate) fn spawn(
     ffi::set_own_group(pid);
     // Parent. The child has its own copy of the read end.
     drop(gate_read);
-    drop(_pipe_lock);
     drop(report_write);
+    drop(stdout);
+    drop(_pipe_lock);
     Ok(Box::new(MacHeld {
         pid: Some(pid as u32),
         gate: Some(gate_write),
@@ -347,13 +389,20 @@ impl HeldChild for MacHeld {
         // released handle, which is the only wait from here on.
         ffi::write_all(&gate, b"1")?;
         drop(gate);
-        // The child writes one record and exits, or execs and the CLOEXEC write
-        // end closes. Either way this read finishes. A record is a failed step:
-        // reap that child here, so it is never a zombie, and return the errno.
+        // The child writes its raw errno and exits, or execs and the CLOEXEC
+        // write end closes. Either way this read finishes. An errno means a
+        // failed step: reap that child here, so it is never a zombie, then use
+        // its documented exit status to classify the failed step.
         let report = self.report.take();
-        if let Some(record) = report.as_ref().and_then(ffi::read_failure) {
-            let _ = ffi::wait_block(pid);
-            return Err(failure_error(record));
+        let Some(report) = report else {
+            return Err(PlatformError::Invalid {
+                capability: "spawn_suspended",
+                detail: "held child has no error pipe",
+            });
+        };
+        if let Some(errno) = ffi::read_failure(&report).map_err(PlatformError::Io)? {
+            let outcome = ffi::wait_outcome(pid).map_err(PlatformError::Io)?;
+            return Err(failure_error(outcome, errno));
         }
         Ok(Box::new(MacReleased { pid }))
     }
@@ -404,42 +453,26 @@ fn hold_delay() -> Option<u64> {
         .map(|delay| delay.min(10_000))
 }
 
-/// Which failed step the child reports. Distinct from the exit code: the parent
-/// reads this off the failure pipe, so a missing program and a missing working
-/// directory are different errors instead of both being "exited 127".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-enum FailStep {
-    Chdir = 1,
-    Exec = 2,
-}
-
-/// One failure, written by the child before it `_exit`s. Four bytes: the step,
-/// then the errno as a little-endian `i32` with its low three bytes. Errnos here
-/// are small positive values, so three bytes hold them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FailRecord {
-    step: FailStep,
-    errno: i32,
-}
-
-/// The error a failed step becomes. `chdir` and `execve` both return `ENOENT`
-/// for "not there"; the step is what tells them apart, so callers can say
-/// 找不到工作目录 and 找不到程序 separately.
-fn failure_error(record: FailRecord) -> PlatformError {
-    let kind = match record.errno {
-        libc::ENOENT | libc::ENOTDIR => std::io::ErrorKind::NotFound,
-        libc::EACCES | libc::EPERM => std::io::ErrorKind::PermissionDenied,
-        _ => std::io::ErrorKind::Other,
-    };
-    let step = match record.step {
-        FailStep::Chdir => "chdir",
-        FailStep::Exec => "exec",
-    };
-    PlatformError::Io(std::io::Error::new(
-        kind,
-        format!("{step}: errno {}", record.errno),
-    ))
+/// The error a failed step becomes. The child writes only its raw errno to the
+/// close-on-exec pipe; its `_exit` status says whether `chdir` or `execve`
+/// produced it. Both can return `ENOENT`, so that status keeps their public
+/// errors distinct.
+fn failure_error(outcome: ReapOutcome, errno: i32) -> PlatformError {
+    let permitted = matches!(errno, libc::EACCES | libc::EPERM);
+    PlatformError::Spawn(match outcome {
+        ReapOutcome::Exited(EXIT_CHDIR) if permitted => SpawnFailure::CwdNotPermitted,
+        ReapOutcome::Exited(EXIT_CHDIR) => SpawnFailure::CwdNotFound,
+        // `exec` keeps searching candidates after EACCES, and reports it over
+        // ENOENT when any candidate denied execution (execvp semantics).
+        ReapOutcome::Exited(EXIT_EXEC) if permitted => SpawnFailure::ProgramNotPermitted,
+        ReapOutcome::Exited(EXIT_EXEC) => SpawnFailure::ProgramNotFound,
+        _ => {
+            return PlatformError::Invalid {
+                capability: "spawn_suspended",
+                detail: "hold child reported errno with an unexpected exit status",
+            }
+        }
+    })
 }
 
 /// Which step of the hold stage failed. The code is what the child `_exit`s.
@@ -521,6 +554,9 @@ mod ffi {
             // SAFETY: closing the inherited write end. The parent keeps its own.
             libc::close(gate_write);
         }
+        if let Some(stdout) = prepared.stdout {
+            redirect_stdout_or_exit(stdout, prepared.report);
+        }
         // A caller-controlled loader must not be in force while this process
         // is still privileged. The target receives its own env at execve.
         clear_preload();
@@ -541,6 +577,24 @@ mod ffi {
             libc::close(prepared.gate_read);
         }
         exec(prepared);
+    }
+
+    fn redirect_stdout_or_exit(stdout: RawFd, prepared_report: RawFd) {
+        let duplicated = unsafe {
+            // SAFETY: `stdout` is an inherited pipe descriptor created before
+            // fork. `dup2` changes only this hold child and is async-signal-safe.
+            libc::dup2(stdout, libc::STDOUT_FILENO)
+        };
+        if duplicated != libc::STDOUT_FILENO {
+            report_and_exit(prepared_report, GateStep::Spec, errno_now());
+        }
+        if stdout != libc::STDOUT_FILENO {
+            unsafe {
+                // SAFETY: stdout now refers to the duplicated descriptor; this
+                // closes only the inherited source descriptor in the child.
+                libc::close(stdout);
+            }
+        }
     }
 
     /// `execve` errno that means "not this candidate, try the next". `execvp`
@@ -619,7 +673,7 @@ mod ffi {
         if rc != 0 {
             // Raw errno: building a `std::io::Error` allocates, and this runs
             // after `fork` in a process that has other threads.
-            report_and_exit(prepared_report, super::FailStep::Chdir, errno_now());
+            report_and_exit(prepared_report, GateStep::Chdir, errno_now());
         }
     }
 
@@ -638,31 +692,25 @@ mod ffi {
         }
     }
 
-    /// Write the four-byte failure record and `_exit`. Never returns. The write
-    /// is a raw syscall: this runs after `fork`, so nothing here allocates.
-    fn report_and_exit(fd: RawFd, step: super::FailStep, errno: i32) -> ! {
-        let mut bytes = [0_u8; 4];
-        bytes[0] = step as u8;
-        let errno = errno.max(0);
-        bytes[1] = (errno & 0xff) as u8;
-        bytes[2] = ((errno >> 8) & 0xff) as u8;
-        bytes[3] = ((errno >> 16) & 0xff) as u8;
+    /// Write only the raw errno integer, then `_exit`. Never returns. The
+    /// write is a raw syscall: this runs after `fork`, so nothing here
+    /// allocates or formats a string.
+    fn report_and_exit(fd: RawFd, step: GateStep, errno: i32) -> ! {
+        let bytes = errno.max(0).to_ne_bytes();
         unsafe {
-            // SAFETY: `bytes` is four live bytes and `fd` is the pipe end this
+            // SAFETY: `bytes` is the raw integer and `fd` is the pipe end this
             // child inherited. `write` is async-signal-safe. A short or failed
-            // write still exits: the parent then sees a closed pipe with no
-            // record and treats it as a failed exec rather than a success.
+            // write still exits; the parent treats a partial record as I/O
+            // failure, never as a successful exec.
             libc::write(fd, bytes.as_ptr().cast(), bytes.len());
         }
-        exit_step(match step {
-            super::FailStep::Chdir => GateStep::Chdir,
-            super::FailStep::Exec => GateStep::Exec,
-        });
+        exit_step(step);
     }
 
-    /// Read one failure record. `None` is EOF: the child exec'd and the CLOEXEC
-    /// write end closed, which is success.
-    pub(super) fn read_failure(fd: &OwnedFd) -> Option<super::FailRecord> {
+    /// Read one raw errno. `None` is EOF: the child exec'd and the CLOEXEC
+    /// write end closed, which is success. A partial integer is I/O failure,
+    /// never success.
+    pub(super) fn read_failure(fd: &OwnedFd) -> io::Result<Option<i32>> {
         let mut bytes = [0_u8; 4];
         let mut got = 0_usize;
         while got < bytes.len() {
@@ -681,19 +729,21 @@ mod ffi {
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                return None;
+                return Err(err);
             }
             if read == 0 {
-                return None;
+                return if got == 0 {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "partial held-child errno record",
+                    ))
+                };
             }
             got += read as usize;
         }
-        let step = match bytes[0] {
-            1 => super::FailStep::Chdir,
-            _ => super::FailStep::Exec,
-        };
-        let errno = i32::from(bytes[1]) | (i32::from(bytes[2]) << 8) | (i32::from(bytes[3]) << 16);
-        Some(super::FailRecord { step, errno })
+        Ok(Some(i32::from_ne_bytes(bytes)))
     }
 
     /// Block until the creator writes the release byte, or `_exit` on EOF.
@@ -729,13 +779,8 @@ mod ffi {
         if prepared.argv.is_empty() || prepared.program_paths.is_empty() {
             // No candidate at all is "not found", the same answer `execvp` gives
             // for a bare name whose PATH produced nothing.
-            report_and_exit(prepared.report, super::FailStep::Exec, libc::ENOENT);
+            report_and_exit(prepared.report, GateStep::Exec, libc::ENOENT);
         }
-        let mut argv: Vec<*const libc::c_char> =
-            prepared.argv.iter().map(|arg| arg.as_ptr()).collect();
-        argv.push(std::ptr::null());
-        let mut env: Vec<*const libc::c_char> = prepared.env.iter().map(|e| e.as_ptr()).collect();
-        env.push(std::ptr::null());
         let mut saw_eacces = false;
         let mut last = libc::ENOENT;
         for path in &prepared.program_paths {
@@ -743,8 +788,12 @@ mod ffi {
                 // SAFETY: both arrays are NULL-terminated and point at strings
                 // allocated in the parent, which outlive this call. `path` is
                 // one of those strings. `execve` replaces the process; it only
-                // returns on failure, and no allocation happens between tries.
-                libc::execve(path.as_ptr(), argv.as_ptr(), env.as_ptr());
+                // returns on failure, and this child does not allocate.
+                libc::execve(
+                    path.as_ptr(),
+                    prepared.argv_pointers.as_ptr(),
+                    prepared.env_pointers.as_ptr(),
+                );
             }
             let errno = errno_now();
             if try_next(errno) {
@@ -756,11 +805,11 @@ mod ffi {
                 last = errno;
                 continue;
             }
-            report_and_exit(prepared.report, super::FailStep::Exec, errno);
+            report_and_exit(prepared.report, GateStep::Exec, errno);
         }
         report_and_exit(
             prepared.report,
-            super::FailStep::Exec,
+            GateStep::Exec,
             if saw_eacces { libc::EACCES } else { last },
         );
     }
@@ -1118,7 +1167,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn missing_program_is_reaped_and_reported() {
-        use crate::{IdentifiedCaller, PlatformError, SpawnRequest};
+        use crate::{IdentifiedCaller, PlatformError, SpawnFailure, SpawnRequest};
         let caller = IdentifiedCaller::current_user().expect("current user");
         let request = SpawnRequest {
             command: vec!["aw-no-such-prog-xyz".to_owned()],
@@ -1131,11 +1180,9 @@ mod tests {
         let Err(error) = held.release() else {
             panic!("a missing program released");
         };
-        let PlatformError::Io(error) = error else {
-            panic!("expected an io error");
+        let PlatformError::Spawn(SpawnFailure::ProgramNotFound) = error else {
+            panic!("expected a typed program-not-found error");
         };
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-        assert!(error.to_string().starts_with("exec:"), "{}", error);
         // Reaped: a second wait finds no child.
         let still = std::process::Command::new("ps")
             .args(["-p", &pid.to_string()])
@@ -1151,12 +1198,78 @@ mod tests {
         }
     }
 
+    /// The root hold path must not reveal whether a program exists below a
+    /// root-owned 0700 directory. The child switches to `nobody` before it
+    /// tries either form of the identical absolute candidate.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root and a normal account"]
+    fn root_hold_does_not_distinguish_a_program_in_a_private_directory() {
+        use crate::{
+            EnvSource, IdentifiedCaller, Owner, PeerIdentity, PlatformError, SpawnRequest,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(nix::unistd::geteuid().as_raw(), 0, "run this test as root");
+        let nobody = nix::unistd::User::from_name("nobody")
+            .expect("nobody lookup")
+            .expect("this test needs the nobody account");
+        let uid = nobody.uid.as_raw();
+        let gid = nobody.gid.as_raw();
+        let caller = IdentifiedCaller::from_peer(PeerIdentity::new(
+            Owner::Unix {
+                ruid: uid,
+                euid: uid,
+                suid: uid,
+                rgid: gid,
+                egid: gid,
+                sgid: gid,
+                groups: Some(vec![gid]),
+            },
+            None,
+        ));
+        let dir = private_dir("root-hidden");
+        let hidden = dir.join("root-only");
+        std::fs::create_dir(&hidden).expect("root-only directory");
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700))
+            .expect("root-only directory permissions");
+        let program = hidden.join("program");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").expect("hidden program");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("hidden program permissions");
+
+        let attempt = |path: &std::path::Path| {
+            let request = SpawnRequest {
+                command: vec![path.to_string_lossy().into_owned()],
+                cwd: Some(std::path::PathBuf::from("/")),
+                env: Vec::new(),
+                env_source: EnvSource::Exact,
+            };
+            let held = super::spawn(&caller, &request).expect("held child");
+            let error = match held.release() {
+                Err(error) => error,
+                Ok(_) => panic!("inaccessible program must fail"),
+            };
+            let PlatformError::Io(error) = error else {
+                panic!("expected child exec error");
+            };
+            (error.kind(), error.to_string())
+        };
+
+        let present = attempt(&program);
+        std::fs::remove_file(&program).expect("remove hidden program");
+        let absent = attempt(&program);
+        assert_eq!(present.0, std::io::ErrorKind::PermissionDenied);
+        assert_eq!(present, absent, "presence below 0700 changed the result");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A working directory that does not exist fails at `chdir`, which is a
     /// different error from a missing program.
     #[cfg(unix)]
     #[test]
     fn missing_cwd_is_not_a_missing_program() {
-        use crate::{IdentifiedCaller, PlatformError, SpawnRequest};
+        use crate::{IdentifiedCaller, PlatformError, SpawnFailure, SpawnRequest};
         let caller = IdentifiedCaller::current_user().expect("current user");
         let request = SpawnRequest {
             command: vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
@@ -1171,15 +1284,43 @@ mod tests {
         let Err(error) = held.release() else {
             panic!("a missing directory released");
         };
-        let PlatformError::Io(error) = error else {
-            panic!("expected an io error");
+        let PlatformError::Spawn(SpawnFailure::CwdNotFound) = error else {
+            panic!("expected a typed cwd-not-found error");
         };
-        // The step is what separates the two failures. The errno is ENOENT when
-        // the harness is quiet; under parallel forks the child's inherited
-        // stdout can already be a closed pipe, and the errno then reads EPIPE.
-        // Either way the program did not run and the failure is the directory.
-        assert!(error.to_string().starts_with("chdir:"), "{}", error);
-        assert_ne!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    /// `execvp` semantics retain a permission denial even if later PATH
+    /// entries do not contain the requested name.  The hold-pipe record must
+    /// preserve that distinction for the caller, rather than flattening it to
+    /// a missing program.
+    #[cfg(unix)]
+    #[test]
+    fn non_executable_path_candidate_beats_later_missing_candidates() {
+        use crate::{IdentifiedCaller, PlatformError, SpawnFailure, SpawnRequest};
+        use std::os::unix::fs::PermissionsExt;
+        let caller = IdentifiedCaller::current_user().expect("current user");
+        let dir = private_dir("eacces");
+        let program = dir.join("aw-no-exec");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").expect("script");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let request = SpawnRequest {
+            command: vec!["aw-no-exec".to_owned()],
+            cwd: Some(dir.clone()),
+            env: vec![(
+                "PATH".to_owned(),
+                format!("{}:/no/such/aw-path", dir.display()),
+            )],
+            env_source: crate::EnvSource::Inherit,
+        };
+        let held = super::spawn(&caller, &request).expect("held");
+        let Err(error) = held.release() else {
+            panic!("a non-executable program released");
+        };
+        assert!(matches!(
+            error,
+            PlatformError::Spawn(SpawnFailure::ProgramNotPermitted)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A relative program name that contains `/` is resolved against the target
@@ -1217,9 +1358,8 @@ mod tests {
     #[test]
     fn exact_env_is_only_the_base_five_plus_the_request() {
         use crate::{EnvSource, IdentifiedCaller, SpawnRequest};
+        use std::io::Read;
         let caller = IdentifiedCaller::current_user().expect("current user");
-        let dir = private_dir("env");
-        let out = dir.join("env");
         // A name this process has and the target must not. The value is a
         // sentinel, not a real secret; the assertion is that the name is absent
         // and that the printed set equals the requested set.
@@ -1228,36 +1368,25 @@ mod tests {
         let base = account_base_env(caller_uid(&caller));
         let mut env = base.clone();
         env.push(("AW_RV".to_owned(), "1".to_owned()));
-        // `sh` writes the env it was exec'd with into the file. Redirecting this
-        // process's own stdout would be inherited by any other test that forked
-        // at the same moment, so the target writes the file itself.
+        let (out, capture) = super::ffi::pipe_cloexec().expect("stdout pipe");
         let request = SpawnRequest {
-            command: vec![
-                "sh".to_owned(),
-                "-c".to_owned(),
-                format!("env > '{}'", out.display()),
-            ],
+            command: vec!["/usr/bin/env".to_owned()],
             cwd: None,
             env,
             env_source: EnvSource::Exact,
         };
-        let held = super::spawn(&caller, &request).expect("held");
+        let held = super::spawn_capturing_stdout(&caller, &request, capture).expect("held");
         let released = held.release().expect("release");
         assert_eq!(
             released.wait().expect("wait"),
             crate::ReapOutcome::Exited(0)
         );
-        let text = std::fs::read_to_string(&out).expect("env file");
+        let mut text = String::new();
+        std::fs::File::from(out)
+            .read_to_string(&mut text)
+            .expect("env output");
         let mut got: Vec<String> = text.lines().map(str::to_owned).collect();
         got.sort();
-        // `sh` inserts `PWD` (its own working directory) into a command it runs.
-        // That is the shell, not the environment it was exec'd with. Everything
-        // else must be exactly the base five plus the one requested name.
-        // macOS's `sh` (bash) also adds `SHLVL` and `_`; those come from the
-        // shell too, not from the environment it was exec'd with.
-        got.retain(|line| {
-            !line.starts_with("PWD=") && !line.starts_with("SHLVL=") && !line.starts_with("_=")
-        });
         let mut want: Vec<String> = base
             .iter()
             .map(|(key, value)| format!("{key}={value}"))
@@ -1269,7 +1398,6 @@ mod tests {
         assert!(!got.iter().any(|line| line.starts_with("LD_PRELOAD=")));
         std::env::remove_var("AW_HOLD_SENTINEL");
         std::env::remove_var("LD_PRELOAD");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The five names a privileged launch builds from the target account, the

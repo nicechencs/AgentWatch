@@ -41,8 +41,9 @@ type T = (key: string, vars?: Record<string, string | number>) => string;
  * `launch_other_user` and friends are 403s but say more than 「没有权限」.
  */
 const CODE_TEXT: Record<string, string> = {
-  program_not_found: "error.programNotFound",
-  program_not_permitted: "error.programNotPermitted",
+  // Launch failures carry the reviewed Chinese sentence with the program or
+  // directory name in the daemon response. Do not replace it with a generic
+  // local translation that would hide which input failed.
   spawn_failed: "error.spawnFailed",
   launch_other_user: "error.launchOtherUser",
   caller_unidentified: "error.callerUnidentified",
@@ -66,6 +67,9 @@ export function describeError(error: unknown, t: T): string {
   if (error instanceof ApiError) {
     const coded = CODE_TEXT[error.code];
     if (coded) {
+      if (error.code === "launch_other_user" && error.message.startsWith("这个后台是「")) {
+        return error.message;
+      }
       if (error.code === "db_busy") {
         const waited = /\bWaited\s+(\d+)\s+s\b/u.exec(error.message)?.[1] ?? "0";
         return t(coded, { seconds: waited });

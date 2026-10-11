@@ -108,6 +108,29 @@ impl fmt::Display for UnsupportedKind {
     }
 }
 
+/// A target failed after the launch gate was released.  These categories are
+/// deliberately independent of `std::io::ErrorKind`: callers must preserve
+/// whether the target program or its working directory caused the failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnFailure {
+    ProgramNotFound,
+    ProgramNotPermitted,
+    CwdNotFound,
+    CwdNotPermitted,
+}
+
+impl SpawnFailure {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ProgramNotFound => "program_not_found",
+            Self::ProgramNotPermitted => "program_not_permitted",
+            Self::CwdNotFound => "cwd_not_found",
+            Self::CwdNotPermitted => "cwd_not_permitted",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PlatformError {
     Unsupported {
@@ -126,6 +149,10 @@ pub enum PlatformError {
         operation: &'static str,
         win32_error: i32,
     },
+    /// The held child reached `chdir` or `execve` after the caller released
+    /// its gate.  This is not a generic gate failure: it is a user-correctable
+    /// program or directory failure and must reach the API/CLI unchanged.
+    Spawn(SpawnFailure),
     Io(std::io::Error),
     Invalid {
         capability: &'static str,
@@ -153,6 +180,7 @@ impl fmt::Display for PlatformError {
                 f,
                 "named-pipe peer was not identified: {operation} failed (Win32 error {win32_error})"
             ),
+            Self::Spawn(kind) => write!(f, "held target could not start: {}", kind.code()),
             Self::Io(error) => write!(f, "platform I/O error: {error}"),
             Self::Invalid { capability, detail } => write!(f, "{capability}: {detail}"),
         }
@@ -525,8 +553,7 @@ pub fn verify_pipe_server(
 /// Product callers use [`verify_pipe_server`], whose observation comes from
 /// the local SCM. This hook keeps the same production decision path testable
 /// without installing a service.
-#[cfg(windows)]
-#[doc(hidden)]
+#[cfg(all(windows, any(test, feature = "test-support")))]
 pub fn verify_pipe_server_with_service_status(
     handle: std::os::windows::io::RawHandle,
     service_status: &PipeServiceStatus,
@@ -536,8 +563,7 @@ pub fn verify_pipe_server_with_service_status(
 
 /// Testable owner-allowlist form retained for the existing reverse tests.
 /// Product callers must use [`verify_pipe_server`] or the service-status hook.
-#[cfg(windows)]
-#[doc(hidden)]
+#[cfg(all(windows, any(test, feature = "test-support")))]
 pub fn verify_pipe_server_for_owners(
     handle: std::os::windows::io::RawHandle,
     trusted_owners: &[&str],
@@ -588,6 +614,13 @@ pub fn is_reserved_env_name(name: &str, case_insensitive: bool) -> bool {
             name == *reserved
         }
     })
+}
+
+/// Whether the host platform compares environment-variable names without
+/// case. Launch routes use this instead of carrying an OS branch themselves.
+#[must_use]
+pub const fn environment_names_are_case_insensitive() -> bool {
+    cfg!(windows)
 }
 
 /// Windows environment names are case-insensitive, including the reserved

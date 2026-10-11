@@ -29,6 +29,11 @@ serde_json = "1"
 # verification before request bytes are sent.
 aw-channel = { path = "../../crates/aw-channel" }
 
+[dev-dependencies]
+# Test-only short socket directories (`aw_channel::short_temp_dir`); release
+# builds of the app do not enable this feature.
+aw-channel = { path = "../../crates/aw-channel", features = ["test-support"] }
+
 [features]
 # On by default so `cargo run` / `cargo build --release` / `tauri build`
 # always serve the bundled ui/dist through tauri's asset protocol. A dev run

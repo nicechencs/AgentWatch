@@ -60,8 +60,11 @@ pub(crate) struct AttachRequest {
 
 /// Body for `POST /api/v1/sessions/run`.
 ///
-/// Environment variables deliberately have no representation here. They are
-/// only applied by the CLI process spawner.
+/// `--env` values deliberately have no representation here: they are only
+/// applied by the CLI process spawner. The three locale settings are the
+/// caller's own values, forwarded so daemon launch requests retain the
+/// caller's language and time zone without sending the rest of the process
+/// environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BeginRunRequest {
     /// Target argv, including the program.
@@ -72,6 +75,23 @@ pub(crate) struct BeginRunRequest {
     pub name: Option<String>,
     /// Optional agent label.
     pub agent: Option<String>,
+    /// The caller's set `LANG`, `LC_ALL`, and/or `TZ` values only.
+    pub env: Vec<(String, String)>,
+}
+
+/// The locale-related subset of a caller environment.
+///
+/// This intentionally does not accept arbitrary environment names.  In
+/// particular, `--env` remains local to the caller-created child and never
+/// crosses the daemon API boundary.
+pub(crate) fn user_locale_env<F>(get: F) -> Vec<(String, String)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    ["LANG", "LC_ALL", "TZ"]
+        .into_iter()
+        .filter_map(|name| get(name).map(|value| (name.to_owned(), value)))
+        .collect()
 }
 
 /// A launch session awaiting adoption by the caller-created child.
@@ -258,6 +278,16 @@ pub(crate) trait DaemonSessions {
     /// The daemon preserves a code it already recorded itself.
     fn record_exit(&mut self, session: &LaunchSession, exit_code: i32) -> Result<(), ControlError>;
 
+    /// Delete an adopted launch that could not exec before it recorded output.
+    /// This is deliberately separate from `stop_monitoring`: it is allowed
+    /// only for the owning caller and only for the daemon's empty/root-only
+    /// handoff state.
+    fn discard_run(&mut self, _: &LaunchSession) -> Result<(), ControlError> {
+        Err(ControlError::BadReply {
+            detail: "这个会话控制器没有实现启动失败清理".to_owned(),
+        })
+    }
+
     /// Create a session for an existing root process.
     fn attach(&mut self, request: &AttachRequest) -> Result<SessionHandle, ControlError>;
 
@@ -386,6 +416,18 @@ impl<T: Transport> DaemonSessions for HttpDaemonSessions<T> {
         insert_optional_text(&mut body, "cwd", request.cwd.as_deref());
         insert_optional_text(&mut body, "name", request.name.as_deref());
         insert_optional_text(&mut body, "agent", request.agent.as_deref());
+        if !request.env.is_empty() {
+            body.insert(
+                "env".to_owned(),
+                Value::Object(
+                    request
+                        .env
+                        .iter()
+                        .map(|(name, value)| (name.clone(), Value::String(value.clone())))
+                        .collect(),
+                ),
+            );
+        }
         let reply = self.call(&ApiRequest::post_json(
             "/api/v1/sessions/run",
             &Value::Object(body),
@@ -417,6 +459,15 @@ impl<T: Transport> DaemonSessions for HttpDaemonSessions<T> {
             &path,
             &json!({ "exit_code": exit_code }),
         ))?;
+        Ok(())
+    }
+
+    fn discard_run(&mut self, session: &LaunchSession) -> Result<(), ControlError> {
+        let path = format!(
+            "/api/v1/sessions/{}/discard",
+            encode_path_segment(&session.public_id)
+        );
+        let _ = self.call(&ApiRequest::post_json(&path, &json!({})))?;
         Ok(())
     }
 
@@ -492,6 +543,10 @@ impl DaemonSessions for UnwiredControl {
     }
 
     fn record_exit(&mut self, _: &LaunchSession, _: i32) -> Result<(), ControlError> {
+        Err(unwired())
+    }
+
+    fn discard_run(&mut self, _: &LaunchSession) -> Result<(), ControlError> {
         Err(unwired())
     }
 
@@ -1045,6 +1100,7 @@ mod tests {
                 cwd: Some("/work".to_owned()),
                 name: Some("session".to_owned()),
                 agent: Some("agent-a".to_owned()),
+                env: vec![("LANG".to_owned(), "zh_TW.UTF-8".to_owned())],
             })
             .expect("begin");
         control.adopt(&launch, 42).expect("adopt");
@@ -1063,7 +1119,7 @@ mod tests {
         let seen = server.join().expect("join");
         assert!(seen[0].starts_with("POST /api/v1/sessions/run HTTP/1.1"));
         assert!(seen[0]
-            .contains(r#"{"agent":"agent-a","argv":["tool"],"cwd":"/work","name":"session"}"#));
+            .contains(r#"{"agent":"agent-a","argv":["tool"],"cwd":"/work","env":{"LANG":"zh_TW.UTF-8"},"name":"session"}"#));
         assert!(seen[1].starts_with("POST /api/v1/sessions/s-run/adopt HTTP/1.1"));
         assert!(seen[1].contains(r#"{"pid":42,"ticket":"t-run"}"#));
         assert!(seen[2].starts_with("POST /api/v1/sessions HTTP/1.1"));
@@ -1074,5 +1130,22 @@ mod tests {
         assert!(seen[4].starts_with("PATCH /api/v1/sessions/s-attach HTTP/1.1"));
         assert!(seen[4].contains(r#"{"pinned":true}"#));
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn user_locale_env_keeps_only_set_locale_variables() {
+        let locale = super::user_locale_env(|name| match name {
+            "LANG" => Some("zh_TW.UTF-8".to_owned()),
+            "TZ" => Some("Asia/Taipei".to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            locale,
+            vec![
+                ("LANG".to_owned(), "zh_TW.UTF-8".to_owned()),
+                ("TZ".to_owned(), "Asia/Taipei".to_owned()),
+            ]
+        );
+        assert!(!locale.iter().any(|(name, _)| name == "LC_ALL"));
     }
 }

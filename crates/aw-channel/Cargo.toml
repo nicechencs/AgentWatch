@@ -9,6 +9,10 @@ license = "MIT OR Apache-2.0"
 publish = false
 description = "Internal-channel client shared by aw and the desktop app: socket/pipe path order, dial with error classes, one HTTP/1.1 exchange."
 
+[features]
+# Makes test-only pipe owner seams available to downstream integration tests.
+test-support = ["aw-platform/test-support"]
+
 [dependencies]
 
 # The Windows client asks the platform boundary to validate the connected
@@ -21,6 +25,7 @@ aw-platform = { path = "../aw-platform" }
 # Existing workspace crates, used only to create a real same-user named-pipe
 # server for the client-side owner-rule tests.
 aw-collector-windows = { path = "../aw-collector-windows" }
+aw-platform = { path = "../aw-platform", features = ["test-support"] }
 tokio = { version = "1.24.2", default-features = false, features = ["rt", "net", "time"] }
 
 [lints.rust]

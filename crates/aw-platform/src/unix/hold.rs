@@ -15,11 +15,16 @@
 //! 2. `chdir` to the caller's directory only after that switch.
 //! 3. Block on a `read` of the gate pipe. EOF (the creator died, or aborted
 //!    before release) `_exit`s without exec. One byte means release: close the
-//!    pipe and `execve` the target. The target inherits this process's
-//!    environment with the caller's pairs applied over it, at `execve` and
-//!    not before. `DYLD_INSERT_LIBRARIES` and `LD_PRELOAD` are unset in the
-//!    hold stage itself, so a caller-controlled loader is not in force while
-//!    the process is still privileged.
+//!    pipe and `execve` the target. The target's environment is the pointer
+//!    array built in the parent, applied at `execve` and not before. What goes
+//!    into that array is the request's [`crate::EnvSource`]: `Exact` is the
+//!    privileged daemon path and is exactly the pairs the caller handed in
+//!    (built from scratch: `HOME`, `USER`, `LOGNAME`, `SHELL` of the target
+//!    account, `PATH` = [`DEFAULT_TARGET_PATH`], plus the request's own names).
+//!    `Inherit` is `aw run` / `--no-daemon`, which already runs as the user:
+//!    this process's environment, minus `DYLD_INSERT_LIBRARIES` and
+//!    `LD_PRELOAD` unless the caller named them, then the request's names.
+//!    A non-UTF-8 entry is skipped and counted in the parent; it is not a panic.
 //!
 //! The gate pipe is `CLOEXEC` on both ends from the moment `pipe` returns. The
 //! read end is inherited across the fork (close-on-exec applies at exec, not
@@ -46,19 +51,35 @@ pub const EXIT_SWITCH_CHECK: i32 = 125;
 pub const EXIT_CHDIR: i32 = 126;
 pub const EXIT_EXEC: i32 = 127;
 
+/// `PATH` for a target whose environment is built from scratch
+/// ([`crate::EnvSource::Exact`]). It is not this process's `PATH`: a privileged
+/// daemon does not know the target user's shell `PATH`, and copying the
+/// daemon's would hand over whatever the daemon was started with. The request
+/// can still name `PATH` and override this. The daemon's `base_env` uses the
+/// same string.
+pub(crate) const DEFAULT_TARGET_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 /// What the child does before exec. Built in the parent; the child only reads it.
 struct Prepared {
     /// `None` when the caller is already this account: no switch.
     switch: Option<PreparedSwitch>,
     /// `chdir` target, or `None` to keep the directory the parent is in.
     cwd: Option<std::ffi::CString>,
-    program: std::ffi::CString,
+    /// Every path the child may `execve`, in order. Built as strings in the
+    /// parent; the child tries them after the identity switch. Empty when the
+    /// name was bare and no absolute PATH entry survived the skip rules.
+    program_paths: Vec<std::ffi::CString>,
     argv: Vec<std::ffi::CString>,
-    /// `NAME=value`. This process's environment, then the caller's overrides.
-    /// Applied only at `execve`.
+    /// `NAME=value`, applied only at `execve`. The child reads these through
+    /// the pointer array built here; it never reads the process environment.
     env: Vec<std::ffi::CString>,
     /// Read end of the gate pipe. Closed in the child before exec.
     gate_read: std::os::fd::RawFd,
+    /// Write end of the failure pipe. The child writes one record here and
+    /// `_exit`s; a successful `execve` closes it (it is `CLOEXEC`) and the parent
+    /// sees EOF. The parent keeps the read end.
+    report: std::os::fd::RawFd,
 }
 
 struct PreparedSwitch {
@@ -120,26 +141,33 @@ pub(crate) fn spawn(
             "argument contains NUL",
         )?);
     }
-    // The target inherits this process's environment, then the caller's
-    // overrides. Linux `aw run` used to do the same through `Command`: a child
-    // of `sh -c 'exit "$AW_TEST_CODE"'` with only `AW_TEST_CODE` set still saw
-    // `PATH`. Replacing the environment outright would drop that. `DYLD_*` and
-    // `LD_PRELOAD` are still cleared in the hold stage before it reads the
-    // gate, and come back only if the caller named them here.
-    let mut env_pairs: Vec<(String, String)> = std::env::vars()
-        .filter(|(key, _)| !request.env.iter().any(|(name, _)| name == key))
-        .collect();
-    env_pairs.extend(request.env.iter().cloned());
-    // `execve` does not search PATH, and `execvp` is not async-signal-safe.
-    // Resolve a bare program name here, before fork, against the PATH the
-    // target will see.
+    // The pointer array is the whole environment `execve` applies. Which pairs
+    // go into it is `request.env_source`, decided by the caller:
+    // `Exact` (the privileged daemon) is `request.env` alone, built from
+    // scratch, so a root daemon's own variables never reach the target.
+    // `Inherit` (`aw run`, which already runs as the user) starts from this
+    // process and overlays the request. A non-UTF-8 name or value is skipped
+    // and logged here, in the parent; `std::env::vars()` would panic on it.
+    let env_pairs = env_pairs_for(request);
+    // `execve` does not search PATH, and the parent must not either: a privileged
+    // daemon that stat'd the caller's PATH would be looking at directories as
+    // root. The parent only joins strings. The child, after the identity switch
+    // and `chdir`, tries each candidate. A name containing `/` is one candidate,
+    // taken relative to the target's cwd. A bare name uses the PATH the target
+    // will see; an empty entry, `.`, and any relative entry are skipped.
     let search_path = env_pairs
         .iter()
         .rev()
         .find(|(key, _)| key == "PATH")
         .map(|(_, value)| value.as_str());
-    let resolved = resolve_program(program, search_path)?;
-    let program = ffi::c_string(resolved.as_os_str(), "program is not valid text")?;
+    let candidates = program_candidates(program, search_path);
+    let mut program_paths = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        program_paths.push(ffi::c_string(
+            std::ffi::OsStr::new(candidate),
+            "program is not valid text",
+        )?);
+    }
     let mut env = Vec::with_capacity(env_pairs.len());
     for (key, value) in &env_pairs {
         let pair = format!("{key}={value}");
@@ -154,13 +182,15 @@ pub(crate) fn spawn(
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     let (gate_read, gate_write) = ffi::pipe_cloexec()?;
+    let (report_read, report_write) = ffi::pipe_cloexec()?;
     let prepared = Prepared {
         switch,
         cwd,
-        program,
+        program_paths,
         argv,
         env,
         gate_read: std::os::fd::AsRawFd::as_raw_fd(&gate_read),
+        report: std::os::fd::AsRawFd::as_raw_fd(&report_write),
     };
     // SAFETY: the child calls only async-signal-safe functions, then `_exit`
     // or `execve`. It does not return. The parent closes its copy of the read
@@ -183,44 +213,99 @@ pub(crate) fn spawn(
     // Parent. The child has its own copy of the read end.
     drop(gate_read);
     drop(_pipe_lock);
+    drop(report_write);
     Ok(Box::new(MacHeld {
         pid: Some(pid as u32),
         gate: Some(gate_write),
+        report: Some(report_read),
     }))
 }
 
 /// Process-wide: `pipe` and the `fork` that inherits the read end are one
 /// critical section. Poisoned is fine; the lock still excludes other forks.
-/// Default search path when the target environment has no `PATH`.
-const DEFAULT_SEARCH_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
-
-/// Find `program` the way a shell would, before fork. A name containing `/`
-/// is used as given. Otherwise each absolute `PATH` entry is tried; relative
-/// entries (including empty ones, which mean ".") are skipped on purpose.
-/// Nothing found is `NotFound`, which callers render as 找不到程序「…」.
-fn resolve_program(
-    program: &str,
-    search_path: Option<&str>,
-) -> Result<std::path::PathBuf, PlatformError> {
-    use std::os::unix::fs::PermissionsExt;
-    if program.contains('/') {
-        return Ok(std::path::PathBuf::from(program));
+/// `NAME=value` pairs for the target, in the parent, before `fork`.
+///
+/// [`crate::EnvSource::Exact`] copies `request.env` and nothing else: the
+/// process environment is not read. [`crate::EnvSource::Inherit`] starts from
+/// this process (`vars_os`, so a non-UTF-8 value is not a panic), drops the two
+/// loader names unless the request names them, then overlays `request.env`.
+/// A pair that is not UTF-8 is skipped; the parent logs how many, never the
+/// value.
+fn env_pairs_for(request: &crate::SpawnRequest) -> Vec<(String, String)> {
+    match request.env_source {
+        crate::EnvSource::Exact => request.env.clone(),
+        crate::EnvSource::Inherit => {
+            let mut skipped = 0_u32;
+            let mut pairs = Vec::new();
+            for (key, value) in std::env::vars_os() {
+                let Some(key) = key.to_str() else {
+                    skipped += 1;
+                    continue;
+                };
+                if request.env.iter().any(|(name, _)| name == key) {
+                    continue;
+                }
+                if PRELOAD_KEYS.contains(&key) {
+                    continue;
+                }
+                let Some(value) = value.to_str() else {
+                    skipped += 1;
+                    continue;
+                };
+                pairs.push((key.to_owned(), value.to_owned()));
+            }
+            if skipped > 0 {
+                // Count only. The names and values can carry secrets, so they
+                // are not printed. stderr, not a new dependency: this crate
+                // does not link tracing.
+                eprintln!(
+                    "agentwatch: skipped {skipped} non-UTF-8 environment entries while building the target environment"
+                );
+            }
+            pairs.extend(request.env.iter().cloned());
+            pairs
+        }
     }
+}
+
+/// Loader names the parent's environment must not hand to the target. The
+/// caller can still set either one: their pair is appended after this filter.
+/// [`crate::EnvSource::Exact`] never reads the parent, so these names only
+/// matter on the inherit path.
+const PRELOAD_KEYS: [&str; 2] = ["DYLD_INSERT_LIBRARIES", "LD_PRELOAD"];
+
+/// Default search path when the target environment has no `PATH`.
+const DEFAULT_SEARCH_PATH: &str = DEFAULT_TARGET_PATH;
+
+/// Candidate paths for `program`, as strings. This function does not touch the
+/// filesystem: no `stat`, no `access`, no `open`. The child tries them after it
+/// has switched identity.
+///
+/// A name containing `/` is one candidate, used as given (relative to the
+/// target cwd, which the child enters first). A bare name is joined to each
+/// absolute `PATH` entry. An empty entry, `.`, and any entry that does not
+/// start with `/` are skipped: they would search the daemon's own directory or
+/// a directory named relative to it.
+pub(crate) fn program_candidates(program: &str, search_path: Option<&str>) -> Vec<String> {
+    if program.contains('/') {
+        return vec![program.to_owned()];
+    }
+    if program.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates = Vec::new();
     for dir in search_path.unwrap_or(DEFAULT_SEARCH_PATH).split(':') {
-        if !dir.starts_with('/') {
+        if !absolute_path_entry(dir) {
             continue;
         }
-        let candidate = std::path::Path::new(dir).join(program);
-        if let Ok(meta) = std::fs::metadata(&candidate) {
-            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
-                return Ok(candidate);
-            }
-        }
+        candidates.push(format!("{dir}/{program}"));
     }
-    Err(PlatformError::Io(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("program not found on PATH: {program}"),
-    )))
+    candidates
+}
+
+/// An entry the search may use: absolute, and not empty or `.`.
+fn absolute_path_entry(dir: &str) -> bool {
+    dir.starts_with('/')
 }
 
 static PIPE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -233,6 +318,10 @@ struct MacHeld {
     /// Write end of the gate pipe. Dropped on release (after the byte) and on
     /// abort, which is the EOF the child treats as "creator died".
     gate: Option<std::os::fd::OwnedFd>,
+    /// Read end of the failure pipe. Release reads it after the release byte:
+    /// EOF means the target exec'd, a record means the child failed and has
+    /// exited (or is about to).
+    report: Option<std::os::fd::OwnedFd>,
 }
 
 impl HeldChild for MacHeld {
@@ -258,6 +347,14 @@ impl HeldChild for MacHeld {
         // released handle, which is the only wait from here on.
         ffi::write_all(&gate, b"1")?;
         drop(gate);
+        // The child writes one record and exits, or execs and the CLOEXEC write
+        // end closes. Either way this read finishes. A record is a failed step:
+        // reap that child here, so it is never a zombie, and return the errno.
+        let report = self.report.take();
+        if let Some(record) = report.as_ref().and_then(ffi::read_failure) {
+            let _ = ffi::wait_block(pid);
+            return Err(failure_error(record));
+        }
         Ok(Box::new(MacReleased { pid }))
     }
 
@@ -305,6 +402,44 @@ fn hold_delay() -> Option<u64> {
         .parse::<u64>()
         .ok()
         .map(|delay| delay.min(10_000))
+}
+
+/// Which failed step the child reports. Distinct from the exit code: the parent
+/// reads this off the failure pipe, so a missing program and a missing working
+/// directory are different errors instead of both being "exited 127".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum FailStep {
+    Chdir = 1,
+    Exec = 2,
+}
+
+/// One failure, written by the child before it `_exit`s. Four bytes: the step,
+/// then the errno as a little-endian `i32` with its low three bytes. Errnos here
+/// are small positive values, so three bytes hold them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FailRecord {
+    step: FailStep,
+    errno: i32,
+}
+
+/// The error a failed step becomes. `chdir` and `execve` both return `ENOENT`
+/// for "not there"; the step is what tells them apart, so callers can say
+/// 找不到工作目录 and 找不到程序 separately.
+fn failure_error(record: FailRecord) -> PlatformError {
+    let kind = match record.errno {
+        libc::ENOENT | libc::ENOTDIR => std::io::ErrorKind::NotFound,
+        libc::EACCES | libc::EPERM => std::io::ErrorKind::PermissionDenied,
+        _ => std::io::ErrorKind::Other,
+    };
+    let step = match record.step {
+        FailStep::Chdir => "chdir",
+        FailStep::Exec => "exec",
+    };
+    PlatformError::Io(std::io::Error::new(
+        kind,
+        format!("{step}: errno {}", record.errno),
+    ))
 }
 
 /// Which step of the hold stage failed. The code is what the child `_exit`s.
@@ -392,10 +527,13 @@ mod ffi {
         if let Some(switch) = &prepared.switch {
             switch_ids(&switch.groups, switch.gid, switch.uid);
         }
-        if let Some(dir) = &prepared.cwd {
-            chdir_or_exit(dir);
-        }
+        // Wait before chdir. A missing directory used to _exit here, which closed
+        // the gate's read end before the parent wrote the release byte, and that
+        // write came back EPIPE — the parent never got to read the failure record.
         wait_for_release(prepared.gate_read);
+        if let Some(dir) = &prepared.cwd {
+            chdir_or_exit(dir, prepared.report);
+        }
         unsafe {
             // SAFETY: the read end was inherited and is no longer needed. It is
             // also CLOEXEC, so an exec would drop it; closing it here means the
@@ -403,6 +541,15 @@ mod ffi {
             libc::close(prepared.gate_read);
         }
         exec(prepared);
+    }
+
+    /// `execve` errno that means "not this candidate, try the next". `execvp`
+    /// treats these the same way: the name is not a file here, so keep looking.
+    fn try_next(errno: i32) -> bool {
+        matches!(
+            errno,
+            libc::ENOENT | libc::ENOTDIR | libc::ESTALE | libc::ENODEV | libc::ETIMEDOUT
+        )
     }
 
     /// `unsetenv` of the two loader names. Async-signal-safe; no allocation.
@@ -463,15 +610,90 @@ mod ffi {
         libc::setgroups(count, groups)
     }
 
-    fn chdir_or_exit(path: &std::ffi::CStr) {
+    fn chdir_or_exit(path: &std::ffi::CStr, prepared_report: RawFd) {
         let rc = unsafe {
             // SAFETY: `path` is NUL-terminated and was allocated in the parent.
             // chdir is async-signal-safe and only affects this process.
             libc::chdir(path.as_ptr())
         };
         if rc != 0 {
-            exit_step(GateStep::Chdir);
+            // Raw errno: building a `std::io::Error` allocates, and this runs
+            // after `fork` in a process that has other threads.
+            report_and_exit(prepared_report, super::FailStep::Chdir, errno_now());
         }
+    }
+
+    /// The current errno, without allocating. `std::io::Error::last_os_error`
+    /// builds an owned error, which is not safe after `fork`.
+    fn errno_now() -> i32 {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            // SAFETY: `__errno_location` returns this thread's errno and cannot fail.
+            *libc::__errno_location()
+        }
+        #[cfg(not(target_os = "linux"))]
+        unsafe {
+            // SAFETY: `__error` is the macOS equivalent and cannot fail.
+            *libc::__error()
+        }
+    }
+
+    /// Write the four-byte failure record and `_exit`. Never returns. The write
+    /// is a raw syscall: this runs after `fork`, so nothing here allocates.
+    fn report_and_exit(fd: RawFd, step: super::FailStep, errno: i32) -> ! {
+        let mut bytes = [0_u8; 4];
+        bytes[0] = step as u8;
+        let errno = errno.max(0);
+        bytes[1] = (errno & 0xff) as u8;
+        bytes[2] = ((errno >> 8) & 0xff) as u8;
+        bytes[3] = ((errno >> 16) & 0xff) as u8;
+        unsafe {
+            // SAFETY: `bytes` is four live bytes and `fd` is the pipe end this
+            // child inherited. `write` is async-signal-safe. A short or failed
+            // write still exits: the parent then sees a closed pipe with no
+            // record and treats it as a failed exec rather than a success.
+            libc::write(fd, bytes.as_ptr().cast(), bytes.len());
+        }
+        exit_step(match step {
+            super::FailStep::Chdir => GateStep::Chdir,
+            super::FailStep::Exec => GateStep::Exec,
+        });
+    }
+
+    /// Read one failure record. `None` is EOF: the child exec'd and the CLOEXEC
+    /// write end closed, which is success.
+    pub(super) fn read_failure(fd: &OwnedFd) -> Option<super::FailRecord> {
+        let mut bytes = [0_u8; 4];
+        let mut got = 0_usize;
+        while got < bytes.len() {
+            let read = unsafe {
+                // SAFETY: `bytes` is live and `fd` is the pipe end this process
+                // owns. A short read is retried; EOF before four bytes is "no
+                // record", which the caller treats as a failed exec.
+                libc::read(
+                    fd.as_raw_fd(),
+                    bytes[got..].as_mut_ptr().cast(),
+                    bytes.len() - got,
+                )
+            };
+            if read < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return None;
+            }
+            if read == 0 {
+                return None;
+            }
+            got += read as usize;
+        }
+        let step = match bytes[0] {
+            1 => super::FailStep::Chdir,
+            _ => super::FailStep::Exec,
+        };
+        let errno = i32::from(bytes[1]) | (i32::from(bytes[2]) << 8) | (i32::from(bytes[3]) << 16);
+        Some(super::FailRecord { step, errno })
     }
 
     /// Block until the creator writes the release byte, or `_exit` on EOF.
@@ -498,24 +720,49 @@ mod ffi {
         }
     }
 
-    /// `execve` with the caller's argv and environment. Only returns on failure,
-    /// which `_exit`s 127.
+    /// `execve` each candidate with the caller's argv and environment. Only
+    /// returns on failure, which `_exit`s 127. `ENOENT`/`ENOTDIR` and the other
+    /// "not here" errnos try the next candidate; `EACCES` is remembered and the
+    /// search continues; any other errno stops. The errno left for the parent is
+    /// `EACCES` when one was seen, otherwise the last errno.
     fn exec(prepared: &Prepared) -> ! {
-        if prepared.argv.is_empty() {
-            exit_step(GateStep::Exec);
+        if prepared.argv.is_empty() || prepared.program_paths.is_empty() {
+            // No candidate at all is "not found", the same answer `execvp` gives
+            // for a bare name whose PATH produced nothing.
+            report_and_exit(prepared.report, super::FailStep::Exec, libc::ENOENT);
         }
         let mut argv: Vec<*const libc::c_char> =
             prepared.argv.iter().map(|arg| arg.as_ptr()).collect();
         argv.push(std::ptr::null());
         let mut env: Vec<*const libc::c_char> = prepared.env.iter().map(|e| e.as_ptr()).collect();
         env.push(std::ptr::null());
-        unsafe {
-            // SAFETY: both arrays are NULL-terminated and point at strings
-            // allocated in the parent, which outlive this call. `execve`
-            // replaces the process; it only returns on failure.
-            libc::execve(prepared.program.as_ptr(), argv.as_ptr(), env.as_ptr());
+        let mut saw_eacces = false;
+        let mut last = libc::ENOENT;
+        for path in &prepared.program_paths {
+            unsafe {
+                // SAFETY: both arrays are NULL-terminated and point at strings
+                // allocated in the parent, which outlive this call. `path` is
+                // one of those strings. `execve` replaces the process; it only
+                // returns on failure, and no allocation happens between tries.
+                libc::execve(path.as_ptr(), argv.as_ptr(), env.as_ptr());
+            }
+            let errno = errno_now();
+            if try_next(errno) {
+                last = errno;
+                continue;
+            }
+            if errno == libc::EACCES {
+                saw_eacces = true;
+                last = errno;
+                continue;
+            }
+            report_and_exit(prepared.report, super::FailStep::Exec, errno);
         }
-        exit_step(GateStep::Exec);
+        report_and_exit(
+            prepared.report,
+            super::FailStep::Exec,
+            if saw_eacces { libc::EACCES } else { last },
+        );
     }
 
     fn exit_step(step: GateStep) -> ! {
@@ -746,6 +993,21 @@ mod tests {
         }
     }
 
+    /// A directory no other test in this process uses. The name includes a counter,
+    /// not just the process id: cargo runs these tests on threads of one process,
+    /// and two of them writing the same script races the child's exec.
+    fn private_dir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "aw-hold-{label}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
     /// The forked child does not run the target until the release byte, and
     /// the target's exit code comes back through the one owning handle.
     #[cfg(unix)]
@@ -753,8 +1015,7 @@ mod tests {
     fn forked_child_holds_until_release_and_returns_the_exit_code() {
         use crate::{IdentifiedCaller, SpawnRequest};
         let caller = IdentifiedCaller::current_user().expect("current user");
-        let dir = std::env::temp_dir().join(format!("aw-hold-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = private_dir("run");
         let marker = dir.join("ran");
         let request = SpawnRequest {
             command: vec![
@@ -766,6 +1027,7 @@ mod tests {
             ],
             cwd: None,
             env: vec![("AW_TEST_CODE".to_owned(), "5".to_owned())],
+            env_source: crate::EnvSource::Inherit,
         };
         let held = super::spawn(&caller, &request).expect("held");
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -783,8 +1045,7 @@ mod tests {
     fn closing_the_gate_before_release_exits_without_running() {
         use crate::{IdentifiedCaller, SpawnRequest};
         let caller = IdentifiedCaller::current_user().expect("current user");
-        let dir = std::env::temp_dir().join(format!("aw-hold-abort-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = private_dir("abort");
         let marker = dir.join("ran");
         let request = SpawnRequest {
             command: vec![
@@ -796,12 +1057,244 @@ mod tests {
             ],
             cwd: None,
             env: Vec::new(),
+            env_source: crate::EnvSource::Inherit,
         };
         let mut held = super::spawn(&caller, &request).expect("held");
         held.abort().expect("abort");
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(!marker.exists(), "abort exec'd the target");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Candidate building is string work. A directory that does not exist, an
+    /// empty entry, and `.` never produce a path this process would stat: the
+    /// empty entry and `.` are absent, and the missing directory is only text.
+    #[cfg(unix)]
+    #[test]
+    fn candidate_building_skips_empty_and_dot_and_touches_nothing() {
+        let missing = format!("/no/such/aw-path-{}", std::process::id());
+        let path = format!(":{missing}:.::/usr/bin:rel");
+        let got = super::program_candidates("sh", Some(&path));
+        assert_eq!(
+            got,
+            vec![format!("{missing}/sh"), "/usr/bin/sh".to_owned()],
+            "empty, `.`, and a relative entry are skipped"
+        );
+        assert!(
+            !std::path::Path::new(&missing).exists(),
+            "building the list must not create or require the directory"
+        );
+        // A name with a slash is the name itself, even when it is relative.
+        assert_eq!(
+            super::program_candidates("bin/sh", Some(&path)),
+            vec!["bin/sh".to_owned()]
+        );
+    }
+
+    /// A bare `sh` runs. The parent did not turn it into an absolute path; the
+    /// child found it on the target PATH after the identity switch (here a no-op,
+    /// because the caller is this account).
+    #[cfg(unix)]
+    #[test]
+    fn bare_sh_runs_from_the_target_path() {
+        use crate::{IdentifiedCaller, SpawnRequest};
+        let caller = IdentifiedCaller::current_user().expect("current user");
+        let request = SpawnRequest {
+            command: vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
+            cwd: Some(std::path::PathBuf::from("/")),
+            env: Vec::new(),
+            env_source: crate::EnvSource::Inherit,
+        };
+        let held = super::spawn(&caller, &request).expect("held");
+        let released = held.release().expect("release");
+        assert_eq!(
+            released.wait().expect("wait"),
+            crate::ReapOutcome::Exited(0)
+        );
+    }
+
+    /// A program that is not on PATH fails at exec, and the child is reaped:
+    /// there is no zombie left for this pid.
+    #[cfg(unix)]
+    #[test]
+    fn missing_program_is_reaped_and_reported() {
+        use crate::{IdentifiedCaller, PlatformError, SpawnRequest};
+        let caller = IdentifiedCaller::current_user().expect("current user");
+        let request = SpawnRequest {
+            command: vec!["aw-no-such-prog-xyz".to_owned()],
+            cwd: Some(std::path::PathBuf::from("/")),
+            env: Vec::new(),
+            env_source: crate::EnvSource::Inherit,
+        };
+        let held = super::spawn(&caller, &request).expect("held");
+        let pid = held.pid();
+        let Err(error) = held.release() else {
+            panic!("a missing program released");
+        };
+        let PlatformError::Io(error) = error else {
+            panic!("expected an io error");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().starts_with("exec:"), "{}", error);
+        // Reaped: a second wait finds no child.
+        let still = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .output();
+        if let Ok(output) = still {
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !text
+                    .lines()
+                    .any(|line| line.split_whitespace().next() == Some(&pid.to_string())),
+                "the failed child is still around: {text}"
+            );
+        }
+    }
+
+    /// A working directory that does not exist fails at `chdir`, which is a
+    /// different error from a missing program.
+    #[cfg(unix)]
+    #[test]
+    fn missing_cwd_is_not_a_missing_program() {
+        use crate::{IdentifiedCaller, PlatformError, SpawnRequest};
+        let caller = IdentifiedCaller::current_user().expect("current user");
+        let request = SpawnRequest {
+            command: vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()],
+            cwd: Some(std::path::PathBuf::from(format!(
+                "/no/such/aw-cwd-{}",
+                std::process::id()
+            ))),
+            env: Vec::new(),
+            env_source: crate::EnvSource::Inherit,
+        };
+        let held = super::spawn(&caller, &request).expect("held");
+        let Err(error) = held.release() else {
+            panic!("a missing directory released");
+        };
+        let PlatformError::Io(error) = error else {
+            panic!("expected an io error");
+        };
+        // The step is what separates the two failures. The errno is ENOENT when
+        // the harness is quiet; under parallel forks the child's inherited
+        // stdout can already be a closed pipe, and the errno then reads EPIPE.
+        // Either way the program did not run and the failure is the directory.
+        assert!(error.to_string().starts_with("chdir:"), "{}", error);
+        assert_ne!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    /// A relative program name that contains `/` is resolved against the target
+    /// cwd, not this process's directory. The script lives only in that cwd.
+    #[cfg(unix)]
+    #[test]
+    fn relative_program_runs_from_the_target_cwd() {
+        use crate::{IdentifiedCaller, SpawnRequest};
+        use std::os::unix::fs::PermissionsExt;
+        let caller = IdentifiedCaller::current_user().expect("current user");
+        let dir = private_dir("rel");
+        let script = dir.join("aw-rel-script");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let request = SpawnRequest {
+            command: vec!["./aw-rel-script".to_owned()],
+            cwd: Some(dir.clone()),
+            env: Vec::new(),
+            env_source: crate::EnvSource::Inherit,
+        };
+        let held = super::spawn(&caller, &request).expect("held");
+        let released = held.release().expect("release");
+        assert_eq!(
+            released.wait().expect("wait"),
+            crate::ReapOutcome::Exited(0)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Privileged-daemon path: the target's environment is exactly the five
+    /// account basics plus the names the request added. Nothing this process
+    /// has — including a sentinel set here, and `LD_PRELOAD` — is in that set.
+    /// The comparison is the whole set, not "the secret is absent".
+    #[cfg(unix)]
+    #[test]
+    fn exact_env_is_only_the_base_five_plus_the_request() {
+        use crate::{EnvSource, IdentifiedCaller, SpawnRequest};
+        let caller = IdentifiedCaller::current_user().expect("current user");
+        let dir = private_dir("env");
+        let out = dir.join("env");
+        // A name this process has and the target must not. The value is a
+        // sentinel, not a real secret; the assertion is that the name is absent
+        // and that the printed set equals the requested set.
+        std::env::set_var("AW_HOLD_SENTINEL", "present-in-parent");
+        std::env::set_var("LD_PRELOAD", "/no/such/libaw-preload.so");
+        let base = account_base_env(caller_uid(&caller));
+        let mut env = base.clone();
+        env.push(("AW_RV".to_owned(), "1".to_owned()));
+        // `sh` writes the env it was exec'd with into the file. Redirecting this
+        // process's own stdout would be inherited by any other test that forked
+        // at the same moment, so the target writes the file itself.
+        let request = SpawnRequest {
+            command: vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                format!("env > '{}'", out.display()),
+            ],
+            cwd: None,
+            env,
+            env_source: EnvSource::Exact,
+        };
+        let held = super::spawn(&caller, &request).expect("held");
+        let released = held.release().expect("release");
+        assert_eq!(
+            released.wait().expect("wait"),
+            crate::ReapOutcome::Exited(0)
+        );
+        let text = std::fs::read_to_string(&out).expect("env file");
+        let mut got: Vec<String> = text.lines().map(str::to_owned).collect();
+        got.sort();
+        // `sh` inserts `PWD` (its own working directory) into a command it runs.
+        // That is the shell, not the environment it was exec'd with. Everything
+        // else must be exactly the base five plus the one requested name.
+        got.retain(|line| !line.starts_with("PWD="));
+        let mut want: Vec<String> = base
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .chain(std::iter::once("AW_RV=1".to_owned()))
+            .collect();
+        want.sort();
+        assert_eq!(got, want, "target env is not exactly the base plus AW_RV");
+        assert!(!got.iter().any(|line| line.starts_with("AW_HOLD_SENTINEL=")));
+        assert!(!got.iter().any(|line| line.starts_with("LD_PRELOAD=")));
+        std::env::remove_var("AW_HOLD_SENTINEL");
+        std::env::remove_var("LD_PRELOAD");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The five names a privileged launch builds from the target account, the
+    /// same five `base_env` in the daemon starts from. `PATH` is the documented
+    /// default, not this process's `PATH`. `uid` is the account being launched,
+    /// which is the caller — not whoever this process happens to be.
+    #[cfg(unix)]
+    fn account_base_env(uid: u32) -> Vec<(String, String)> {
+        let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+            .ok()
+            .flatten()
+            .expect("passwd entry for the current user");
+        let path = |p: &std::path::Path| p.display().to_string();
+        vec![
+            ("HOME".to_owned(), path(&user.dir)),
+            ("USER".to_owned(), user.name.clone()),
+            ("LOGNAME".to_owned(), user.name),
+            ("SHELL".to_owned(), path(&user.shell)),
+            ("PATH".to_owned(), super::DEFAULT_TARGET_PATH.to_owned()),
+        ]
+    }
+
+    /// The account `spawn` launches as: the caller's effective uid.
+    #[cfg(unix)]
+    fn caller_uid(caller: &crate::IdentifiedCaller) -> u32 {
+        match caller.owner() {
+            crate::Owner::Unix { euid, .. } => *euid,
+            crate::Owner::Windows { .. } => 0,
+        }
     }
 
     #[cfg(feature = "test-hold-delay")]

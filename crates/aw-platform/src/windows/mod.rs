@@ -114,10 +114,39 @@ fn wide_nul(text: &OsStr) -> Vec<u16> {
     text.encode_wide().chain(Some(0)).collect()
 }
 
+/// Whether `path` is the official data directory. Both sides are the final path
+/// of an opened handle (`\\?\` prefix, 8.3 short names, `.` and `..`, and a
+/// trailing separator already resolved), compared case-insensitively. A string
+/// compare of the caller's spelling would miss `PROGRA~2`, a doubled separator,
+/// or a `\\?\` prefix, and a non-admin daemon could then use the official dir.
 fn is_machine_data_dir(path: &Path, default: &Path) -> bool {
-    path.as_os_str()
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&default.as_os_str().to_string_lossy())
+    path_key(path) == path_key(default)
+}
+
+/// One spelling of a Windows path: drop the `\\?\` prefix, turn `/` into `\`,
+/// drop a trailing separator, and resolve `.` and `..`. What remains is compared
+/// case-insensitively. The final path of an opened handle already does this;
+/// this covers a path that has not been opened yet.
+fn path_key(path: &Path) -> String {
+    let mut text = path.as_os_str().to_string_lossy().to_string();
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        text = rest.to_owned();
+    }
+    text = text.replace('/', "\\");
+    let mut parts: Vec<&str> = Vec::new();
+    for part in text.split('\\') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                // Never pop the drive (`C:`). A `..` above it stays there.
+                if parts.len() > 1 {
+                    parts.pop();
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("\\").to_ascii_lowercase()
 }
 
 #[derive(Clone)]
@@ -454,6 +483,53 @@ fn open_data_object(path: &Path) -> Result<(HANDLE, bool), PlatformError> {
             & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY.0
             != 0,
     ))
+}
+
+/// `FOLDERID_ProgramData` from the shell, never from the process environment.
+/// The returned path is the folder Windows names, so a `ProgramData` variable
+/// set by the caller does not move it.
+///
+/// Called through `shell32` directly. The `windows` crate's binding needs the
+/// `Win32_UI_Shell` feature, which is not in the locked feature set; adding it
+/// would change `Cargo.lock`. The GUID and the signature are the documented ones.
+fn known_folder_program_data() -> Result<PathBuf, PlatformError> {
+    // FOLDERID_ProgramData {62AB5D82-FDC1-4DC3-A9DD-070D1D495D97}.
+    const FOLDERID_PROGRAM_DATA: windows::core::GUID =
+        windows::core::GUID::from_u128(0x62ab5d82_fdc1_4dc3_a9dd_070d1d495d97);
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetKnownFolderPath(
+            rfid: *const windows::core::GUID,
+            dwflags: u32,
+            htoken: HANDLE,
+            ppszpath: *mut PWSTR,
+        ) -> windows::core::HRESULT;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoTaskMemFree(block: *const c_void);
+    }
+    let mut wide = PWSTR::null();
+    // SAFETY: a null token asks for this process's folder. On success Windows
+    // allocates `wide` with CoTaskMemAlloc; it is copied below and freed here.
+    #[allow(unsafe_code)]
+    let result =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_PROGRAM_DATA, 0, HANDLE::default(), &mut wide) };
+    if result.is_err() {
+        return Err(io_error(Error::from(result)));
+    }
+    // SAFETY: the call succeeded, so `wide` is a NUL-terminated wide string.
+    #[allow(unsafe_code)]
+    let text = unsafe { wide.to_string() }.map_err(|_| PlatformError::Invalid {
+        capability: "default_data_dir",
+        detail: "ProgramData folder path was not valid UTF-16",
+    });
+    // SAFETY: SHGetKnownFolderPath allocated `wide` with CoTaskMemAlloc.
+    #[allow(unsafe_code)]
+    unsafe {
+        CoTaskMemFree(wide.0.cast());
+    }
+    text.map(PathBuf::from)
 }
 
 fn final_path_for_handle(handle: HANDLE) -> Result<PathBuf, PlatformError> {
@@ -1674,12 +1750,10 @@ impl Platform for CurrentPlatform {
         secure_data_dir_with_policy(path, &default, policy)
     }
     fn default_data_dir(&self) -> Result<PathBuf, PlatformError> {
-        std::env::var_os("ProgramData")
-            .map(|v| PathBuf::from(v).join("AgentWatch"))
-            .ok_or(PlatformError::Invalid {
-                capability: "default_data_dir",
-                detail: "ProgramData is unset",
-            })
+        // The known-folder API, not the `ProgramData` environment variable. A
+        // caller who sets that variable must not move the official directory.
+        let program_data = known_folder_program_data()?;
+        Ok(program_data.join("AgentWatch"))
     }
     fn default_config_path(&self) -> Result<PathBuf, PlatformError> {
         Ok(self.default_data_dir()?.join("config.toml"))
@@ -1819,6 +1893,54 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_nanos())
         ))
+    }
+
+    /// The official directory comes from the known folder, not from the
+    /// `ProgramData` environment variable. Setting that variable to somewhere
+    /// else does not move it. This is the reverse of the old behavior: removing
+    /// the known-folder call and reading the variable again makes this fail.
+    #[test]
+    fn program_data_env_does_not_move_the_official_dir() {
+        let saved = std::env::var_os("ProgramData");
+        std::env::set_var("ProgramData", r"C:\aw-not-program-data");
+        let got = CurrentPlatform.default_data_dir().expect("known folder");
+        match saved {
+            Some(value) => std::env::set_var("ProgramData", value),
+            None => std::env::remove_var("ProgramData"),
+        }
+        let text = got.to_string_lossy().to_ascii_lowercase();
+        assert!(
+            text.ends_with(r"\agentwatch") || text.ends_with("/agentwatch"),
+            "official dir ends in AgentWatch: {got:?}"
+        );
+        assert!(
+            !text.contains("aw-not-program-data"),
+            "ProgramData env moved the official dir: {got:?}"
+        );
+    }
+
+    /// Spellings of the same directory are still the official one: different
+    /// case, a trailing separator, a `\\?\` prefix, and a `..` segment. A
+    /// case-sensitive string compare would let a non-admin daemon through.
+    #[test]
+    fn official_dir_spellings_compare_equal() {
+        let official = std::path::Path::new(r"C:\ProgramData\AgentWatch");
+        for spelling in [
+            r"c:\programdata\agentwatch",
+            r"C:\ProgramData\AgentWatch\\",
+            r"\\?\C:\ProgramData\AgentWatch",
+            r"C:\ProgramData\AgentWatch\.",
+            r"C:\ProgramData\Other\..\AgentWatch",
+        ] {
+            assert!(
+                super::is_machine_data_dir(std::path::Path::new(spelling), official),
+                "{spelling} must be recognized as the official dir"
+            );
+        }
+        assert!(!super::is_machine_data_dir(
+            std::path::Path::new(r"C:\somewhere-else\AgentWatch"),
+            official
+        ));
     }
 
     #[test]
@@ -2142,6 +2264,7 @@ mod tests {
             command: vec!["cmd".to_owned(), "/c".to_owned(), "exit 7".to_owned()],
             cwd: None,
             env: Vec::new(),
+            env_source: crate::EnvSource::Inherit,
         };
         let held = platform()
             .spawn_suspended(&caller, &request)
@@ -2157,6 +2280,7 @@ mod tests {
             command: vec!["cmd".to_owned(), "/c".to_owned(), "exit 300".to_owned()],
             cwd: None,
             env: Vec::new(),
+            env_source: crate::EnvSource::Inherit,
         };
         let released = platform()
             .spawn_suspended(&caller, &request)
@@ -2180,6 +2304,7 @@ mod tests {
             ],
             cwd: None,
             env: Vec::new(),
+            env_source: crate::EnvSource::Inherit,
         };
         let released = platform()
             .spawn_suspended(&caller, &request)
@@ -2248,6 +2373,7 @@ mod tests {
             command: vec!["cmd".to_owned(), "/c".to_owned(), "exit 0".to_owned()],
             cwd: None,
             env: Vec::new(),
+            env_source: crate::EnvSource::Inherit,
         };
 
         let error = match CurrentPlatform.spawn_suspended(&caller, &request) {
@@ -2295,6 +2421,7 @@ mod tests {
             command: vec!["cmd".to_owned(), "/c".to_owned(), "echo hello".to_owned()],
             cwd: None,
             env: Vec::new(),
+            env_source: crate::EnvSource::Inherit,
         };
         let held = platform()
             .spawn_suspended(&caller, &request)

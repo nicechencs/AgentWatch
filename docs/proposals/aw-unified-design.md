@@ -90,7 +90,7 @@
    - **附加组一律由后台按用户重新加载**：Linux 和 Mac 都用 `launch_as::login_groups`（`getgrouplist`）在**父进程里**算好传进去，**不用连接方报上来的组**（Linux SO_PEERCRED 本来就拿不到附加组，Mac 永远是 None）。**Mac 照 initgroups 的语义加载**（PM 13:47 已定，不截断也不拒绝）：组列表在 fork 之前用 `getgrouplist` 解析（缓冲区不够就加大重试），子进程里只做系统调用，不做任何查询；macOS 上用带 gmuid 的 `initgroups` 系统调用开启动态成员解析，或者用准备好的列表 `setgroups`。系统仍然只给一部分时记日志、doctor 如实显示。细节见文末「Mac 附加组超过 16 个」。Linux 同样按 `getgrouplist`，不用 `/proc/<pid>/status` 的 `Groups:`（c21dcec 剩下的第 2 处）。
    - 自检：`getuid/geteuid/getgid/getegid` 都对，`setgid(0)` 和 `setuid(0)` 都必须失败，不对就按「切身份失败」退出。
    - **程序名怎么找（PATH，review 挡 2 + PM 定）**：execve 不查 PATH，`execvp` 又不是异步信号安全的，所以分两半做。**挂住启动（`unix/hold.rs`）和 Linux root 后台的 helper（dev `aw-daemon/src/api/launch_as.rs:216` 起的 `spawn_as`，helper 副本里 exec 目标）这两条路调同一个查找函数** `aw_platform::program::candidates(name, cwd, path) -> Vec<CString>`，不各写一份；helper 那条路跑同一组 PATH 测试。
-     - **用哪个 PATH**：后台替人起的程序一律用固定的 `DEFAULT_PATH`（dev `launch_as.rs:54-55`）。请求里**不能**给 PATH（PM 定，给了就 400 `env_reserved`，见文末「启动程序时的环境变量」），所以查找永远不受请求影响。aw 自己起的程序（默认模式、`--no-daemon`）用 aw 的 PATH。
+     - **用哪个 PATH**：后台替人起的程序一律用固定的 `DEFAULT_PATH`（dev `launch_as.rs:54-55`）。请求里**不能**给 PATH（PM 定，给了就 400 `env_var_reserved`，见文末「启动程序时的环境变量」），所以查找永远不受请求影响。aw 自己起的程序（默认模式、`--no-daemon`）用 aw 的 PATH。
      - **工作目录一律是绝对路径**：相对的工作目录由调用方（aw、App）先换成绝对路径再发给后台；后台收到相对路径直接 400 `bad_request`（这是客户端的 bug，不是用户写错），不替它拼。没给工作目录时按目标用户的 HOME。
      - **父进程只拼候选列表，不碰文件系统**（不 `stat`、不 `access`、不 `canonicalize`）：
        - 程序名是绝对路径：只有它自己一个候选；
@@ -501,7 +501,7 @@
 | `program_not_found` | | 后台 / CLI | 400 | 6 | 找不到程序「{名}」，请检查名字或路径 |
 | `program_not_permitted` | | 后台 / CLI（报错管道，失败在 execve） | 403 | 4 | 程序「{路径}」没有执行权限，请检查文件权限后再试。 |
 | `program_not_permitted` | | 后台 / CLI（报错管道，失败在 chdir） | 403 | 4 | 没有权限进入工作目录「{路径}」，请换一个目录或检查权限。 |
-| `env_reserved` | 新 | 后台（替人起程序时，请求带了基础变量） | 400 | 2 | 环境变量「{名}」由系统按你的账户来填，不能在请求里改。请去掉这个变量再试。 |
+| `env_var_reserved` | 新 | 后台（替人起程序时，请求带了基础变量） | 400 | 2 | 环境变量「{名}」由系统按你的账户来填，不能在请求里改。请去掉这个变量再试。 |
 | `cwd_not_found` | 新 | 后台 / CLI（报错管道，A1 规矩 3） | 400 | 6 | 找不到工作目录「{路径}」 |
 | `owner_user_not_found` | 新 | 后台 | 400 | 2 | 找不到用户「{名}」，没有做任何改动。 |
 | `owner_lookup_failed` | 新 | 后台 | 503 | 1 | 查不到用户「{名}」对应的账户，没有做任何改动。 |
@@ -685,7 +685,7 @@
 | # | 提交（路） | 内容 | 为什么这时 CI 能绿 | 用什么验证 |
 |---|---|---|---|---|
 | −1 | **文档先行**（只改文档，单独推；本文 0aff6cb / ef28f88 / 本版） | architecture.md 按实际重写（内部通道 + 手写路由、crate 表补 aw-platform/aw-channel、「谁启动程序」改对）；ADR-0005 标「部分被取代」；接口文档加「启动契约」（A1 规矩）、「请求生命周期」（A2 规矩）两节；Mac 三处顺序写反的改掉（`macos.md:128`、`api-and-cli.md:186`，`launch_as.rs:423-428` 注释在第 4 步一起改） | 只改文档，CI 不受影响；规矩先落文档，后面的代码对着它写（review 要补 8） | crate 表跟 `cargo metadata` 对照脚本 |
-| 0a | **安全快修**（排在最前面，比第 0 步还早；每条一个反向测试） | ① `spawn_as_self`（dev `watch_routes.rs:539-555`）只调了 `envs(...)`、没有 `env_clear()`，后台用自己身份起程序时把**后台自己的整套环境**交给了程序 → 先 `env_clear()`，再放 5 个基础变量和请求给的变量；② `hold.rs:201-224` `resolve_program` 以 root 身份按 PATH 找程序 → 改成父进程只拼候选、子进程切身份后 execve（A1 规矩 4，先在 hold.rs 里改，不等第 4 步的统一启动函数；PATH 跳过空项、`.`、相对项）；③ Windows 数据目录能绕开 → 正式目录用 `SHGetKnownFolderPath(FOLDERID_ProgramData)`，不读 `%ProgramData%` 这类环境变量，非管理员后台在**建目录之前**就拒绝（原第 0、6 步里这一小块提前）；④ 请求里给 HOME/USER/LOGNAME/SHELL/PATH 就 400 `env_reserved`（`launch_as.rs:186-194` `base_env` 现在让请求覆盖）。`--data-dir` 只在测试 feature 里那一条仍在第 2 步，第 2 步紧跟着推 | 都是小改，不碰启动契约和看门进程，跟后面的步骤不冲突 | 反向测试：① 后台环境里放 `AW_SECRET=1`，起的程序的环境里没有它，并且跟完整集合一模一样；② root CI 上 A1 规矩 4 那三条 + 「PATH 带空项和 `.`」那条；③ 设了 `ProgramData=C:\Users\x\evil` 时后台照样用真正的 ProgramData，非管理员时目录根本没建出来；④ 5 个变量各一条，都是 400，都没有起任何进程 |
+| 0a | **安全快修**（排在最前面，比第 0 步还早；每条一个反向测试） | ① `spawn_as_self`（dev `watch_routes.rs:539-555`）只调了 `envs(...)`、没有 `env_clear()`，后台用自己身份起程序时把**后台自己的整套环境**交给了程序 → 先 `env_clear()`，再放 5 个基础变量和请求给的变量；② `hold.rs:201-224` `resolve_program` 以 root 身份按 PATH 找程序 → 改成父进程只拼候选、子进程切身份后 execve（A1 规矩 4，先在 hold.rs 里改，不等第 4 步的统一启动函数；PATH 跳过空项、`.`、相对项）；③ Windows 数据目录能绕开 → 正式目录用 `SHGetKnownFolderPath(FOLDERID_ProgramData)`，不读 `%ProgramData%` 这类环境变量，非管理员后台在**建目录之前**就拒绝（原第 0、6 步里这一小块提前）；④ 请求里给 HOME/USER/LOGNAME/SHELL/PATH 就 400 `env_var_reserved`（`launch_as.rs:186-194` `base_env` 现在让请求覆盖）。`--data-dir` 只在测试 feature 里那一条仍在第 2 步，第 2 步紧跟着推 | 都是小改，不碰启动契约和看门进程，跟后面的步骤不冲突 | 反向测试：① 后台环境里放 `AW_SECRET=1`，起的程序的环境里没有它，并且跟完整集合一模一样；② root CI 上 A1 规矩 4 那三条 + 「PATH 带空项和 `.`」那条；③ 设了 `ProgramData=C:\Users\x\evil` 时后台照样用真正的 ProgramData，非管理员时目录根本没建出来；④ 5 个变量各一条，都是 400，都没有起任何进程 |
 | 0 | **tip 变绿**：Mac 收尾 + 数据目录放宽（aw-xplat-macfix / aw-xplat-win） | A4 规矩 6 的 Unix 部分和规则判断（是不是管理员只看自己令牌、正式目录规范化后比、非管理员不碰正式目录、上级目录检查、系统链接放行、子项检查）；Windows 用 `SHGetKnownFolderPath`、建前拒绝；DACL 测试预期改对；数据目录报错中文按 wording 文件 | 修的就是现在红的那一片 | Mac/Win/Linux CI 全绿；A4 的数据目录矩阵（Windows 句柄化部分在第 6 步补完） |
 | 1 | winpipe A 的过关 | 不改代码，看第 0 步之后的 Windows CI | — | Win CI 绿 + PM 开发模式真机连跑 5 条命令都成功 |
 | 2 | **CLI 安全修**（`--data-dir`、`--owner`；CLI 路，紧跟第 0a 步推） | `--data-dir` 只在 `test-data-dir` feature 里；CI 加 release 行为检查（`--help` 没有、传了报参数错、目录还在；`test-hold-delay` 同样）；`--owner` 统一走 `mutation_owner`（stop / attach 加进程也是），主人的会话 + `--owner 别人` 拒绝，主人带 `--owner=自己` 放行，后台解析用户名，「找不到用户」「查不到…对应的账户」两句，用户列显示用户名，管理员按会话名只找自己的；**内存会话分支放进 `#[cfg(test)]`**；改掉原来断言「主人带 `--owner=自己` 被拒」的测试；通知 Test-bot 改用测试版跑 `--purge --data-dir` | 后台和 CLI 一起改、测试一起加，不碰平台层 | A4 的参数化表；release 检查；release 走不到内存分支 |
@@ -837,7 +837,7 @@
 ## 补充决定（PM 13:44–13:51，提交前加入）
 
 ### 启动程序时的环境变量
-- **后台起的程序**（App 新建会话、以 root 起再切到用户）：环境变量从零构造，只有 HOME、USER、LOGNAME、SHELL（来自目标用户的账户，fork 前用 `getpwuid_r` 取好）和固定的 PATH，再加上请求里给的变量；绝不继承后台自己的环境，也不是「先复制再删」。**请求里给了 HOME、USER、LOGNAME、SHELL、PATH 中的任何一个就拒绝**（PM 14:30 定），回 400 `env_reserved`，一个程序都不起：「环境变量「{名}」由系统按你的账户来填，不能在请求里改。请去掉这个变量再试。」（现在 dev `launch_as.rs:186-194` `base_env` 是让请求覆盖，第 0a 步改；测试：5 个变量各一条，请求带上就 400 `env_reserved`、没有起任何进程）。查找程序用的 PATH 因此永远是固定的 `DEFAULT_PATH`（A1 规矩 4）。只对后台替人起的程序生效；`aw run` 默认模式和 `--no-daemon` 用的是用户自己的环境，不受这条限制。测试比对完整集合，不只是「没有密钥」。
+- **后台起的程序**（App 新建会话、以 root 起再切到用户）：环境变量从零构造，只有 HOME、USER、LOGNAME、SHELL（来自目标用户的账户，fork 前用 `getpwuid_r` 取好）和固定的 PATH，再加上请求里给的变量；绝不继承后台自己的环境，也不是「先复制再删」。**请求里给了 HOME、USER、LOGNAME、SHELL、PATH 中的任何一个就拒绝**（PM 14:30 定），回 400 `env_var_reserved`，一个程序都不起：「环境变量「{名}」由系统按你的账户来填，不能在请求里改。请去掉这个变量再试。」（现在 dev `launch_as.rs:186-194` `base_env` 是让请求覆盖，第 0a 步改；测试：5 个变量各一条，请求带上就 400 `env_var_reserved`、没有起任何进程）。查找程序用的 PATH 因此永远是固定的 `DEFAULT_PATH`（A1 规矩 4）。只对后台替人起的程序生效；`aw run` 默认模式和 `--no-daemon` 用的是用户自己的环境，不受这条限制。测试比对完整集合，不只是「没有密钥」。
 - **`aw run` 默认模式和 `--no-daemon`**：aw 本来就以当前用户运行、自己起程序，原样传当前用户的环境，不经过后台（PM 13:47 定）；加测试确认用户环境原样传到程序。
 - 环境里不是 UTF-8 的变量：跳过并记日志，不 panic。
 

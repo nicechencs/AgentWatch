@@ -21,6 +21,7 @@ path = "src/lib.rs"
 
 [dependencies]
 aw-core = { workspace = true }
+aw-platform = { workspace = true }
 # Internal channel: path order, dial, error classes (shared with the app).
 aw-channel = { workspace = true }
 aw-store = { workspace = true }

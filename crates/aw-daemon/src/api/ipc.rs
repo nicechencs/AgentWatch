@@ -8,10 +8,9 @@
 //! can reach a filesystem socket.
 //!
 //! Peer identity:
-//! - Linux: `SO_PEERCRED` through `rustix`; macOS: `getpeereid` (the
-//!   `LOCAL_PEERCRED` uid) through `nix`. No `unsafe` in this crate. uid 0 is
-//!   an administrator. A peer whose uid cannot be read is [`UNVERIFIED_PEER`],
-//!   never an administrator.
+//! - Unix peer credentials are read only by `aw-platform`. uid 0 is an
+//!   administrator; an unidentified peer is refused with 403 and never given
+//!   a placeholder identity.
 //! - When a group named [`SOCKET_GROUP`] exists, the socket is
 //!   `root:agentwatch 0660`: members connect without root. Without the group
 //!   it is 0666: any local account may connect and is identified by uid (an
@@ -54,9 +53,6 @@ pub const MACOS_SOCKET: &str = aw_channel::MACOS_SOCKET;
 
 /// Windows named pipe (api-and-cli §1).
 pub const WINDOWS_PIPE: &str = aw_channel::WINDOWS_PIPE;
-
-/// `user_id` given to a peer whose uid could not be read. Not an administrator.
-pub const UNVERIFIED_PEER: &str = "unverified-peer";
 
 /// Socket mode when the [`SOCKET_GROUP`] group exists: owner and members.
 pub const SOCKET_MODE: u32 = 0o660;
@@ -182,7 +178,7 @@ mod unix {
     use nix::fcntl::{Flock, FlockArg};
 
     use super::super::routes::error_response;
-    use super::{answer, socket_mode, Control, SharedState, SOCKET_GROUP, UNVERIFIED_PEER};
+    use super::{answer, socket_mode, Control, SharedState, SOCKET_GROUP};
 
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const MAX_REQUEST: usize = 80 * 1024;
@@ -384,44 +380,39 @@ mod unix {
         }
     }
 
-    /// The peer as an API caller. uid 0 is an administrator.
-    pub(super) fn peer_caller(stream: &UnixStream) -> Caller {
-        match peer_uid(stream) {
-            Some(uid) => Caller {
-                user_id: uid.to_string(),
-                admin: uid == 0,
-            },
-            None => Caller {
-                user_id: UNVERIFIED_PEER.to_owned(),
-                admin: false,
-            },
+    /// The peer as an API caller. The platform layer is the only code that
+    /// reads peer credentials, so an unverified socket can never become a
+    /// low-privilege placeholder identity.
+    pub(super) fn peer_caller(stream: &UnixStream) -> Result<Caller, aw_platform::PlatformError> {
+        let peer = aw_platform::identify_unix_peer(stream)?;
+        match peer.owner() {
+            aw_platform::Owner::Unix { euid, .. } => Ok(Caller {
+                user_id: euid.to_string(),
+                admin: *euid == 0,
+            }),
+            aw_platform::Owner::Windows { .. } => {
+                Err(aw_platform::PlatformError::PeerNotIdentified {
+                    reason: "Unix socket peer did not have a Unix owner",
+                })
+            }
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn peer_uid(stream: &UnixStream) -> Option<u32> {
-        rustix::net::sockopt::socket_peercred(stream)
-            .ok()
-            .map(|cred| cred.uid.as_raw())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn peer_uid(stream: &UnixStream) -> Option<u32> {
-        nix::unistd::getpeereid(stream)
-            .ok()
-            .map(|(uid, _gid)| uid.as_raw())
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    fn peer_uid(_stream: &UnixStream) -> Option<u32> {
-        None
     }
 
     fn serve(mut stream: UnixStream, state: &SharedState, control: &Control) -> io::Result<()> {
         stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
-        let caller = peer_caller(&stream);
+        let caller = match peer_caller(&stream) {
+            Ok(caller) => caller,
+            Err(_) => {
+                let response = error_response(
+                    403,
+                    "unidentified_peer",
+                    "socket peer could not be identified",
+                );
+                return write_response(&mut stream, &response);
+            }
+        };
         let mut buf = vec![0_u8; 8 * 1024];
         let mut collected = Vec::new();
         // listen_port 0: the peer path never checks `Host`.

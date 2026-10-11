@@ -1,6 +1,6 @@
 use crate::{
-    IdentifiedCaller, Platform, PlatformError, ProcessEntry, ProcessKey, ReapOutcome,
-    SamplingProcess, SpawnRequest, UnsupportedKind,
+    Capability, CapabilityStatus, IdentifiedCaller, Owner, PeerIdentity, Platform, PlatformError,
+    ProcessEntry, SamplingProcess, SpawnRequest, UnsupportedKind,
 };
 use std::path::{Path, PathBuf};
 pub(crate) struct CurrentPlatform;
@@ -11,9 +11,17 @@ fn no(capability: &'static str) -> PlatformError {
         kind: UnsupportedKind::NotInThisBuild,
     }
 }
+pub fn identify_pipe_peer(
+    _: std::os::windows::io::RawHandle,
+) -> Result<PeerIdentity, PlatformError> {
+    Err(no("peer_identity"))
+}
 impl Platform for CurrentPlatform {
     fn os(&self) -> &'static str {
         "windows"
+    }
+    fn capability(&self, _: Capability) -> CapabilityStatus {
+        CapabilityStatus::NotInThisBuild
     }
     fn spawn_suspended(
         &self,
@@ -34,11 +42,8 @@ impl Platform for CurrentPlatform {
     fn sampling_process_table(&self) -> Result<Vec<SamplingProcess>, PlatformError> {
         Err(no("sampling_process_table"))
     }
-    fn reap_child(&self, _: ProcessKey) -> Result<ReapOutcome, PlatformError> {
-        Err(no("reap_child"))
-    }
-    fn secure_data_dir(&self, p: &Path) -> Result<(), PlatformError> {
-        std::fs::create_dir_all(p).map_err(Into::into)
+    fn secure_data_dir(&self, _: &Path) -> Result<(), PlatformError> {
+        Err(no("secure_data_dir"))
     }
     fn default_data_dir(&self) -> Result<PathBuf, PlatformError> {
         std::env::var_os("ProgramData")
@@ -56,5 +61,8 @@ impl Platform for CurrentPlatform {
     }
     fn current_user_id(&self) -> Option<String> {
         None
+    }
+    fn current_owner(&self) -> Result<Owner, PlatformError> {
+        Err(no("current_owner"))
     }
 }

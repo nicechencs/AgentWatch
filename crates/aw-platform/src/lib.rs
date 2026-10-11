@@ -1,7 +1,9 @@
 //! Explicit operating-system boundary for AgentWatch shared code.
 #![forbid(unsafe_code)]
+
 use std::fmt;
 use std::path::{Path, PathBuf};
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -45,12 +47,17 @@ impl fmt::Display for UnsupportedKind {
         f.write_str(self.en())
     }
 }
+
 #[derive(Debug)]
 pub enum PlatformError {
     Unsupported {
         capability: &'static str,
         os: &'static str,
         kind: UnsupportedKind,
+    },
+    /// Never convert a missing OS credential into a daemon/default identity.
+    PeerNotIdentified {
+        reason: &'static str,
     },
     Io(std::io::Error),
     Invalid {
@@ -71,22 +78,31 @@ impl fmt::Display for PlatformError {
                 kind.en(),
                 kind.as_str()
             ),
-            Self::Io(e) => write!(f, "platform I/O error: {e}"),
+            Self::PeerNotIdentified { reason } => write!(f, "peer was not identified: {reason}"),
+            Self::Io(error) => write!(f, "platform I/O error: {error}"),
             Self::Invalid { capability, detail } => write!(f, "{capability}: {detail}"),
         }
     }
 }
 impl std::error::Error for PlatformError {}
 impl From<std::io::Error> for PlatformError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
     }
 }
-/// PID and start time prevent PID reuse. Linux: `/proc/<pid>/stat` field 22 ticks; macOS: `proc_pidinfo(PROC_PIDTBSDINFO)` / `sysctl(KERN_PROC)`; Windows: `GetProcessTimes`.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProcessKey {
     pub pid: u32,
     pub start_time: u64,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityLevel {
+    Low,
+    Medium,
+    High,
+    System,
+    Other(u32),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Owner {
@@ -94,11 +110,15 @@ pub enum Owner {
         ruid: u32,
         euid: u32,
         suid: u32,
+        rgid: u32,
+        egid: u32,
+        sgid: u32,
         groups: Vec<u32>,
     },
     Windows {
         sid: String,
         elevated: bool,
+        integrity: Option<IntegrityLevel>,
     },
 }
 #[derive(Clone, PartialEq, Eq)]
@@ -109,11 +129,6 @@ pub struct ProcessEntry {
     pub argv: Option<Vec<String>>,
     pub owner: Option<Owner>,
 }
-/// Process facts needed to form the poll collector's stable identity.
-///
-/// `start_ns` is a wall-clock timestamp when the OS can provide one.  It is
-/// deliberately separate from [`ProcessKey::start_time`], whose unit is
-/// native to the OS (Linux clock ticks, Windows FILETIME, and so on).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SamplingProcess {
     pub key: ProcessKey,
@@ -147,46 +162,81 @@ impl fmt::Debug for SpawnRequest {
             .finish()
     }
 }
-/// HELD: daemon death also kills the target (Linux gate EOF/PDEATHSIG; Windows suspended Job `KILL_ON_JOB_CLOSE`; macOS `POSIX_SPAWN_START_SUSPENDED` watchdog). RELEASED: target survives daemon restart. `abort`/Drop before release kill and reap.
+
+/// Owns a process only until release. Dropping/aborting it terminates and reaps it.
 pub trait HeldChild: Send {
     fn pid(&self) -> u32;
-    fn release(&mut self) -> Result<(), PlatformError>;
+    fn release(self: Box<Self>) -> Result<Box<dyn ReleasedChild>, PlatformError>;
     fn abort(&mut self) -> Result<(), PlatformError>;
+}
+/// The sole owner of a released OS child handle. It cannot reap an arbitrary PID.
+pub trait ReleasedChild: Send {
+    fn pid(&self) -> u32;
+    fn try_reap(&mut self) -> Result<ReapOutcome, PlatformError>;
+    fn wait(self: Box<Self>) -> Result<ReapOutcome, PlatformError>;
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReapOutcome {
     Exited(i32),
     Signaled(i32),
     StillRunning,
-    NotOurChild,
 }
-/// Transport identity comes from Linux `SO_PEERCRED`, macOS `getpeereid` plus `LOCAL_PEERPID`, or Windows `GetNamedPipeClientProcessId` plus client token. Windows pipes require `PIPE_REJECT_REMOTE_CLIENTS` and an explicit DACL.
+
+/// An OS-authenticated peer. Private fields prevent request data from forging it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PeerIdentity {
-    Identified { owner: Owner, pid: Option<u32> },
-    NotIdentified { reason: &'static str },
+pub struct PeerIdentity {
+    owner: Owner,
+    pid: Option<u32>,
+}
+impl PeerIdentity {
+    #[allow(dead_code)] // constructed by OS modules that identify peers in this build
+    pub(crate) fn new(owner: Owner, pid: Option<u32>) -> Self {
+        Self { owner, pid }
+    }
+    pub fn owner(&self) -> &Owner {
+        &self.owner
+    }
+    pub const fn pid(&self) -> Option<u32> {
+        self.pid
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentifiedCaller {
     owner: Owner,
 }
 impl IdentifiedCaller {
-    pub fn from_peer(peer: PeerIdentity) -> Result<Self, PlatformError> {
-        match peer {
-            PeerIdentity::Identified { owner, .. } => Ok(Self { owner }),
-            PeerIdentity::NotIdentified { .. } => Err(PlatformError::Invalid {
-                capability: "caller_identity",
-                detail: "caller was not identified",
-            }),
-        }
+    pub fn from_peer(peer: PeerIdentity) -> Self {
+        Self { owner: peer.owner }
     }
-    #[allow(dead_code)]
-    pub(crate) fn owner(&self) -> &Owner {
+    pub fn current_user() -> Result<Self, PlatformError> {
+        Ok(Self {
+            owner: platform().current_owner()?,
+        })
+    }
+    pub fn owner(&self) -> &Owner {
         &self.owner
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    SpawnSuspended,
+    ProcessIdentity,
+    ProcessTable,
+    PeerIdentity,
+    SecureDataDir,
+    ExitCode,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityStatus {
+    Available,
+    NotInThisBuild,
+    NotSupportedOnThisOs,
+}
+
 pub trait Platform: Send + Sync {
     fn os(&self) -> &'static str;
+    fn capability(&self, capability: Capability) -> CapabilityStatus;
     fn spawn_suspended(
         &self,
         caller: &IdentifiedCaller,
@@ -194,67 +244,51 @@ pub trait Platform: Send + Sync {
     ) -> Result<Box<dyn HeldChild>, PlatformError>;
     fn process_identity(&self, pid: u32) -> Result<Option<ProcessEntry>, PlatformError>;
     fn process_table(&self) -> Result<Vec<ProcessEntry>, PlatformError>;
-    /// Facts used by the platform-independent poll sampler to make a stable
-    /// process identity.  Unsupported systems return an explicit error rather
-    /// than an empty table.
     fn sampling_process(&self, pid: u32) -> Result<Option<SamplingProcess>, PlatformError>;
     fn sampling_process_table(&self) -> Result<Vec<SamplingProcess>, PlatformError>;
-    /// Used by stop-recording and sampler disappearance handling; Windows waits, uses `GetExitCodeProcess`, and closes its handle.
-    fn reap_child(&self, key: ProcessKey) -> Result<ReapOutcome, PlatformError>;
     fn secure_data_dir(&self, path: &Path) -> Result<(), PlatformError>;
     fn default_data_dir(&self) -> Result<PathBuf, PlatformError>;
     fn default_config_path(&self) -> Result<PathBuf, PlatformError>;
     fn is_privileged(&self) -> Option<bool>;
-    /// Stable textual identifier for the daemon's own account, if the OS has
-    /// one that can be represented without guessing.
     fn current_user_id(&self) -> Option<String>;
+    fn current_owner(&self) -> Result<Owner, PlatformError>;
 }
 #[must_use]
 pub fn platform() -> &'static dyn Platform {
     static CURRENT: CurrentPlatform = CurrentPlatform;
     &CURRENT
 }
-#[cfg(feature = "test-hold-delay")]
-pub fn test_hold_delay() -> Option<std::time::Duration> {
-    let ms = std::env::var("AW_TEST_HOLD_DELAY_MS")
-        .ok()?
-        .parse::<u64>()
-        .ok()?;
-    Some(std::time::Duration::from_millis(ms.min(10_000)))
+
+#[cfg(unix)]
+pub fn identify_unix_peer(
+    stream: &std::os::unix::net::UnixStream,
+) -> Result<PeerIdentity, PlatformError> {
+    identify_peer(stream)
 }
-#[cfg(not(feature = "test-hold-delay"))]
-pub const fn test_hold_delay() -> Option<std::time::Duration> {
-    None
+#[cfg(target_os = "linux")]
+fn identify_peer(stream: &std::os::unix::net::UnixStream) -> Result<PeerIdentity, PlatformError> {
+    linux::identify_unix_peer(stream)
 }
+#[cfg(target_os = "macos")]
+fn identify_peer(stream: &std::os::unix::net::UnixStream) -> Result<PeerIdentity, PlatformError> {
+    macos::identify_unix_peer(stream)
+}
+#[cfg(windows)]
+pub fn identify_pipe_peer(
+    handle: std::os::windows::io::RawHandle,
+) -> Result<PeerIdentity, PlatformError> {
+    windows::identify_pipe_peer(handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn peer_required() {
-        assert!(
-            IdentifiedCaller::from_peer(PeerIdentity::NotIdentified { reason: "test" }).is_err()
-        )
-    }
     #[test]
     fn unsupported_words() {
         assert_eq!(
             UnsupportedKind::NotInThisBuild.as_str(),
             "not_in_this_build"
         );
-        assert_eq!(UnsupportedKind::NotSupportedOnThisOs.zh(), "这个系统不支持")
-    }
-    #[cfg(not(feature = "test-hold-delay"))]
-    #[test]
-    fn delay_off() {
-        std::env::set_var("AW_TEST_HOLD_DELAY_MS", "1");
-        assert_eq!(test_hold_delay(), None);
-        std::env::remove_var("AW_TEST_HOLD_DELAY_MS");
-    }
-    #[cfg(feature = "test-hold-delay")]
-    #[test]
-    fn delay_capped() {
-        std::env::set_var("AW_TEST_HOLD_DELAY_MS", "10001");
-        assert_eq!(test_hold_delay(), Some(std::time::Duration::from_secs(10)));
-        std::env::remove_var("AW_TEST_HOLD_DELAY_MS");
+        assert_eq!(UnsupportedKind::NotSupportedOnThisOs.zh(), "这个系统不支持");
     }
 }

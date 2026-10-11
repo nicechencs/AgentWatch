@@ -412,7 +412,7 @@ fn create_inner(
             let response = created(&target, json!({}));
             state.watch_requests.push(WatchRequest::Start {
                 target: Box::new(target),
-                child: Some(child),
+                child: Some(crate::watch::released_child(child)),
             });
             Ok(response)
         }

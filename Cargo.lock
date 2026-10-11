@@ -78,6 +78,7 @@ dependencies = [
  "aw-collector-macos",
  "aw-collector-windows",
  "aw-core",
+ "aw-platform",
  "aw-pipeline",
  "aw-proxy",
  "aw-store",

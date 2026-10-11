@@ -12,6 +12,7 @@
 use serde_json::{json, Value};
 
 use aw_core::{Evidence, NaReason};
+use aw_platform::{Capability as PlatformCapability, CapabilityStatus};
 
 use crate::exit;
 use crate::output::{evidence_badge, evidence_code};
@@ -368,12 +369,17 @@ pub(crate) fn report_json(report: &DoctorReport) -> Value {
             })
         })
         .collect();
+    let platform_capabilities: Vec<Value> = platform_capabilities()
+        .into_iter()
+        .map(|(status, name)| json!({ "capability": name, "status": capability_text(status) }))
+        .collect();
     json!({
         "os": report.host.os,
         "version": report.host.version,
         "privileged": report.host.privileged,
         "collectors": collectors,
         "categories": categories,
+        "platform_capabilities": platform_capabilities,
     })
 }
 
@@ -435,7 +441,51 @@ fn report_text(report: &DoctorReport) -> String {
             fix
         ));
     }
+    out.push_str("platform capability  status\n");
+    for (capability, name) in platform_capabilities() {
+        out.push_str(&format!("{name}  {}\n", capability_text(capability)));
+    }
     out
+}
+
+/// Fixed interface-v2 capabilities are deliberately shown separately from
+/// collector matrix rows, whose existing wording and test contract stay intact.
+fn platform_capabilities() -> [(CapabilityStatus, &'static str); 6] {
+    let platform = aw_platform::platform();
+    [
+        (
+            platform.capability(PlatformCapability::SpawnSuspended),
+            "spawn_suspended",
+        ),
+        (
+            platform.capability(PlatformCapability::ProcessIdentity),
+            "process_identity",
+        ),
+        (
+            platform.capability(PlatformCapability::ProcessTable),
+            "process_table",
+        ),
+        (
+            platform.capability(PlatformCapability::PeerIdentity),
+            "peer_identity",
+        ),
+        (
+            platform.capability(PlatformCapability::SecureDataDir),
+            "secure_data_dir",
+        ),
+        (
+            platform.capability(PlatformCapability::ExitCode),
+            "exit_code",
+        ),
+    ]
+}
+
+const fn capability_text(status: CapabilityStatus) -> &'static str {
+    match status {
+        CapabilityStatus::Available => "可用",
+        CapabilityStatus::NotInThisBuild => "本版本未接入",
+        CapabilityStatus::NotSupportedOnThisOs => "这个系统不支持",
+    }
 }
 
 /// Run `aw doctor`. `--perf` is P2 and exits 2 without calling `source`.

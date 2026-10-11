@@ -6,7 +6,6 @@
 //! [`DaemonSessions::adopt`]. None of these operations signal a target process.
 
 use std::marker::PhantomData;
-use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
@@ -399,6 +398,11 @@ impl<T: Transport> DaemonSessions for HttpDaemonSessions<T> {
         let mut body = Map::new();
         body.insert("mode".to_owned(), json!("attach"));
         body.insert("pid".to_owned(), json!(request.pid));
+        if let Some(duration) = request.duration {
+            // The deadline belongs to the daemon.  The CLI may exit or be
+            // killed immediately after this request without changing it.
+            body.insert("duration_ms".to_owned(), json!(duration.as_millis()));
+        }
         insert_optional_text(&mut body, "agent", request.agent.as_deref());
         let reply = self.call(&ApiRequest::post_json(
             "/api/v1/sessions",
@@ -500,32 +504,9 @@ fn required_text(body: &Value, key: &str) -> Result<String, ControlError> {
         })
 }
 
-/// A clock that can be replaced in tests so `--duration` does not sleep.
-pub(crate) trait Sleeper {
-    /// Wait for `duration` before the monitoring session is stopped.
-    fn sleep(&mut self, duration: Duration);
-}
-
-/// Production duration clock.
-pub(crate) struct ThreadSleeper;
-
-impl Sleeper for ThreadSleeper {
-    fn sleep(&mut self, duration: Duration) {
-        thread::sleep(duration);
-    }
-}
-
-/// Run `aw attach` with the production clock.
+/// Run `aw attach`.  A duration is sent to the daemon as a deadline; this
+/// process intentionally does not wait and cannot end the session itself.
 pub(crate) fn run(args: &AttachArgs<'_>, control: &mut dyn DaemonSessions) -> Outcome {
-    run_with_sleeper(args, control, &mut ThreadSleeper)
-}
-
-/// Run `aw attach` with an injectable duration clock.
-pub(crate) fn run_with_sleeper(
-    args: &AttachArgs<'_>,
-    control: &mut dyn DaemonSessions,
-    sleeper: &mut dyn Sleeper,
-) -> Outcome {
     let request = match prepare(args) {
         Ok(request) => request,
         Err(outcome) => return outcome,
@@ -534,7 +515,7 @@ pub(crate) fn run_with_sleeper(
     let until_exit = request.until_exit;
     let handle = match control.attach(&request) {
         Ok(handle) => handle,
-        Err(error) => return control_outcome(error, args.json),
+        Err(error) => return attach_control_outcome(error, args.json),
     };
     let pin_warning = if args.pin {
         control
@@ -544,16 +525,9 @@ pub(crate) fn run_with_sleeper(
     } else {
         None
     };
-    if let Some(duration) = duration {
-        sleeper.sleep(duration);
-        if let Err(error) = control.stop_monitoring(&handle.public_id, None) {
-            return control_outcome(error, args.json);
-        }
-        return attached_outcome(&handle, true, false, args.json, pin_warning.as_deref());
-    }
     attached_outcome(
         &handle,
-        false,
+        duration.is_some(),
         until_exit,
         args.json,
         pin_warning.as_deref(),
@@ -673,19 +647,35 @@ pub(crate) fn control_outcome(error: ControlError, json: bool) -> Outcome {
     )
 }
 
+/// A local read deadline after `POST /sessions` is ambiguous to the caller,
+/// but the daemon closes an undelivered 201 as `attach_failed`.  Never print
+/// the transport's OS-English `daemon_timeout` detail to people.
+fn attach_control_outcome(error: ControlError, json: bool) -> Outcome {
+    if matches!(&error, ControlError::Transport { detail } if detail.starts_with("daemon_timeout"))
+    {
+        return super::error_outcome(
+            exit::GENERAL,
+            "daemon_timeout",
+            "后台 12 秒没有回应，这次请求没有完成。这个会话已记为附着失败。",
+            json,
+        );
+    }
+    control_outcome(error, json)
+}
+
 fn pin_warning(error: &ControlError) -> String {
     format!("[aw] 警告：后台没有保留这个会话：{error}\n")
 }
 
 fn attached_outcome(
     handle: &SessionHandle,
-    stopped_on_duration: bool,
+    daemon_duration: bool,
     until_exit: bool,
     json: bool,
     warning: Option<&str>,
 ) -> Outcome {
-    let note = if stopped_on_duration {
-        "监控已按 --duration 结束；目标进程未被结束"
+    let note = if daemon_duration {
+        "监控已附着；后台会在 --duration 到时结束会话；停止监控不会结束目标进程"
     } else if until_exit {
         "监控已附着；后台会在根进程退出时结束会话；停止监控不会结束目标进程"
     } else {
@@ -694,7 +684,7 @@ fn attached_outcome(
     let text = if json {
         let body = json!({
             "session": handle.public_id,
-            "monitoring": if stopped_on_duration { "stopped" } else { "attached" },
+            "monitoring": "attached",
             "process_terminated": false,
             "message": note,
         });
@@ -715,8 +705,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        run_with_sleeper, AttachArgs, AttachRequest, BeginRunRequest, ControlError, DaemonSessions,
-        LaunchSession, SessionHandle, Sleeper,
+        run, AttachArgs, AttachRequest, BeginRunRequest, ControlError, DaemonSessions,
+        LaunchSession, SessionHandle,
     };
     use crate::exit;
 
@@ -780,15 +770,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct FakeSleeper(Vec<Duration>);
-
-    impl Sleeper for FakeSleeper {
-        fn sleep(&mut self, duration: Duration) {
-            self.0.push(duration);
-        }
-    }
-
     fn args() -> AttachArgs<'static> {
         AttachArgs {
             pid: Some(100),
@@ -808,8 +789,7 @@ mod tests {
     #[test]
     fn attach_forwards_pid_and_agent() {
         let mut control = FakeControl::default();
-        let mut sleeper = FakeSleeper::default();
-        let outcome = run_with_sleeper(&args(), &mut control, &mut sleeper);
+        let outcome = run(&args(), &mut control);
         assert_eq!(outcome.code, exit::OK);
         assert_eq!(control.attached.len(), 1);
         assert_eq!(control.attached[0].pid, 100);
@@ -820,11 +800,10 @@ mod tests {
     #[test]
     fn name_is_refused_without_a_daemon_call() {
         let mut control = FakeControl::default();
-        let mut sleeper = FakeSleeper::default();
         let mut parsed = args();
         parsed.pid = None;
         parsed.name = Some("python*");
-        let outcome = run_with_sleeper(&parsed, &mut control, &mut sleeper);
+        let outcome = run(&parsed, &mut control);
         assert_eq!(outcome.code, exit::GENERAL);
         assert!(String::from_utf8(outcome.stderr)
             .expect("utf8")
@@ -833,17 +812,16 @@ mod tests {
     }
 
     #[test]
-    fn duration_sleeps_then_stops_monitoring_without_ending_the_target() {
+    fn duration_is_owned_by_the_daemon_and_cli_does_not_stop_the_session() {
         let mut control = FakeControl::default();
-        let mut sleeper = FakeSleeper::default();
         let mut parsed = args();
         parsed.duration = Some("10s");
-        let outcome = run_with_sleeper(&parsed, &mut control, &mut sleeper);
+        let outcome = run(&parsed, &mut control);
         assert_eq!(outcome.code, exit::OK);
-        assert_eq!(sleeper.0, vec![Duration::from_secs(10)]);
-        assert_eq!(control.stopped, vec!["s-attach".to_owned()]);
+        assert_eq!(control.attached[0].duration, Some(Duration::from_secs(10)));
+        assert!(control.stopped.is_empty());
         let text = String::from_utf8(outcome.stdout).expect("utf8");
-        assert!(text.contains("目标进程未被结束"), "{text}");
+        assert!(text.contains("后台会在 --duration 到时结束会话"), "{text}");
     }
 
     #[test]
@@ -856,8 +834,7 @@ mod tests {
             }),
             ..FakeControl::default()
         };
-        let mut sleeper = FakeSleeper::default();
-        let outcome = run_with_sleeper(&args(), &mut forbidden, &mut sleeper);
+        let outcome = run(&args(), &mut forbidden);
         assert_eq!(outcome.code, exit::PERMISSION);
         assert!(String::from_utf8(outcome.stderr)
             .expect("utf8")
@@ -869,8 +846,26 @@ mod tests {
             }),
             ..FakeControl::default()
         };
-        let outcome = run_with_sleeper(&args(), &mut unreachable, &mut sleeper);
+        let outcome = run(&args(), &mut unreachable);
         assert_eq!(outcome.code, exit::UNREACHABLE);
+    }
+
+    #[test]
+    fn attach_timeout_hides_the_transport_detail_and_explains_cleanup() {
+        let mut control = FakeControl {
+            attach_error: Some(ControlError::Transport {
+                detail: format!("{}{}", "daemon_timeout: read: operation ", "would block"),
+            }),
+            ..FakeControl::default()
+        };
+        let outcome = run(&args(), &mut control);
+        assert_eq!(outcome.code, exit::GENERAL);
+        let stderr = String::from_utf8(outcome.stderr).expect("utf8");
+        assert_eq!(
+            stderr,
+            "aw: 后台 12 秒没有回应，这次请求没有完成。这个会话已记为附着失败。\n"
+        );
+        assert!(!stderr.contains("daemon_timeout"));
     }
 
     /// Read one HTTP/1.1 request: headers, then `Content-Length` body bytes,
@@ -1019,7 +1014,7 @@ mod tests {
             .attach(&AttachRequest {
                 pid: 77,
                 until_exit: false,
-                duration: None,
+                duration: Some(Duration::from_secs(10)),
                 agent: Some("agent-b".to_owned()),
             })
             .expect("attach");
@@ -1034,7 +1029,9 @@ mod tests {
         assert!(seen[1].starts_with("POST /api/v1/sessions/s-run/adopt HTTP/1.1"));
         assert!(seen[1].contains(r#"{"pid":42,"ticket":"t-run"}"#));
         assert!(seen[2].starts_with("POST /api/v1/sessions HTTP/1.1"));
-        assert!(seen[2].contains(r#"{"agent":"agent-b","mode":"attach","pid":77}"#));
+        assert!(
+            seen[2].contains(r#"{"agent":"agent-b","duration_ms":10000,"mode":"attach","pid":77}"#)
+        );
         assert!(seen[3].starts_with("POST /api/v1/sessions/s-attach/stop HTTP/1.1"));
         assert!(seen[4].starts_with("PATCH /api/v1/sessions/s-attach HTTP/1.1"));
         assert!(seen[4].contains(r#"{"pinned":true}"#));

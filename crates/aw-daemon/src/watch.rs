@@ -35,6 +35,8 @@ pub(crate) enum WatchRequest {
     Start {
         target: Box<SampleTarget>,
         child: Option<Box<dyn ReleasedChild>>,
+        /// Daemon-owned deadline for `aw attach --duration`.
+        deadline_ns: Option<i64>,
     },
     /// Stop watching every root of this `sessions.id`. The row was already
     /// marked ended by the route.
@@ -51,6 +53,7 @@ pub(crate) struct PendingLaunch {
 struct Running {
     sampler: HostSampler,
     child: Option<Box<dyn ReleasedChild>>,
+    deadline_ns: Option<i64>,
 }
 
 /// Wrap the daemon's already-launched child in the interface-v2 ownership
@@ -133,6 +136,9 @@ impl Watches {
     pub(crate) fn tick(&mut self, shared: &Arc<Mutex<ApiState>>) {
         let (requests, expired) = match shared.lock() {
             Ok(mut state) => {
+                // A client may disappear after its 201 was committed. Retry
+                // its attach_failed close before beginning any new scans.
+                crate::api::watch_routes::retry_undelivered_sessions(&mut state);
                 let requests = std::mem::take(&mut state.watch_requests);
                 let now = now_ns();
                 let expired: Vec<i64> = state
@@ -153,12 +159,29 @@ impl Watches {
         }
         for request in requests {
             match request {
-                WatchRequest::Start { target, child } => self.start(*target, child),
+                WatchRequest::Start {
+                    target,
+                    child,
+                    deadline_ns,
+                } => {
+                    let public_id = target.public_id.clone();
+                    self.start(*target, child, deadline_ns);
+                    if let Ok(mut state) = shared.lock() {
+                        state.pending_scans.remove(&public_id);
+                    }
+                }
                 WatchRequest::Stop { db_id } => self.stop_session(db_id),
             }
         }
         let mut finished = Vec::new();
         for (index, running) in self.running.iter_mut().enumerate() {
+            if running
+                .deadline_ns
+                .is_some_and(|deadline| now_ns() >= deadline)
+            {
+                finished.push((index, None, "duration"));
+                continue;
+            }
             running.sampler.tick();
             let exit = running
                 .child
@@ -167,10 +190,10 @@ impl Watches {
             if exit.is_some_and(|outcome| outcome != ReapOutcome::StillRunning)
                 || !running.sampler.root_alive()
             {
-                finished.push((index, exit));
+                finished.push((index, exit, "exited"));
             }
         }
-        for (index, outcome) in finished.into_iter().rev() {
+        for (index, outcome, reason) in finished.into_iter().rev() {
             let mut running = self.running.remove(index);
             running.sampler.flush();
             running.sampler.stop();
@@ -194,7 +217,7 @@ impl Watches {
                 }
                 self.end(
                     db_id,
-                    "exited",
+                    reason,
                     match outcome {
                         Some(ReapOutcome::Exited(code)) => Some(code),
                         _ => None,
@@ -245,15 +268,54 @@ impl Watches {
         self.running.len()
     }
 
-    fn start(&mut self, target: SampleTarget, child: Option<Box<dyn ReleasedChild>>) {
+    fn start(
+        &mut self,
+        target: SampleTarget,
+        child: Option<Box<dyn ReleasedChild>>,
+        deadline_ns: Option<i64>,
+    ) {
         let db_id = target.db_id;
         let pid = target.root_pid;
+        // A large initial process scan can outlive a short requested duration.
+        // Do not begin recording after that daemon-owned deadline merely
+        // because the foreground loop reached this queued request late.
+        if deadline_ns.is_some_and(|deadline| now_ns() >= deadline) {
+            self.end(db_id, "duration", None);
+            if let Some(child) = child {
+                reap_launched_child(child);
+            }
+            return;
+        }
         let mut sampler = HostSampler::for_target(self.db_path.clone(), target);
+        let started_at = std::time::Instant::now();
         // Adopted root: its row first (from the `/adopt` identity), then poll.
         let hinted = sampler.persist_root_hint();
+        let root_hint_elapsed = started_at.elapsed();
+        let scan_started = std::time::Instant::now();
         if sampler.start() {
-            tracing::info!(session = db_id, pid, "watching process");
-            self.running.push(Running { sampler, child });
+            if deadline_ns.is_some_and(|deadline| now_ns() >= deadline) {
+                // The snapshot began before the deadline but finished after
+                // it.  Close in this same foreground turn rather than leave a
+                // recording session open until the next 250 ms tick.
+                sampler.stop();
+                self.end(db_id, "duration", None);
+                if let Some(child) = child {
+                    reap_launched_child(child);
+                }
+                return;
+            }
+            tracing::info!(
+                session = db_id,
+                pid,
+                root_hint_ms = root_hint_elapsed.as_millis(),
+                scan_ms = scan_started.elapsed().as_millis(),
+                "watching process"
+            );
+            self.running.push(Running {
+                sampler,
+                child,
+                deadline_ns,
+            });
         } else if hinted || sampler.persist_gone_root_hint() {
             // `/adopt` captured this identity while the CLI's pipe gate held
             // it. The target has already gone before the first poll, but the
@@ -396,7 +458,11 @@ pub(crate) type PendingLaunches = BTreeMap<String, PendingLaunch>;
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::Watches;
+    use std::sync::{Arc, Mutex};
+
+    use super::{now_ns, WatchRequest, Watches};
+    use crate::api::ApiState;
+    use crate::sample::SampleTarget;
 
     #[test]
     fn startup_recovery_marks_open_sessions_as_daemon_restart() {
@@ -451,6 +517,65 @@ mod tests {
             .expect("already ended session");
         assert_eq!(ended, (Some(4), Some("stopped".to_owned())));
 
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expired_attach_deadline_is_ended_by_the_daemon_before_a_scan() {
+        let dir = std::env::temp_dir().join(format!(
+            "aw-watch-deadline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp directory");
+        let db = dir.join("agentwatch.db");
+        let store = aw_store::Store::open(&db).expect("store");
+        store
+            .connection()
+            .execute(
+                "INSERT INTO sessions (id, public_id, mode, user_id, started_ns, platform, collectors) \
+                 VALUES (2, 's-deadline', 'attach', 'u', 1, 'linux', '[]')",
+                [],
+            )
+            .expect("seed session");
+        let target = SampleTarget {
+            db_id: 2,
+            public_id: "s-deadline".to_owned(),
+            name: None,
+            mode: "attach",
+            root_pid: 1,
+            user_id: "u".to_owned(),
+            argv_json: None,
+            agent: None,
+            write_session_row: false,
+            root_hint: None,
+            root_identity: None,
+        };
+        let state = Arc::new(Mutex::new(ApiState::default()));
+        state
+            .lock()
+            .expect("state")
+            .watch_requests
+            .push(WatchRequest::Start {
+                target: Box::new(target),
+                child: None,
+                deadline_ns: Some(now_ns().saturating_sub(1)),
+            });
+        Watches::new(db.clone()).tick(&state);
+        let ended: (Option<i64>, Option<String>) = store
+            .connection()
+            .query_row(
+                "SELECT ended_ns, end_reason FROM sessions WHERE id = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("ended session");
+        assert!(ended.0.is_some());
+        assert_eq!(ended.1.as_deref(), Some("duration"));
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

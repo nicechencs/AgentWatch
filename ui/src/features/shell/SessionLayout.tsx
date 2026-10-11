@@ -118,6 +118,7 @@ export function SessionLayout() {
         <span className="text-xs text-ink-faint">
           {isWallTime(data.started_ns) ? <RelTime ns={data.started_ns} /> : "–"}
         </span>
+        {data.scan_pending ? <span className="text-xs text-ink-faint">正在读取进程…</span> : null}
         <div className="ml-auto flex gap-2">
           {active ? (
             <button type="button" onClick={stop} disabled={stopping} className="rounded border border-line px-2 py-1 text-xs">

@@ -105,6 +105,8 @@ export interface Session {
   /** Present when the session was removed by the retention policy. */
   purged?: boolean | null;
   purged_reason?: string | null;
+  /** The daemon is still taking the initial asynchronous process snapshot. */
+  scan_pending?: boolean;
 }
 
 export interface SessionListQuery {

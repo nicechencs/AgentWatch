@@ -285,32 +285,6 @@ fn label_from_argv(argv: &[String]) -> String {
     }
 }
 
-/// The display label for an attach target: its executable base name, or the
-/// base name of `argv[0]` when the executable path is unavailable.
-fn attach_target_name(exe: Option<&str>, argv: Option<&[String]>) -> Option<String> {
-    fn base_name(path: &str) -> Option<&str> {
-        path.rsplit(['/', '\\'])
-            .find(|part| !part.trim().is_empty())
-    }
-
-    let name = exe.and_then(base_name).or_else(|| {
-        argv.and_then(|items| items.first())
-            .and_then(|arg0| base_name(arg0))
-    })?;
-    let redactor = aw_pipeline::Redactor::new(&aw_pipeline::config::RedactionConfig::default());
-    Some(redactor.scrub_text(name))
-}
-
-/// Read the target from the same process table used by the attach picker.
-/// The table is live, so a target that exits during creation may not have a
-/// label to retain.
-fn attach_target_name_for_pid(pid: u32) -> Option<String> {
-    let process = aw_collector_poll::host_process_table()?
-        .into_iter()
-        .find(|process| process.row.pid == pid)?;
-    attach_target_name(process.row.exe.as_deref(), process.row.argv.as_deref())
-}
-
 fn target_for(
     caller: &Caller,
     body: &Value,
@@ -318,13 +292,11 @@ fn target_for(
     root_pid: u32,
     argv: Option<&[String]>,
 ) -> Result<SampleTarget, ApiResponse> {
-    let name = opt_text(body, "name")
-        .or_else(|| argv.map(label_from_argv))
-        .or_else(|| {
-            (mode == "attach")
-                .then(|| attach_target_name_for_pid(root_pid))
-                .flatten()
-        });
+    // Attach used to read the entire host process table here merely to derive
+    // a display label.  That made the HTTP 201 wait for the initial scan
+    // (notably several seconds on a busy host).  The watcher performs that
+    // scan after this response; callers can supply a name if one is needed.
+    let name = opt_text(body, "name").or_else(|| argv.map(label_from_argv));
     Ok(SampleTarget {
         db_id: 0,
         public_id: new_public_id()?,
@@ -336,7 +308,31 @@ fn target_for(
         agent: opt_text(body, "agent"),
         write_session_row: true,
         root_hint: None,
+        root_identity: None,
     })
+}
+
+/// Convert the optional public duration into a daemon-owned absolute
+/// deadline.  The daemon, rather than the CLI connection, owns session end.
+fn duration_deadline(value: &Value) -> Result<Option<i64>, ApiResponse> {
+    let Some(milliseconds) = value.get("duration_ms") else {
+        return Ok(None);
+    };
+    let milliseconds = milliseconds
+        .as_u64()
+        .filter(|milliseconds| *milliseconds > 0)
+        .ok_or_else(|| {
+            error_response(
+                400,
+                "bad_argument",
+                "duration_ms: expected a positive integer",
+            )
+        })?;
+    let nanos = milliseconds
+        .checked_mul(1_000_000)
+        .and_then(|nanos| i64::try_from(nanos).ok())
+        .ok_or_else(|| error_response(400, "bad_argument", "duration_ms is too large"))?;
+    Ok(Some(now_ns().saturating_add(nanos)))
 }
 
 fn created(target: &SampleTarget, extra: Value) -> ApiResponse {
@@ -369,13 +365,23 @@ fn create_inner(
     match value.get("mode").and_then(Value::as_str) {
         Some("attach") => {
             let pid = pid_field(&value)?;
-            let _ = check_pid_owner(caller, pid, true)?;
+            let root_identity = check_pid_owner(caller, pid, true)?;
+            let deadline_ns = duration_deadline(&value)?;
             let mut target = target_for(caller, &value, "attach", pid, None)?;
+            // This is a single identity read, not the full process-table scan.
+            // It is retained so the session always identifies the root the
+            // daemon actually authorized, even if that root exits before the
+            // asynchronous sampler gets its first turn.
+            target.root_identity = Some(root_identity);
+            target.root_hint =
+                crate::sample::root_hint(pid, None).filter(|hint| hint.uid == root_identity);
             insert_session(&path, &mut target)?;
-            let response = created(&target, json!({}));
+            let response = created(&target, json!({ "scan_pending": true }));
+            state.pending_scans.insert(target.public_id.clone());
             state.watch_requests.push(WatchRequest::Start {
                 target: Box::new(target),
                 child: None,
+                deadline_ns,
             });
             Ok(response)
         }
@@ -490,6 +496,7 @@ fn create_inner(
                 let mut target = target_for(caller, &value, "launch", pid, Some(&argv))?;
                 target.root_hint =
                     crate::sample::root_hint(pid, argv0_basename(target.argv_json.as_deref()));
+                target.root_identity = target.root_hint.as_ref().map(|hint| hint.uid);
                 insert_session(&path, &mut target)?;
                 let response = created(&target, json!({}));
                 state.watch_requests.push(WatchRequest::Start {
@@ -500,6 +507,7 @@ fn create_inner(
                     child: Some(child.into_released()),
                     #[cfg(not(target_os = "macos"))]
                     child: Some(crate::watch::released_child(child)),
+                    deadline_ns: None,
                 });
                 Ok(response)
             }
@@ -634,6 +642,7 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
         };
         pending.target.root_pid = pid;
         pending.target.root_hint = Some(root_hint);
+        pending.target.root_identity = pending.target.root_hint.as_ref().map(|hint| hint.uid);
         // Write the root's row now, while `aw run` still holds it at the gate:
         // the foreground loop starts the sampler up to a poll later, and a
         // root that exits (and posts `/exit`) before then would otherwise be
@@ -650,6 +659,7 @@ pub(super) fn adopt(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u8
         state.watch_requests.push(WatchRequest::Start {
             target: Box::new(pending.target),
             child: None,
+            deadline_ns: None,
         });
         Ok(response)
     };
@@ -777,7 +787,9 @@ pub(super) fn attach(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u
                 "session is not open for attach",
             ));
         }
-        let _ = check_pid_owner(caller, pid, true)?;
+        let root_identity = check_pid_owner(caller, pid, true)?;
+        let root_hint =
+            crate::sample::root_hint(pid, None).filter(|hint| hint.uid == root_identity);
         let target = SampleTarget {
             db_id,
             public_id: sid.to_owned(),
@@ -788,11 +800,13 @@ pub(super) fn attach(state: &mut ApiState, caller: &Caller, sid: &str, body: &[u
             argv_json: None,
             agent,
             write_session_row: false,
-            root_hint: None,
+            root_hint,
+            root_identity: Some(root_identity),
         };
         state.watch_requests.push(WatchRequest::Start {
             target: Box::new(target),
             child: None,
+            deadline_ns: None,
         });
         Ok(ApiResponse::json(
             200,
@@ -822,6 +836,87 @@ pub(super) fn stopped(state: &mut ApiState, sid: &str) {
     ) {
         state.watch_requests.push(WatchRequest::Stop { db_id });
     }
+}
+
+/// The route created a session but its success response could not reach the
+/// peer (for example, the CLI was killed while SQLite was busy).  Do not leave
+/// that unacknowledged recording session open: mark it as an attach failure,
+/// remove its pending work, and stop an already-started sampler if necessary.
+///
+/// This is called only by transport writers after a failed write of a 201.
+pub(super) fn reply_delivery_failed(
+    state: &mut ApiState,
+    request: &super::routes::HttpRequest,
+    response: &ApiResponse,
+) {
+    if request.method != "POST"
+        || !matches!(
+            request.path.as_str(),
+            "/api/v1/sessions" | "/api/v1/sessions/run"
+        )
+        || response.status != 201
+    {
+        return;
+    }
+    let Some(public_id) = serde_json::from_slice::<Value>(&response.body)
+        .ok()
+        .and_then(|body| body.get("id").and_then(Value::as_str).map(str::to_owned))
+    else {
+        return;
+    };
+    state.pending_scans.remove(&public_id);
+    state.pending_launches.remove(&public_id);
+    // Prevent a queued scan from starting after the client has gone away.
+    state.watch_requests.retain(|pending| {
+        !matches!(pending, WatchRequest::Start { target, .. } if target.public_id == public_id)
+    });
+    state.undelivered_sessions.insert(public_id.clone());
+    close_undelivered_session(state, &public_id);
+}
+
+/// Retry every failed-delivery close that a temporary database lock delayed.
+/// The foreground watcher calls this every tick; daemon restart recovery is a
+/// final backstop if the daemon stops before a retry can succeed.
+pub(crate) fn retry_undelivered_sessions(state: &mut ApiState) {
+    let pending: Vec<String> = state.undelivered_sessions.iter().cloned().collect();
+    for public_id in pending {
+        close_undelivered_session(state, &public_id);
+    }
+}
+
+fn close_undelivered_session(state: &mut ApiState, public_id: &str) {
+    let Some(path) = state.query.db_path.clone() else {
+        return;
+    };
+    let Ok(conn) = aw_store::open_connection(&path) else {
+        tracing::error!("could not open database to close undelivered session reply");
+        return;
+    };
+    let db_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM sessions WHERE public_id = ?1",
+            [public_id],
+            |row| row.get(0),
+        )
+        .ok();
+    let Ok(updated) = conn.execute(
+        "UPDATE sessions SET ended_ns = ?1, end_reason = 'attach_failed' \
+         WHERE public_id = ?2 AND ended_ns IS NULL",
+        rusqlite::params![now_ns(), public_id],
+    ) else {
+        tracing::error!("could not close undelivered session reply");
+        return;
+    };
+    if updated == 1 {
+        if let Some(db_id) = db_id {
+            state.watch_requests.push(WatchRequest::Stop { db_id });
+        }
+        tracing::warn!(
+            "session creation reply was not delivered; recording ended as attach_failed"
+        );
+    }
+    // A row already ended is also resolved: do not retry it forever.
+    state.undelivered_sessions.remove(public_id);
 }
 
 /// A failed `spawn` as an error the UI can word. The code says what went
@@ -873,25 +968,6 @@ mod spawn_error_tests {
 }
 
 #[cfg(test)]
-mod attach_target_name_tests {
-    use super::attach_target_name;
-
-    #[test]
-    fn attach_name_prefers_the_executable_then_argv_zero() {
-        let argv = vec!["/usr/local/bin/from-argv".to_owned()];
-        assert_eq!(
-            attach_target_name(Some("/opt/tools/from-exe"), Some(&argv)),
-            Some("from-exe".to_owned())
-        );
-        assert_eq!(
-            attach_target_name(None, Some(&argv)),
-            Some("from-argv".to_owned())
-        );
-        assert_eq!(attach_target_name(None, None), None);
-    }
-}
-
-#[cfg(test)]
 #[allow(clippy::expect_used)]
 mod database_busy_tests {
     use std::sync::mpsc;
@@ -900,7 +976,7 @@ mod database_busy_tests {
 
     use rusqlite::{Transaction, TransactionBehavior};
 
-    use super::{insert_session, SampleTarget};
+    use super::{insert_session, reply_delivery_failed, ApiResponse, ApiState, SampleTarget};
 
     #[test]
     fn lock_past_busy_timeout_returns_db_busy_with_measured_wait() {
@@ -925,7 +1001,10 @@ mod database_busy_tests {
             )
             .expect("writer row");
             ready_tx.send(()).expect("signal writer");
-            thread::sleep(aw_store::BUSY_TIMEOUT + Duration::from_secs(1));
+            // Keep the lock well beyond the connection's busy timeout.  A
+            // one-second margin raced on macOS, where setup before the write
+            // can take long enough for the writer to release first.
+            thread::sleep(aw_store::BUSY_TIMEOUT + Duration::from_secs(3));
             tx.commit().expect("writer commit");
         });
         ready_rx.recv().expect("writer ready");
@@ -941,6 +1020,7 @@ mod database_busy_tests {
             agent: None,
             write_session_row: true,
             root_hint: None,
+            root_identity: None,
         };
         let response = insert_session(&path, &mut target).expect_err("busy response");
         assert_eq!(response.status, 503);
@@ -959,6 +1039,55 @@ mod database_busy_tests {
             .is_some_and(|detail| detail.contains("database is locked")
                 || detail.contains("database is busy")));
         writer.join().expect("writer thread");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn undelivered_creation_reply_ends_the_new_session_as_attach_failed() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("aw-undelivered-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let path = dir.join("agentwatch.db");
+        let mut state = ApiState::default();
+        state.query = super::super::StoreQuery::open_path(path.clone());
+        let mut target = SampleTarget {
+            db_id: 0,
+            public_id: "s-undelivered".to_owned(),
+            name: None,
+            mode: "attach",
+            root_pid: 1,
+            user_id: "test".to_owned(),
+            argv_json: None,
+            agent: None,
+            write_session_row: true,
+            root_hint: None,
+            root_identity: None,
+        };
+        insert_session(&path, &mut target).expect("session row");
+        state.pending_scans.insert(target.public_id.clone());
+        let request = super::super::routes::HttpRequest {
+            method: "POST".to_owned(),
+            path: "/api/v1/sessions".to_owned(),
+            ..super::super::routes::HttpRequest::default()
+        };
+        let response = ApiResponse::json(201, &serde_json::json!({ "id": target.public_id }));
+        reply_delivery_failed(&mut state, &request, &response);
+
+        let conn = aw_store::open_connection(&path).expect("connection");
+        let ended: (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT ended_ns, end_reason FROM sessions WHERE public_id = 's-undelivered'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("ended session");
+        assert!(ended.0.is_some());
+        assert_eq!(ended.1.as_deref(), Some("attach_failed"));
+        assert!(state.pending_scans.is_empty());
+        assert!(state.undelivered_sessions.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

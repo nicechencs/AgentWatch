@@ -94,23 +94,23 @@ pub(crate) enum Command {
         #[arg(long, help = "要附着的进程号")]
         pid: Option<u32>,
         /// 进程名 pattern
-        #[arg(long, help = "不跟随子进程")]
+        #[arg(long, help = "进程名 pattern")]
         name: Option<String>,
-        #[arg(long, help = "不纳入已有子进程")]
+        #[arg(long, help = "不跟随子进程")]
         no_follow_children: bool,
-        #[arg(long, help = "移入 cgroup")]
+        #[arg(long, help = "不纳入已有子进程")]
         no_existing_children: bool,
-        #[arg(long, help = "智能体类型")]
+        #[arg(long, help = "移入 cgroup")]
         move_to_cgroup: bool,
-        #[arg(long, help = "固定会话，不参与自动清理")]
+        #[arg(long, help = "智能体类型")]
         agent: Option<String>,
-        #[arg(long, help = "监控组（本版本未接入）")]
+        #[arg(long, help = "固定会话，不参与自动清理")]
         pin: bool,
-        #[arg(long, help = "直到目标进程退出")]
+        #[arg(long, help = "监控组（本版本未接入）")]
         group: Option<String>,
-        #[arg(long, help = "记录时长，例如 10m")]
+        #[arg(long, help = "直到目标进程退出")]
         until_exit: bool,
-        #[arg(long)]
+        #[arg(long, help = "记录时长，例如 10m")]
         duration: Option<String>,
     },
     /// 停止记录（程序继续运行）

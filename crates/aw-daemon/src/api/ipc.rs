@@ -458,7 +458,15 @@ mod unix {
                 "request"
             );
         }
-        write_response(&mut stream, &response)
+        if let Err(err) = write_response(&mut stream, &response) {
+            let mut guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            super::super::watch_routes::reply_delivery_failed(&mut guard, &request, &response);
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
@@ -652,11 +660,24 @@ mod pipe {
         };
         // Routes are synchronous (SQLite); off the runtime thread so one slow
         // request (a large export) does not stall every other pipe client.
+        let reply_state = Arc::clone(&state);
+        let delivery_request = request.clone();
         let response =
-            tokio::task::spawn_blocking(move || answer(&state, &control, &request, &caller))
+            tokio::task::spawn_blocking(move || answer(&reply_state, &control, &request, &caller))
                 .await
                 .unwrap_or_else(|_| error_response(500, "internal", "request handler failed"));
-        write_all(&pipe, &response_bytes(&response)).await?;
+        if let Err(err) = write_all(&pipe, &response_bytes(&response)).await {
+            let mut guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            super::super::watch_routes::reply_delivery_failed(
+                &mut guard,
+                &delivery_request,
+                &response,
+            );
+            return Err(err);
+        }
         finish(&pipe).await
     }
 

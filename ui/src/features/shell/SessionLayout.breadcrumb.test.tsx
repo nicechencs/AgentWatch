@@ -46,4 +46,19 @@ describe("session breadcrumb", () => {
     expect(link?.getAttribute("href")).toBe("/");
     expect(container.textContent).toContain("sleep 60");
   });
+
+  it("shows that the initial process scan is pending", async () => {
+    const { SessionLayout } = await import("@/features/shell/SessionLayout");
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(
+      ["session", "s-1"],
+      toSession({ id: "s-1", session_id: 1, mode: "attach", started_ns: 1, ended_ns: null, scan_pending: true, collectors: [] }),
+    );
+    const { container } = render(
+      <QueryClientProvider client={client}>
+        <SessionLayout />
+      </QueryClientProvider>,
+    );
+    expect(container.textContent).toContain("正在读取进程…");
+  });
 });

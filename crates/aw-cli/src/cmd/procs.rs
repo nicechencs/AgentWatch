@@ -36,9 +36,14 @@ pub(crate) fn run(
     }
     let mode = OutputMode::from_json_flag(json);
     match source.procs(session, tree, filter) {
-        Ok(nodes) => {
-            let table = render::procs_table(&nodes, tree);
-            let doc = render::procs_json(&nodes, tree);
+        Ok(processes) if processes.scan_pending => Ok(Outcome {
+            code: exit::OK,
+            stdout: "正在读取进程…\n".as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }),
+        Ok(processes) => {
+            let table = render::procs_table(&processes.nodes, tree);
+            let doc = render::procs_json(&processes.nodes, tree);
             write_ok(mode, &table, &doc)
         }
         Err(err) => Ok(query_outcome(err, json)),
@@ -105,6 +110,25 @@ mod tests {
         assert_eq!(
             String::from_utf8(outcome.stderr).expect("utf8"),
             "aw: 找不到会话「s-someone-else」\n"
+        );
+    }
+
+    #[test]
+    fn pending_initial_scan_is_not_rendered_as_zero_processes() {
+        let paths = Rc::new(RefCell::new(Vec::new()));
+        let script = Script {
+            paths,
+            replies: RefCell::new(vec![(
+                200,
+                br#"{"processes":[],"scan_pending":true}"#.to_vec(),
+            )]),
+        };
+        let source = HttpQuerySource::with_transport(endpoint(), script);
+        let outcome = run("s-pending", false, None, false, &source).expect("procs");
+        assert_eq!(outcome.code, exit::OK);
+        assert_eq!(
+            String::from_utf8(outcome.stdout).expect("utf8"),
+            "正在读取进程…\n"
         );
     }
 }

@@ -201,6 +201,13 @@ pub struct ApiState {
     pub watch_requests: Vec<crate::watch::WatchRequest>,
     /// `POST /sessions/run` tickets waiting for `/adopt`, by public id.
     pub pending_launches: crate::watch::PendingLaunches,
+    /// Attach sessions whose first full process-tree scan has not completed.
+    /// This is runtime state rather than a database default: daemon recovery
+    /// ends open sessions, so no stale "pending" value can survive a restart.
+    pub pending_scans: std::collections::BTreeSet<String>,
+    /// A created-session reply that did not reach its peer and still needs its
+    /// `attach_failed` close retried after a transient database lock.
+    pub undelivered_sessions: std::collections::BTreeSet<String>,
     /// Collector state written by the foreground loop; read by `/doctor`.
     pub collector_runtime: crate::collector_state::CollectorRuntime,
 }
@@ -224,6 +231,8 @@ impl Default for ApiState {
             watch_requests: Vec::new(),
             collector_runtime: crate::collector_state::CollectorRuntime::default(),
             pending_launches: crate::watch::PendingLaunches::new(),
+            pending_scans: std::collections::BTreeSet::new(),
+            undelivered_sessions: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -1464,7 +1473,10 @@ fn session_sub(
             Ok(None) => return not_found_session(),
             Err(err) => return from_backend(err),
         };
-        return map_summary(state.query.session_detail(&owner, &sid));
+        return with_scan_pending(
+            map_summary(state.query.session_detail(&owner, &sid)),
+            state.pending_scans.contains(&sid),
+        );
     }
     if tail.is_empty() && method == "DELETE" {
         let requested_owner = query_value(query, "owner");
@@ -1688,6 +1700,25 @@ fn map_summary(result: Result<Option<aw_store::SessionSummary>, QueryBackendErro
         ),
         Err(err) => from_backend(err),
     }
+}
+
+/// Mark a session response while the watcher has not yet completed its first
+/// process-table scan.  This is deliberately ephemeral state: after a daemon
+/// restart the recovery path closes open sessions rather than claiming a scan
+/// is still in progress.
+fn with_scan_pending(mut response: ApiResponse, pending: bool) -> ApiResponse {
+    if !pending || response.status != 200 {
+        return response;
+    }
+    let Ok(mut body) = serde_json::from_slice::<Value>(&response.body) else {
+        return response;
+    };
+    let Some(object) = body.as_object_mut() else {
+        return response;
+    };
+    object.insert("scan_pending".to_owned(), Value::Bool(true));
+    response.body = serde_json::to_vec(&body).unwrap_or(response.body);
+    response
 }
 
 /// Stored session rows use [`std::env::consts::OS`] when they are created.
@@ -2153,7 +2184,10 @@ fn session_query_route(
     // Memory stub sessions are not in SQLite. Query endpoints 404 them the same
     // way a hidden id does, except `/live`, which is in-process.
     let response = match (method, tail) {
-        ("GET", "summary") => map_summary(state.query.session_summary(user, sid)),
+        ("GET", "summary") => with_scan_pending(
+            map_summary(state.query.session_summary(user, sid)),
+            state.pending_scans.contains(sid),
+        ),
         ("GET", "timeline") => match state.query.timeline(user, sid, &parsed) {
             Ok(None) => not_found_session(),
             Ok(Some(page)) => {
@@ -2164,7 +2198,10 @@ fn session_query_route(
             Err(err) => from_backend(err),
         },
         ("GET", "timeline/histogram") => map_opt(state.query.histogram(user, sid, &parsed)),
-        ("GET", "processes") => map_opt(state.query.processes(user, sid, &parsed)),
+        ("GET", "processes") => with_scan_pending(
+            map_opt(state.query.processes(user, sid, &parsed)),
+            state.pending_scans.contains(sid),
+        ),
         ("GET", "flows") => map_opt(state.query.flows(user, sid, &parsed)),
         ("GET", "traffic") => map_opt(state.query.traffic(user, sid, &parsed)),
         ("GET", "dns") => map_opt(state.query.dns(user, sid, &parsed)),

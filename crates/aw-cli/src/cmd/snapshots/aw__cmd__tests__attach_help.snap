@@ -1,0 +1,28 @@
+---
+source: crates/aw-cli/src/cmd/mod.rs
+assertion_line: 1531
+expression: attach_help
+---
+附着到已有进程
+
+Usage: aw attach [OPTIONS]
+
+Options:
+      --json                  机器可读的 JSON 输出
+      --pid <PID>             要附着的进程号
+      --name <NAME>           进程名 pattern
+      --socket <SOCKET>       Unix socket 或 Windows 命名管道
+      --http <HTTP>           改用回环 HTTP。只接受 http://127.0.0.1:<port> 或 http://localhost:<port>
+      --no-follow-children    不跟随子进程
+      --no-existing-children  不纳入已有子进程
+      --token <TOKEN>         HTTP Bearer 令牌，也可用环境变量 AW_TOKEN。不会写入日志
+      --lang <LANG>           语言：zh 或 en
+      --move-to-cgroup        移入 cgroup
+      --agent <AGENT>         智能体类型
+  -q, --quiet                 安静模式
+      --pin                   固定会话，不参与自动清理
+  -v, --verbose...            更详细的日志，可重复
+      --group <GROUP>         监控组（本版本未接入）
+  -h, --help                  显示帮助
+      --until-exit            直到目标进程退出
+      --duration <DURATION>   记录时长，例如 10m

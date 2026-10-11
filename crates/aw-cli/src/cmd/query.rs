@@ -213,6 +213,17 @@ pub(crate) struct ProcItem {
     pub children: Vec<ProcItem>,
 }
 
+/// A process endpoint reply.  While the daemon is taking the initial
+/// asynchronous snapshot, an empty `nodes` list means "not ready", not
+/// "there were zero processes".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessList {
+    /// Recorded process rows.
+    pub nodes: Vec<ProcItem>,
+    /// The initial full process-tree scan is still running.
+    pub scan_pending: bool,
+}
+
 /// One flow, or one group of flows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FlowItem {
@@ -345,12 +356,8 @@ pub(crate) trait QuerySource {
     /// # Errors
     ///
     /// [`QueryError::NotFound`].
-    fn procs(
-        &self,
-        key: &str,
-        tree: bool,
-        filter: Option<&str>,
-    ) -> Result<Vec<ProcItem>, QueryError>;
+    fn procs(&self, key: &str, tree: bool, filter: Option<&str>)
+        -> Result<ProcessList, QueryError>;
 
     /// Flows, already grouped and sorted by the source.
     ///
@@ -852,7 +859,7 @@ impl QuerySource for UnavailableSource {
         })
     }
 
-    fn procs(&self, _: &str, _: bool, _: Option<&str>) -> Result<Vec<ProcItem>, QueryError> {
+    fn procs(&self, _: &str, _: bool, _: Option<&str>) -> Result<ProcessList, QueryError> {
         Err(QueryError::Unavailable {
             detail: UNAVAILABLE.to_owned(),
         })
@@ -1145,7 +1152,7 @@ impl QuerySource for MemorySource {
         key: &str,
         tree: bool,
         filter: Option<&str>,
-    ) -> Result<Vec<ProcItem>, QueryError> {
+    ) -> Result<ProcessList, QueryError> {
         let index = self.find(key)?;
         let roots = self.sessions[index].procs.clone();
         if filter.is_some_and(|text| !text.trim().is_empty()) {
@@ -1162,18 +1169,30 @@ impl QuerySource for MemorySource {
             let mut roots = roots;
             retain(&mut roots, &needle);
             if tree {
-                return Ok(roots);
+                return Ok(ProcessList {
+                    nodes: roots,
+                    scan_pending: false,
+                });
             }
             let mut flat = Vec::new();
             flatten_procs(&roots, &mut flat);
-            return Ok(flat);
+            return Ok(ProcessList {
+                nodes: flat,
+                scan_pending: false,
+            });
         }
         if tree {
-            Ok(roots)
+            Ok(ProcessList {
+                nodes: roots,
+                scan_pending: false,
+            })
         } else {
             let mut flat = Vec::new();
             flatten_procs(&roots, &mut flat);
-            Ok(flat)
+            Ok(ProcessList {
+                nodes: flat,
+                scan_pending: false,
+            })
         }
     }
 

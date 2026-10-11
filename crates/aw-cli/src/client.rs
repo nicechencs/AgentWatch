@@ -317,7 +317,10 @@ impl LoopbackHttp {
         };
         Ok(Self {
             target,
-            timeout: Duration::from_secs(5),
+            // Store writes may wait for SQLite's 8 second busy timeout.  Keep
+            // the client deadline beyond that wait so a successful daemon
+            // reply is not discarded as a client-side timeout.
+            timeout: Duration::from_secs(12),
         })
     }
 }

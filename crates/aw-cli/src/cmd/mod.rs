@@ -1525,6 +1525,10 @@ mod tests {
         let run_text = text(&run_help.stdout);
         assert!(run_text.contains("只交给被启动的程序，不发给后台"));
         assert!(run_text.contains("关闭脱敏（本版本未接入）"));
+        let attach = run(&["attach", "--help"], None, &mut http);
+        let attach_help = text(&attach.stdout);
+        assert_eq!(attach.code, exit::OK, "{attach_help}");
+        insta::assert_snapshot!("attach_help", attach_help);
         let purge = run(&["db", "purge", "--help"], None, &mut http);
         assert!(text(&purge.stdout).contains("不再确认，直接删除（无法恢复）"));
 

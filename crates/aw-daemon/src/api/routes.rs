@@ -1857,27 +1857,87 @@ pub fn error_response(status: u16, code: &str, message: &str) -> ApiResponse {
     )
 }
 
+/// The database was written by a newer AgentWatch. Reads are allowed, but a
+/// write must never make an older binary silently alter the newer schema.
+pub(crate) fn database_read_only_newer_response() -> ApiResponse {
+    ApiResponse::json(
+        409,
+        &json!({
+            "error": {
+                "code": "db_read_only_newer",
+                "message": "这份记录是更新版本的 AgentWatch 写的，现在只能查看，不能新建或修改。请升级 AgentWatch。",
+            }
+        }),
+    )
+}
+
+fn database_busy_json(waited_seconds: Option<u64>, detail: Option<&str>) -> ApiResponse {
+    if let (Some(waited_seconds), Some(detail)) = (waited_seconds, detail) {
+        tracing::warn!(waited_seconds, sqlite_detail = %detail, "session database remained busy");
+        let message = format!(
+            "会话数据库正忙（后台在写入），等了 {waited_seconds} 秒还是没轮到，请稍后再试。"
+        );
+        return ApiResponse::json(
+            503,
+            &json!({
+                "error": {
+                    "code": "db_busy",
+                    "message": message,
+                    "waited_seconds": waited_seconds,
+                    "detail": detail,
+                }
+            }),
+        );
+    }
+    ApiResponse::json(
+        503,
+        &json!({
+            "error": {
+                "code": "db_busy",
+                "message": "会话数据库正忙（后台在写入），请稍后再试。",
+            }
+        }),
+    )
+}
+
+pub(crate) fn legacy_wal_conversion_response(path: &std::path::Path, reason: &str) -> ApiResponse {
+    ApiResponse::json(
+        503,
+        &json!({
+            "error": {
+                "code": "db_legacy_wal_conversion",
+                "message": format!(
+                    "没法转换旧版的会话数据库，后台没有启动。原因：{reason}。可以先备份「{}」再删掉它，后台会新建一份。",
+                    path.display()
+                ),
+            }
+        }),
+    )
+}
+
+/// Map a direct `aw-store` open/write failure without losing the two database
+/// states that clients can act on. Most query paths use `from_backend`; the
+/// session recorder also opens the store directly.
+pub(crate) fn database_store_response(err: &aw_store::StoreError, fallback: &str) -> ApiResponse {
+    if let Some(response) = database_busy_response(err) {
+        return response;
+    }
+    match err {
+        aw_store::StoreError::ReadOnly => database_read_only_newer_response(),
+        aw_store::StoreError::LegacyWalConversion { path, reason } => {
+            legacy_wal_conversion_response(path, reason)
+        }
+        _ => error_response(500, "store", fallback),
+    }
+}
+
 /// A measured SQLite lock timeout. The human message deliberately says only
 /// that the service is writing; SQLite's English diagnostic stays in a log and
 /// the structured JSON `detail`, never in a localized UI/CLI sentence.
 pub(crate) fn database_busy_response(err: &aw_store::StoreError) -> Option<ApiResponse> {
     let waited_seconds = err.busy_waited_seconds()?;
     let detail = err.busy_detail().unwrap_or_default();
-    tracing::warn!(waited_seconds, sqlite_detail = %detail, "session database remained busy");
-    let message = format!(
-        "The session database is busy (the service is writing). Waited {waited_seconds} s and still couldn't get in; try again later."
-    );
-    Some(ApiResponse::json(
-        503,
-        &json!({
-            "error": {
-                "code": "db_busy",
-                "message": message,
-                "waited_seconds": waited_seconds,
-                "detail": detail,
-            }
-        }),
-    ))
+    Some(database_busy_json(Some(waited_seconds), Some(&detail)))
 }
 
 fn error_at(status: u16, code: &str, message: &str, offset: Option<usize>) -> ApiResponse {
@@ -1906,22 +1966,10 @@ fn from_backend(err: QueryBackendError) -> ApiResponse {
         QueryBackendError::Busy {
             waited_seconds,
             detail,
-        } => {
-            tracing::warn!(waited_seconds, sqlite_detail = %detail, "session database remained busy");
-            let message = format!(
-                "The session database is busy (the service is writing). Waited {waited_seconds} s and still couldn't get in; try again later."
-            );
-            ApiResponse::json(
-                503,
-                &json!({
-                    "error": {
-                        "code": "db_busy",
-                        "message": message,
-                        "waited_seconds": waited_seconds,
-                        "detail": detail,
-                    }
-                }),
-            )
+        } => database_busy_json(Some(waited_seconds), Some(&detail)),
+        QueryBackendError::ReadOnlyNewer => database_read_only_newer_response(),
+        QueryBackendError::LegacyWalConversion { path, reason } => {
+            legacy_wal_conversion_response(&path, &reason)
         }
         QueryBackendError::Store(message) => error_response(500, "store", &message),
     }
@@ -2465,6 +2513,7 @@ fn doctor(state: &ApiState) -> ApiResponse {
     // means the check failed, not "not privileged".
     let runtime = &state.collector_runtime;
     let caps = poll_capabilities();
+    let database_read_only = state.query.database_read_only().ok().flatten();
     ApiResponse::json(
         200,
         &json!({
@@ -2477,6 +2526,9 @@ fn doctor(state: &ApiState) -> ApiResponse {
                 "version": aw_platform::os_version(),
                 "privileged": crate::privilege::current(),
                 "privileged_note": "poll collector only in this build; eBPF, ETW, and eslogger are not attached even when privileged",
+            },
+            "database": {
+                "read_only": database_read_only,
             },
         }),
     )
@@ -2679,13 +2731,47 @@ fn forbidden() -> ApiResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch, not_implemented, ApiState, HttpBind, HttpRequest};
+    use super::{
+        database_busy_json, database_read_only_newer_response, dispatch, not_implemented, ApiState,
+        HttpBind, HttpRequest,
+    };
     use crate::api::auth::{TicketStore, UI_TICKET_TTL};
     use crate::api::pipe_dacl_configured;
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::net::TcpListener;
     use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn database_errors_use_localized_messages_and_keep_elapsed_structured() {
+        let unknown = database_busy_json(None, None);
+        let unknown_body: Value = serde_json::from_slice(&unknown.body).expect("busy JSON");
+        assert_eq!(unknown_body["error"]["code"], "db_busy");
+        assert_eq!(
+            unknown_body["error"]["message"],
+            "会话数据库正忙（后台在写入），请稍后再试。"
+        );
+        assert!(unknown_body["error"].get("waited_seconds").is_none());
+
+        let measured = database_busy_json(Some(3), Some("test: database is locked"));
+        let measured_body: Value = serde_json::from_slice(&measured.body).expect("busy JSON");
+        assert_eq!(measured_body["error"]["waited_seconds"], 3);
+        assert_eq!(
+            measured_body["error"]["message"],
+            "会话数据库正忙（后台在写入），等了 3 秒还是没轮到，请稍后再试。"
+        );
+
+        let read_only = database_read_only_newer_response();
+        let read_only_body: Value =
+            serde_json::from_slice(&read_only.body).expect("read-only JSON");
+        assert_eq!(read_only.status, 409);
+        assert_eq!(read_only_body["error"]["code"], "db_read_only_newer");
+        assert_eq!(
+            read_only_body["error"]["message"],
+            "这份记录是更新版本的 AgentWatch 写的，现在只能查看，不能新建或修改。请升级 AgentWatch。"
+        );
+    }
 
     fn req(
         method: &str,

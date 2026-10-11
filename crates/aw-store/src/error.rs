@@ -53,11 +53,16 @@ pub enum StoreError {
     },
     /// The caller asked for a write on a database this binary opened read-only.
     ReadOnly,
-    /// An existing database was not already using WAL. Reopening it must not
-    /// change journal mode because that needs a lock shared with live writers.
-    UnexpectedJournalMode {
-        /// Value returned by `PRAGMA journal_mode`.
-        found: String,
+    /// An old database could not be converted to WAL before the daemon started.
+    ///
+    /// This stays separate from a normal SQLite write error so the daemon can
+    /// give the operator the backup-and-recreate instruction rather than an
+    /// English 500 response.
+    LegacyWalConversion {
+        /// Database the daemon declined to start on.
+        path: PathBuf,
+        /// SQLite's diagnostic or the mode SQLite left in place.
+        reason: String,
     },
 }
 
@@ -83,8 +88,12 @@ impl fmt::Display for StoreError {
                 )
             }
             Self::ReadOnly => write!(f, "database was opened read-only"),
-            Self::UnexpectedJournalMode { found } => {
-                write!(f, "database journal_mode is {found}, expected wal")
+            Self::LegacyWalConversion { path, reason } => {
+                write!(
+                    f,
+                    "could not convert legacy database {} to wal: {reason}",
+                    path.display()
+                )
             }
         }
     }
@@ -99,7 +108,7 @@ impl std::error::Error for StoreError {
             Self::BadSchemaVersion { .. }
             | Self::VersionMismatch { .. }
             | Self::ReadOnly
-            | Self::UnexpectedJournalMode { .. } => None,
+            | Self::LegacyWalConversion { .. } => None,
         }
     }
 }
@@ -148,6 +157,16 @@ impl StoreError {
     pub fn busy_detail(&self) -> Option<String> {
         match self {
             Self::Busy { op, source, .. } => Some(format!("{op}: {source}")),
+            _ => None,
+        }
+    }
+
+    /// Legacy journal conversion detail for the daemon's dedicated startup
+    /// error. The path is returned separately so callers never parse text.
+    #[must_use]
+    pub fn legacy_wal_conversion(&self) -> Option<(&std::path::Path, &str)> {
+        match self {
+            Self::LegacyWalConversion { path, reason } => Some((path, reason)),
             _ => None,
         }
     }

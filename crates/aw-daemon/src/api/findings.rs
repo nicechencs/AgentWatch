@@ -144,6 +144,9 @@ pub(crate) fn patch_finding(
         Err(response) => return response,
     };
     let (store, session_id) = opened;
+    if store.is_read_only() {
+        return super::routes::database_read_only_newer_response();
+    }
     let now_ns = unix_ns();
     // A null body clears the mark and who/when. A set records this caller.
     let (mark, by, at): (Option<&str>, Option<&str>, Option<i64>) = match user_state.as_deref() {

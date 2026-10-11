@@ -113,12 +113,19 @@ impl Watches {
 
     /// Close sessions a previous daemon run left open (not the daemon sample).
     pub(crate) fn recover(&self) {
-        if let Ok(conn) = aw_store::open_connection(&self.db_path) {
-            let _ = conn.execute(
-                "UPDATE sessions SET ended_ns = ?1, end_reason = 'daemon_restart' \
-                 WHERE ended_ns IS NULL AND id <> 1",
-                [now_ns()],
-            );
+        match aw_store::open_connection(&self.db_path) {
+            Ok(conn) => {
+                if let Err(err) = conn.execute(
+                    "UPDATE sessions SET ended_ns = ?1, end_reason = 'daemon_restart' \
+                     WHERE ended_ns IS NULL AND id <> 1",
+                    [now_ns()],
+                ) {
+                    tracing::error!(error = %err, "could not mark interrupted sessions after daemon restart");
+                }
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "could not open the session database for restart recovery");
+            }
         }
     }
 
@@ -287,14 +294,20 @@ impl Watches {
     }
 
     fn end(&self, db_id: i64, reason: &str, exit_code: Option<i32>) {
-        let Ok(conn) = aw_store::open_connection(&self.db_path) else {
-            return;
+        let conn = match aw_store::open_connection(&self.db_path) {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::error!(session = db_id, error = %err, "could not open the session database to end recording");
+                return;
+            }
         };
-        let _ = conn.execute(
+        if let Err(err) = conn.execute(
             "UPDATE sessions SET ended_ns = ?1, end_reason = ?2, \
              exit_code = COALESCE(?3, exit_code) WHERE id = ?4 AND ended_ns IS NULL",
             rusqlite::params![now_ns(), reason, exit_code, db_id],
-        );
+        ) {
+            tracing::error!(session = db_id, error = %err, "could not end recording session");
+        }
     }
 }
 
@@ -327,8 +340,12 @@ pub(crate) fn record_root_exit(
     root: &crate::sample::RootHint,
     code: i32,
 ) {
-    let Ok(conn) = aw_store::open_connection(db_path) else {
-        return;
+    let conn = match aw_store::open_connection(db_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            tracing::error!(session = db_id, error = %err, "could not open the session database to record root exit");
+            return;
+        }
     };
     let code = i64::from(code);
     let root_uid = i64::from_ne_bytes(root.uid.0.to_ne_bytes());
@@ -339,7 +356,7 @@ pub(crate) fn record_root_exit(
         );
         return;
     };
-    let Ok(updated) = conn.execute(
+    let updated = match conn.execute(
         "UPDATE processes SET \
             exit_code = COALESCE(exit_code, ?1), \
             exit_ns = COALESCE(exit_ns, ?2) \
@@ -353,8 +370,12 @@ pub(crate) fn record_root_exit(
             i64::from(root.pid),
             start_ns
         ],
-    ) else {
-        return;
+    ) {
+        Ok(updated) => updated,
+        Err(err) => {
+            tracing::error!(session = db_id, error = %err, "could not record root exit");
+            return;
+        }
     };
     if updated == 0 {
         tracing::warn!(session = db_id, "root exit did not update a process row");

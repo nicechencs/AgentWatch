@@ -43,7 +43,7 @@ use crate::error::StoreError;
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Highest schema version understood by this binary, independently of bootstrap.
-const SUPPORTED_SCHEMA_VERSION: u32 = INTER_AGENT_SCHEMA_VERSION;
+const SUPPORTED_SCHEMA_VERSION: u32 = REPLAY_SCHEMA_VERSION;
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 
@@ -131,6 +131,17 @@ pub const MIGRATION_0010: &str = include_str!("../migrations/0010_inter_agent.sq
 /// Version after [`MIGRATION_0010`].
 pub const INTER_AGENT_SCHEMA_VERSION: u32 = 10;
 
+/// Durable replay markers for bounded writer transactions.
+///
+/// Unlike the feature-specific tables, this table is installed for runtime
+/// writers so retrying a delivery after one of its 500-row chunks committed is
+/// exactly-once at the row level.  The marker is a deterministic hash of the
+/// already-redacted row content, not a random write-time token.
+pub const MIGRATION_0011: &str = include_str!("../migrations/0011_replay_writes.sql");
+
+/// Version after [`MIGRATION_0011`].
+pub const REPLAY_SCHEMA_VERSION: u32 = 11;
+
 /// Apply [`http_schema_scripts`] when `http` is not there yet.
 ///
 /// `file_access` must already exist: 0007's view reads it. A database that has
@@ -146,15 +157,18 @@ pub fn apply_http_schema(store: &mut Store) -> Result<(), StoreError> {
     if table_present(conn, "http", "probe_http")? {
         return Ok(());
     }
-    if !table_present(conn, "file_access", "probe_file_access")? {
-        return Err(StoreError::VersionMismatch {
-            expected: FILE_SCHEMA_VERSION,
-            found: Some(store.schema_version()?),
-        });
-    }
     let tx =
         immediate_transaction(conn).map_err(|err| StoreError::sqlite("begin_http_schema", err))?;
     let applied = (|| {
+        if table_present(&tx, "http", "probe_http_locked")? {
+            return Ok(());
+        }
+        if !table_present(&tx, "file_access", "probe_file_access_locked")? {
+            return Err(StoreError::VersionMismatch {
+                expected: FILE_SCHEMA_VERSION,
+                found: Some(read_version(&tx)?),
+            });
+        }
         for (version, sql) in http_schema_scripts() {
             tx.execute_batch(sql)
                 .map_err(|err| StoreError::sqlite("migrate_http_schema", err))?;
@@ -197,22 +211,27 @@ pub fn apply_proxy_schema(store: &mut Store) -> Result<(), StoreError> {
         return Err(StoreError::ReadOnly);
     }
     let conn = store.connection();
-    if !table_present(conn, "http", "probe_http_proxy")? {
-        return Err(StoreError::VersionMismatch {
-            expected: HTTP_SCHEMA_VERSION,
-            found: Some(store.schema_version()?),
-        });
-    }
-    let need_field = !column_present(conn, "http", "field_evidence", "probe_http_field_evidence")?;
-    let need_na = !column_present(conn, "http", "na_reason", "probe_http_na_reason")?;
-    if !need_field && !need_na {
-        return Ok(());
-    }
     let field_sql = alter_statement(MIGRATION_0008, "field_evidence");
     let na_sql = alter_statement(MIGRATION_0008, "na_reason");
     let tx =
         immediate_transaction(conn).map_err(|err| StoreError::sqlite("begin_proxy_schema", err))?;
     let applied = (|| {
+        if !table_present(&tx, "http", "probe_http_proxy_locked")? {
+            return Err(StoreError::VersionMismatch {
+                expected: HTTP_SCHEMA_VERSION,
+                found: Some(read_version(&tx)?),
+            });
+        }
+        let need_field = !column_present(
+            &tx,
+            "http",
+            "field_evidence",
+            "probe_http_field_evidence_locked",
+        )?;
+        let need_na = !column_present(&tx, "http", "na_reason", "probe_http_na_reason_locked")?;
+        if !need_field && !need_na {
+            return Ok(());
+        }
         // Statements are the two ALTERs in MIGRATION_0008, in that order.
         // Running the whole script would fail once either column already exists.
         if need_field {
@@ -272,6 +291,9 @@ pub fn apply_agent_schema(store: &mut Store) -> Result<(), StoreError> {
     let tx =
         immediate_transaction(conn).map_err(|err| StoreError::sqlite("begin_agent_schema", err))?;
     let applied = (|| {
+        if table_present(&tx, "agent_events", "probe_agent_events_locked")? {
+            return Ok(());
+        }
         tx.execute_batch(MIGRATION_0009)
             .map_err(|err| StoreError::sqlite("migrate_agent_events", err))?;
         tx.execute(
@@ -318,6 +340,9 @@ pub fn apply_inter_agent_schema(store: &mut Store) -> Result<(), StoreError> {
     let tx = immediate_transaction(conn)
         .map_err(|err| StoreError::sqlite("begin_inter_agent_schema", err))?;
     let applied = (|| {
+        if table_present(&tx, "watch_groups", "probe_watch_groups_locked")? {
+            return Ok(());
+        }
         tx.execute_batch(MIGRATION_0010)
             .map_err(|err| StoreError::sqlite("migrate_inter_agent", err))?;
         tx.execute(
@@ -333,6 +358,48 @@ pub fn apply_inter_agent_schema(store: &mut Store) -> Result<(), StoreError> {
         Ok(()) => tx
             .commit()
             .map_err(|err| StoreError::sqlite("commit_inter_agent_schema", err)),
+        Err(err) => {
+            drop(tx);
+            Err(err)
+        }
+    }
+}
+
+/// Create the row-replay marker table when it is absent.
+///
+/// The presence check is repeated after `BEGIN IMMEDIATE`: two runtime opens
+/// can both observe an old database before either acquires the write lock.
+/// Checking only before the transaction would make the second opener run the
+/// non-`IF NOT EXISTS` migration and fail with "table already exists".
+pub fn apply_replay_schema(store: &mut Store) -> Result<(), StoreError> {
+    if store.is_read_only() {
+        return Err(StoreError::ReadOnly);
+    }
+    let conn = store.connection();
+    if table_present(conn, "replay_writes", "probe_replay_writes")? {
+        return Ok(());
+    }
+    let tx = immediate_transaction(conn)
+        .map_err(|err| StoreError::sqlite("begin_replay_schema", err))?;
+    let applied = (|| {
+        if table_present(&tx, "replay_writes", "probe_replay_writes_locked")? {
+            return Ok(());
+        }
+        tx.execute_batch(MIGRATION_0011)
+            .map_err(|err| StoreError::sqlite("migrate_replay_schema", err))?;
+        tx.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value =
+                 MAX(CAST(schema_meta.value AS INTEGER), CAST(excluded.value AS INTEGER))",
+            rusqlite::params![REPLAY_SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|err| StoreError::sqlite("migrate_replay_schema_version", err))?;
+        Ok::<(), StoreError>(())
+    })();
+    match applied {
+        Ok(()) => tx
+            .commit()
+            .map_err(|err| StoreError::sqlite("commit_replay_schema", err)),
         Err(err) => {
             drop(tx);
             Err(err)
@@ -448,7 +515,7 @@ impl std::fmt::Debug for Store {
 impl Store {
     /// Open `path`, creating the bootstrap schema when missing.
     ///
-    /// Supported schemas through [`INTER_AGENT_SCHEMA_VERSION`] remain writable;
+    /// Supported schemas through [`REPLAY_SCHEMA_VERSION`] remain writable;
     /// optional tables are only added by their schema helpers. Parent directories
     /// are created. On Unix the new or migrated file is mode `0o600`.
     /// A version higher than the supported ceiling yields [`OpenStatus::ReadOnlyNewer`]
@@ -468,7 +535,13 @@ impl Store {
     pub fn open_runtime(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let started = Instant::now();
         let mut store = Self::open(path)?;
+        // A future database is deliberately readable.  Do not attempt an
+        // optional backfill through its read-only connection.
+        if store.is_read_only() {
+            return Ok(store);
+        }
         crate::sink::apply_file_schema(&mut store).map_err(|err| err.with_busy_elapsed(started))?;
+        apply_replay_schema(&mut store).map_err(|err| err.with_busy_elapsed(started))?;
         Ok(store)
     }
 
@@ -494,9 +567,9 @@ impl Store {
         }
 
         let existed = file_nonempty(path)?;
-        let (found, needs_migration) = if existed {
+        let found = if existed {
             let found = read_version_quietly(path)?;
-            if found > SUPPORTED_SCHEMA_VERSION {
+            if let Some(found) = found.filter(|found| *found > SUPPORTED_SCHEMA_VERSION) {
                 let conn = open_connection_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                     .map_err(|err| StoreError::sqlite("open_read_only", err))?;
                 return Ok(Self {
@@ -508,24 +581,16 @@ impl Store {
                     read_only: true,
                 });
             }
-            (Some(found), found < SCHEMA_VERSION || !extra.is_empty())
+            found
         } else {
-            (None, true)
+            None
         };
 
-        if !needs_migration {
-            let conn = open_writable(path)?;
-            apply_connection_pragmas(&conn)?;
-            verify_wal_mode(&conn)?;
-            let _ = restrict_unix(path);
-            return Ok(Self {
-                conn,
-                status: OpenStatus::Current,
-                read_only: false,
-            });
-        }
+        let initial_needs_migration = found.is_some_and(|from| {
+            from < SCHEMA_VERSION || extra.iter().any(|(version, _)| *version > from)
+        });
 
-        let backup = if existed {
+        let backup = if existed && initial_needs_migration {
             let from = found.ok_or(StoreError::BadSchemaVersion { found: None })?;
             Some(backup_closed_file(path, from)?)
         } else {
@@ -534,25 +599,26 @@ impl Store {
 
         let conn = open_writable(path)?;
         apply_connection_pragmas(&conn)?;
-        if existed {
-            // Reopening an existing database never rewrites persistent PRAGMAs.
-            // `journal_mode` is read only, so an active writer does not fail the
-            // open just because it owns the write lock.
-            verify_wal_mode(&conn)?;
+        if found.is_some() || !new_database_needs_pragmas_locked(&conn)? {
+            // An old database can be safely upgraded to WAL once. If SQLite
+            // refuses, surface a dedicated startup error with the path and
+            // reason rather than continuing in rollback-journal mode.
+            ensure_wal_mode(&conn, path)?;
         } else {
             // These two persistent settings need an exclusive lock. This is the
             // only point they are written: after the busy handler was installed,
             // and before migration 0001 creates the first table.
-            apply_new_database_pragmas(&conn)?;
+            apply_new_database_pragmas(&conn, path)?;
         }
 
-        let from = found.unwrap_or(0);
-        let result = apply_pending(&conn, from, extra);
+        let result = apply_pending(&conn, extra);
         match result {
-            Ok(to) => {
+            Ok((from, to)) => {
                 restrict_unix(path)?;
-                let status = if from == 0 && backup.is_none() {
+                let status = if found.is_none() && from == 0 && backup.is_none() {
                     OpenStatus::Created
+                } else if from == to && backup.is_none() {
+                    OpenStatus::Current
                 } else {
                     OpenStatus::Migrated {
                         from,
@@ -630,46 +696,91 @@ fn apply_connection_pragmas(conn: &Connection) -> Result<(), StoreError> {
 }
 
 /// Persistent PRAGMAs for a brand-new, empty database only.
-fn apply_new_database_pragmas(conn: &Connection) -> Result<(), StoreError> {
+fn apply_new_database_pragmas(conn: &Connection, path: &Path) -> Result<(), StoreError> {
     conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
         .map_err(|err| StoreError::sqlite("pragma_auto_vacuum", err))?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|err| StoreError::sqlite("pragma_journal_mode", err))?;
-    verify_wal_mode(conn)?;
-    Ok(())
-}
-
-/// Read and verify, but never change, the journal mode of an existing file.
-fn verify_wal_mode(conn: &Connection) -> Result<(), StoreError> {
-    let mode: String = conn
-        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-        .map_err(|err| StoreError::sqlite("read_journal_mode", err))?;
+    let mode = journal_mode(conn)?;
     if mode.eq_ignore_ascii_case("wal") {
         Ok(())
     } else {
-        Err(StoreError::UnexpectedJournalMode { found: mode })
+        Err(StoreError::LegacyWalConversion {
+            path: path.to_path_buf(),
+            reason: format!("journal_mode remained {mode}"),
+        })
     }
 }
 
-fn apply_pending(conn: &Connection, from: u32, extra: &[(u32, &str)]) -> Result<u32, StoreError> {
-    let mut scripts: Vec<(u32, &str)> = Vec::new();
-    if from < SCHEMA_VERSION {
-        scripts.push((SCHEMA_VERSION, MIGRATION_0001));
-    }
-    for (version, sql) in extra {
-        if *version > from {
-            scripts.push((*version, *sql));
-        }
-    }
-    scripts.sort_by_key(|(version, _)| *version);
-    if scripts.is_empty() {
-        return Ok(from);
-    }
+/// Decide whether persistent new-database pragmas are needed while holding
+/// the same SQLite write lock that guards bootstrap migration. A process can
+/// observe a non-empty file between `open_writable` and 0001; the outer file
+/// probe is only an optimization and is not authoritative.
+fn new_database_needs_pragmas_locked(conn: &Connection) -> Result<bool, StoreError> {
+    let tx = immediate_transaction(conn)
+        .map_err(|err| StoreError::sqlite("begin_probe_new_database", err))?;
+    let needs = !table_present(&tx, "schema_meta", "probe_schema_meta_new_locked")?;
+    tx.commit()
+        .map_err(|err| StoreError::sqlite("commit_probe_new_database", err))?;
+    Ok(needs)
+}
 
+/// Read the current journal mode.
+fn journal_mode(conn: &Connection) -> Result<String, StoreError> {
+    conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .map_err(|err| StoreError::sqlite("read_journal_mode", err))
+}
+
+/// Convert an existing legacy database to WAL once.
+///
+/// `journal_mode=WAL` cannot run inside `BEGIN IMMEDIATE`; it requests the
+/// required exclusive lock itself, after the shared connection opener has
+/// installed its busy timeout.  A result other than WAL is a failed conversion
+/// too: SQLite can return the mode it kept without returning an SQL error.
+fn ensure_wal_mode(conn: &Connection, path: &Path) -> Result<(), StoreError> {
+    let mode = journal_mode(conn)?;
+    if mode.eq_ignore_ascii_case("wal") {
+        return Ok(());
+    }
+    let converted = conn
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+        .map_err(|err| StoreError::LegacyWalConversion {
+            path: path.to_path_buf(),
+            reason: err.to_string(),
+        })?;
+    if converted.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(StoreError::LegacyWalConversion {
+            path: path.to_path_buf(),
+            reason: format!("journal_mode remained {converted}"),
+        })
+    }
+}
+
+fn apply_pending(conn: &Connection, extra: &[(u32, &str)]) -> Result<(u32, u32), StoreError> {
     let tx =
         immediate_transaction(conn).map_err(|err| StoreError::sqlite("begin_migration", err))?;
-    let mut to = from;
     let applied = (|| {
+        // This is deliberately inside the lock. Two processes can both see a
+        // zero-length new file before either creates `schema_meta`; only the
+        // winner is allowed to run 0001.
+        let from = if table_present(&tx, "schema_meta", "probe_schema_meta_locked")? {
+            read_version(&tx)?
+        } else {
+            0
+        };
+        let mut scripts: Vec<(u32, &str)> = Vec::new();
+        if from < SCHEMA_VERSION {
+            scripts.push((SCHEMA_VERSION, MIGRATION_0001));
+        }
+        for (version, sql) in extra {
+            if *version > from {
+                scripts.push((*version, *sql));
+            }
+        }
+        scripts.sort_by_key(|(version, _)| *version);
+        let mut to = from;
         for (version, sql) in &scripts {
             if *version <= to {
                 continue;
@@ -688,10 +799,10 @@ fn apply_pending(conn: &Connection, from: u32, extra: &[(u32, &str)]) -> Result<
             }
             to = *version;
         }
-        Ok::<(), StoreError>(())
+        Ok::<(u32, u32), StoreError>((from, to))
     })();
     match applied {
-        Ok(()) => {
+        Ok((from, to)) => {
             tx.commit()
                 .map_err(|err| StoreError::sqlite("commit_migration", err))?;
             let found = read_version(conn)?;
@@ -701,7 +812,7 @@ fn apply_pending(conn: &Connection, from: u32, extra: &[(u32, &str)]) -> Result<
                     found: Some(found),
                 });
             }
-            Ok(to)
+            Ok((from, to))
         }
         Err(err) => {
             // Dropping the transaction rolls it back. DDL in SQLite is transactional.
@@ -781,14 +892,22 @@ fn read_version(conn: &Connection) -> Result<u32, StoreError> {
     parse_version(value)
 }
 
-fn read_version_quietly(path: &Path) -> Result<u32, StoreError> {
+fn read_version_quietly(path: &Path) -> Result<Option<u32>, StoreError> {
     let conn = open_connection_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|err| StoreError::sqlite("peek_version", err))?;
     // foreign_keys is irrelevant for a one-row read. Do not set write pragmas.
-    let found = read_version(&conn)?;
+    // A second opener can see the SQLite header after another process has
+    // touched a new file but before that process creates `schema_meta`. This
+    // is not a malformed version and must not turn a harmless race into a
+    // `no such table` error. `apply_pending` repeats the same check under
+    // BEGIN IMMEDIATE before it runs 0001.
+    if !table_present(&conn, "schema_meta", "peek_schema_meta")? {
+        return Ok(None);
+    }
+    let found = Some(read_version(&conn)?);
     drop(conn);
     Ok(found)
 }

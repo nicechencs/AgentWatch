@@ -82,6 +82,19 @@ pub enum QueryBackendError {
         /// SQLite's English diagnostic.
         detail: String,
     },
+    /// A database made by a newer AgentWatch is intentionally queryable but
+    /// this operation would modify it.
+    ReadOnlyNewer,
+    /// A legacy rollback-journal database could not be converted to WAL.
+    /// This is distinct from an ordinary store error because the daemon must
+    /// tell the operator how to preserve the original database.
+    LegacyWalConversion {
+        /// Local database path, supplied separately rather than parsed from a
+        /// display string.
+        path: PathBuf,
+        /// SQLite's diagnostic.
+        reason: String,
+    },
     /// SQLite or the store rejected the call. Display text only.
     Store(String),
 }
@@ -103,6 +116,10 @@ impl std::fmt::Display for QueryBackendError {
                 f,
                 "session database remained busy after {waited_seconds} seconds"
             ),
+            Self::ReadOnlyNewer => write!(f, "database was opened read-only because it is newer"),
+            Self::LegacyWalConversion { path, reason } => {
+                write!(f, "could not convert {} to WAL: {reason}", path.display())
+            }
             Self::Store(msg) => write!(f, "{msg}"),
         }
     }
@@ -631,6 +648,7 @@ impl SessionQuery for StoreQuery {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
+        require_writable(&store)?;
         let Some(id) = self.resolve_id(&store, user_id, sid)? else {
             return Ok(None);
         };
@@ -647,6 +665,7 @@ impl SessionQuery for StoreQuery {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
+        require_writable(&store)?;
         let Some(id) = self.resolve_id(&store, user_id, sid)? else {
             return Ok(None);
         };
@@ -657,6 +676,7 @@ impl SessionQuery for StoreQuery {
         let Some(store) = self.open()? else {
             return Ok(None);
         };
+        require_writable(&store)?;
         let Some(id) = self.resolve_id(&store, user_id, sid)? else {
             return Ok(None);
         };
@@ -1253,7 +1273,32 @@ impl StoreQuery {
     /// unlike [`StoreQuery::open`], which treats absence as "no database".
     fn open_mut(&self) -> Result<Store, QueryBackendError> {
         let path = self.db_path.as_ref().ok_or_else(missing_db)?;
-        Store::open_runtime(path).map_err(map_store)
+        let store = Store::open_runtime(path).map_err(map_store)?;
+        require_writable(&store)?;
+        Ok(store)
+    }
+
+    /// `None` means this daemon has not created a session database yet. The
+    /// flag is intentionally available independently of a write endpoint so
+    /// API clients can disable mutating controls before submitting a request.
+    pub(crate) fn database_read_only(&self) -> Result<Option<bool>, QueryBackendError> {
+        let Some(path) = &self.db_path else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        Store::open_runtime(path)
+            .map(|store| Some(store.is_read_only()))
+            .map_err(map_store)
+    }
+}
+
+fn require_writable(store: &Store) -> Result<(), QueryBackendError> {
+    if store.is_read_only() {
+        Err(QueryBackendError::ReadOnlyNewer)
+    } else {
+        Ok(())
     }
 }
 
@@ -1310,12 +1355,16 @@ fn map_query(err: QueryError) -> QueryBackendError {
 }
 
 fn map_store(err: StoreError) -> QueryBackendError {
-    match (err.busy_waited_seconds(), err.busy_detail()) {
-        (Some(waited_seconds), Some(detail)) => QueryBackendError::Busy {
-            waited_seconds,
-            detail,
+    match err {
+        StoreError::Busy { waited, op, source } => QueryBackendError::Busy {
+            waited_seconds: waited.as_secs().max(1),
+            detail: format!("{op}: {source}"),
         },
-        _ => QueryBackendError::Store(err.to_string()),
+        StoreError::ReadOnly => QueryBackendError::ReadOnlyNewer,
+        StoreError::LegacyWalConversion { path, reason } => {
+            QueryBackendError::LegacyWalConversion { path, reason }
+        }
+        err => QueryBackendError::Store(err.to_string()),
     }
 }
 
@@ -1790,7 +1839,7 @@ fn gap_json(row: &aw_store::GapItem) -> serde_json::Value {
 
 #[cfg(test)]
 mod label_tests {
-    use super::{argv_value, session_label};
+    use super::{argv_value, session_label, QueryBackendError, StoreQuery};
 
     /// UI re-review #144 new-5: a session started with 「启动程序」 was listed
     /// as `s-31988513fa4a`; with no name, the command is the label.
@@ -1811,5 +1860,41 @@ mod label_tests {
             serde_json::json!(["sleep", "90"])
         );
         assert!(argv_value(None).is_null());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn newer_database_is_reported_read_only_and_rejects_mutations() {
+        let dir = std::env::temp_dir().join(format!(
+            "aw-query-newer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let path = dir.join("agentwatch.db");
+        let store = aw_store::Store::open(&path).expect("seed store");
+        store
+            .connection()
+            .execute(
+                "UPDATE schema_meta SET value = '12' WHERE key = 'schema_version'",
+                [],
+            )
+            .expect("future version");
+        drop(store);
+
+        let query = StoreQuery::open_path(path);
+        assert_eq!(
+            query.database_read_only().expect("read-only flag"),
+            Some(true)
+        );
+        assert!(matches!(
+            query.open_mut(),
+            Err(QueryBackendError::ReadOnlyNewer)
+        ));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

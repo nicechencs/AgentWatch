@@ -74,21 +74,35 @@
 5. **挂住期间**：创建方（aw 或后台）一死，子程序必须退出，而且目标程序一行都没跑过。Unix 靠门控管道读到 EOF 后 `_exit`（规矩 1 保证没有别人拿着写端，所以 EOF 不会被拖），Windows 靠 Job 的 `KILL_ON_JOB_CLOSE`。
 6. **放行以后谁来收尾**——**只有起程序的是 aw 时（`aw run` 默认模式和 `--no-daemon`），才把程序跟 aw 绑在一起；起程序的是后台时一律不绑**，后台崩了程序照样跑，会话标成「记录已中断（后台重启）」。
    - 绑定由一个**看门进程**来做，不指望 aw 自己（aw 被 SIGKILL 后一行代码都跑不了）：
-     - Linux：aw 起一个很小的看门进程，看门进程设 `PR_SET_PDEATHSIG(SIGTERM)` 盯 aw，收到后 `killpg(程序的进程组, SIGKILL)`；有可委派的 cgroup v2 时直接写 `cgroup.kill`（连脱离进程组的孙程序也能收掉）。
-     - Mac（watchdog + kqueue）：看门进程用 kqueue `EVFILT_PROC` + `NOTE_EXIT` 盯 aw 的 pid，aw 一死就 `killpg` 整组。
-     - Windows：aw 持有一个带 `KILL_ON_JOB_CLOSE` 的 Job，不允许 breakaway，覆盖整棵树；aw 死了句柄关闭，整棵树结束（接第 6 步）。
+     - **Linux（决定，PM 14:04 + review：看门进程就是 subreaper，有没有 cgroup 都一样）**：
+       - **进程关系：aw → 看门进程 → 程序**。aw `fork` 后马上 `execve` 自己的二进制进 `aw __no-daemon-watchdog` 子命令（`/proc/self/exe`，管道 fd 用参数传入），所以看门进程是一个全新的单线程进程，可以正常分配内存、读 `/proc`。看门进程**在起程序之前**先 `prctl(PR_SET_CHILD_SUBREAPER, 1)`，然后由它（走 A1 规矩 1–4 的同一个启动函数）起程序。subreaper 只收养**自己的子孙**，所以看门进程必须是程序的祖先，不能像现在这样跟程序做兄弟（见文末 345d216 的说明）。程序和它的所有子孙，不管自己 `setsid`/`setpgid` 了多少次、中间那一层先退出了多少次，变成孤儿时都会被挂到看门进程名下，而不是挂到 init。
+       - **看门进程不跟 aw 一起死**：它要比 aw 活得久，才能在 aw 被 SIGKILL 之后做清理。它通过两条线知道 aw 死了：aw 留给它的一根「存活管道」读到 EOF（主要），加上 `PR_SET_PDEATHSIG(SIGUSR1)` 当后备（信号处理函数只置一个标志）。PDEATHSIG 的坑照上面一条处理（fork 看门进程必须在 aw 的主线程里做；设完马上查 `getppid()` 是不是还是 aw）。
+       - **看门进程自己在单独的进程组里，不在程序的组里，也不在 aw 的组里**（`setpgid(0, 0)`），并且忽略 SIGINT、SIGQUIT、SIGHUP、SIGTSTP、SIGTTIN、SIGTTOU。这样终端里按 Ctrl+C 只会打到前台组（程序的组），终端挂断和 shell 给作业组发的 SIGHUP 也打不到它。不在终端里时，看门进程直接 `setsid()`，自成一个会话。**在终端里时不能 `setsid`**：`tcsetpgrp` 只能把前台交给同一个会话里的进程组，看门进程要是换了会话，它起的程序就永远拿不到 aw 那个终端的前台。所以在终端里时是「同一个会话，单独的进程组」，这一点已经能满足「Ctrl+C 和组 SIGHUP 杀不到它」。aw 死后看门进程所在的组会变成孤儿进程组；只有组里有被停住的进程时内核才发 SIGHUP+SIGCONT，看门进程不会被停住，而且也忽略 SIGHUP。
+       - **退出码**：看门进程 `waitpid(程序, WUNTRACED | WCONTINUED)`，把结果从「状态管道」报给 aw：`exited N`、`signaled N`、`stopped N`、`continued`。aw 照原样退出：`exited N` 时退 N，`signaled N` 时退 128+N（SIGINT → 130，SIGTERM → 143）。启动时看门进程先报一行 `started <pid> <启动时间>`，aw 拿到程序的进程号是为了 `tcsetpgrp` 和显示，**不是为了自己发信号**。
+       - **转发信号**：aw 照旧接 SIGINT、SIGTERM、SIGHUP（默认模式和 `--no-daemon` 一样），把信号号写进「控制管道」，由**看门进程**去 `killpg(程序的进程组, 信号)`。看门进程是程序的父进程，程序没被它 `wait` 之前，进程号不会被回收复用，所以这样发信号不会打错进程。aw 自己不直接对程序发信号。
+       - **终端前台（tcsetpgrp）**：程序的进程组跟 aw 在同一个会话里，所以 aw 照规矩 7 用 `tcsetpgrp` 把前台交给程序的组（前后都挡住 SIGTTOU）。Ctrl+Z 时，看门进程用 WUNTRACED 看到 `stopped`，报给 aw；aw 把前台拿回给自己的组，再给自己发 SIGTSTP 停下。`fg` 时 shell 给 aw 的组发 SIGCONT，aw 把前台再交给程序的组，并通过控制管道让看门进程 `killpg(SIGCONT)`。看门进程在自己的组里，不会被 Ctrl+Z 停住。aw panic 或因信号退出时照样先还前台（规矩 7）。
+       - **看门进程自己意外死了**：aw 也设 `PR_SET_CHILD_SUBREAPER`，所以程序会被挂回 aw 名下。aw 读到状态管道 EOF、又没收到最后的状态时，自己接手：`waitpid` 程序，再按下面同样的循环做清理，同时报「看门进程意外退出」。
+       - **清理循环**（程序退出以后、aw 正常退出以后、aw 被杀以后，都会跑一遍，所以 `--no-daemon` 的「aw 一退出，程序和它启动的子程序都会跟着结束」三种情况都成立）：
+         1. 扫一遍 `/proc/*/stat`，按 ppid 找出看门进程的所有子孙。因为它是 subreaper，孤儿都已经挂到它名下了，所以这样找不会漏掉 `setsid` 出去的那些；
+         2. 先给每一个子孙发 **SIGSTOP**，冻住，让它们没法再 fork。然后重新扫描，新冒出来的接着 SIGSTOP，一直扫到某一轮没有新的为止，所以一直 fork 的子程序也压得住；
+         3. 再给所有子孙发 **SIGKILL**，用 `waitpid(-1, WNOHANG)` 把挂到自己名下的都回收掉；
+         4. 重新扫描，回到第 1 步，直到 `waitpid` 返回 ECHILD、而且扫描结果为空。有上限：总共 5 秒；到点还有剩下的，把剩下的进程号和命令名写进日志，aw 报「还有 N 个子程序没能结束」，退出码不变。
+       - **防进程号复用（发每一个信号之前都核对）**：每个目标记成（pid、ppid、启动时间），启动时间是 `/proc/<pid>/stat` 第 22 列。发信号前重新读一遍，三项有一项对不上就跳过（说明原来那个进程已经没了，号被别人用了）。内核支持（5.3 及以上）时优先用 `pidfd_open` + `pidfd_send_signal`，它本身就不会打到被复用的号上；（pid、ppid、启动时间）这一套是不支持时的退路，也是第 1 步扫描时判断「是不是我的子孙」的依据。
+       - **管不到的**：子孙换成了别的用户（比如程序里跑了 `sudo`、setuid 程序）以后，普通用户身份的看门进程发不出信号。这种情况记日志，aw 报「还有 N 个子程序没能结束」，不说成已经清掉了。有可委派的 cgroup v2 时，额外再写一次 `cgroup.kill` 兜底，但**不依赖它**。
+     - Mac（watchdog + kqueue，**唯一的例外**）：看门进程用 kqueue `EVFILT_PROC` + `NOTE_EXIT` 盯 aw 的 pid，aw 一死就 `killpg` 整组。macOS 没有 subreaper，清不到自己 `setsid`/改了进程组的孙程序，所以 Mac 的 `--no-daemon` 帮助单独一句（规矩 11）。
+     - Windows：靠 Job Object。aw 持有一个带 `KILL_ON_JOB_CLOSE` 的 Job，不允许 breakaway，覆盖整棵树（包括自己另起进程组的）；aw 死了句柄关闭，整棵树结束（接第 6 步；345d216 已经这样做）。
    - PDEATHSIG 的三个坑写进实现注释并各有测试：setuid 会清掉它，所以要在切完身份**之后**再设；设完马上查 `getppid()` 是否已经变了（父进程可能先死）；它跟的是**发起 fork 的那个线程**，fork 看门进程要在活得跟 aw 一样长的线程（主线程）里做。
-   - 信号：默认模式下 aw 收到的 SIGINT、SIGTERM、SIGHUP 原样转发给程序的进程组，跟 `--no-daemon` 一样；aw 的退出码 = 128+信号号（SIGINT → 130）。`ProcessGroupForwarder` 每 10ms 醒一次（`run.rs:1049`）改成阻塞等信号。
-   - 能保证的范围：三个系统都保证**直接子程序和留在同一进程组里的孙程序**跟着结束；**脱离进程组（自己 setsid/setpgid）的孙程序**只有 Linux（有 cgroup 时）和 Windows（Job）保证，Mac 和没有 cgroup 的 Linux 不保证——这是唯一一处「这个系统不支持」。
+   - 信号：默认模式下 aw 收到的 SIGINT、SIGTERM、SIGHUP 原样转发给程序的进程组，跟 `--no-daemon` 一样（Linux 经看门进程转发，见上）；aw 的退出码 = 128+信号号（SIGINT → 130）。`ProcessGroupForwarder` 每 10ms 醒一次（`run.rs:1049`）改成阻塞等信号。
+   - 能保证的范围：**Linux（有没有 cgroup v2 都一样，靠看门进程当 subreaper）和 Windows（Job）都保证程序和它的所有子孙**跟着结束，包括自己 `setsid`/`setpgid` 出去的、中间那一层先退出留下来的；例外只有两种：子孙换成了别的用户（`sudo` 一类），记日志并如实报「还有 N 个子程序没能结束」。**Mac 是唯一的例外**：只保证直接子程序和留在同一进程组里的孙程序，脱离进程组的孙程序不保证——这是唯一一处「这个系统不支持」。
 7. **终端前台**（`--no-daemon` 和 Mac `aw run` 两种模式都要覆盖）：
    - 在终端里时，子程序进程组用 `tcsetpgrp` 设成前台；aw 调 `tcsetpgrp` 前后**挡住 SIGTTOU**（否则 aw 自己在后台组时会被停住）。
    - aw 用 `waitpid(…, WUNTRACED)` 看到子程序被 Ctrl+Z 停住时：把终端前台拿回给自己原来的组，再给自己发 SIGTSTP 停下；`fg` 后（SIGCONT）把前台再交给子程序组并 `killpg(SIGCONT)`，不卡住。
    - 正常结束、aw 因信号退出、**aw panic**（panic hook 里）都把前台还给原来的组。
    - 不在终端里时保持单独的进程组，不调 tcsetpgrp。
 8. **出错怎么报**：每一步各有自己的错误码，从报错管道回传，用户看到的是 A5 表里的中文。
-9. **等待一律有上限**，超时按「不可得」报（Windows 973 行改掉）。
+9. **等待一律有上限**（Windows 973 行改掉）。超时是出错，用定稿的两句超时错误报，不用「不可得」：等程序结束超时报「等了 {N} 秒，程序还没结束」；等后台回复超时报「后台 {N} 秒没有回应，这次请求没有完成。」（码 `daemon_timeout`，见 B1 码表）。
 10. **`.cmd` / `.bat`**：Windows 走 `cmd /c` 的安全转义，参数里有 `"`、`&`、`%` 这类字符时拒绝或按规矩转义。
-11. **`--no-daemon` 帮助三个系统统一一句**（UI审查+review 13:25）：「不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序都会跟着结束。」Mac 靠 watchdog + kqueue 做到。原来准备的 Mac 专用那句**作废**，只有 Mac 真机测试证明做不到时才恢复（恢复时 UI审查 重新定句子）。帮助快照测试三个系统各存一份，断言这句原文。
+11. **`--no-daemon` 帮助**（以 `UI-147-wording.md` 为准）：**Linux 和 Windows 用统一那句**「不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序都会跟着结束。」——Linux 靠看门进程当 subreaper（有没有 cgroup 都成立），Windows 靠 Job。**Mac 单独一句**（13:51 更正）：「不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序会跟着结束。子程序要是自己脱离了进程组（比如在后台另起服务），在 Mac 上不保证会跟着结束。」帮助快照按系统分开存，各自断言原文。
 
 **共用测试**（`aw-platform/tests/launch_contract.rs` + 已写好的 `aw-platform/tests/gate_concurrent_spawn.rs`，三个系统的 CI 都跑）：
 - **并发泄漏**：48 线程 × 20 轮（CI 默认），`AW_GATE_STRESS_ROUNDS=300` 做压力；每个子程序 `/proc/self/fd`（Mac 用 `lsof -p`/`proc_pidinfo`，Windows 用句柄表）里只有白名单。修前失败率 30.3%（泄漏）+ 67.8%（退 2），修后 0/14400，见 H1；
@@ -98,12 +112,22 @@
 - 目标的 SigIgn、SigBlk 都是 0；目标环境正好只有请求给的那几项；
 - cwd 不存在：release 返回「工作目录」类错误，`/proc/<pid>` 不是 Z；
 - 切身份自检：egid 不对、`setgid(0)` 成功都会退出（root CI 跑）；附加组等于 `getgrouplist` 的结果而不是连接方报的；
-- **aw 起的程序**：放行后用 SIGHUP / SIGTERM / SIGKILL 杀 aw，直接子程序和**同一进程组里**的孙程序 2 秒内都没了（三个系统都断言）；Linux 有 cgroup 时脱离进程组的孙程序也没了；
+- **aw 起的程序**：放行后用 SIGHUP / SIGTERM / SIGKILL 杀 aw，直接子程序和**同一进程组里**的孙程序 2 秒内都没了（三个系统都断言）；Linux 和 Windows 上**自己 setsid 出去的孙程序也没了**（Linux 不依赖 cgroup）；Mac 只断言同组的；
+- **Linux 看门进程（subreaper）**，`aw-cli/tests/no_daemon_tree.rs`，Linux CI 跑。每个用例结束后，用测试打在环境变量里的标记（`AW_TREE_TAG=<随机值>`）扫 `/proc/*/environ`，断言**一个带这个标记的进程都没有了**：
+  - 孙程序自己 `setsid` 出去（`sh -c 'setsid sleep 600 & wait'`），然后 SIGKILL aw → 2 秒内孙程序没了；
+  - 子程序一直在 fork（`while :; do sleep 600 & done` 这类，加上进程数上限防止把 CI 压垮）→ aw 退出后 5 秒内全部没了，看门进程自己也退出了；
+  - 中间那一层先退出、留下孙程序（`sh -c '(setsid sleep 600 &) ; exit 0'`），然后 SIGKILL aw → 孙程序没了（它已经挂到看门进程名下）；
+  - aw 分别以正常退出、SIGINT、SIGTERM、SIGHUP、SIGKILL 结束，每一种都没有子孙留下；
+  - 退出码转交：程序 `exit 7` → aw 退 7；程序被 SIGTERM 杀 → aw 退 143；
+  - pty 里按 Ctrl+C：程序收到 SIGINT，看门进程没死，最后照样报出程序的退出状态；关掉 pty 主端（终端挂断）→ 没有子孙留下；
+  - pty 里 Ctrl+Z 再 `fg`，在 aw → 看门进程 → 程序这种关系下程序照常继续，aw 不卡；`sh -c 'read x'` 能读到输入；
+  - SIGKILL 看门进程 → 程序挂回 aw，aw 照样报出退出码，并且做清理；
+  - 防复用的单元测试：喂一份假的 `/proc` 表，同一个 pid 但启动时间不同，那一项会被跳过、不发信号。
 - **后台起的程序**：后台被 SIGKILL，已放行的程序还在跑，会话标成「记录已中断（后台重启）」；
 - pty 里跑 `sh -c 'read x'` 能读到输入（Linux + Mac，两种模式）；pty 里 Ctrl+Z 再 `fg`，程序继续、aw 不卡；aw panic 后终端前台还回来了；
 - SIGINT 退出码 130；默认模式信号转发；
 - `.cmd` 带特殊字符的参数；
-- `--no-daemon` 帮助快照里是统一那句。
+- `--no-daemon` 帮助快照：Linux、Windows 是统一那句，Mac 是 Mac 那句。
 
 | 问题 | 来源 | 状态 | 进哪个提交 |
 |---|---|---|---|
@@ -125,7 +149,7 @@
 | 后台起的程序不能绑后台 | review 挡-3 | 设计已定 | 第 4 步（测试） |
 | 默认模式不转发 SIGINT/SIGTERM/SIGHUP | Test-bot E | 没修 | 第 4 步 |
 | `--no-daemon` / Mac `aw run` 卡住要读终端的程序 | review（2511990 必改 2、95b49ff 收 4） | 设计已定（规矩 7，含 SIGTTOU、WUNTRACED、panic） | 第 4 步 |
-| `--no-daemon` 帮助三系统统一 | UI审查+review 13:25 | 没改 | 第 4 步（帮助快照在第 8b 步） |
+| `--no-daemon` 帮助（Linux/Windows 统一句，Mac 单独一句） | UI审查+review 13:25 / 13:51 | 没改 | 第 4 步（帮助快照在第 8b 步） |
 | `.cmd` 找不到 / 转义 | PM 真机 | 没修 | 第 6 步 |
 | 缺「信号杀掉」「SIGINT」测试、Mac 转发测试 | review | 没写 | 第 4 步 |
 
@@ -242,7 +266,7 @@
 3. **权限一律由后台按认出来的身份判断**。所有写操作（delete、rename、pin、**stop**、**attach 加进程**）都走同一个 `mutation_owner`：
    - 会话主人带不带 `--owner=自己` 都放行；
    - **会话是自己的、但 `--owner` 填了别人 → 拒绝**，不再静默执行，专门修 `@last --owner alice` 这个组合。`@last` 时报「`@last` 只指你自己最近的会话，不能跟 `--owner` 一起用。要操作别人的会话，请写会话号。」；写会话号时报「会话「{号}」的主人不是「{填的用户}」，没有做任何改动。」（码名沿用 `daemon_errors.rs` 已有的，没有就在第 8a 步按表加，不改已有码名）；
-   - 管理员改别人的会话必须写 `--owner`；`--owner` 可以填用户名或 uid，**由后台解析**（Unix `getpwnam_r`，Windows `LookupAccountName` → SID）。用户不存在报「找不到用户「{名}」」（退出码跟「找不到会话」分开，按退出码表）；查询本身失败（不是「不存在」）报「查不到用户「{名}」对应的账户，没有做任何改动。」，并且**不放行**。这两处都**不写「没有这个」+「用户」那句，也不用「不可得」**（UI-147-wording.md:71/76，那句在禁用词表里）；
+   - 管理员改别人的会话必须写 `--owner`；`--owner` 可以填用户名或 uid，**由后台解析**（Unix `getpwnam_r`，Windows `LookupAccountName` → SID）。用户不存在报「找不到用户「{名}」，没有做任何改动。」（码 `owner_user_not_found`，退出码 2，跟「找不到会话」的 6 分开，见 B1 码表）；查询本身失败（不是「不存在」）报「查不到用户「{名}」对应的账户，没有做任何改动。」，并且**不放行**。这两处都**不写「没有这个」+「用户」那句，也不用「不可得」**（UI-147-wording.md:71/76，那句在禁用词表里）；
    - 管理员按会话名找会话时，没写 `--owner` 只在自己的会话里找；写了 `--owner` 才在那个用户的会话里找（修 `attach.rs:325`）；
    - `@last` 永远只指调用者自己的会话，`@last` + `--owner=别人` 一律拒绝；
    - 「用户」列由后台填用户名（查不到时显示数字 uid）；
@@ -267,7 +291,7 @@
 
 **测试**：
 - 反向测试：用匿名级别连上来的客户端被拒；对面不是后台时客户端一个字节都不发；`aw hook` 也一样；
-- **`mutation_owner` 一张参数化表**，delete / rename / pin / stop / attach 加进程五种操作 × 下面每种组合都跑：普通用户带 `--owner` 改别人的 → 403；主人带 `--owner=自己` → 200；主人的会话 + `--owner alice` → 拒绝（专门覆盖 `@last --owner alice` 停自己会话）；管理员不写 `--owner` 改别人的 → 拒绝；管理员 `--owner 用户名` → 200；`--owner 1001` → 200；`--owner nosuchuser` → 中文「找不到用户「nosuchuser」」，退出码跟找不到会话不同；用户名查询失败（注入）→「查不到用户「x」对应的账户，没有做任何改动。」且没改动；管理员按会话名找，没写 `--owner` 只找到自己的；
+- **`mutation_owner` 一张参数化表**，delete / rename / pin / stop / attach 加进程五种操作 × 下面每种组合都跑：普通用户带 `--owner` 改别人的 → 403；主人带 `--owner=自己` → 200；主人的会话 + `--owner alice` → 拒绝（专门覆盖 `@last --owner alice` 停自己会话）；管理员不写 `--owner` 改别人的 → 拒绝；管理员 `--owner 用户名` → 200；`--owner 1001` → 200；`--owner nosuchuser` → 中文「找不到用户「nosuchuser」，没有做任何改动。」，退出码跟找不到会话不同；用户名查询失败（注入）→「查不到用户「x」对应的账户，没有做任何改动。」且没改动；管理员按会话名找，没写 `--owner` 只找到自己的；
 - 原来断言「主人带 `--owner=自己` 会被拒」的测试在第 2 步同一个提交里改掉；
 - release 构建：`uninstall --help` 没有 `--data-dir`、传了报参数错误、目录还在；`test-hold-delay` 同样检查；release 构建里走不到内存会话分支；
 - **数据目录矩阵**（review 3d95803 挡 1 的表全部照搬，每格一条测试）：普通用户 + 自己的临时目录 → 接受并收紧权限（Mac/Win CI 的 `ensure_data_dir_creates_a_temp_tree` 和 e2e 变绿）；普通用户 + 别人预建的 → 拒；普通用户 + 正式目录 → 拒且**目录没被建出来**；管理员 + 正式目录（不存在 / 普通用户预建）→ 新建 / 纠正或拒；管理员 + 自己的非正式目录 → 按普通用户规则接受；管理员 + 别人的非正式目录 → 拒；最后一级是恶意链接 → 拒；Mac `/var/folders/...` → 接受；ProgramData 的 5 种写法（反斜杠、末尾 `\`、8.3、`\\?\`、大小写）都被认成正式目录；预建 `data\evil` 联接 → 拒；预建 `data\secret.txt` 主人是普通用户 → 被纠正或拒；查完到用之间换成联接 → 第二次核对抓到；Windows CI 真建 junction 和 symlink；DACL 断言改成「去重后只有 SY 和 BA 两个 SID、有一条带 OI|CI」。
@@ -322,7 +346,21 @@
 | 「找不到程序「{名字}」，请检查名字或路径」；工作目录另报「找不到工作目录「{路径}」」 | Test-bot H3 / UI审查 | 没修 | 第 8b 步（报错管道在第 4 步） |
 | `daemon_errors.rs` 中文跟 wording 文件不一致 | review（3d95803 收 2）/ 13:25 | 没修 | 第 8b 步（照 wording 文件改） |
 | 两套文案检查、`///` 不查、检查不进 CI | PM / UI审查 / review 要补 3 | 没做 | 第 8b 步（并进 xtask wording-lint） |
-| `--no-daemon` 帮助三系统统一 | UI审查+review 13:25 | 没改 | 第 4 步改文字，第 8b 步快照 |
+| `--no-daemon` 帮助（Linux/Windows 统一句，Mac 单独一句） | UI审查+review 13:25 / 13:51 | 没改 | 第 4 步改文字，第 8b 步快照 |
+
+**定稿句子的落点表**（UI审查 0aff6cb 第 5 条；每条写第几步、改哪个文件。行号按 0aff6cb）：
+
+| 定稿 | 第几步 | 文件 | 做什么 |
+|---|---|---|---|
+| Windows App 新建会话那句 + 单独的码 `launch_not_in_this_build` | 8b（文字）、10（界面） | `crates/aw-daemon/src/api/watch_routes.rs:390-398`、`crates/aw-cli/src/daemon_errors.rs:91`、`ui/src/i18n/zh.json:497` | 三处换成定稿原文；码名不变；HTTP 503 → 退出码按码表改成 5 |
+| 新建按钮旁同一句灰字提示（不等点了才报） | 10 | `ui/src/features/sessions/NewSessionPage.tsx`、`ui/src/features/sessions/SessionsPage.tsx`（新建按钮） | 按 `/capabilities` 里的「Windows App 新建会话 = 本版本未接入」直接显示灰字，按钮变灰；jsdom 测试 |
+| `doctor` 能力表表头改中文 | 8b | `crates/aw-cli/src/cmd/doctor.rs` | 345d216 已经把表头改成中文；第 8b 步按 wording 文件核对三个系统一致，加进帮助/输出快照 |
+| 启动到一半出错，按步骤的句子 | 4（报错管道带步骤）、8b（句子） | `crates/aw-platform/src/unix/hold.rs`、`crates/aw-platform/src/windows/mod.rs`、`crates/aw-cli/src/daemon_errors.rs` | 总句「程序启动到一半出错，已经结束，没有运行：{原因}」；{原因}按步骤分：进工作目录 → 用 `cwd_not_found` 那句；执行 → `program_not_found` 那句；建管道、切身份、自检、放行四步的{原因}中文**请 UI审查 补进 wording 文件**，补之前用总句加「（第 N 步）」，不出现英文 |
+| 打码的参数显示「（已隐藏）」 | 8b | `crates/aw-cli/src/cmd/render.rs`（会话命令行、参数显示）、`ui/src/lib/redact-preview.ts`、`ui/src/i18n/zh.json` | 人看的输出把打码标记换成「（已隐藏）」，原标记只留在 `--json` 和导出；`aw run --help` 补定稿那段隐藏说明（`crates/aw-cli/src/cmd/tree.rs` 的 `///`）；e2e 实际跑出「（已隐藏）」 |
+| 管理员看别人的会话：停止 / 删除 / 改名变灰，旁注「只有会话主人能操作」 | 2 | `ui/src/features/sessions/SessionsPage.tsx:365-366`（现在只有改名、置顶两个按钮带 `title`）、会话详情页的停止按钮 | 停止、删除也变灰；「只有会话主人能操作」作为看得见的旁注文字，不只放在 `title` 里；jsdom 测试 |
+| 库比程序新：App 顶部提示、按钮变灰，命令行报同一句 | 5 | `ui/src/api/errors.ts`、`ui/src/features/shell/`（顶部提示）、`crates/aw-daemon/src/api/routes.rs:1893`（文字已对） | 读接口回带只读标记（或 `/capabilities` 带上），App 顶部常驻提示，新建 / 停止 / 删除 / 改名变灰；命令行写操作报同一句 |
+| App 里管道被占住的顶部提示 | 7 | `ui/src/lib/auth.tsx:35-36`、`ui/src/features/shell/SignIn.tsx:40`、`ui/src/api/errors.ts:51` | `daemon_untrusted_server` 用「连上的不是 AgentWatch 后台……」那句，做成顶部提示，不只在登录页显示 |
+| 新建页命令框下方的环境变量灰字提示（13:41） | 10 | `ui/src/features/sessions/NewSessionPage.tsx`、`ui/src/i18n/zh.json` | 命令框下面常驻灰字，原文照 wording 文件；jsdom 测试 |
 
 ---
 
@@ -346,6 +384,40 @@
 - **收拢的问题**：review F5、U4、U5；UI审查 的 `unidentified_peer` 中文；`daemon_timeout` 英文；Test-bot H1/H4；`doctor`「当前不可用」不在四种说法里；review 要补 2。
 - **测试**：`ErrorCode` 每个值都有中文和退出码（单元测试）；`xtask error-lint` 在 CI 里结果为 0；App 端 errors.ts 快照；老的码名断言全部原样通过。
 - **拆成两个提交**（review 建议 5）：**8a** 只放 `ErrorCode` 枚举、生成代码、`error-lint`（码名不变，没有测试会变红）；**8b** 放文字表 `zh.toml`、wording 文件对照测试、「没采」替换、`daemon_errors.rs` 中文照 wording 文件改、帮助快照、`check-147-wording.sh` 并进 xtask，8b 一合进去 CI 检查就打开。
+
+### B1 附：码表（UI审查 0aff6cb 第 1 条）
+
+规则：码名以 `aw-cli/src/daemon_errors.rs` 为准，已有的一个不改；中文以 `UI-147-wording.md` 为准。退出码按 `aw-cli/src/exit.rs`：0 成功、1 一般错误、2 参数错、3 连不上后台、4 没权限、5 本版本未接入、6 找不到；**新加 7 = 用户取消**（取消删除用，`exit.rs` 第 9 步加常量）。「新码」那一列标「新」的，是第 8a 步要新加进枚举的码，名字以这张表为准。HTTP 状态和退出码跟现在代码不一样的，按这张表改代码（不改表）。
+
+| 码 | 新 | 谁报 | HTTP | 退出码 | 中文（原文照 UI-147-wording.md） |
+|---|---|---|---|---|---|
+| `launch_not_in_this_build` | | 后台（Windows App 新建会话） | 503 | 5 | Windows 上暂时还不能在 App 里新建会话（本版本未接入）。可以先在命令行里用 `aw run -- 程序` 记录。 |
+| `option_not_wired` | 新 | 后台 | 400 | 5 | 「{选项名}」本版本未接入，这次没有新建会话。请去掉这个选项再试。 |
+| `db_read_only_newer` | | 后台 | 409 | 1 | 这份记录是更新版本的 AgentWatch 写的，现在只能查看，不能新建或修改。请升级 AgentWatch。 |
+| `program_not_found` | | 后台 / CLI | 400 | 6 | 找不到程序「{名}」，请检查名字或路径 |
+| `cwd_not_found` | 新 | 后台 / CLI（报错管道，A1 规矩 3） | 400 | 6 | 找不到工作目录「{路径}」 |
+| `owner_user_not_found` | 新 | 后台 | 400 | 2 | 找不到用户「{名}」，没有做任何改动。 |
+| `owner_lookup_failed` | 新 | 后台 | 503 | 1 | 查不到用户「{名}」对应的账户，没有做任何改动。 |
+| `owner_mismatch` | 新 | 后台 | 403 | 4 | 会话「{号}」的主人不是「{填的用户}」，没有做任何改动。 |
+| `last_with_owner` | 新 | CLI（发请求前就拒） | — | 2 | `@last` 只指你自己最近的会话，不能跟 `--owner` 一起用。要操作别人的会话，请写会话号。 |
+| `owner_action_forbidden` | | 后台 | 403 | 4 | 只有会话主人能操作 |
+| `delete_cancelled` | 新 | CLI（终端里答「否」） | — | 7 | 已取消，没有删除任何会话 |
+| `data_dir_untrusted_owner` | 新 | 后台启动时（`agentwatchd` 退出码 1，`aw daemon start` 退 1） | — | 1 | 数据目录「{路径}」不归管理员所有，可能被别人改过。为防万一，后台没有启动。请删掉这个目录后再启动后台。 |
+| `data_dir_link` | 新 | 同上 | — | 1 | 数据目录「{出问题的那一级路径}」是一个链接，后台不会顺着链接写数据，所以没有启动。请换成普通目录后再启动后台。 |
+| `data_dir_fix_failed` | 新 | 同上 | — | 1 | 数据目录「{路径}」的权限改不过来，后台没有启动。原因：{中文原因}。请删掉这个目录后再启动后台。 |
+| `data_dir_others_writable` | 新 | 同上 | — | 1 | 数据目录「{路径}」别的用户也能写，后台没有启动。请把权限改成只有你自己能写，或者换一个目录。 |
+| `data_dir_machine_needs_admin` | 新 | 同上 | — | 1 | 正式数据目录「{路径}」只能由管理员运行的后台使用。请用管理员运行后台，或者换一个自己的目录。 |
+| `daemon_timeout` | | 客户端（aw-channel） | — | 1 | 后台 {N} 秒没有回应，这次请求没有完成。（附着 / 新建会话再加：「后台不会留下这个会话。」撤掉成功才写；收尾成附着失败写「这个会话已记为附着失败」） |
+| `channel_broken` | | 客户端（aw-channel） | — | 1 | 跟后台的连接断了，请再试一次。 |
+| `daemon_server_unverified` | | 客户端（Windows 反查后台） | — | 4 | 没法确认连上的是不是 AgentWatch 后台，为防连到冒充的程序，这次没有发送任何内容。请重启后台后再试。 |
+| `daemon_untrusted_server` | | 客户端（Windows 反查后台） | — | 4 | 连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为防内容被它拿到，这次没有发送任何内容。 |
+| `unidentified_peer` | | 后台 | 403 | 4 | 后台认不出你是哪个用户，已拒绝这次请求。请确认 `aw` 和后台是同一个版本，还不行就重启后台。 |
+| `db_busy` | | 后台 | 503 | 1 | 会话数据库正忙（后台在写入），等了 N 秒还是没轮到，请稍后再试。 |
+
+- 数据目录那 5 个码不走 HTTP：后台启动时就失败，写进 `agentwatchd` 的标准错误和日志（日志里另带英文原因），`aw daemon start` 照原文转给用户。
+- `launch_not_in_this_build` 现在是 503 → 退出码 1，按表改成 5；`daemon_errors.rs:91` 的中文照 wording 文件改（第 8b 步）。
+- `program_not_found` 现在的中文「找不到这个程序或工作目录」在禁用词里，拆成 `program_not_found` + `cwd_not_found` 两个码（第 4 步的报错管道能分出是哪一步）。
+- 表里没列的老码（`daemon_errors.rs` 里其余那些）第 8a 步原样搬进枚举，中文照 wording 文件逐条核对。
 
 ## B2. 筛选语法：一套 —— **进 #147**（第 11 步）
 
@@ -407,7 +479,7 @@
 |---|---|---|
 | 可用 | 做了，这次也拿到了 | Linux 进程采样 |
 | 本版本未接入 | 功能还没做，或者做了还没接上 | 文件、网络、代理、自报告、Windows App 新建会话 |
-| 这个系统不支持 | 这个系统本身做不到 | macOS（和没有 cgroup v2 的 Linux）上**脱离进程组**的孙程序不保证跟着 aw 结束（A1 规矩 6）；直接子程序和同组孙程序三个系统都保证 |
+| 这个系统不支持 | 这个系统本身做不到 | macOS 上**脱离进程组**的孙程序不保证跟着 aw 结束（macOS 没有 subreaper，A1 规矩 6）。Linux（有没有 cgroup 都一样）和 Windows 都保证 |
 | 不可得 | 做了，但这次拿不到（权限、进程已退出、读失败） | 普通用户读不到别人的进程；进程退出太快 |
 
 **「没采」不是第五种说法，全部替换**（在 185fc77 上 grep 代码和 UI，测试文件和快照跟着改）：
@@ -415,16 +487,48 @@
 | 位置 | 现在的写法 | 改成 |
 |---|---|---|
 | `ui/src/i18n/zh.json:443` `coverage.notCollected` | 没采：本版本不采集{kind} | 本版本未接入：{kind}（这里没有数据，不代表没有发生） |
-| `zh.json:441` `coverage.notCollectedShort`、`zh.json:526` `settings.capNo` | 没采 | 本版本未接入 |
+| `zh.json:441` `coverage.notCollectedShort`（`OverviewPage.tsx:153/164`、`NotCollected.tsx:10` 用它表示「这一版没采这类数据」）、`zh.json:526` `settings.capNo` | 没采 | 本版本未接入 |
+| `ProcessesPage.tsx:226` 退出码列（现在借用 `coverage.notCollectedShort`） | 没采 | **拆出新 key `procs.exitUnavailable` =「不可得」**，退出码列只用它；还在跑的进程写「还在运行」（C2）。`ProcessesPage.exit.test.tsx:46` 跟着改 |
 | `zh.json:449` `overview.notCollected` | 没采：{kinds}（本版本只有进程采样） | 本版本未接入：{kinds}（这一版只采进程） |
-| `zh.json:508` `new.capNotCollected` | 没采：{kinds}（{reason}） | 按原因码选「本版本未接入 / 这个系统不支持」 |
+| `zh.json:508` `new.capNotCollected` | 没采：{kinds}（{reason}） | 按原因选「本版本未接入 / 这个系统不支持 / 不可得」（权限不够、读失败这类用「不可得」） |
 | `zh.json:166` `new.procNotCollected`；`aw-cli/src/cmd/ps.rs:206` | 没采：进程表（原因） | 这个平台上没有进程表时用「这个系统不支持」；后台没接上时用「本版本未接入」；读失败用「不可得」 |
 | `aw-cli/src/cmd/render.rs:254/437`、`aw-daemon/src/export/markdown.rs:723`、`ProcessesPage.tsx:215`：退出码缺失（Mac/Windows 根进程的退出码，非子进程） | 没采 | **不可得**（功能做了，这次拿不到） |
 | `render.rs:145`、`query.rs:87`、`http_source.rs:516`：pinned 缺失 | 没采 | 这是 bug，PATCH/show 要带上真实值（A3）；还没修好前写「不可得」 |
 | `aw-cli/src/cmd/run.rs:915` cgroup 退化 | 没采：cgroup 会话范围… | 「不可得：这台机器没法把程序整组跟踪（没有可用的 cgroup v2），改为按父子关系跟踪；离开父子关系的程序可能漏记。」（UI-147-wording.md:82） |
 | `run.rs:1622` | 退出太快没采到 | 不可得（进程退出太快） |
-| `aw-cli/src/cmd/doctor.rs:92/180/266` | 没采 | 本版本未接入（此构建没有探测采集器） |
+| `aw-cli/src/cmd/doctor.rs:92`（`Unprobed`，这一版本来就不检查） | 没采 | 本版本未接入（这一版没有检查采集功能） |
+| `doctor.rs:180`（后台 doctor 没列出采集器）、`doctor.rs:266`（后台回复里没带 status） | 没采 | **不可得**（做了，这次没拿到） |
 | `OverviewPage.tsx:49`、`NewSessionPage.tsx:73/322`、`ComparePage.tsx:212`（注释）；`docs/01-architecture/ui.md:63/93/139/189`、`api-and-cli.md:71/185/191`、`storage.md:458-459` | 没采 | 按上面同样的规则改，文档一起改 |
+
+**四种说法只用来说能力**：出错用错误句子（B1 码表），过程和结果用状态句子（C2），不拿「不可得」「本版本未接入」去报错或标状态。比如超时要报「等了 {N} 秒，程序还没结束」或「后台 {N} 秒没有回应，这次请求没有完成。」，进程还在跑写「还在运行」。
+
+**其他「还不支持」说法的替换表**（UI审查 0aff6cb 第 3 条；行号按 0aff6cb）：
+
+| 位置 | 现在的写法 | 改成 | 第几步 |
+|---|---|---|---|
+| `ui/src/i18n/zh.json:40` `na.collector_unavailable` | 当前运行模式不支持采集此信息（详见 aw doctor） | 按原因选：「{类别}本版本未接入」或「这个系统不支持{类别}」 | 8b |
+| `zh.json:285` `gaps.unavailable` | 本平台不可得的能力 | 这个系统不支持 | 8b |
+| `aw-cli/src/cmd/doctor.rs:507` `CapabilityStatus::Unavailable` | 当前不可用 | 不可得 | 8b |
+| `aw-cli/src/cmd/run.rs:1199` | 后台记录会话时不支持 --no-follow-children（轮询采样器总是跟随子进程）；请移除此参数或使用 --no-daemon | `--no-follow-children` 本版本未接入。请去掉这个参数，或者用 `--no-daemon` | 8b |
+| `aw-cli/src/cmd/attach.rs:573` | 此构建的 attach 不支持 --name；请用 `aw ps` 找到进程后传入 --pid | `--name` 本版本未接入，请用 `aw ps` 找到进程号后写 `--pid` | 8b |
+| `attach.rs:633` | 此构建的 attach 不支持 {name}；后台轮询采样器没有这个参数 | `{参数}` 本版本未接入 | 8b |
+| `run.rs:1437` | 子进程启动尚未接入，本次只给出注入计划，没有设置系统代理，没有改证书库 | 代理模式本版本未接入。这次没有设置系统代理，也没有改证书库。 | 8b |
+| `run.rs:1654` | [aw] 摘要不可用 · 本构建没有会话存储，不能用 0 表示未知 | [aw] 摘要本版本未接入（这一版没有会话存储） | 8b |
+| `run.rs:1661`、`run.rs:1731`（JSON `reason`） | [aw] 摘要不可用 · {detail} | [aw] 摘要不可得：{中文原因}（读失败时）；JSON 里的 `reason` 照样改中文，英文原因只进日志 | 8b |
+| `zh.json:76` `session.recording`、`zh.json:447` `overview.noRecordedGapsYet` | 录制中 / 录制中，到目前没有记录到采集缺口 | 记录中 / 记录中，到目前没有记录到采集缺口 | 8b |
+| 注释：`ui/src/features/sessions/SessionsPage.tsx:387`、`ui/src/lib/live-session.ts:8`（UI审查 列的 `aw-cli/src/cmd/sessions.rs:362`、`docs/04-plan/pack2-checklist.md:13` 在 0aff6cb 上已经没有「录制中」，第 8b 步再 grep 一遍） | 录制中 | 记录中（注释和文档一起改，免得 lint 豁免越来越多） | 8b |
+
+**内部码和术语的替换表**（UI审查 0aff6cb 第 6 条；这些词同时进 `zh.toml` 的 `[lint.forbid]`，但不能只靠 lint，每一处都写清改成什么）：
+
+| 位置 | 现在的写法 | 改成 | 第几步 |
+|---|---|---|---|
+| `aw-cli/src/cmd/ps.rs:207` | 原因码 {code}，这个版本还不认识 | 不可得：进程表（后台给了这个版本不认识的原因，请升级 aw）。原因码只进 `--json` | 8b |
+| `aw-cli/src/launch/unix_linux.rs:64` `V1_DOCTOR_HINT`（`aw-collector-linux/src/scope.rs:79` 里同一句也改） | 检测到 cgroup v1：启动模式不可用，已退化为 scope_pids 进程树跟踪。cgroup v2 才能把进程关在会话目录里。 | 不可得：这台机器没法把程序整组跟踪（没有可用的 cgroup v2），改为按父子关系跟踪；离开父子关系的程序可能漏记。 | 8b（`unix_linux.rs:1248` 的断言跟着改） |
+| `run.rs:915` | 没采：cgroup 会话范围（…），已退化为按进程树跟踪（scope_pids）；… | 同上一行那句 | 8b |
+| `run.rs:1199`、`attach.rs:633` 的「轮询采样器」 | 见上表 | 见上表（句子里不出现「轮询采样器」） | 8b |
+| `run.rs:754` | 中断转发不可用；Windows 启动器未创建控制台进程组 | Windows 上没法把 Ctrl+C 转给程序（不可得） | 4 |
+
+`[lint.forbid]` 加：`原因码`、`scope_pids`、`轮询采样器`、`注入计划`、`摘要不可用`、`本平台不可得`、`当前不可用`、`此构建`、`探测采集器`。代码注释里提到 `scope_pids`（eBPF map 的名字）不算用户可见，lint 只扫字符串和 `///`，不扫 `//`。
 
 ## C2. 会话和页面状态（跟能力状态是两张表，不混用）
 
@@ -435,11 +539,12 @@
 | 程序已退出（退出码 N） | 程序自己退出了，N≠0 时红色，文字里写出码 | `zh.json:78`「程序已退出」，补上退出码 |
 | 程序被信号结束（信号 N） | 程序被信号杀掉，跟非 0 退出码一样标红、有字 | 新增（UI-147-wording.md:80） |
 | 还在运行（进程）/ 记录中（会话） | 退出码为空且程序还在跑；**不写「不可得」** | UI-147-wording.md:81 |
-| 已停止记录 | 用户按了停止 | `zh.json:81` |
+| 正在停止记录… | 用户按了停止，后台还在收尾 | `zh.json:85` `session.stopping`，留着 |
+| 已停止记录 | 用户按了停止 | `zh.json:81`；会话列表里的「○ 已停止」（`zh.json:77` `session.stopped`）**并进「已停止记录」**，不再用单独的「已停止」 |
 | 记录已中断（后台重启） | `daemon_restart` / `daemon_shutdown` | `zh.json:82-83` |
 | 附着失败 | 附着失败，或者回复写不回去被撤回 | `zh.json:79` |
 | 接管超时 | `adopt_timeout`（`watch.rs:145`） | 定稿里有，UI 里要补 |
-| 已停止（采集器） | 设置页里的采集器状态 | `zh.json:522`，留着，但只用在采集器上 |
+| 已停止（采集器） | 设置页里的采集器状态 | `zh.json:522`，留着，只用在采集器上，不用在会话上 |
 
 这两张表都进 `zh.toml`（A5），中文以 `UI-147-wording.md` 为准。
 
@@ -451,7 +556,7 @@
 2. **管理员和 `--owner`**：始终由后台按认出来的身份判断，CLI 传来的 `owner` 只当作「想操作谁的会话」，不当作权限；用户名到 uid 的解析在后台做；普通用户带 `--owner=别人` 一律拒绝（带 `--owner=自己` 照常执行）；`@last` 永远只指自己的会话。这次只是把 stop、attach 也拉进同一个 `mutation_owner`，比现在更严，没有放松。
 3. **降权**：启动契约要求先切身份（setgroups/setgid/setuid 并自检），再 chdir、等放行、exec。附加组**一律由后台按用户重新加载**（`getgrouplist`），不用连接方报上来的组（review 挡-4，原来这里有冲突，已改）；自检补 getegid 和 `setgid(0)` 必须失败；后台禁止用 `current_user`（`aw-daemon/clippy.toml:2`），这条不变。
 3a. **挂住时后台崩了程序结束，放行以后照样跑**：PDEATHSIG/看门进程**只用在 aw 起的程序上**，后台起的程序一律不绑（review 挡-3，原来这里有冲突风险，已改）；挂住阶段子进程关掉白名单以外的所有 fd，EOF 不会被别的挂住进程拖住。
-3b. **`--no-daemon` 时 aw 一死程序跟着结束**：由看门进程保证，aw 被 SIGKILL 也成立（原来「没设计完」，已补）。
+3b. **`--no-daemon` 时 aw 一死程序跟着结束**：由看门进程保证，aw 被 SIGKILL 也成立。Linux 上看门进程是 aw 和程序之间那一层、并且是 subreaper，以 aw 的用户身份运行，只给自己的子孙发信号，每次发信号前按（pid、ppid、启动时间）核对，不会打到别人的进程；Mac 例外见 A1 规矩 6。
 4. **数据目录**：放宽只放宽「普通用户后台用自己的目录」这一种；「是不是管理员」只看后台自己的令牌，「是不是正式目录」规范化后比，非管理员后台在建目录之前就拒绝正式目录，root 后台的目录上面每一级都必须是 root 且不可被别人写（A4 规矩 6）。测试用的 `--data-dir` 从 release 里拿掉，CI 按行为检查，只会更严。
 5. **B3 拒绝未接入字段**只会让后台更严，不会给出新权限；`/capabilities` 只报全局能力和调用者自己能做什么，走同样的认人和 token，App 不拿它当权限依据。**B5 查询时算层级**只读本人有权看的会话，复用现在的 `owner_for_viewer`（query.rs:496）。
 6. **filter 统一**：用户写的文字仍然只做参数绑定，不拼进 SQL（`filter.rs:5-6` 的规矩搬到 aw-core 里继续用）。
@@ -497,7 +602,7 @@
 1. **Linux 改用 hold.rs**：重写 Linux 的启动路，会影响已经过了 Test-bot 307 条测试的那一路。缓解：第 4 步可以先只上证明工作区那个最小修法（父进程一直 CLOEXEC + 子进程 dup2 到 3），压力测试零泄漏后再换 hold.rs；推上来后 Test-bot 把 RETEST-CLI / STEP3 / ALLCLI 全部重跑。
 2. **Windows 都没上过真机**：3d95803、4e6b68a、winpipe B/C 都只在 CI 上跑过。服务模式和普通用户两项要等用户开管理员窗口。
 3. **附着修复只做了一半**：证明工作区只验证了「新行不先 DELETE」。改名和 retention 删除时的 FTS 删除仍然是全表扫描，要按 rowid 删（A2 规矩 7）才算完；第 5 步 CI 缩小版要盖住 retention 删除的耗时。另外 FTS 改 rowid 方案涉及迁移，老库要回填映射表（大库上一次性耗时要测）。
-4. **看门进程**是新加的进程：要防它自己成孤儿（它也要被 PDEATHSIG/kqueue 绑在 aw 上）、防它在 aw 正常退出时误杀（aw 正常退出前先通知看门进程退出）。
+4. **看门进程**是新加的进程：它**必须比 aw 活得久**（不能被绑在 aw 上一起死，否则 aw 被 SIGKILL 后没人清理）；清理完成后自己退出，5 秒上限防止卡住；它自己意外死了，程序挂回 aw（aw 也是 subreaper），由 aw 接手。aw → 看门进程 → 程序这层关系改了退出码、信号和终端前台的走法，第 4 步的 pty 测试必须盖住（A1 测试）。
 5. **wording 表一次性动的地方很多**（Rust、UI、文档、快照）。冲突风险高，第 8b 步期间其他路尽量不改用户可见的文字。
 6. **`--owner` 用户名解析**在 Windows 上要查 SID 对应账户，可能慢或失败；失败时报「查不到用户「{名}」对应的账户，没有做任何改动。」且不放行。
 7. **Mac `setgroups` 超过 16 个**：A1 规矩 4 选了截断 + 日志，待 PM 确认。
@@ -575,7 +680,7 @@
 |---|---|---|
 | 挡-1 附着慢根因写错、验收定错 | 用 10 组对照计时证实是 FTS 全表扫描 DELETE + 库写锁 + 全局大锁；扫描已否定；验收改成「同库同采样会话 ≤ 1.5 秒 / POST ≤ 0.3 秒」，修后达标 | A2、H2、E 第 5 步 |
 | 挡-2 进程树按 parent_uid 现算修不好 | 改成 (b) 查询时 parent_uid 为空按 ppid + 启动时间找（主）+ (a) 采样时补；测试改成孩子 parent_uid 为 NULL、pid 复用 | B5、E 第 12 步 |
-| 挡-3 aw 被强杀谁来清理、Mac 写反、PDEATHSIG 不能用在后台起的程序 | 只绑 aw 起的程序；看门进程（Linux PDEATHSIG+killpg/cgroup.kill，Mac kqueue NOTE_EXIT，Windows Job）；PDEATHSIG 三个坑；Mac 写成「脱离进程组的孙程序不保证」；测试加「后台被杀程序还在跑」 | A1 规矩 6、C1 |
+| 挡-3 aw 被强杀谁来清理、Mac 写反、PDEATHSIG 不能用在后台起的程序 | 只绑 aw 起的程序；看门进程（Linux：看门进程是 subreaper、夹在 aw 和程序之间，SIGSTOP 再 SIGKILL 循环清理；Mac kqueue NOTE_EXIT；Windows Job）；PDEATHSIG 三个坑；Mac 写成「脱离进程组的孙程序不保证」；测试加「后台被杀程序还在跑」 | A1 规矩 6、C1 |
 | 挡-4 hold.rs 附加组来源、异步信号安全、挂住时拿着所有 fd | 附加组一律 `getgrouplist`；父进程准备指针数组、删 `clear_preload`；子进程关 fd（Linux close_range，Mac 原始循环 close，PM 13:13）；测试加挂住阶段白名单、A/B 中止 | A1 规矩 1、3、4 |
 | 要补 1 数据目录放宽 | A4 规矩 6 + 测试矩阵，第 0 步（Windows 句柄化第 6 步） | A4、E |
 | 要补 2 错误码 46+ 种、两张已有表 | B1 重写：41 + 5，`not_implemented` 格式、`json!` 禁用、从 daemon_errors.rs 生成、码名不改、`write_failed` 删 | B1、E 第 8a 步 |
@@ -611,8 +716,8 @@
 - 不截断也不拒绝，按用户加载（跟登录一样，initgroups 语义）。libc 的 `initgroups()` 不是异步信号安全的，所以组列表在 fork **之前**解析（`getgrouplist`，缓冲区给大，溢出就加大重试）；子进程里只做系统调用（macOS 的 `initgroups(ngroups, gidset, gmuid)` 系统调用通过 gmuid 开启动态成员解析，或者用准备好的列表 `setgroups`），fork 后不做任何查询。系统仍然只给一部分时：记日志，并在 doctor 里如实显示，绝不悄悄丢掉。
 
 ### `--no-daemon` 时 aw 退出，子程序怎样跟着结束（13:51 更正）
-- Linux（`PR_SET_CHILD_SUBREAPER` + 看门进程）和 Windows（Job Object `KILL_ON_JOB_CLOSE`）能清到孙程序，包括自己另起进程组的。
-- Mac：看门进程 + kqueue 会 `killpg` 整个进程组，但清不到自己 `setsid`/改了进程组的孙程序（macOS 没有 subreaper）。所以 Mac 的 `--no-daemon` 帮助单独一句（见 UI-147-wording.md），Mac 的 doctor「aw 退出时清理子程序」一项也不写单纯的「可用」，带同样的说明。帮助快照按系统分开存。
+- Linux（看门进程设 `PR_SET_CHILD_SUBREAPER`，进程关系 aw → 看门进程 → 程序，有没有 cgroup 都一样）和 Windows（Job Object `KILL_ON_JOB_CLOSE`）能清到孙程序，包括自己另起进程组的。细节（退出码转交、信号经看门进程转发、tcsetpgrp、SIGSTOP 再 SIGKILL 的清理循环、按 pid+ppid+启动时间防复用、看门进程自己单独一个进程组）见 A1 规矩 6（PM 14:04 定）。
+- Mac：看门进程 + kqueue 会 `killpg` 整个进程组，但清不到自己 `setsid`/改了进程组的孙程序（macOS 没有 subreaper）。所以只有 Mac 的 `--no-daemon` 帮助单独一句（见 UI-147-wording.md），Linux 跟 Windows 用统一那句，Mac 的 doctor「aw 退出时清理子程序」一项也不写单纯的「可用」，带同样的说明。帮助快照按系统分开存。
 
 ### UI审查 13:50 新增文字（数据目录其余失败、option_not_wired）
 - 路径含链接：「数据目录「{出问题的那一级路径}」是一个链接，后台不会顺着链接写数据，所以没有启动。请换成普通目录后再启动后台。」
@@ -621,3 +726,8 @@
 - 普通用户后台用正式目录：「正式数据目录「{路径}」只能由管理员运行的后台使用。请用管理员运行后台，或者换一个自己的目录。」
 - option_not_wired：「「{选项名}」本版本未接入，这次没有新建会话。请去掉这个选项再试。」
 - 以上以 `/workspace/qa-issues/UI-147-wording.md` 为准，两边不一致时照那份文件。
+
+### 345d216（Windows 第三轮）里的 `--no-daemon` 整树清理跟上面差在哪（14:05 核对）
+- 345d216 在 Linux/Mac 上用的是 `NoDaemonTreeWatchdog`（`crates/aw-cli/src/cmd/run.rs`，约 1046-1112 行）：aw 用 `std::process::Command` 起一个 `/bin/sh`，它读 aw 留下的管道，读到 EOF 就 `kill -KILL -<程序的进程组>`；aw 正常退出前先写一行 `done`，避免打到被复用的进程组号。**它没有用 `PR_SET_CHILD_SUBREAPER`**，代码注释自己也写着「自己 `setsid`/换了进程组的程序能逃掉，Linux 上更强的是 cgroup」。
+- 跟上面的决定比，差了这几处：看门进程是 aw 的**子进程、程序的兄弟**，不是程序的祖先，就算设了 subreaper 也收养不到程序的子孙；只按进程组 `killpg`，没有 SIGSTOP 再 SIGKILL 的扫描循环；不按（pid、ppid、启动时间）核对；而且这个 sh 跟 aw 在**同一个进程组**里（Command 默认不另起组）。按代码推断（没实测）：终端里按 Ctrl+C 或者终端挂断时，SIGINT/SIGHUP 会把这个 sh 一起打死，之后 aw 再死就没人清理了。
+- 结论：345d216 的 Windows Job 部分符合上面的决定；Linux/Mac 的 watchdog 是过渡做法，第 4 步换成上面的设计（Linux 用 subreaper 看门进程，Mac 改成 kqueue 看门进程），并加 A1 那组测试。

@@ -89,12 +89,9 @@ async fn aw_request(
     body: Option<String>,
 ) -> Result<channel::Reply, Failure> {
     let path = channel_path();
-    let body = launch_body_with_user_locale(
-        &method,
-        &target,
-        body.unwrap_or_default(),
-        |key| std::env::var(key).ok(),
-    );
+    let body = launch_body_with_user_locale(&method, &target, body.unwrap_or_default(), |key| {
+        std::env::var(key).ok()
+    });
     tauri::async_runtime::spawn_blocking(move || channel::exchange(&path, &method, &target, &body))
         .await
         .map_err(|err| Failure::broken(&format!("request task failed: {err}")))?
@@ -245,7 +242,8 @@ mod tests {
     #[test]
     fn unset_locale_does_not_add_an_env_object() {
         let original = r#"{"mode":"launch","argv":["tool"]}"#.to_owned();
-        let body = launch_body_with_user_locale("POST", "/api/v1/sessions", original.clone(), |_| None);
+        let body =
+            launch_body_with_user_locale("POST", "/api/v1/sessions", original.clone(), |_| None);
         assert_eq!(body, original);
     }
 }

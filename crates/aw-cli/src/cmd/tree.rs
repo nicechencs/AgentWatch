@@ -76,9 +76,19 @@ pub(crate) enum Command {
         group: Option<String>,
         #[arg(long, help = "MCP 调用记录（本版本未接入）")]
         mcp_tap: bool,
-        #[arg(
-            long,
-            help = "不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序都会跟着结束。"
+        #[cfg_attr(
+            target_os = "macos",
+            arg(
+                long,
+                help = "不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序会跟着结束。子程序要是自己脱离了进程组（比如在后台另起服务），在 Mac 上不保证会跟着结束。"
+            )
+        )]
+        #[cfg_attr(
+            not(target_os = "macos"),
+            arg(
+                long,
+                help = "不经过后台，直接运行程序，不做记录；`aw` 一退出，程序和它启动的子程序都会跟着结束。"
+            )
         )]
         no_daemon: bool,
         #[arg(long, help = "原始事件文件（本版本未接入）")]

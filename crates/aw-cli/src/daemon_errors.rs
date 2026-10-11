@@ -144,6 +144,26 @@ const ROWS: &[Row] = &[
         en: None,
     },
     Row {
+        code: "invalid_config_key",
+        zh: "配置键不存在或不受支持",
+        en: None,
+    },
+    Row {
+        code: "invalid_config",
+        zh: "配置键或配置值无效",
+        en: None,
+    },
+    Row {
+        code: "config_path_unavailable",
+        zh: "后台没有可写的配置文件",
+        en: Some("后台没有可写的配置文件"),
+    },
+    Row {
+        code: "config_write_failed",
+        zh: "无法写入配置文件",
+        en: None,
+    },
+    Row {
         code: "bad_query",
         zh: "查询参数不正确",
         en: None,

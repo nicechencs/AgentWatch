@@ -12,6 +12,8 @@
 //! The daemon owns the log path (its data dir), so `aw` never guesses a file
 //! location and never needs read access to it.
 
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::thread;
 use std::time::Duration;
@@ -23,6 +25,9 @@ use super::{error_outcome, Outcome};
 use crate::client::{ApiRequest, Client, Transport};
 use crate::endpoint::Endpoint;
 use crate::exit;
+
+#[cfg(unix)]
+use nix::fcntl::{Flock, FlockArg};
 
 /// How long `stop` waits for `/health` to go away.
 pub(crate) const STOP_WAIT: Duration = Duration::from_secs(20);
@@ -99,6 +104,9 @@ pub(crate) fn daemon_restart(
     if stopped.code != exit::OK {
         return stopped;
     }
+    if let Err(detail) = wait_for_shutdown_release(endpoint, stop_wait) {
+        return error_outcome(exit::GENERAL, "restart_timeout", &detail, json);
+    }
     let started = daemon_start(endpoint, open, starter, start_wait, json);
     if json || started.code != exit::OK {
         return started;
@@ -106,6 +114,70 @@ pub(crate) fn daemon_restart(
     let mut stdout = stopped.stdout;
     stdout.extend_from_slice(&started.stdout);
     Outcome { stdout, ..started }
+}
+
+/// Wait until the old daemon has released its internal-channel start lock.
+///
+/// `POST /daemon/stop` is deliberately acknowledged before the foreground
+/// loop has flushed collectors and closed its store.  The health endpoint goes
+/// away when IPC starts shutting down, which is earlier than releasing this
+/// lock.  Starting at that point races the old daemon's data-dir lock.
+///
+/// Unix sockets have an adjacent flock specifically for serialising startup.
+/// Named pipes and HTTP have no equivalent lock file, so their daemon-side
+/// bounded instance-lock retry is the fallback.
+fn wait_for_shutdown_release(endpoint: &Endpoint, wait: Duration) -> Result<(), String> {
+    #[cfg(unix)]
+    let lock = match endpoint {
+        Endpoint::Unix { path } => {
+            let mut name = path.as_os_str().to_owned();
+            name.push(".lock");
+            Some(std::path::PathBuf::from(name))
+        }
+        _ => None,
+    };
+    #[cfg(not(unix))]
+    let lock: Option<std::path::PathBuf> = None;
+
+    let Some(lock) = lock else {
+        return Ok(());
+    };
+    let mut waited = Duration::ZERO;
+    loop {
+        if channel_lock_is_free(&lock)? {
+            return Ok(());
+        }
+        if waited >= wait {
+            return Err(format!(
+                "agentwatchd 已停止响应，但 {} 秒后仍未释放重启锁；没有启动新实例，以免与旧实例争用数据目录 [{endpoint}]",
+                wait.as_secs()
+            ));
+        }
+        thread::sleep(STOP_POLL);
+        waited += STOP_POLL;
+    }
+}
+
+#[cfg(unix)]
+fn channel_lock_is_free(path: &std::path::Path) -> Result<bool, String> {
+    let file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(err) => return Err(format!("无法检查重启锁 {}：{}", path.display(), err.kind())),
+    };
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => {
+            drop(lock);
+            Ok(true)
+        }
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(false),
+        Err((_, err)) => Err(format!("无法检查重启锁 {}：{err}", path.display())),
+    }
+}
+
+#[cfg(not(unix))]
+fn channel_lock_is_free(_path: &std::path::Path) -> Result<bool, String> {
+    Ok(true)
 }
 
 /// One logs read: `(text, next offset)`.

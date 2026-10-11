@@ -188,9 +188,12 @@ impl ConfigApi for HttpConfigApi {
 
     fn get(&mut self, key: &str) -> Result<Value, ConfigError> {
         let body = self.call(&show_request(true, Some(key)))?;
-        // The daemon ignores `?key=` and returns the whole in-memory document.
-        // Walk it. A missing key is not `null` invented by this process.
+        // Newer daemons return the selected value for `?key=`; retain the
+        // whole-document walk for older daemons during a rolling upgrade.
         let root = body.get("config").unwrap_or(&body);
+        if !root.is_object() {
+            return Ok(root.clone());
+        }
         lookup_key(root, key)
     }
 

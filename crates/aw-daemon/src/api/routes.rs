@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
@@ -184,6 +185,9 @@ pub struct ApiState {
     pub query: StoreQuery,
     /// Effective config snapshot for `GET /config`. Not a secret store.
     pub config_json: serde_json::Value,
+    /// The configuration file that supplied `config_json`. Kept in memory only
+    /// so an administrator's `config set` can merge a single key into it.
+    pub config_path: Option<PathBuf>,
     /// SSE subscribers, keyed by session public id. Slow clients are lagged.
     pub live: LiveHub,
     /// `AW_UI_DEV_URL`, captured at construction. Empty means embedded assets.
@@ -210,6 +214,7 @@ impl Default for ApiState {
             next_session: 0,
             query: StoreQuery::disconnected(),
             config_json: serde_json::json!({}),
+            config_path: None,
             live: LiveHub::default(),
             ui_dev_url: match crate::assets::AssetMode::from_env() {
                 crate::assets::AssetMode::DevProxy { origin } => Some(origin),
@@ -1260,13 +1265,7 @@ fn route_authed(state: &mut ApiState, req: &HttpRequest, caller: &Caller) -> Api
         ("POST", "/api/v1/db/vacuum") => db_admin(state, caller, StoreOp::Vacuum),
         ("POST", "/api/v1/db/migrate") => db_admin(state, caller, StoreOp::Migrate),
         ("PUT", "/api/v1/config") => put_config(state, caller, &req.body),
-        ("GET", "/api/v1/config") => ApiResponse::json(
-            200,
-            &json!({
-                "config": state.config_json,
-                "builtin_redaction_rules": builtin_redaction_json(),
-            }),
-        ),
+        ("GET", "/api/v1/config") => get_config(state, &req.query),
         ("GET", "/api/v1/openapi.json") => {
             ApiResponse::json(200, &super::openapi::document(req.listen_port))
         }
@@ -2361,6 +2360,33 @@ fn search(state: &ApiState, caller: &Caller, req: &HttpRequest) -> ApiResponse {
     }
 }
 
+fn get_config(state: &ApiState, query: &str) -> ApiResponse {
+    let mut config = state.config_json.clone();
+    if let Some(key) = query_value(query, "key") {
+        for part in key.split('.') {
+            let Some(next) = config.get(part) else {
+                return error_response(400, "invalid_config_key", &format!("未知配置键 `{key}`"));
+            };
+            config = next.clone();
+        }
+        return ApiResponse::json(200, &json!({ "config": config }));
+    }
+    ApiResponse::json(
+        200,
+        &json!({
+            "config": config,
+            "builtin_redaction_rules": builtin_redaction_json(),
+        }),
+    )
+}
+
+fn query_value<'a>(query: &'a str, wanted: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == wanted).then_some(value)
+    })
+}
+
 fn put_config(state: &mut ApiState, caller: &Caller, body: &[u8]) -> ApiResponse {
     let input = AuthInput {
         http: false,
@@ -2375,13 +2401,38 @@ fn put_config(state: &mut ApiState, caller: &Caller, body: &[u8]) -> ApiResponse
     if !matches!(authorize(&input), AuthDecision::Allow(_)) {
         return forbidden();
     }
-    let value: serde_json::Value = match serde_json::from_slice(body) {
+    let input: serde_json::Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(_) => return error_response(400, "bad_request", "config body is not JSON"),
     };
-    // In-memory only. Disk write and hot reload belong to the config owner.
-    state.config_json = value;
-    ApiResponse::json(200, &json!({ "applied": "memory" }))
+    let Some(key) = input.get("key").and_then(Value::as_str) else {
+        return error_response(400, "bad_request", "配置请求缺少 key");
+    };
+    let Some(value) = input.get("value") else {
+        return error_response(400, "bad_request", "配置请求缺少 value");
+    };
+    let Some(path) = state.config_path.as_deref() else {
+        return error_response(409, "config_path_unavailable", "后台没有可写的配置文件");
+    };
+    let config = match crate::config::merge_set_path(path, key, value) {
+        Ok(config) => config,
+        Err(crate::config::ConfigError::Invalid { detail, .. }) => {
+            return error_response(
+                400,
+                "invalid_config",
+                &format!("配置键 `{key}` 无效：{detail}"),
+            );
+        }
+        Err(err) => {
+            return error_response(500, "config_write_failed", &format!("无法写入配置：{err}"))
+        }
+    };
+    state.config_json = crate::config::effective_json(&config);
+    state.preview_ui = config.debug.preview_ui;
+    ApiResponse::json(
+        200,
+        &json!({ "applied": "file", "config": state.config_json }),
+    )
 }
 
 fn static_asset(state: &ApiState, req: &HttpRequest) -> ApiResponse {

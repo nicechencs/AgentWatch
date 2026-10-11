@@ -143,10 +143,31 @@ impl Daemon {
         };
         command
             .env_remove("AW_TOKEN")
+            .env("AW_DAEMON_CONFIG", self.root.join("config.toml"))
             .args(args)
             .stdin(Stdio::null())
             .output()
             .expect("spawn aw")
+    }
+
+    /// Run the CLI as root for administrator-only daemon operations. This is
+    /// used only with an isolated root daemon and its temporary socket.
+    fn aw_as_root(&self, args: &[&str]) -> Output {
+        let mut command = Command::new("sudo");
+        command.arg("-n").arg("env");
+        for (key, value) in env_for(&self.root) {
+            command.arg(format!("{key}={}", value.display()));
+        }
+        command
+            .arg(format!(
+                "AW_DAEMON_CONFIG={}",
+                self.root.join("config.toml").display()
+            ))
+            .arg(aw_bin())
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn root aw")
     }
 
     /// One HTTP/1.1 request over the socket; the peer credential is the caller.
@@ -251,6 +272,95 @@ impl Daemon {
             sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// Restart must not start a replacement while the old foreground loop still
+/// owns the data-dir and IPC locks. This is deliberately a real process test:
+/// the race only exists between the CLI's health polling and daemon teardown.
+#[test]
+fn daemon_restart_releases_locks_before_every_replacement() {
+    let daemon = Daemon::start(As::Me);
+    for round in 0..31 {
+        let out = daemon.aw(&["daemon", "restart"]);
+        assert!(
+            out.status.success(),
+            "restart {round} failed: {} / {}",
+            String::from_utf8_lossy(&out.stderr),
+            daemon.log()
+        );
+        let status = daemon.aw(&["daemon", "status"]);
+        assert!(
+            status.status.success(),
+            "daemon was not up after restart {round}: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+    let out = daemon.aw(&["daemon", "stop"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let started = Instant::now();
+    while UnixStream::connect(daemon.socket()).is_ok() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "replacement did not stop"
+        );
+        sleep(Duration::from_millis(50));
+    }
+}
+
+/// A config update patches one schema key in the source TOML; it must neither
+/// replace unrelated sections nor accept a typo as an inert setting.
+#[test]
+#[ignore = "needs passwordless sudo for an isolated root daemon"]
+fn config_set_merges_validates_and_shows_effective_defaults() {
+    let daemon = Daemon::start(As::Root);
+    let config = daemon.root.join("config.toml");
+    let source = std::fs::read_to_string(&config).expect("config");
+    std::fs::write(
+        &config,
+        format!("# keep this comment\n{source}\n[debug]\npreview_ui = false # keep too\n"),
+    )
+    .expect("rewrite config before set");
+
+    let out = daemon.aw_as_root(&["config", "set", "collectors.linux.tls_uprobe", "false"]);
+    assert!(
+        out.status.success(),
+        "config set: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(&config).expect("merged config");
+    assert!(text.contains("# keep this comment"));
+    assert!(text.contains("[storage]"));
+    assert!(text.contains("[api]"));
+
+    let get = daemon.aw_as_root(&["config", "get", "api.http_port"]);
+    assert!(
+        get.status.success(),
+        "{}",
+        String::from_utf8_lossy(&get.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "0");
+
+    let show = daemon.aw_as_root(&["config", "show"]);
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let shown = String::from_utf8_lossy(&show.stdout);
+    assert!(shown.contains("[storage]"), "{shown}");
+    assert!(shown.contains("[api]"), "{shown}");
+
+    let unknown = daemon.aw_as_root(&["config", "set", "nope.key", "1"]);
+    assert_eq!(unknown.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("未知配置键 \u{0060}nope.key\u{0060}"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
 }
 
 impl Drop for Daemon {

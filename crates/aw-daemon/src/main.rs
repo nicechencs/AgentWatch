@@ -158,8 +158,8 @@ fn command_config(args: &[String]) -> Result<ExitCode, CliError> {
 }
 
 fn command_foreground(config_path: Option<&std::path::Path>) -> Result<ExitCode, CliError> {
-    let (config, warnings, _) = load_selected(config_path).map_err(CliError::Config)?;
-    run_foreground(&config, &warnings).map_err(CliError::Runtime)?;
+    let (config, warnings, loaded_path) = load_selected(config_path).map_err(CliError::Config)?;
+    run_foreground(&config, &warnings, loaded_path.as_deref()).map_err(CliError::Runtime)?;
     Ok(ExitCode::SUCCESS)
 }
 

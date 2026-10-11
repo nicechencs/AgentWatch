@@ -12,6 +12,7 @@ export class ApiError extends Error {
   readonly code: string;
   readonly column: number | null;
   readonly suggestion: string | null;
+  readonly daemonOwner: string | null;
 
   constructor(status: number, body: ApiErrorBody | null, fallback: string) {
     const part = errorPart(body);
@@ -21,6 +22,7 @@ export class ApiError extends Error {
     this.code = typeof part?.code === "string" ? part.code : "unknown";
     this.column = typeof part?.column === "number" ? part.column : null;
     this.suggestion = typeof part?.suggestion === "string" ? part.suggestion : null;
+    this.daemonOwner = typeof part?.detail?.daemon_owner === "string" ? part.detail.daemon_owner : null;
   }
 }
 
@@ -38,13 +40,13 @@ type T = (key: string, vars?: Record<string, string | number>) => string;
  */
 /**
  * Daemon error codes that have their own sentence. Checked before the status:
- * `launch_other_user` and friends are 403s but say more than 「没有权限」.
+ * `daemon_owner_only` and friends are 403s but say more than 「没有权限」.
  */
 const CODE_TEXT: Record<string, string> = {
   program_not_found: "error.programNotFound",
   program_not_permitted: "error.programNotPermitted",
   spawn_failed: "error.spawnFailed",
-  launch_other_user: "error.launchOtherUser",
+  daemon_owner_only: "error.daemonOwnerOnly",
   caller_unidentified: "error.callerUnidentified",
   caller_unknown: "error.callerUnidentified",
   unidentified_peer: "error.unidentifiedPeer",
@@ -66,8 +68,8 @@ export function describeError(error: unknown, t: T): string {
   if (error instanceof ApiError) {
     const coded = CODE_TEXT[error.code];
     if (coded) {
-      if (error.code === "launch_other_user" && error.message.startsWith("这个后台是「")) {
-        return error.message;
+      if (error.code === "daemon_owner_only" && error.daemonOwner !== null) {
+        return t(coded, { owner: error.daemonOwner });
       }
       if (error.code === "db_busy") {
         const waited = /\bWaited\s+(\d+)\s+s\b/u.exec(error.message)?.[1] ?? "0";

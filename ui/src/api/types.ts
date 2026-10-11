@@ -45,7 +45,13 @@ export interface Page<T> {
 }
 
 export interface ApiErrorBody {
-  error: { code: string; message: string; column?: number; suggestion?: string };
+  error: {
+    code: string;
+    message: string;
+    column?: number;
+    suggestion?: string;
+    detail?: { daemon_owner?: string };
+  };
 }
 
 export type SessionMode = "launch" | "attach";

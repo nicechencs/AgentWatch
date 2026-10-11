@@ -124,32 +124,6 @@ fn daemon_uid() -> u32 {
     }
 }
 
-/// Linux socket callers obtain `user_id` from `SO_PEERCRED`; a UI token keeps
-/// the account bound to the peer that received it. The route uses that value
-/// to ensure a non-root daemon only launches for its own uid, never an account
-/// reconstructed from the user database.
-#[cfg(target_os = "linux")]
-fn linux_launch_peer_user_id(caller: &Caller) -> String {
-    #[cfg(test)]
-    if let Some(uid) = TEST_LINUX_LAUNCH_PEER_UID.with(std::cell::Cell::get) {
-        return uid.to_string();
-    }
-    caller.user_id.clone()
-}
-
-// Route tests cannot create a second Unix socket user on every CI host. This
-// test-only override stands in for the uid that SO_PEERCRED supplied; it is not
-// compiled into non-test binaries and no request field can affect it.
-#[cfg(all(test, target_os = "linux"))]
-thread_local! {
-    static TEST_LINUX_LAUNCH_PEER_UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn set_test_linux_launch_peer_uid(uid: Option<u32>) {
-    TEST_LINUX_LAUNCH_PEER_UID.with(|slot| slot.set(uid));
-}
-
 fn collector_available() -> Result<(), ApiResponse> {
     let available = |capability| {
         aw_platform::platform().capability(capability) == aw_platform::CapabilityStatus::Available
@@ -444,9 +418,6 @@ fn create_inner(
                 let argv = argv_field(&value)?;
                 // Whose account: only the OS-verified caller (see `launch_as`).
                 // A `uid` / `user` in the body is never read.
-                #[cfg(target_os = "linux")]
-                let caller_user_id = linux_launch_peer_user_id(caller);
-                #[cfg(not(target_os = "linux"))]
                 let caller_user_id = caller.user_id.clone();
                 let who = super::launch_as::identity_for(&caller_user_id, daemon_uid())?;
                 collector_available()?;
@@ -630,6 +601,11 @@ pub(super) fn run(state: &mut ApiState, caller: &Caller, body: &[u8]) -> ApiResp
     let mut inner = || -> Result<ApiResponse, ApiResponse> {
         let value = parse(body)?;
         let argv = argv_field(&value)?;
+        // `aw run` starts its target locally. A non-root daemon must still not
+        // accept a session from another account: it would make that account's
+        // launch appear under a daemon it does not own.
+        #[cfg(unix)]
+        super::launch_as::require_daemon_owner(&caller.user_id, daemon_uid())?;
         collector_available()?;
         let path = db_path(state)?;
         let mut target = target_for(caller, &value, "launch", 0, Some(&argv))?;

@@ -4,6 +4,7 @@
 //! belong in these functions so tests can expire a ticket without sleeping.
 
 use std::collections::HashMap;
+use std::fmt;
 
 /// One-time UI ticket lifetime. api-and-cli §1: 60 seconds.
 pub const UI_TICKET_TTL: u64 = 60;
@@ -108,17 +109,46 @@ pub struct UiTicket {
     pub issued_at: u64,
 }
 
+/// A ticket or ui_token secret. [`Debug`] and [`Display`] print `<redacted>`:
+/// no length, no prefix, no fragment. The bytes leave this type only through
+/// [`Secret::expose`], and only when a caller compares or stores them.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Secret(String);
+
+impl Secret {
+    fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl fmt::Display for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 /// In-memory tickets and the tokens they redeem into.
 ///
 /// Nothing here is written to disk. Dropping the store drops every token.
 /// Ticket and token secrets are 256 bits from the operating system CSPRNG,
 /// hex-encoded. A counter or a timestamp would let any local process guess
-/// the next value.
+/// the next value. The map keys are [`Secret`], so formatting the store cannot
+/// print one.
 #[derive(Debug, Default)]
 pub struct TicketStore {
-    tickets: HashMap<String, UiTicket>,
+    tickets: HashMap<Secret, UiTicket>,
     /// token → (user_id, admin, expires_at_unix).
-    tokens: HashMap<String, (String, bool, u64)>,
+    tokens: HashMap<Secret, (String, bool, u64)>,
 }
 
 /// Random secret bytes. 32 bytes = 256 bits.
@@ -181,7 +211,7 @@ impl TicketStore {
         let Some(secret) = random_secret("t-") else {
             return Err(TicketError::RandomUnavailable);
         };
-        self.tickets.insert(secret.clone(), ticket.clone());
+        self.tickets.insert(Secret::new(secret.clone()), ticket.clone());
         Ok((ticket, secret))
     }
 
@@ -208,14 +238,15 @@ impl TicketStore {
     /// [`TicketError::UnknownOrUsed`], [`TicketError::Expired`], or
     /// [`TicketError::RandomUnavailable`] (the ticket is consumed, no token).
     pub fn redeem(&mut self, ticket: &str, now: u64) -> Result<String, TicketError> {
-        let Some(issued) = self.tickets.get(ticket) else {
+        let ticket = Secret::new(ticket);
+        let Some(issued) = self.tickets.get(&ticket) else {
             return Err(TicketError::UnknownOrUsed);
         };
         if now >= issued.issued_at.saturating_add(UI_TICKET_TTL) {
-            self.tickets.remove(ticket);
+            self.tickets.remove(&ticket);
             return Err(TicketError::Expired);
         }
-        let issued = match self.tickets.remove(ticket) {
+        let issued = match self.tickets.remove(&ticket) {
             Some(issued) => issued,
             None => return Err(TicketError::UnknownOrUsed),
         };
@@ -223,8 +254,10 @@ impl TicketStore {
             return Err(TicketError::RandomUnavailable);
         };
         let expires_at = now.saturating_add(UI_TOKEN_TTL);
-        self.tokens
-            .insert(token.clone(), (issued.user_id, issued.admin, expires_at));
+        self.tokens.insert(
+            Secret::new(token.clone()),
+            (issued.user_id, issued.admin, expires_at),
+        );
         Ok(token)
     }
 
@@ -234,11 +267,12 @@ impl TicketStore {
     ///
     /// [`AuthError::UnknownToken`] when missing or expired.
     pub fn caller_for_token(&mut self, token: &str, now: u64) -> Result<Caller, AuthError> {
-        let Some((user_id, admin, expires_at)) = self.tokens.get(token).cloned() else {
+        let token = Secret::new(token);
+        let Some((user_id, admin, expires_at)) = self.tokens.get(&token).cloned() else {
             return Err(AuthError::UnknownToken);
         };
         if now >= expires_at {
-            self.tokens.remove(token);
+            self.tokens.remove(&token);
             return Err(AuthError::UnknownToken);
         }
         // A token remembers the account it was issued to. It does not carry the
@@ -352,8 +386,8 @@ pub fn bearer_token(authorization: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        authorize, bearer_token, visible_sessions, AuthDecision, AuthInput, Caller, SessionView,
-        TicketError, TicketStore, FAIL_RANDOM, UI_TICKET_TTL,
+        authorize, bearer_token, visible_sessions, AuthDecision, AuthInput, Caller, Secret,
+        SessionView, TicketError, TicketStore, FAIL_RANDOM, UI_TICKET_TTL,
     };
 
     fn http_input(host: Option<&str>, caller: Option<Caller>, operation: &str) -> AuthInput {
@@ -547,5 +581,28 @@ mod tests {
         assert_eq!(ticket.err(), Some(TicketError::RandomUnavailable));
         assert_eq!(token, Err(TicketError::RandomUnavailable));
         assert_eq!(store.ticket_count(), 0, "nothing stored under an empty key");
+    }
+
+    #[test]
+    fn debug_and_display_of_a_stored_ticket_redact_the_secret() {
+        let mut store = TicketStore::new();
+        let (_ticket, secret) = store
+            .issue_ui_ticket("alice", false, 1_000)
+            .expect("issued");
+        let rendered = format!("{store:?}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains(&secret), "{rendered}");
+        assert!(!rendered.contains("len="), "{rendered}");
+        let wrapped = Secret::new(secret.clone());
+        assert_eq!(format!("{wrapped:?}"), "<redacted>");
+        assert_eq!(wrapped.to_string(), "<redacted>");
+        assert_eq!(wrapped.expose(), secret);
+        for window in secret.chars().collect::<Vec<_>>().windows(3) {
+            let piece: String = window.iter().collect();
+            assert!(
+                !rendered.contains(&piece),
+                "store debug contains `{piece}`: {rendered}"
+            );
+        }
     }
 }

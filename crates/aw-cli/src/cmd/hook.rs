@@ -101,7 +101,7 @@ fn send_blocking(endpoint: &Endpoint, body: &[u8]) -> io::Result<()> {
             let head = format!(
                 "POST /api/v1/agent/hook HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 base.host_header(),
-                token,
+                token.expose(),
                 body.len(),
             );
             stream.write_all(head.as_bytes())?;

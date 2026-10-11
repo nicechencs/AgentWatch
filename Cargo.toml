@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/aw-platform",
     "crates/aw-core",
     "crates/aw-pipeline",
     "crates/aw-store",
@@ -33,6 +34,7 @@ version = "0.1.0"
 # Stubs intentionally depend on none of these yet (P0-CI-01). Add a dep only
 # when a later task needs it, and only if ADR-0001 or repo-layout already names it.
 [workspace.dependencies]
+aw-platform = { path = "crates/aw-platform" }
 aw-core = { path = "crates/aw-core" }
 aw-pipeline = { path = "crates/aw-pipeline" }
 aw-store = { path = "crates/aw-store" }

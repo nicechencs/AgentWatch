@@ -1,0 +1,24 @@
+[package]
+name = "aw-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "AgentWatch operating-system boundary for launch, process identity, and local security."
+
+[features]
+test-hold-delay = []
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Already used by aw-daemon and present in Cargo.lock. It provides safe waitpid.
+nix = { version = "0.30", default-features = false, features = ["process"] }
+aw-collector-linux = { path = "../aw-collector-linux" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+aw-collector-macos = { path = "../aw-collector-macos" }
+
+[target.'cfg(windows)'.dependencies]
+aw-collector-windows = { path = "../aw-collector-windows" }
+
+[lints]
+workspace = true

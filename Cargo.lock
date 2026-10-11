@@ -150,6 +150,7 @@ dependencies = [
  "aw-collector-windows",
  "aw-core",
  "aw-pipeline",
+ "aw-platform",
  "aw-proxy",
  "aw-store",
  "flate2",
@@ -177,6 +178,16 @@ dependencies = [
  "regex",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "aw-platform"
+version = "0.1.0"
+dependencies = [
+ "aw-collector-linux",
+ "aw-collector-macos",
+ "aw-collector-windows",
+ "nix",
 ]
 
 [[package]]

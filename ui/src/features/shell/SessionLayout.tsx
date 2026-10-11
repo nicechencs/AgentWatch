@@ -28,7 +28,7 @@ const TABS = [
 
 /** Top bar, tabs, shared filter and density strip for every in-session page. */
 export function SessionLayout() {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const exporter = useExport();
   const { sid } = useParams({ strict: false }) as { sid: string };
   const { query, patch } = useSessionQuery();
@@ -105,7 +105,7 @@ export function SessionLayout() {
             {t("nav.sessions")}
           </Link>
           <span className="text-ink-faint">/</span>
-          <span className="truncate">{sessionTitle(data)}</span>
+          <span className="truncate">{sessionTitle(data, lang)}</span>
         </nav>
         <span className="font-mono text-xs">{data.public_id}</span>
         <span

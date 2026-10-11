@@ -523,7 +523,7 @@ fn usage_outcome(err: clap::Error) -> Outcome {
         ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => exit::OK,
         _ => exit::USAGE,
     };
-    let message = err.render().to_string();
+    let message = err.render().to_string().replace("Usage: ", "用法：");
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     if code == exit::OK {
@@ -1158,7 +1158,7 @@ fn endpoint_outcome(err: EndpointError, json: bool) -> Outcome {
     error_outcome(code, machine, &err.to_string(), json)
 }
 
-fn client_outcome(err: ClientError, endpoint: &Endpoint, json: bool) -> Outcome {
+fn client_outcome(err: ClientError, _endpoint: &Endpoint, json: bool) -> Outcome {
     let code = err.exit_code();
     let machine = match &err {
         ClientError::Unreachable { .. } => "unreachable",
@@ -1175,15 +1175,11 @@ fn client_outcome(err: ClientError, endpoint: &Endpoint, json: bool) -> Outcome 
     };
     // Terminal output uses the reviewed Chinese sentence. JSON is for
     // tooling, so preserve a transport's technical diagnostic.
-    let mut message = if json {
+    let message = if json {
         err.json_detail().unwrap_or(&err.to_string()).to_owned()
     } else {
         err.to_string()
     };
-    if matches!(err, ClientError::Status { .. }) {
-        message.push_str("; ");
-        message.push_str(&endpoint.to_string());
-    }
     // `from_http_status` is what `ClientError::exit_code` uses. Keep the call so
     // a status this match does not name still maps.
     let _ = from_http_status;
@@ -1521,7 +1517,7 @@ mod tests {
         let mut http = script(200, "{}");
         let root = run(&["--lang", "zh", "--help"], None, &mut http);
         let root_help = text(&root.stdout);
-        assert!(root_help.contains("用法:"), "{root_help}");
+        assert!(root_help.contains("用法：aw [选项] <命令>"), "{root_help}");
         assert!(!root_help.contains("agents"), "{root_help}");
         assert!(!root_help.contains("mcp-tap"), "{root_help}");
         assert!(!root_help.contains("proxy"), "{root_help}");
@@ -1536,6 +1532,21 @@ mod tests {
         let attach_help = text(&attach.stdout);
         assert_eq!(attach.code, exit::OK, "{attach_help}");
         insta::assert_snapshot!("attach_help", attach_help);
+        let attach_text = text(&attach.stdout);
+        for expected in [
+            "按进程名筛选",
+            "不跟随子进程",
+            "不纳入已有子进程",
+            "移入 cgroup",
+            "直到目标进程退出",
+            "记录时长，例如 10m",
+            "智能体类型",
+            "固定会话，不参与自动清理",
+            "监控组（本版本未接入）",
+        ] {
+            assert!(attach_text.contains(expected), "{attach_text}");
+        }
+        assert!(attach_text.contains("用法："), "{attach_text}");
         let purge = run(&["db", "purge", "--help"], None, &mut http);
         assert!(text(&purge.stdout).contains("不再确认，直接删除（无法恢复）"));
 
@@ -1592,7 +1603,7 @@ mod tests {
         let attach = run(&["attach", "--pid", "100"], None, &mut http);
         assert_eq!(attach.code, exit::UNREACHABLE, "{}", text(&attach.stderr));
         let err = text(&attach.stderr);
-        assert!(err.contains("连不上后台"), "{err}");
+        assert!(err.contains("连不上 AgentWatch 后台"), "{err}");
         assert!(
             err.contains("aw daemon start") || err.contains("--no-daemon"),
             "{err}"

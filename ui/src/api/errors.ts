@@ -12,6 +12,8 @@ export class ApiError extends Error {
   readonly code: string;
   readonly column: number | null;
   readonly suggestion: string | null;
+  /** Structured wait duration from daemon errors; never parsed from prose. */
+  readonly waitedSeconds: number | null;
 
   constructor(status: number, body: ApiErrorBody | null, fallback: string) {
     const part = errorPart(body);
@@ -21,6 +23,7 @@ export class ApiError extends Error {
     this.code = typeof part?.code === "string" ? part.code : "unknown";
     this.column = typeof part?.column === "number" ? part.column : null;
     this.suggestion = typeof part?.suggestion === "string" ? part.suggestion : null;
+    this.waitedSeconds = typeof part?.waited_seconds === "number" ? part.waited_seconds : null;
   }
 }
 
@@ -60,6 +63,7 @@ const CODE_TEXT: Record<string, string> = {
   session_ended: "error.sessionEnded",
   write_failed: "error.writeFailed",
   db_busy: "error.dbBusy",
+  daemon_timeout: "error.daemonTimeout",
 };
 
 export function describeError(error: unknown, t: T): string {
@@ -67,9 +71,11 @@ export function describeError(error: unknown, t: T): string {
     const coded = CODE_TEXT[error.code];
     if (coded) {
       if (error.code === "db_busy") {
-        const waited = /\bWaited\s+(\d+)\s+s\b/u.exec(error.message)?.[1] ?? "0";
-        return t(coded, { seconds: waited });
+        return error.waitedSeconds === null
+          ? t("error.dbBusyNoWait")
+          : t(coded, { seconds: error.waitedSeconds });
       }
+      if (error.code === "daemon_timeout") return t(coded, { seconds: error.waitedSeconds ?? 5 });
       return t(coded);
     }
     if (error.status === 401 || error.code === "unauthorized") return t("error.unauthorized");
@@ -77,7 +83,6 @@ export function describeError(error: unknown, t: T): string {
     if (error.status === 501 || error.code === "not_implemented") return t("error.notImplemented");
     if (error.status === 404 && /session/iu.test(error.message)) return t("error.sessionNotFound");
     if (error.status === 404) return t("error.notFound");
-    if (error.message && error.message !== "unknown") return error.message;
     return t("error.status", { status: error.status });
   }
   if (error instanceof Error && error.message) return error.message;

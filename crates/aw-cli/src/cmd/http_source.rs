@@ -502,7 +502,7 @@ fn client_to_query_for(err: &ClientError, key: Option<&str>) -> QueryError {
         | ClientError::Status {
             status: 401 | 403, ..
         } => QueryError::Permission {
-            detail: clip(&format!("认证失败：{err}")),
+            detail: clip(&err.to_string()),
         },
         ClientError::Unreachable { .. }
         | ClientError::Transport { .. }
@@ -1237,7 +1237,7 @@ mod tests {
         .expect("render");
         let text = String::from_utf8(buf).expect("utf8");
         assert!(text.contains("demo"), "{text}");
-        assert!(text.contains("launch"), "{text}");
+        assert!(text.contains("启动"), "{text}");
         assert!(text.contains("没采"), "{text}");
         assert!(!text.contains("no"), "{text}");
     }

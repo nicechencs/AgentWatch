@@ -503,6 +503,8 @@
   "error.writeFailed": "Could not write the export to the chosen location. Try another location.",
   "error.sessionEnded": "This session has ended; nothing more can be attached.",
   "error.dbBusy": "The session database is busy (the service is writing). Waited {seconds} s and still couldn't get in; try again later.",
+  "error.dbBusyNoWait": "The session database is busy (the service is writing). Try again later.",
+  "error.daemonTimeout": "The service did not respond within {seconds} s. This request did not finish.",
   "coverage.kinds.proc": "processes",
   "coverage.kinds.file": "files",
   "coverage.kinds.net": "network traffic",

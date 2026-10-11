@@ -26,12 +26,7 @@ const zh = {
   onRejectFail: "fail：连接失败并记录 cert_pinned（默认，不会静默降级）",
   onRejectTunnel: "tunnel：放行为 CONNECT 隧道，只记录域名和字节数，URL 不可得",
   trustTitle: "信任到用户证书库",
-  trustBody:
-    "AgentWatch 默认只通过环境变量把 CA 注入给被启动的进程，不修改任何证书库。只有在某些客户端只认系统证书库（例如 macOS 上的 Go 程序）时才需要下面的命令。界面不提供一键操作。",
-  trustRisk:
-    "风险：安装后，同一用户下的所有程序都会信任这张 CA。任何拿到 CA 私钥的人都能对这些程序的 HTTPS 流量做中间人解密。用完请执行 aw proxy untrust 移除。",
-  copy: "复制",
-  copied: "已复制",
+  trustUnavailable: "`aw proxy trust` 本版本未接入",
 } as const;
 
 export type ProxyStrings = { [K in keyof typeof zh]: string };
@@ -56,12 +51,7 @@ const en: ProxyStrings = {
   onRejectFail: "fail: the connection fails and cert_pinned is recorded (default, no silent downgrade)",
   onRejectTunnel: "tunnel: pass through as a CONNECT tunnel; only domain and byte counts are kept, the URL is unavailable",
   trustTitle: "Trust in the user certificate store",
-  trustBody:
-    "By default AgentWatch injects the CA into launched processes through environment variables and does not modify any certificate store. The command below is only for clients that read the system store only (for example Go on macOS). The UI offers no one-click action.",
-  trustRisk:
-    "Risk: once installed, every program of this user trusts this CA. Anyone holding the CA private key can decrypt those programs' HTTPS traffic. Run aw proxy untrust when done.",
-  copy: "Copy",
-  copied: "Copied",
+  trustUnavailable: "`aw proxy trust` is not wired in this version",
 };
 
 /** Both catalogs, for the locale tests. */

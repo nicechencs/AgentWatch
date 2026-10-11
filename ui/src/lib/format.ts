@@ -73,11 +73,17 @@ export function nsToRfc3339(ns: number): string {
   return nsToDate(ns).toISOString();
 }
 
-export function joinCommand(argv: string[] | null | undefined): string {
+export function joinCommand(argv: string[] | null | undefined, lang: Lang = "zh"): string {
   if (!argv || argv.length === 0) return "";
   return argv
+    .map((part) => redactionForDisplay(part, lang))
     .map((part) => (/[\s"]/u.test(part) ? `"${part.replaceAll('"', '\\"')}"` : part))
     .join(" ");
+}
+
+/** Storage markers are for JSON and exports; the App always shows their meaning. */
+export function redactionForDisplay(text: string, lang: Lang = "zh"): string {
+  return text.replace(/«redacted:[^»]*»/gu, lang === "en" ? "(hidden)" : "（已隐藏）");
 }
 
 export async function copyText(text: string): Promise<boolean> {

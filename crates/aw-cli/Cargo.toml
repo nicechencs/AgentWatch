@@ -44,6 +44,10 @@ aw-collector-windows = { workspace = true }
 clap = { version = "=4.5.31", default-features = false, features = ["std", "help", "usage", "error-context", "suggestions", "derive"] }
 serde = { version = "1.0.229", default-features = false, features = ["alloc", "derive", "std"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+# Already used by aw-proxy (MIT OR Apache-2.0). The local-offset feature lets
+# the terminal session list use the reader's local clock without platform code
+# in this crate.
+time = { version = "0.3.55", default-features = false, features = ["local-offset"] }
 
 # Unix `aw run` holds the caller-created child at a pipe gate until the daemon
 # has acknowledged `/adopt`. nix is MIT and keeps this fd work safe under the

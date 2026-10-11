@@ -2,6 +2,7 @@
 //!
 //! Records come from a [`QuerySource`]. Production passes the daemon client.
 
+use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write};
 
 use serde_json::json;
@@ -169,15 +170,27 @@ fn delete(
     mode: OutputMode,
     source: &mut dyn QuerySource,
 ) -> io::Result<Outcome> {
-    if !yes && !confirm_delete(sessions.len()) {
-        return Ok(super::error_outcome(
-            exit::USAGE,
-            "usage",
-            "现在不在终端里，没法确认删除。确定要删的话，请加上 `--yes`（删除后无法恢复）",
-            mode == OutputMode::Json,
-        ));
-    }
-    match source.delete_sessions(sessions, owner) {
+    let keys = if yes {
+        sessions.to_vec()
+    } else {
+        let keys = match resolved_delete_keys(sessions, source) {
+            Ok(keys) => keys,
+            Err(err) => return Ok(query_outcome(err, mode == OutputMode::Json)),
+        };
+        match confirm_delete(keys.len()) {
+            DeleteConfirmation::Confirmed => keys,
+            DeleteConfirmation::Declined => return Ok(cancelled_outcome(mode == OutputMode::Json)),
+            DeleteConfirmation::NotInteractive => {
+                return Ok(super::error_outcome(
+                    exit::USAGE,
+                    "usage",
+                    "现在不在终端里，没法确认删除。确定要删的话，请加上 `--yes`（删除后无法恢复）",
+                    mode == OutputMode::Json,
+                ));
+            }
+        }
+    };
+    match source.delete_sessions(&keys, owner) {
         Ok(removed) => {
             let doc = mutation_json("delete", &json!({ "removed": removed }));
             let table = crate::output::Table {
@@ -193,10 +206,30 @@ fn delete(
     }
 }
 
+/// Resolve aliases and duplicates before the prompt, so the number is the
+/// number of actual sessions that the following delete request will target.
+fn resolved_delete_keys(
+    sessions: &[String],
+    source: &dyn QuerySource,
+) -> Result<Vec<String>, QueryError> {
+    let mut ids = BTreeSet::new();
+    for session in sessions {
+        ids.insert(source.show_session(session)?.item.public_id);
+    }
+    Ok(ids.into_iter().collect())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteConfirmation {
+    Confirmed,
+    Declined,
+    NotInteractive,
+}
+
 /// Ask only on an interactive terminal; redirected input must never block.
-fn confirm_delete(count: usize) -> bool {
+fn confirm_delete(count: usize) -> DeleteConfirmation {
     if !io::stdin().is_terminal() {
-        return false;
+        return DeleteConfirmation::NotInteractive;
     }
     let _ = write!(
         io::stderr(),
@@ -204,11 +237,26 @@ fn confirm_delete(count: usize) -> bool {
     );
     let _ = io::stderr().flush();
     let mut answer = String::new();
-    io::stdin().read_line(&mut answer).is_ok()
-        && matches!(
-            answer.trim().to_ascii_lowercase().as_str(),
-            "是" | "y" | "yes"
-        )
+    if io::stdin().read_line(&mut answer).is_err() {
+        return DeleteConfirmation::Declined;
+    }
+    if matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "是" | "y" | "yes"
+    ) {
+        DeleteConfirmation::Confirmed
+    } else {
+        DeleteConfirmation::Declined
+    }
+}
+
+fn cancelled_outcome(json: bool) -> Outcome {
+    super::error_outcome(
+        exit::CANCELLED,
+        "cancelled",
+        "已取消，没有删除任何会话",
+        json,
+    )
 }
 
 pub(crate) fn write_ok(
@@ -243,9 +291,10 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use super::run;
+    use super::{cancelled_outcome, resolved_delete_keys, run};
     use crate::client::{ApiReply, ApiRequest, ClientError, Transport};
     use crate::cmd::http_source::HttpQuerySource;
+    use crate::cmd::query::sample_source;
     use crate::cmd::tree::SessionsCmd;
     use crate::endpoint::{Endpoint, HttpBase};
     use crate::exit;
@@ -286,6 +335,24 @@ mod tests {
         "started_ns":10,"ended_ns":null,"pinned":false,
         "stats":{"process_count":0,"flow_count":0,"dns_count":0,"gap_count":0}
     }"#;
+
+    #[test]
+    fn delete_confirmation_counts_unique_resolved_sessions() {
+        let source = sample_source();
+        let keys = resolved_delete_keys(&["s-7k2m".to_owned(), "s-7k2m".to_owned()], &source)
+            .expect("resolve");
+        assert_eq!(keys.len(), 1, "{keys:?}");
+    }
+
+    #[test]
+    fn declined_delete_has_its_own_exit_and_exact_sentence() {
+        let outcome = cancelled_outcome(false);
+        assert_eq!(outcome.code, exit::CANCELLED);
+        assert_eq!(
+            String::from_utf8(outcome.stderr).expect("utf8"),
+            "aw: 已取消，没有删除任何会话\n"
+        );
+    }
 
     /// `@last` goes to the daemon as `@last`. The printed id is the one the
     /// daemon resolved, not the token.
@@ -439,13 +506,14 @@ mod tests {
         .expect("show");
         let text = String::from_utf8(outcome.stdout).expect("utf8");
         assert!(
-            text.lines().any(|line| line.contains("exit_code")
-                && line.split_whitespace().any(|cell| cell == "0")),
+            text.lines()
+                .any(|line| line.contains("退出码")
+                    && line.split_whitespace().any(|cell| cell == "0")),
             "{text}"
         );
         assert!(
             text.lines()
-                .any(|line| line.contains("pinned") && line.contains("yes")),
+                .any(|line| line.contains("固定") && line.contains("是")),
             "{text}"
         );
     }

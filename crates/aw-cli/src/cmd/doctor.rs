@@ -334,10 +334,10 @@ fn fix_for(category: &str, privileged: bool) -> &'static str {
     match category {
         "file" | "net" | "dns" if privileged => "本版本未接入",
         "proc" | "file" | "net" | "dns" => {
-            "请以管理员权限（Windows）或 root（Linux/macOS）运行后台，或使用 --no-daemon（证据 S）"
+            "请以管理员权限（Windows）或 root（Linux/macOS）运行后台，或使用 --no-daemon（不做记录）"
         }
         "url" => "URL 需要显式代理（P3）；否则字段为 NA(tls_no_proxy)",
-        "scope" => "启动模式需要 Job、cgroup 或进程树范围；附着点之前为证据 S",
+        "scope" => "启动模式需要 Job、cgroup 或进程树范围；附着点之前的数据来自轮询采样",
         "priv" => "install 和 uninstall 需要管理员终端或 sudo",
         _ => "此类别没有已知修复方法",
     }

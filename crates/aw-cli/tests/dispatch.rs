@@ -72,7 +72,7 @@ fn ps_without_a_daemon_exits_3() {
     );
     let err = String::from_utf8(out.stderr).expect("utf8");
     assert!(
-        err.starts_with("aw: 连不上后台，请先运行 `aw daemon start`"),
+        err.starts_with("aw: 连不上 AgentWatch 后台。请先启动后台（`sudo aw daemon start`）"),
         "{err}"
     );
     assert!(err.contains("--no-daemon"), "{err}");

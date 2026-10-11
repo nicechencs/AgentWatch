@@ -104,7 +104,6 @@ pub(crate) struct UnwiredProxy;
 
 const CA_INFO_UNWIRED: &str = "`aw proxy ca-info` 本版本未接入";
 const ROTATE_CA_UNWIRED: &str = "`aw proxy rotate-ca` 本版本未接入";
-const TRUST_UNWIRED: &str = "后台代理 API 未接通；aw proxy 不会读取 ca.key。请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）";
 
 impl ProxyApi for UnwiredProxy {
     fn ca_info(&mut self) -> Result<CaInfoView, String> {
@@ -116,7 +115,7 @@ impl ProxyApi for UnwiredProxy {
     }
 
     fn note_trust(&mut self, _plan: &TrustPlan) -> Result<(), String> {
-        Err(TRUST_UNWIRED.to_owned())
+        Err(crate::client::DAEMON_UNREACHABLE.to_owned())
     }
 }
 
@@ -141,27 +140,7 @@ pub(crate) fn run(
             Ok(info) => render_info(&info, json),
             Err(detail) => super::error_outcome(exit::UNREACHABLE, "unreachable", &detail, json),
         },
-        ProxyCmd::Trust { user, .. } => {
-            if !user {
-                return super::error_outcome(
-                    exit::USAGE,
-                    "usage",
-                    "`aw proxy trust` 需要 --user。不会安装到系统证书库。",
-                    json,
-                );
-            }
-            let confirmed = yes || confirm.confirm("将修改当前用户证书库。确定吗？[是/否]");
-            let plan = trust_plan(confirmed);
-            if !confirmed {
-                return render_plan(&plan, json, true);
-            }
-            match api.note_trust(&plan) {
-                Ok(()) => render_plan(&plan, json, false),
-                Err(detail) => {
-                    super::error_outcome(exit::UNREACHABLE, "unreachable", &detail, json)
-                }
-            }
-        }
+        ProxyCmd::Trust { .. } => super::not_in_build("aw proxy trust", json),
         ProxyCmd::Untrust { .. } => {
             let confirmed = yes || confirm.confirm("将修改当前用户证书库。确定吗？[是/否]");
             let plan = TrustPlan {
@@ -180,21 +159,6 @@ pub(crate) fn run(
                 }
             }
         }
-    }
-}
-
-fn trust_plan(confirmed: bool) -> TrustPlan {
-    TrustPlan {
-        action: "trust",
-        scope: "user",
-        steps: [
-            "这会把会话 CA 放进当前用户的证书库，使本机其他程序信任它。",
-            "本进程不会执行 certutil、security 或 update-ca-certificates。",
-            "确认后只把一条安装记录交给 daemon，写入 schema_meta，供卸载时清理。",
-            "再次运行并带上显式确认才会记录。没有确认标志时到此为止。",
-        ]
-        .join(" "),
-        confirmed,
     }
 }
 
@@ -268,5 +232,56 @@ fn render_plan(plan: &TrustPlan, json: bool, needs_confirm: bool) -> Outcome {
         } else {
             Vec::new()
         },
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::{run, CaInfoView, Confirm, ProxyApi, TrustPlan};
+    use crate::cmd::tree::ProxyCmd;
+    use crate::exit;
+
+    struct UnusedApi;
+
+    impl ProxyApi for UnusedApi {
+        fn ca_info(&mut self) -> Result<CaInfoView, String> {
+            unreachable!("trust must not call the daemon")
+        }
+
+        fn rotate(&mut self, _revoke_now: bool) -> Result<CaInfoView, String> {
+            unreachable!("trust must not call the daemon")
+        }
+
+        fn note_trust(&mut self, _plan: &TrustPlan) -> Result<(), String> {
+            unreachable!("trust must not call the daemon")
+        }
+    }
+
+    struct UnusedConfirm;
+
+    impl Confirm for UnusedConfirm {
+        fn confirm(&mut self, _prompt: &str) -> bool {
+            unreachable!("trust must not ask for confirmation")
+        }
+    }
+
+    #[test]
+    fn trust_is_explicitly_not_connected_in_this_build() {
+        let outcome = run(
+            &ProxyCmd::Trust {
+                user: true,
+                yes: true,
+            },
+            false,
+            true,
+            &mut UnusedApi,
+            &mut UnusedConfirm,
+        );
+        assert_eq!(outcome.code, exit::NOT_IN_BUILD);
+        assert_eq!(
+            String::from_utf8(outcome.stderr).expect("utf8"),
+            "aw: `aw proxy trust` 本版本未接入\n"
+        );
     }
 }

@@ -191,7 +191,7 @@ impl DaemonSummary {
 
 /// Fixed sentence for a daemon-recorded run. Not a claim about the target.
 const DAEMON_LEVEL_NOTE: &str =
-    "证据 S（后台轮询采样）· 数字为目标退出时后台已记录的部分，会话由后台在根进程退出后结束";
+    "后台轮询采样·数字为目标退出时后台已记录的部分，会话由后台在根进程退出后结束";
 
 impl SessionSummary for DaemonSummary {
     fn summarize(&mut self, session_hint: Option<&str>) -> Result<Option<Summary>, String> {
@@ -2075,7 +2075,7 @@ mod tests {
             bytes_down: Some(0),
             top_domains: Vec::new(),
             gaps: Some(0),
-            level_note: "证据 S".to_owned(),
+            level_note: "后台轮询采样".to_owned(),
         };
         let mut launcher = fake_exit_7();
         let outcome = run(
@@ -2449,6 +2449,7 @@ mod tests {
             status: 410,
             code: None,
             message: "adopt_timeout".to_owned(),
+            waited_seconds: None,
         });
         let mut spawner = FakeSpawner {
             log: Rc::clone(&log),
@@ -2915,6 +2916,7 @@ mod tests {
             status: 503,
             code: Some("collector_unavailable".to_owned()),
             message: "collector unavailable".to_owned(),
+            waited_seconds: None,
         });
         let mut spawner = FakeSpawner {
             log,

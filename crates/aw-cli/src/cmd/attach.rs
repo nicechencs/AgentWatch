@@ -110,6 +110,8 @@ pub(crate) enum ControlError {
         status: u16,
         code: Option<String>,
         message: String,
+        /// Measured wait carried by structured daemon errors such as `db_busy`.
+        waited_seconds: Option<u64>,
     },
     /// A successful daemon response omitted a required field.
     BadReply { detail: String },
@@ -118,13 +120,9 @@ pub(crate) enum ControlError {
 impl std::fmt::Display for ControlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unreachable { detail } => write!(
-                f,
-                "连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：{detail}"
-            ),
-            Self::Forbidden { detail } => write!(
-                f,
-                "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。详情：{detail}"
+            Self::Unreachable { .. } => f.write_str(crate::client::DAEMON_UNREACHABLE),
+            Self::Forbidden { .. } => f.write_str(
+                "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。",
             ),
             Self::UntrustedServer { .. } => {
                 f.write_str("连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为防内容被它拿到，这次没有发送任何内容。")
@@ -134,13 +132,20 @@ impl std::fmt::Display for ControlError {
             ),
             // Keep OS/pipe details for `--json`; the terminal gets the shared
             // #147 wording only.
-            Self::Transport { .. } => f.write_str("跟后台的连接断了，请再试一次。"),
+            Self::Transport { detail } => f.write_str(&crate::client::human_transport_message(detail)),
             Self::Status {
                 status,
                 code,
                 message,
-            } => crate::daemon_errors::write_status(f, *status, code.as_deref(), message),
-            Self::BadReply { detail } => write!(f, "后台返回的会话数据不完整：{detail}"),
+                waited_seconds,
+            } => crate::daemon_errors::write_status(
+                f,
+                *status,
+                code.as_deref(),
+                message,
+                *waited_seconds,
+            ),
+            Self::BadReply { .. } => f.write_str("后台返回的会话数据不完整。"),
         }
     }
 }
@@ -161,10 +166,12 @@ impl From<ClientError> for ControlError {
                 status,
                 code,
                 message,
+                waited_seconds,
             } => Self::Status {
                 status,
                 code,
                 message,
+                waited_seconds,
             },
         }
     }
@@ -222,7 +229,7 @@ impl ControlError {
     /// Whether the daemon specifically reported that no collector is present.
     #[must_use]
     pub(crate) fn collector_unavailable(&self) -> bool {
-        matches!(self, Self::Status { status: 503, code, message }
+        matches!(self, Self::Status { status: 503, code, message, .. }
             if code.as_deref() == Some("collector_unavailable") || message.contains("collector"))
     }
 
@@ -374,6 +381,7 @@ impl<T: Transport> HttpDaemonSessions<T> {
                     "有 {} 个会话名为 `{key}`；请传入 `aw sessions list` 中的公开 ID",
                     many.len()
                 ),
+                waited_seconds: None,
             }),
         }
     }
@@ -857,6 +865,7 @@ mod tests {
                 status: 403,
                 code: None,
                 message: "forbidden".to_owned(),
+                waited_seconds: None,
             }),
             ..FakeControl::default()
         };
@@ -864,7 +873,7 @@ mod tests {
         assert_eq!(outcome.code, exit::PERMISSION);
         assert!(String::from_utf8(outcome.stderr)
             .expect("utf8")
-            .contains("forbidden"));
+            .contains("后台返回了错误（HTTP 403）"));
 
         let mut unreachable = FakeControl {
             attach_error: Some(ControlError::Unreachable {

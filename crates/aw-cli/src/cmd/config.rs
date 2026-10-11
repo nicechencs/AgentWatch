@@ -112,7 +112,7 @@ pub(crate) struct RuleInfo {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct UnwiredConfig;
 
-const UNWIRED: &str = "后台配置 API 未接通；GET /api/v1/config 仍是占位实现，所以此命令不会读取配置文件。请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）";
+const UNWIRED: &str = crate::client::DAEMON_UNREACHABLE;
 
 impl ConfigApi for UnwiredConfig {
     fn show(&mut self, _: bool) -> Result<ConfigDoc, ConfigError> {

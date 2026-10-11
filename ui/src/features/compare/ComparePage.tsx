@@ -115,7 +115,7 @@ function SessionSelect({
   items: Session[];
   onChange: (value: string) => void;
 }) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   return (
     <label className="flex flex-col gap-1">
       <span className="text-ink-faint">{label}</span>
@@ -123,7 +123,7 @@ function SessionSelect({
         <option value="">{t("compare.none")}</option>
         {items.map((session) => (
           <option key={session.public_id} value={session.public_id}>
-            {sessionTitle(session)}
+            {sessionTitle(session, lang)}
           </option>
         ))}
       </select>

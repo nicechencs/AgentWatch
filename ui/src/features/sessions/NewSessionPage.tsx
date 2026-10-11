@@ -7,6 +7,7 @@ import { describeError } from "@/api/errors";
 import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { ErrorNote } from "@/components/QueryState";
 import { kindInSentence, kindLabel } from "@/lib/capabilities";
+import { joinCommand } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
 
 const AGENTS = ["auto", "claude", "codex", "cursor", "other"];
@@ -224,7 +225,7 @@ function AttachForm({
   /** Called when a process is picked. A failed launch must not stay on screen. */
   onPick?: () => void;
 }) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const [q, setQ] = useState("");
   // Off by default: the picker must show the program the user is looking
   // for (real-window #144: searching `sleep` found nothing).
@@ -291,7 +292,7 @@ function AttachForm({
               }`}
               style={{ paddingLeft: `${8 + row.depth * 14}px` }}
             >
-              <span className="font-mono" title={row.argv ? row.argv.join(" ") : undefined}>{row.name}</span>
+              <span className="font-mono" title={joinCommand(row.argv, lang)}>{row.name}</span>
               <span className="text-ink-faint">({row.pid})</span>
               {row.agent ? <span>{row.agent}</span> : null}
             </button>

@@ -26,7 +26,7 @@ const SEARCH_DEBOUNCE_MS = 250;
 const RANGES = ["7d", "30d", "all"] as const;
 
 export function SessionsPage() {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const { me } = useAuth();
   const admin = Boolean(me?.admin);
   const navigate = useNavigate();
@@ -198,7 +198,7 @@ export function SessionsPage() {
       <ConfirmDialog
         open={pendingDelete !== null}
         title={t("sessions.delete")}
-        body={t("sessions.deleteConfirm", { name: pendingDelete ? sessionTitle(pendingDelete) : "" })}
+        body={t("sessions.deleteConfirm", { name: pendingDelete ? sessionTitle(pendingDelete, lang) : "" })}
         confirmLabel={t("sessions.delete")}
         onCancel={() => setPendingDelete(null)}
         onConfirm={() => {
@@ -298,7 +298,7 @@ function SessionRow({
   stopNotice: boolean;
   onDelete: () => void;
 }) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const exporter = useExport();
   const [draft, setDraft] = useState(session.name ?? "");
   const status = sessionStatus(session, t);
@@ -331,7 +331,7 @@ function SessionRow({
           />
         ) : (
           <button type="button" onClick={onOpen} className="text-left">
-            <span className="block">{sessionTitle(session)}</span>
+            <span className="block">{sessionTitle(session, lang)}</span>
             <span className="font-mono text-[11px] text-ink-faint">{session.public_id}</span>
           </button>
         )}

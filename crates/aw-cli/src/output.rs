@@ -130,13 +130,15 @@ fn table_json(table: &Table) -> Value {
 
 fn render_table(table: &Table, width: usize) -> String {
     let mut headers = table.headers.clone();
-    headers.push("evidence".to_owned());
+    headers.push("证据".to_owned());
     let mut grid: Vec<Vec<String>> = Vec::with_capacity(table.rows.len() + 1);
     grid.push(headers);
     for row in &table.rows {
         let mut cells = Vec::with_capacity(table.headers.len() + 1);
         for index in 0..table.headers.len() {
-            cells.push(row.cells.get(index).cloned().unwrap_or_default());
+            cells.push(human_redactions(
+                row.cells.get(index).map(String::as_str).unwrap_or_default(),
+            ));
         }
         cells.push(evidence_badge(&row.evidence).to_owned());
         grid.push(cells);
@@ -162,6 +164,29 @@ fn render_table(table: &Table, width: usize) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Replace storage-only redaction markers before they reach a human-facing
+/// terminal table. JSON and export paths intentionally keep the exact marker.
+#[must_use]
+pub fn human_redactions(text: &str) -> String {
+    const PREFIX: &str = "«redacted:";
+    const HUMAN: &str = "（已隐藏）";
+
+    let mut rendered = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(PREFIX) {
+        rendered.push_str(&rest[..start]);
+        let marker = &rest[start + PREFIX.len()..];
+        let Some(end) = marker.find('»') else {
+            rendered.push_str(&rest[start..]);
+            return rendered;
+        };
+        rendered.push_str(HUMAN);
+        rest = &marker[end + '»'.len_utf8()..];
+    }
+    rendered.push_str(rest);
+    rendered
 }
 
 /// Shrink columns so `sum(widths) + 2*(n-1)` fits in `width` when that is possible
@@ -423,13 +448,34 @@ mod tests {
         let mut buf = Cursor::new(Vec::new());
         write_table(&mut buf, OutputMode::Table, &sample()).expect("write");
         let text = String::from_utf8(buf.into_inner()).expect("utf8");
-        assert!(text.contains("evidence"), "{text}");
+        assert!(text.contains("证据"), "{text}");
         assert!(text.contains("E1 系统"), "{text}");
         assert_eq!(evidence_badge(&Evidence::I), "推测");
         assert_eq!(
             evidence_badge(&Evidence::NA(NaReason::CollectorUnavailable)),
             "不可得"
         );
+    }
+
+    #[test]
+    fn human_tables_hide_storage_redaction_markers_but_json_keeps_them() {
+        let table = Table {
+            headers: vec!["argv".to_owned()],
+            rows: vec![Row {
+                cells: vec!["tool «redacted:argv.flag_secret_eq»".to_owned()],
+                evidence: Evidence::E1,
+            }],
+        };
+        let mut human = Cursor::new(Vec::new());
+        write_table(&mut human, OutputMode::Table, &table).expect("table");
+        let human = String::from_utf8(human.into_inner()).expect("utf8");
+        assert!(human.contains("tool （已隐藏）"), "{human}");
+        assert!(!human.contains("redacted:"), "{human}");
+
+        let mut json = Cursor::new(Vec::new());
+        write_table(&mut json, OutputMode::Json, &table).expect("json");
+        let json = String::from_utf8(json.into_inner()).expect("utf8");
+        assert!(json.contains("«redacted:argv.flag_secret_eq»"), "{json}");
     }
 
     #[test]

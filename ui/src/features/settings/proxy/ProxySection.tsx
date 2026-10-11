@@ -4,13 +4,10 @@ import { isApiError } from "@/api/errors";
 import type { ConfigView } from "@/api/types";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { RelTime } from "@/components/RelTime";
-import { copyText } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
 import { proxyApi, routeMissing, type CaInfo, type TlsReject } from "./api";
 import { fill, useProxyStrings } from "./strings";
 
-export const TRUST_COMMAND = "aw proxy trust --user";
-export const UNTRUST_COMMAND = "aw proxy untrust";
 export const ROTATE_COMMAND = "aw proxy rotate-ca";
 
 /** `ConfigView.proxy` may carry `on_tls_reject` once the daemon returns it. */
@@ -91,10 +88,7 @@ export function ProxyView({ admin, config, ca, onTlsReject, notice, busy, onRota
 
         <div className="rounded border border-dashed border-line p-2" data-section="trust">
           <h3 className="font-medium">{s.trustTitle}</h3>
-          <p className="mt-1 text-ink-soft">{s.trustBody}</p>
-          <CommandLine command={TRUST_COMMAND} />
-          <CommandLine command={UNTRUST_COMMAND} />
-          <p className="mt-1 text-ink-soft">{s.trustRisk}</p>
+          <p className="mt-1 text-ink-soft">{s.trustUnavailable}</p>
         </div>
       </div>
       <ConfirmDialog
@@ -109,24 +103,6 @@ export function ProxyView({ admin, config, ca, onTlsReject, notice, busy, onRota
         }}
       />
     </section>
-  );
-}
-
-/** A command the operator runs themselves. Copy only; nothing is executed. */
-function CommandLine({ command }: { command: string }) {
-  const s = useProxyStrings();
-  const [copied, setCopied] = useState(false);
-  return (
-    <div className="mt-1 flex items-center gap-2">
-      <code className="rounded bg-paper-sunken px-1 font-mono">{command}</code>
-      <button
-        type="button"
-        onClick={() => void copyText(command).then((ok) => setCopied(ok))}
-        className="text-ink-faint underline"
-      >
-        {copied ? s.copied : s.copy}
-      </button>
-    </div>
   );
 }
 

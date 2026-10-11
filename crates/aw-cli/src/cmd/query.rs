@@ -2061,7 +2061,7 @@ mod tests {
             table
                 .lines()
                 .next()
-                .is_some_and(|line| line.contains("evidence")),
+                .is_some_and(|line| line.contains("证据")),
             "table header missing evidence:\n{table}"
         );
         let body: Vec<&str> = table
@@ -2189,7 +2189,7 @@ mod tests {
         .expect("pin");
         assert_eq!(pinned.code, exit::OK);
         assert!(
-            text(&pinned.stdout).contains("yes"),
+            text(&pinned.stdout).contains("是"),
             "{}",
             text(&pinned.stdout)
         );

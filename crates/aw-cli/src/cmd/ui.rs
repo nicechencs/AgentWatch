@@ -345,7 +345,7 @@ fn running_outcome(endpoint: &Endpoint, version: &str, note: Option<&str>, json:
     }
 }
 
-pub(crate) fn client_error(err: &ClientError, endpoint: &Endpoint, json: bool) -> Outcome {
+pub(crate) fn client_error(err: &ClientError, _endpoint: &Endpoint, json: bool) -> Outcome {
     let machine = match err {
         ClientError::Unreachable { .. } => "unreachable",
         ClientError::Forbidden { .. } => "forbidden",
@@ -354,12 +354,7 @@ pub(crate) fn client_error(err: &ClientError, endpoint: &Endpoint, json: bool) -
         ClientError::Transport { .. } => "transport",
         ClientError::Status { .. } => "status",
     };
-    error_outcome(
-        err.exit_code(),
-        machine,
-        &format!("{err} [{endpoint}]"),
-        json,
-    )
+    error_outcome(err.exit_code(), machine, &err.to_string(), json)
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@
 export function redactPreview(pattern: string, sample: string): { text: string; invalid: boolean } {
   if (!pattern) return { text: sample, invalid: false };
   try {
-    return { text: sample.replace(new RegExp(pattern, "gu"), "«redacted:custom»"), invalid: false };
+    return { text: sample.replace(new RegExp(pattern, "gu"), "（已隐藏）"), invalid: false };
   } catch {
     return { text: sample, invalid: true };
   }

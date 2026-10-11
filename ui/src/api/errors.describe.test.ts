@@ -40,6 +40,7 @@ describe("error text", () => {
         error: {
           code: "db_busy",
           message: "The session database is busy (the service is writing). Waited 8 s and still couldn't get in; try again later.",
+          waited_seconds: 8,
         },
       },
       "x",
@@ -56,5 +57,16 @@ describe("error text", () => {
     for (const [code, expected] of cases) {
       expect(describeError(new ApiError(403, { error: { code, message: "developer detail" } }, "x"), t)).toBe(expected);
     }
+  });
+
+  it("uses structured values only and never parses English diagnostics", () => {
+    const busy = new ApiError(503, { error: { code: "db_busy", message: "Waited 99 s" } }, "x");
+    expect(describeError(busy, t)).toBe("会话数据库正忙（后台在写入），请稍后再试。");
+    const timeout = new ApiError(
+      504,
+      { error: { code: "daemon_timeout", message: "daemon_timeout: read: operation would block", waited_seconds: 7 } },
+      "x",
+    );
+    expect(describeError(timeout, t)).toBe("后台 7 秒没有回应，这次请求没有完成。");
   });
 });

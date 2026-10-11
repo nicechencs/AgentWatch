@@ -2,6 +2,6 @@
 source: crates/aw-cli/src/cmd/query.rs
 expression: rendered
 ---
-proc  pid  exe     argv        退出码  redaction      evidence
+proc  pid  exe     argv        退出码  redaction      证据
 10    100  demo    <redacted>  7       P1 脱敏为占位  E1 系统
   11  101  helper  不可得      没采    P1 脱敏为占位  S 采样

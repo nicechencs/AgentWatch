@@ -118,7 +118,7 @@ function ProcessRow({
   onLoad: () => void;
   onMenu: (event: React.MouseEvent) => void;
 }) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const image = node.images[node.images.length - 1];
   const name = processName(node);
   const chain = node.images.map((item) => item.exe?.split(/[/\\]/u).pop() ?? t("procs.nameNa")).join(" → ");
@@ -147,7 +147,7 @@ function ProcessRow({
           )}
           <span className="text-ink-faint">({node.pid})</span>
           {node.images.length > 1 ? <span className="text-ink-soft">{chain}</span> : null}
-          <span className="truncate text-ink-faint" title={joinCommand(image?.argv)}>{joinCommand(image?.argv)}</span>
+          <span className="truncate text-ink-faint" title={joinCommand(image?.argv, lang)}>{joinCommand(image?.argv, lang)}</span>
           {node.how === "snapshot" ? <span title={t("procs.snapshot")}><EvidenceBadge level="S" /></span> : null}
           {node.agent ? <span className="rounded border border-line px-1 text-[10px]">{node.agent}</span> : null}
           {node.sensitive ? <span title={t("procs.sensitive")} className="text-sensitive">▲</span> : null}
@@ -174,10 +174,10 @@ function ProcessRow({
 }
 
 function ContextMenu({ state, sid, onClose }: { state: MenuState; sid: string; onClose: () => void }) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   const navigate = useNavigate();
   const { patch } = useSessionQuery();
-  const command = joinCommand(state.node.images[state.node.images.length - 1]?.argv);
+  const command = joinCommand(state.node.images[state.node.images.length - 1]?.argv, lang);
   const items = [
     {
       label: t("procs.menu.subtree"),

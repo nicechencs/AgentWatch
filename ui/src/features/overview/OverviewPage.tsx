@@ -10,6 +10,7 @@ import { EvidenceBadge } from "@/components/EvidenceBadge";
 import { NotCollected } from "@/components/NotCollected";
 import { ErrorNote, Loading } from "@/components/QueryState";
 import { capabilitiesUnknown, coverage, kindInSentence, kindLabel, uncollectedKinds } from "@/lib/capabilities";
+import { redactionForDisplay } from "@/lib/format";
 import { useI18n } from "@/lib/i18n";
 import { usePrefs } from "@/lib/prefs";
 import { summaryQueryOptions } from "@/lib/live-session";
@@ -229,7 +230,7 @@ function TopTable({
   onPick: (row: TopEntry) => void;
   render: (row: TopEntry) => ReactNode;
 }) {
-  const { t } = useI18n();
+  const { t, lang } = useI18n();
   return (
     <section className="rounded border border-line p-3">
       <h2 className="text-sm font-medium">{title}</h2>
@@ -238,7 +239,7 @@ function TopTable({
         {rows.map((row) => (
           <li key={row.label} className="flex items-center justify-between gap-2 border-b border-line/60 py-1">
             <button type="button" onClick={() => onPick(row)} className="truncate text-left font-mono hover:underline">
-              {row.label}
+              {redactionForDisplay(row.label, lang)}
             </button>
             <span className="flex items-center gap-2">
               {render(row)}

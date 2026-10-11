@@ -9,7 +9,7 @@ const ZH = zh as Record<string, string>;
 
 describe("redaction rule preview", () => {
   it("uses the regex the daemon uses", () => {
-    expect(redactPreview("tok=\\w+", "a tok=abc1 b").text).toBe("a «redacted:custom» b");
+    expect(redactPreview("tok=\\w+", "a tok=abc1 b").text).toBe("a （已隐藏） b");
     expect(redactPreview("(", "x").invalid).toBe(true);
     expect(ZH["settings.customRule"]).toBe("自定义");
   });

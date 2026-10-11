@@ -7,6 +7,7 @@
 use std::io::{self, Write};
 
 use serde_json::{json, Value};
+use time::{OffsetDateTime, UtcOffset};
 
 use aw_core::Evidence;
 
@@ -45,19 +46,19 @@ pub(crate) fn write_out(
 /// would lose the evidence badge. Cells are not cut here.
 fn render_uncut(table: &Table) -> String {
     let mut headers = table.headers.clone();
-    headers.push("evidence".to_owned());
+    headers.push("证据".to_owned());
     let mut grid: Vec<Vec<String>> = Vec::with_capacity(table.rows.len() + 1);
     grid.push(headers);
     for row in &table.rows {
         let mut cells = Vec::with_capacity(table.headers.len() + 1);
         for index in 0..table.headers.len() {
-            cells.push(
+            cells.push(output::human_redactions(
                 row.cells
                     .get(index)
-                    .cloned()
                     .filter(|cell| !cell.is_empty())
-                    .unwrap_or_else(|| "不可得".to_owned()),
-            );
+                    .map(String::as_str)
+                    .unwrap_or("不可得"),
+            ));
         }
         cells.push(output::evidence_badge(&row.evidence).to_owned());
         grid.push(cells);
@@ -140,10 +141,33 @@ fn na_code(reason: &aw_core::NaReason) -> &'static str {
 /// `pinned` as a table cell. A missing field is 没采, not "no".
 pub(crate) fn pinned_text(pinned: Option<bool>) -> String {
     match pinned {
-        Some(true) => "yes".to_owned(),
-        Some(false) => "no".to_owned(),
+        Some(true) => "是".to_owned(),
+        Some(false) => "否".to_owned(),
         None => "没采".to_owned(),
     }
+}
+
+/// A session timestamp in the reader's local clock, without an invented value
+/// when the daemon did not send one. The date stays short for a terminal list.
+fn session_time(ns: Option<i64>) -> String {
+    let Some(ns) = ns else {
+        return "没采".to_owned();
+    };
+    let Ok(utc) = OffsetDateTime::from_unix_timestamp_nanos(i128::from(ns)) else {
+        return "不可得".to_owned();
+    };
+    let local = UtcOffset::local_offset_at(utc)
+        .map(|offset| utc.to_offset(offset))
+        .unwrap_or(utc);
+    let (_, month, day) = local.date().to_calendar_date();
+    format!(
+        "{:02}-{:02} {:02}:{:02}:{:02}",
+        u8::from(month),
+        day,
+        local.hour(),
+        local.minute(),
+        local.second()
+    )
 }
 
 /// Record-level evidence for a row that may not have one (a mixed group).
@@ -159,17 +183,17 @@ pub(crate) fn session_table(items: &[SessionItem]) -> Table {
     // does not expose an owner field).
     let show_user = items.iter().any(|item| item.user_id.is_some());
     let mut headers = vec![
-        "id".to_owned(),
-        "name".to_owned(),
-        "mode".to_owned(),
-        "agent".to_owned(),
-        "started_ns".to_owned(),
-        "ended_ns".to_owned(),
-        "end_reason".to_owned(),
-        "pinned".to_owned(),
+        "会话".to_owned(),
+        "名称".to_owned(),
+        "方式".to_owned(),
+        "智能体".to_owned(),
+        "开始时间".to_owned(),
+        "结束时间".to_owned(),
+        "结束原因".to_owned(),
+        "固定".to_owned(),
     ];
     if show_user {
-        headers.push("User".to_owned());
+        headers.push("用户".to_owned());
     }
     Table {
         headers,
@@ -179,10 +203,10 @@ pub(crate) fn session_table(items: &[SessionItem]) -> Table {
                 let mut cells = vec![
                     item.public_id.clone(),
                     opt_text(item.name.as_deref()),
-                    item.mode.clone(),
+                    session_mode_label(&item.mode).to_owned(),
                     opt_text(item.agent.as_deref()),
-                    opt_i64(item.started_ns),
-                    opt_i64(item.ended_ns),
+                    session_time(item.started_ns),
+                    session_time(item.ended_ns),
                     end_reason_label(item.end_reason.as_deref()).to_owned(),
                     pinned_text(item.pinned),
                 ];
@@ -226,54 +250,58 @@ fn session_item_json(item: &SessionItem) -> Value {
 pub(crate) fn show_table(show: &SessionShow) -> Table {
     let mut rows = vec![
         stat_row(
-            "name",
+            "名称",
             opt_text(show.item.name.as_deref()),
             &show.item.evidence,
         ),
-        stat_row("mode", show.item.mode.clone(), &show.item.evidence),
         stat_row(
-            "agent",
+            "方式",
+            session_mode_label(&show.item.mode).to_owned(),
+            &show.item.evidence,
+        ),
+        stat_row(
+            "智能体",
             opt_text(show.item.agent.as_deref()),
             &show.item.evidence,
         ),
         stat_row(
-            "started_ns",
-            opt_i64(show.item.started_ns),
+            "开始时间",
+            session_time(show.item.started_ns),
             &show.item.evidence,
         ),
-        stat_row("ended_ns", opt_i64(show.item.ended_ns), &show.item.evidence),
         stat_row(
-            "end_reason",
+            "结束时间",
+            session_time(show.item.ended_ns),
+            &show.item.evidence,
+        ),
+        stat_row(
+            "结束原因",
             end_reason_label(show.item.end_reason.as_deref()).to_owned(),
             &show.item.evidence,
         ),
-        stat_row("pinned", pinned_text(show.item.pinned), &show.item.evidence),
+        stat_row("固定", pinned_text(show.item.pinned), &show.item.evidence),
         stat_row(
-            "exit_code",
+            "退出码",
             show.exit_code
                 .map_or_else(|| "没采".to_owned(), |code| code.to_string()),
             &show.item.evidence,
         ),
-        stat_row(
-            "processes",
-            opt_i64(show.process_count),
-            &show.item.evidence,
-        ),
-        stat_row("flows", opt_i64(show.flow_count), &show.item.evidence),
-        stat_row("dns", opt_i64(show.dns_count), &show.item.evidence),
-        stat_row("gaps", opt_i64(show.gap_count), &Evidence::E1),
-        stat_row("bytes_up", opt_i64(show.bytes_up), &show.item.evidence),
-        stat_row("bytes_down", opt_i64(show.bytes_down), &show.item.evidence),
+        stat_row("进程数", opt_i64(show.process_count), &show.item.evidence),
+        stat_row("流数", opt_i64(show.flow_count), &show.item.evidence),
+        stat_row("DNS", opt_i64(show.dns_count), &show.item.evidence),
+        stat_row("采集缺口", opt_i64(show.gap_count), &Evidence::E1),
+        stat_row("上传字节", opt_i64(show.bytes_up), &show.item.evidence),
+        stat_row("下载字节", opt_i64(show.bytes_down), &show.item.evidence),
     ];
     if show.gap_summaries.is_empty() {
         rows.push(stat_row(
-            "gap",
+            "缺口",
             "不可得".to_owned(),
             &Evidence::NA(aw_core::NaReason::Unknown),
         ));
     } else {
         for summary in &show.gap_summaries {
-            rows.push(stat_row("gap", summary.clone(), &Evidence::E1));
+            rows.push(stat_row("缺口", summary.clone(), &Evidence::E1));
         }
     }
     for cap in &show.capabilities {
@@ -282,10 +310,10 @@ pub(crate) fn show_table(show: &SessionShow) -> Table {
             cap.category,
             opt_text(cap.source.as_deref())
         );
-        rows.push(stat_row("capability", value, &cap.evidence));
+        rows.push(stat_row("能力", value, &cap.evidence));
     }
     Table {
-        headers: vec!["field".to_owned(), "value".to_owned()],
+        headers: vec!["字段".to_owned(), "值".to_owned()],
         rows,
     }
 }
@@ -305,6 +333,17 @@ pub(crate) fn end_reason_label(reason: Option<&str>) -> &'static str {
         Some("daemon_shutdown") | Some("daemon_restart") => "记录已中断（后台重启）",
         Some("attach_failed") => "附着失败",
         Some("adopt_timeout") => "接管超时",
+        None => "记录中",
+        _ => "不可得",
+    }
+}
+
+/// Session modes are machine values in JSON. Human tables use their reader
+/// labels and do not expose an unknown raw enum value as if it were prose.
+fn session_mode_label(mode: &str) -> &'static str {
+    match mode {
+        "launch" => "启动",
+        "attach" => "附着",
         _ => "不可得",
     }
 }

@@ -173,8 +173,20 @@ pub(crate) enum DbOp {
 /// no `--yes` flag in the command tree, so a non-TTY vacuum is refused until
 /// a caller passes [`Confirmed`].
 pub(crate) trait Confirm {
-    /// `true` when the operator agreed. Must not print argv, paths, or tokens.
-    fn confirm(&mut self, prompt: &str) -> bool;
+    /// The explicit terminal answer. Must not print argv, paths, or tokens.
+    fn confirm(&mut self, prompt: &str) -> Confirmation;
+}
+
+/// A terminal answer is different from an unavailable terminal: the former is
+/// a user cancellation, while the latter is a usage error that needs `--yes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Confirmation {
+    /// The operator explicitly agreed.
+    Confirmed,
+    /// The operator explicitly declined or submitted another answer in a TTY.
+    Declined,
+    /// stdin is not an interactive terminal.
+    NotInteractive,
 }
 
 /// Production confirmation. There is no TTY on this path, so the answer is no.
@@ -182,8 +194,8 @@ pub(crate) trait Confirm {
 pub(crate) struct NotInteractive;
 
 impl Confirm for NotInteractive {
-    fn confirm(&mut self, _prompt: &str) -> bool {
-        false
+    fn confirm(&mut self, _prompt: &str) -> Confirmation {
+        Confirmation::NotInteractive
     }
 }
 
@@ -193,18 +205,24 @@ impl Confirm for NotInteractive {
 pub(crate) struct StdinConfirm;
 
 impl Confirm for StdinConfirm {
-    fn confirm(&mut self, prompt: &str) -> bool {
+    fn confirm(&mut self, prompt: &str) -> Confirmation {
         if !io::stdin().is_terminal() {
-            return false;
+            return Confirmation::NotInteractive;
         }
         let _ = write!(io::stderr(), "{prompt}");
         let _ = io::stderr().flush();
         let mut answer = String::new();
-        io::stdin().read_line(&mut answer).is_ok()
-            && matches!(
-                answer.trim().to_ascii_lowercase().as_str(),
-                "是" | "y" | "yes"
-            )
+        if io::stdin().read_line(&mut answer).is_err() {
+            return Confirmation::Declined;
+        }
+        if matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "是" | "y" | "yes"
+        ) {
+            Confirmation::Confirmed
+        } else {
+            Confirmation::Declined
+        }
     }
 }
 
@@ -214,8 +232,8 @@ impl Confirm for StdinConfirm {
 pub(crate) struct Confirmed;
 
 impl Confirm for Confirmed {
-    fn confirm(&mut self, _prompt: &str) -> bool {
-        true
+    fn confirm(&mut self, _prompt: &str) -> Confirmation {
+        Confirmation::Confirmed
     }
 }
 
@@ -333,6 +351,9 @@ pub(crate) struct PurgeBody {
     pub older_than: Option<String>,
     /// `--all`.
     pub all: bool,
+    /// List candidates without deleting them, so the terminal prompt has the
+    /// real session count.
+    pub dry_run: bool,
 }
 
 /// Test client. No socket is opened, and an empty success would claim a vacuum
@@ -340,7 +361,7 @@ pub(crate) struct PurgeBody {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct UnwiredApi;
 
-const UNWIRED: &str = "后台数据库 API 未接通；GET /api/v1/db/stats 仍是占位实现，所以此命令不会打开数据库。请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）";
+const UNWIRED: &str = crate::client::DAEMON_UNREACHABLE;
 
 impl DbApi for UnwiredApi {
     fn stats(&mut self) -> Result<DbStatsView, DbApiError> {
@@ -506,27 +527,32 @@ impl DbApi for HttpDbApi {
     }
 
     fn purge(&mut self, body: &PurgeBody) -> Result<PurgeResult, DbApiError> {
-        // The CLI has already confirmed (`--yes` or the prompt); the daemon
-        // refuses a purge without `confirm: true`.
+        // A preview has `dry_run: true`; an actual deletion needs `confirm`.
         let payload = json!({
             "older_than": body.older_than,
             "all": body.all,
-            "confirm": true,
+            "dry_run": body.dry_run,
+            "confirm": !body.dry_run,
         });
         let value = self.call(&crate::client::ApiRequest::post_json(
             "/api/v1/db/purge",
             &payload,
         ))?;
-        let rows = match value.get("purged") {
+        let key = if body.dry_run {
+            "would_purge"
+        } else {
+            "purged"
+        };
+        let rows = match value.get(key) {
             Some(serde_json::Value::Array(rows)) => rows,
             Some(_) => {
                 return Err(DbApiError::Failed {
-                    detail: "字段 `purged` 不是数组".to_owned(),
+                    detail: format!("字段 `{key}` 不是数组"),
                 });
             }
             None => {
                 return Err(DbApiError::Failed {
-                    detail: "后台返回的数据缺少字段 `purged`".to_owned(),
+                    detail: format!("后台返回的数据缺少字段 `{key}`"),
                 });
             }
         };
@@ -536,7 +562,7 @@ impl DbApi for HttpDbApi {
                 Some(text) if !text.is_empty() => removed.push(text.to_owned()),
                 _ => {
                     return Err(DbApiError::Failed {
-                        detail: "字段 `purged` 的条目缺少 `public_id`".to_owned(),
+                        detail: format!("字段 `{key}` 的条目缺少 `public_id`"),
                     });
                 }
             }
@@ -641,7 +667,9 @@ pub(crate) fn run(
             Err(err) => api_error(err, json),
         },
         DbOp::Vacuum { yes } => {
-            if !yes && !confirm.confirm("将压缩数据库，可能耗时很久。确定吗？[是/否]")
+            if !yes
+                && confirm.confirm("将压缩数据库，可能耗时很久。确定吗？[是/否]")
+                    != Confirmation::Confirmed
             {
                 return super::error_outcome(
                     exit::USAGE,
@@ -732,23 +760,47 @@ fn purge_api(args: PurgeArgs<'_>, api: &mut dyn DbApi, confirm: &mut dyn Confirm
             json,
         );
     }
-    let confirmed = yes || confirm.confirm("将删除 N 个会话，删除后无法恢复。确定吗？[是/否]");
-    if !confirmed {
-        return super::error_outcome(
-            exit::USAGE,
-            "usage",
-            "现在不在终端里，没法确认删除。确定要删的话，请加上 `--yes`（删除后无法恢复）",
-            json,
-        );
-    }
     let body = PurgeBody {
         older_than: older_than.map(str::to_owned),
         all,
+        dry_run: false,
     };
+    if !yes {
+        let preview = PurgeBody {
+            dry_run: true,
+            ..body.clone()
+        };
+        let count = match api.purge(&preview) {
+            Ok(result) => result.removed.len(),
+            Err(err) => return api_error(err, json),
+        };
+        let prompt = format!("将删除 {count} 个会话，删除后无法恢复。确定吗？[是/否]");
+        match confirm.confirm(&prompt) {
+            Confirmation::Confirmed => {}
+            Confirmation::Declined => return cancelled_outcome(json),
+            Confirmation::NotInteractive => {
+                return super::error_outcome(
+                    exit::USAGE,
+                    "usage",
+                    "现在不在终端里，没法确认删除。确定要删的话，请加上 `--yes`（删除后无法恢复）",
+                    json,
+                );
+            }
+        }
+    }
     match api.purge(&body) {
         Ok(result) => purge_outcome(&result, json),
         Err(err) => api_error(err, json),
     }
+}
+
+fn cancelled_outcome(json: bool) -> Outcome {
+    super::error_outcome(
+        exit::CANCELLED,
+        "cancelled",
+        "已取消，没有删除任何会话",
+        json,
+    )
 }
 
 fn api_error(err: DbApiError, json: bool) -> Outcome {
@@ -1052,7 +1104,10 @@ fn note(op: &str, detail: &str, json: bool) -> Outcome {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{run_store, Clock, DbOp, DbStats, DbStore, FixedClock, PurgeRequest, PurgeResult};
+    use super::{
+        run, run_store, Clock, Confirm, Confirmation, DbApi, DbApiError, DbOp, DbStats,
+        DbStatsView, DbStore, FixedClock, MigrateReport, PurgeBody, PurgeRequest, PurgeResult,
+    };
     use crate::cmd::daemon::Privilege;
     use crate::exit;
 
@@ -1185,6 +1240,109 @@ mod tests {
                 pinned: false,
             },
         ])
+    }
+
+    #[derive(Default)]
+    struct PreviewApi {
+        seen: Vec<PurgeBody>,
+    }
+
+    impl DbApi for PreviewApi {
+        fn stats(&mut self) -> Result<DbStatsView, DbApiError> {
+            Err(DbApiError::Failed {
+                detail: "unused".to_owned(),
+            })
+        }
+
+        fn vacuum(&mut self) -> Result<String, DbApiError> {
+            Err(DbApiError::Failed {
+                detail: "unused".to_owned(),
+            })
+        }
+
+        fn migrate(&mut self, _: bool) -> Result<MigrateReport, DbApiError> {
+            Err(DbApiError::Failed {
+                detail: "unused".to_owned(),
+            })
+        }
+
+        fn purge(&mut self, body: &PurgeBody) -> Result<PurgeResult, DbApiError> {
+            self.seen.push(body.clone());
+            Ok(PurgeResult {
+                removed: vec!["s-one".to_owned(), "s-two".to_owned()],
+                kept: Vec::new(),
+            })
+        }
+    }
+
+    struct Answer {
+        answer: Confirmation,
+        prompts: Vec<String>,
+    }
+
+    impl Confirm for Answer {
+        fn confirm(&mut self, prompt: &str) -> Confirmation {
+            self.prompts.push(prompt.to_owned());
+            self.answer
+        }
+    }
+
+    #[test]
+    fn purge_preview_uses_the_real_count_and_decline_is_not_usage() {
+        let mut api = PreviewApi::default();
+        let mut confirm = Answer {
+            answer: Confirmation::Declined,
+            prompts: Vec::new(),
+        };
+        let outcome = run(
+            DbOp::Purge {
+                older_than: Some("0s".to_owned()),
+                all: false,
+                yes: false,
+            },
+            false,
+            &Admin(false),
+            &clock(),
+            &mut api,
+            &mut confirm,
+        );
+        assert_eq!(outcome.code, exit::CANCELLED);
+        assert_eq!(
+            confirm.prompts,
+            vec!["将删除 2 个会话，删除后无法恢复。确定吗？[是/否]"]
+        );
+        assert_eq!(api.seen.len(), 1);
+        assert!(api.seen[0].dry_run);
+        assert_eq!(
+            String::from_utf8(outcome.stderr).expect("utf8"),
+            "aw: 已取消，没有删除任何会话\n"
+        );
+    }
+
+    #[test]
+    fn purge_without_a_terminal_keeps_the_distinct_non_tty_message() {
+        let mut api = PreviewApi::default();
+        let mut confirm = Answer {
+            answer: Confirmation::NotInteractive,
+            prompts: Vec::new(),
+        };
+        let outcome = run(
+            DbOp::Purge {
+                older_than: Some("0s".to_owned()),
+                all: false,
+                yes: false,
+            },
+            false,
+            &Admin(false),
+            &clock(),
+            &mut api,
+            &mut confirm,
+        );
+        assert_eq!(outcome.code, exit::USAGE);
+        assert_eq!(
+            String::from_utf8(outcome.stderr).expect("utf8"),
+            "aw: 现在不在终端里，没法确认删除。确定要删的话，请加上 `--yes`（删除后无法恢复）\n"
+        );
     }
 
     #[test]

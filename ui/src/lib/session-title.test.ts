@@ -11,5 +11,7 @@ describe("session title", () => {
     expect(sessionTitle(row)).toBe("sleep 90");
     expect(sessionTitle({ name: "重构", argv: ["sleep"], public_id: "s-1" })).toBe("重构");
     expect(sessionTitle({ name: null, argv: null, public_id: "s-1" })).toBe("s-1");
+    expect(sessionTitle({ name: null, argv: ["tool", "«redacted:argv.flag_secret_eq»"], public_id: "s-1" })).toBe("tool （已隐藏）");
+    expect(sessionTitle({ name: null, argv: ["tool", "«redacted:argv.flag_secret_eq»"], public_id: "s-1" }, "en")).toBe("tool (hidden)");
   });
 });

@@ -204,7 +204,8 @@ pub(crate) fn run(
     }
 }
 
-/// Plan text only. Exit [`exit::USAGE`] so a missing `--yes` is not a success.
+/// Explain the platform installer. Exit [`exit::USAGE`] so a missing `--yes`
+/// is not a success.
 #[allow(clippy::needless_return)]
 fn unconfirmed_install(json: bool) -> Outcome {
     #[cfg(not(target_os = "windows"))]
@@ -215,7 +216,7 @@ fn unconfirmed_install(json: bool) -> Outcome {
             "systemd"
         };
         let detail = format!(
-            "planned: {platform} 安装计划；此命令不注册服务。实际安装由安装包提供\n提示: 请使用 AgentWatch 安装包完成安装\n"
+            "当前系统使用 {platform} 管理 AgentWatch 后台。请使用 AgentWatch 安装包完成安装。\n"
         );
         return if json {
             Outcome {
@@ -271,33 +272,11 @@ fn unconfirmed_install(json: bool) -> Outcome {
                 stderr: Vec::new(),
             };
         }
-        let text = format!(
-        "\
-planned: install plan was rendered; nothing was registered
-service_name={name}
-display_name={display}
-start_mode={start}
-account={account}
-sid_type={sid}
-bin_path={bin}
-recovery=restart/{first}/restart/{second}/restart/{third}
-{acls}\
-hint: re-run `aw daemon install --yes` to print sc.exe text for an administrator; this process does not run it
-",
-        name = plan.name,
-        display = plan.display_name,
-        start = plan.start_mode,
-        account = plan.account,
-        sid = plan.sid_type,
-        bin = plan.bin_path,
-        first = plan.first_delay_ms,
-        second = plan.second_delay_ms,
-        third = plan.third_delay_ms,
-        acls = acls.join(""),
-    );
+        let _ = (plan, acls);
+        let text = "Windows 使用服务管理 AgentWatch 后台。请使用 AgentWatch 安装包完成安装。\n";
         Outcome {
             code: exit::USAGE,
-            stdout: text.into_bytes(),
+            stdout: text.as_bytes().to_vec(),
             stderr: Vec::new(),
         }
     }
@@ -308,6 +287,23 @@ hint: re-run `aw daemon install --yes` to print sc.exe text for an administrator
 fn finish(op: &DaemonOp, effect: &DaemonEffect, json: bool) -> Outcome {
     if matches!(op, DaemonOp::Install { confirm: true }) {
         return confirmed_install(effect, json);
+    }
+    if matches!(
+        op,
+        DaemonOp::Uninstall {
+            purge: true,
+            check: false,
+            data_dir: None,
+        }
+    ) && !json
+    {
+        return Outcome {
+            code: exit::OK,
+            stdout: "这是卸载计划，没有删除任何数据，也没有移除服务。\n"
+                .as_bytes()
+                .to_vec(),
+            stderr: Vec::new(),
+        };
     }
     ok_outcome(effect, json)
 }
@@ -323,8 +319,7 @@ fn confirmed_install(effect: &DaemonEffect, json: bool) -> Outcome {
             "systemd"
         };
         let detail = format!(
-            "{}: {}\nexecuted=false\n{platform} 服务由 AgentWatch 安装包安装；此命令没有注册服务\n",
-            effect.state, effect.detail
+            "当前系统使用 {platform} 管理 AgentWatch 后台。请使用 AgentWatch 安装包完成安装。\n"
         );
         return if json {
             Outcome {
@@ -368,14 +363,7 @@ fn confirmed_install(effect: &DaemonEffect, json: bool) -> Outcome {
                 stderr: Vec::new(),
             };
         }
-        let text = format!(
-            "\
-{state}: {detail}
-executed=false
-{commands}",
-            state = effect.state,
-            detail = effect.detail,
-        );
+        let text = format!("请在管理员终端运行以下命令安装 AgentWatch 后台：\n{commands}");
         Outcome {
             code: exit::OK,
             stdout: text.into_bytes(),
@@ -526,21 +514,18 @@ mod tests {
         assert_eq!(outcome.code, exit::USAGE);
         let text = String::from_utf8(outcome.stdout).expect("utf8");
         assert!(text.contains("AgentWatch"), "{text}");
-        assert!(text.contains("安装计划"), "{text}");
+        assert!(text.contains("当前系统使用"), "{text}");
         // Non-Windows plans describe only this platform's installer pack.
         assert!(!text.contains("sc.exe"), "{text}");
-        assert!(
-            text.contains("安装包") || text.contains("安装计划"),
-            "{text}"
-        );
+        assert!(text.contains("安装包"), "{text}");
         assert!(control.seen.is_empty());
     }
 
-    /// Windows plans name the `sc.exe` registration an administrator would
-    /// run; naming it is not running it.
+    /// A Windows plan is plain installer guidance. Only the confirmed Windows
+    /// output prints `sc.exe` commands for an administrator to run.
     #[cfg(windows)]
     #[test]
-    fn windows_install_without_yes_prints_the_sc_plan_and_does_not_apply() {
+    fn windows_install_without_yes_prints_plain_guidance_and_does_not_apply() {
         let mut control = Recording { seen: Vec::new() };
         let outcome = run(
             DaemonOp::Install { confirm: false },
@@ -551,9 +536,9 @@ mod tests {
         assert_eq!(outcome.code, exit::USAGE);
         let text = String::from_utf8(outcome.stdout).expect("utf8");
         assert!(text.contains("AgentWatch"), "{text}");
-        assert!(
-            text.contains("sc.exe") || text.contains("service_name=AgentWatch"),
-            "{text}"
+        assert_eq!(
+            text,
+            "Windows 使用服务管理 AgentWatch 后台。请使用 AgentWatch 安装包完成安装。\n"
         );
         assert!(control.seen.is_empty());
     }
@@ -582,6 +567,25 @@ mod tests {
                 check: false,
                 data_dir: None,
             }]
+        );
+    }
+
+    #[test]
+    fn human_uninstall_purge_describes_the_safe_plan() {
+        let outcome = run(
+            DaemonOp::Uninstall {
+                purge: true,
+                check: false,
+                data_dir: None,
+            },
+            false,
+            &Admin(true),
+            &mut PlannedControl,
+        );
+        assert_eq!(outcome.code, exit::OK);
+        assert_eq!(
+            String::from_utf8(outcome.stdout).expect("utf8"),
+            "这是卸载计划，没有删除任何数据，也没有移除服务。\n"
         );
     }
 

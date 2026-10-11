@@ -2,6 +2,6 @@
 source: crates/aw-cli/src/cmd/query.rs
 expression: rendered
 ---
-local_port  remote_port  ip      domain        domain_source  domain_evidence  up      down  proc    n  evidence
+local_port  remote_port  ip      domain        domain_source  domain_evidence  up      down  proc    n  证据
 不可得      不可得       不可得  example.test  dns            E1 系统          150     400   不可得  2  不可得
 不可得      不可得       不可得  不可得        不可得         不可得           不可得  20    不可得  1  S 采样

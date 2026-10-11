@@ -1,16 +1,15 @@
 ---
 source: crates/aw-cli/src/cmd/mod.rs
-assertion_line: 1531
 expression: attach_help
 ---
 附着到已有进程
 
-Usage: aw attach [OPTIONS]
+用法：aw attach [OPTIONS]
 
 Options:
       --json                  机器可读的 JSON 输出
       --pid <PID>             要附着的进程号
-      --name <NAME>           进程名 pattern
+      --name <NAME>           按进程名筛选
       --socket <SOCKET>       Unix socket 或 Windows 命名管道
       --http <HTTP>           改用回环 HTTP。只接受 http://127.0.0.1:<port> 或 http://localhost:<port>
       --no-follow-children    不跟随子进程

@@ -22,6 +22,10 @@ use serde_json::Value;
 use crate::endpoint::{token_hint, Endpoint, HttpBase};
 use crate::exit::{self, from_http_status};
 
+/// Fixed human wording for a daemon that cannot be reached. Diagnostics stay
+/// in logs and structured JSON; terminal output never exposes them.
+pub(crate) const DAEMON_UNREACHABLE: &str = "连不上 AgentWatch 后台。请先启动后台（`sudo aw daemon start`）；只想运行程序、不做记录的话，可以加 `--no-daemon`。";
+
 /// One HTTP request, already decided by a command. Header values are not logged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -149,6 +153,8 @@ pub enum ClientError {
         code: Option<String>,
         /// Short message taken from the JSON body, or a fallback. No token.
         message: String,
+        /// Measured wait carried by structured daemon errors such as `db_busy`.
+        waited_seconds: Option<u64>,
     },
 }
 
@@ -156,17 +162,14 @@ impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unreachable { detail } => {
-                if let Some(text) = aw_channel::human_socket_path_error(detail) {
-                    return f.write_str(&text);
+                if let Some(message) = aw_channel::human_socket_path_error(detail) {
+                    f.write_str(&message)
+                } else {
+                    f.write_str(DAEMON_UNREACHABLE)
                 }
-                write!(
-                    f,
-                    "连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：{detail}"
-                )
             }
-            Self::Forbidden { detail } => write!(
-                f,
-                "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。详情：{detail}"
+            Self::Forbidden { .. } => f.write_str(
+                "后台在运行，但这个账户没有权限打开它的通道。请让管理员把你加入 agentwatch 组（Windows：AgentWatch Users）。",
             ),
             Self::UntrustedServer { .. } => f.write_str(
                 "连上的不是 AgentWatch 后台，可能有别的程序占用了这个通信口。为防内容被它拿到，这次没有发送任何内容。",
@@ -176,12 +179,19 @@ impl fmt::Display for ClientError {
             ),
             // The transport detail is for logs and `--json`; it often has a
             // Win32 code and must not become a second, English user message.
-            Self::Transport { .. } => f.write_str("跟后台的连接断了，请再试一次。"),
+            Self::Transport { detail } => f.write_str(&human_transport_message(detail)),
             Self::Status {
                 status,
                 code,
                 message,
-            } => crate::daemon_errors::write_status(f, *status, code.as_deref(), message),
+                waited_seconds,
+            } => crate::daemon_errors::write_status(
+                f,
+                *status,
+                code.as_deref(),
+                message,
+                *waited_seconds,
+            ),
         }
     }
 }
@@ -271,6 +281,7 @@ impl<T: Transport> Client<T> {
                 status: reply.status,
                 code: status_code(&reply),
                 message: status_message(&reply),
+                waited_seconds: status_waited_seconds(&reply),
             })
         }
     }
@@ -301,6 +312,26 @@ fn status_code(reply: &ApiReply) -> Option<String> {
     reply
         .json()
         .and_then(|value| value.get("error")?.get("code")?.as_str().map(str::to_owned))
+}
+
+fn status_waited_seconds(reply: &ApiReply) -> Option<u64> {
+    reply
+        .json()
+        .and_then(|value| value.get("error")?.get("waited_seconds")?.as_u64())
+}
+
+/// Human text for an exchange that broke after connecting. The raw error is a
+/// structured diagnostic, not terminal prose.
+#[must_use]
+pub(crate) fn human_transport_message(detail: &str) -> String {
+    if detail.contains("daemon_timeout")
+        || detail.contains("operation would block")
+        || detail.contains("timed out")
+    {
+        "后台 5 秒没有回应，这次请求没有完成。".to_owned()
+    } else {
+        "跟后台的连接断了，请再试一次。".to_owned()
+    }
 }
 
 /// Production HTTP transport. Dials `127.0.0.1` only, writes one HTTP/1.1
@@ -615,7 +646,7 @@ mod tests {
         assert_eq!(err.exit_code(), exit::PERMISSION);
         let text = err.to_string();
         assert!(text.contains("没有通过后台的身份验证"), "{text}");
-        assert!(text.contains("bearer token required"), "{text}");
+        assert!(!text.contains("bearer token required"), "{text}");
         assert!(!text.contains("unit-test-token"), "{text}");
         assert!(!text.contains("ABCD") || text.contains("len="), "{text}");
         let _ = token_hint("unit-test-token-ABCD");
@@ -642,17 +673,14 @@ mod tests {
     }
 
     #[test]
-    fn unreachable_message_starts_with_the_daemon_instruction_and_keeps_detail() {
+    fn unreachable_message_is_the_fixed_daemon_instruction() {
         let detail = "x.sock: connection refused";
         let text = ClientError::Unreachable {
             detail: detail.to_owned(),
         }
         .to_string();
-        assert!(
-            text.starts_with("连不上后台，请先运行 `aw daemon start`"),
-            "{text}"
-        );
-        assert!(text.contains(detail), "{text}");
+        assert_eq!(text, super::DAEMON_UNREACHABLE);
+        assert!(!text.contains(detail), "{text}");
     }
 
     #[test]
@@ -661,6 +689,7 @@ mod tests {
             status: 403,
             code: Some("unidentified_peer".to_owned()),
             message: "pipe client could not be identified".to_owned(),
+            waited_seconds: None,
         };
         assert_eq!(err.exit_code(), exit::PERMISSION);
         assert_eq!(err.identity_failure_code(), Some("unidentified_peer"));

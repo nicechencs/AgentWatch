@@ -10,12 +10,13 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "aw",
-    version,
+    version = env!("CARGO_PKG_VERSION"),
     about = "AgentWatch 命令行客户端",
     subcommand_required = true,
     disable_help_subcommand = true,
     disable_help_flag = true,
-    help_template = "{about-with-newline}\n用法: {usage}\n\n命令：\n{subcommands}\n\n选项：\n{options}\n"
+    disable_version_flag = true,
+    help_template = "{about-with-newline}\n用法：aw [选项] <命令>\n\n命令：\n{subcommands}\n\n选项：\n{options}\n"
 )]
 pub(crate) struct Cli {
     /// 机器可读的 JSON 输出
@@ -42,6 +43,9 @@ pub(crate) struct Cli {
     /// 显示帮助
     #[arg(short = 'h', long, global = true, action = clap::ArgAction::Help, required = false)]
     pub(crate) help: Option<bool>,
+    /// 显示版本
+    #[arg(short = 'V', long, action = clap::ArgAction::Version, required = false)]
+    pub(crate) version: Option<bool>,
     #[command(subcommand)]
     pub(crate) command: Command,
 }
@@ -94,7 +98,7 @@ pub(crate) enum Command {
         #[arg(long, help = "要附着的进程号")]
         pid: Option<u32>,
         /// 进程名 pattern
-        #[arg(long, help = "进程名 pattern")]
+        #[arg(long, help = "按进程名筛选")]
         name: Option<String>,
         #[arg(long, help = "不跟随子进程")]
         no_follow_children: bool,
@@ -182,7 +186,7 @@ pub(crate) enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// 查看发现
+    /// 查看会话中的规则匹配结果
     Findings {
         /// 会话号或 @last
         session: String,

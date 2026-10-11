@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { describeError } from "@/api/errors";
 import { useI18n } from "@/lib/i18n";
 
@@ -22,7 +23,7 @@ export function ErrorNote({ message, error, onRetry }: { message?: string; error
   );
 }
 
-export function EmptyNote({ children }: { children?: string }) {
+export function EmptyNote({ children }: { children?: ReactNode }) {
   const { t } = useI18n();
   return <p className="px-4 py-6 text-sm text-ink-faint">{children ?? t("common.empty")}</p>;
 }

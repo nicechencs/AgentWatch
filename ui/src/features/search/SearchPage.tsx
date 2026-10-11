@@ -1,4 +1,4 @@
-import { useNavigate, useSearch } from "@tanstack/react-router";
+import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { api } from "@/api/client";
@@ -49,7 +49,11 @@ export function SearchPage() {
   return (
     <main className="mx-auto max-w-3xl px-4 py-3">
       <h1 className="text-base font-semibold">{t("search.title")}</h1>
-      <p className="mt-1 text-xs text-ink-faint">{t("search.hint")}</p>
+      <p className="mt-1 text-xs text-ink-faint">
+        {t("search.hint.before")}
+        <Link to="/" className="underline">{t("search.hint.link")}</Link>
+        {t("search.hint.after")}
+      </p>
       <form onSubmit={submit} className="mt-3 flex gap-2">
         <input
           value={draft}
@@ -73,7 +77,15 @@ export function SearchPage() {
         <p className="mt-2 text-xs text-amber-700 dark:text-amber-400">{t("search.slow")}</p>
       ) : null}
       {result.isError ? <ErrorNote error={result.error} onRetry={() => void result.refetch()} /> : null}
-      {result.data && result.data.groups.length === 0 ? <EmptyNote>{t("search.empty")}</EmptyNote> : null}
+      {result.data && result.data.groups.length === 0 ? (
+        <EmptyNote>
+          {t("search.empty.before")}
+          {q}
+          {t("search.empty.mid")}
+          <Link to="/" className="underline">{t("search.empty.link")}</Link>
+          {t("search.empty.after")}
+        </EmptyNote>
+      ) : null}
 
       <div className="mt-3 space-y-4">
         {result.data?.groups.map((group) => (

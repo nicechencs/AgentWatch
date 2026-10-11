@@ -235,10 +235,24 @@ fn sampling_from(entry: &ProcessEntry) -> SamplingProcess {
         key: entry.key,
         ppid: entry.ppid.unwrap_or(0),
         start_ns,
-        // macOS has no `/proc` boot id. The start time is wall-clock
-        // microseconds, so the key does not need a boot generation.
-        boot_id: Vec::new(),
+        // Decimal seconds of `kern.boottime`, the same bytes the poll collector
+        // hashes (`sysinfo::System::boot_time`, which is `sysctl(KERN_BOOTTIME)`
+        // `tv_sec`). An empty boot id hashes to a different `ProcUid` than that
+        // collector, so a launched pid would never pair with its stored row.
+        // `None` (the sysctl failed) stays empty: inventing a boot id would
+        // attach the row to a different process.
+        boot_id: boot_id_bytes().unwrap_or_default(),
     }
+}
+
+/// `kern.boottime` seconds, decimal ASCII. `None` when the sysctl fails or
+/// returns 0: that is "unavailable", not a boot id of zero.
+fn boot_id_bytes() -> Option<Vec<u8>> {
+    let secs = ffi::boot_time_secs()?;
+    if secs == 0 {
+        return None;
+    }
+    Some(secs.to_string().into_bytes())
 }
 
 fn identity(pid: u32) -> Result<Option<ProcessEntry>, PlatformError> {
@@ -457,6 +471,36 @@ mod ffi {
         unsafe {
             // SAFETY: `buf` is writable and `bytes` is its length.
             libc::proc_listallpids(buf.as_mut_ptr().cast::<libc::c_void>(), bytes)
+        }
+    }
+
+    /// `sysctl(KERN_BOOTTIME)` `tv_sec`. `None` when the call fails. `0` is a
+    /// real return (the kernel wrote a zero timeval) and the caller treats it
+    /// as unavailable.
+    pub(super) fn boot_time_secs() -> Option<i64> {
+        let mut boot = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut len = std::mem::size_of::<libc::timeval>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+        let rc = unsafe {
+            // SAFETY: `mib` is the two-int name of `kern.boottime`, `boot` is
+            // writable storage of one `timeval`, and `len` is that size. The
+            // kernel writes the timeval in place.
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                (&mut boot as *mut libc::timeval).cast::<libc::c_void>(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc < 0 {
+            None
+        } else {
+            Some(boot.tv_sec)
         }
     }
 

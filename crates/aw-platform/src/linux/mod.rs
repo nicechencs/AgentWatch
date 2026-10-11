@@ -1,15 +1,9 @@
 use crate::{
     Capability, CapabilityStatus, HeldChild, IdentifiedCaller, Owner, PeerIdentity, Platform,
-    PlatformError, ProcessEntry, ProcessKey, ReapOutcome, ReleasedChild, SamplingProcess,
-    SpawnRequest, UnsupportedKind,
+    PlatformError, ProcessEntry, ProcessKey, SamplingProcess, SpawnRequest, UnsupportedKind,
 };
-use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
-use nix::unistd::{pipe2, write};
-use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
 use std::{fs, io};
 
 pub(crate) struct CurrentPlatform;
@@ -299,140 +293,15 @@ fn sampling_entry(
     }))
 }
 
-const GATE_FD_ENV: &str = "AW_PLATFORM_GATE_FD";
-
-struct LinuxHeldChild {
-    child: Option<Child>,
-    release_fd: Option<OwnedFd>,
-}
-struct LinuxReleasedChild {
-    child: Child,
-}
-
-fn reap_outcome(status: std::process::ExitStatus) -> ReapOutcome {
-    match status.code() {
-        Some(code) => ReapOutcome::Exited(code),
-        None => ReapOutcome::Signaled(status.signal().unwrap_or_default()),
-    }
-}
-
-impl LinuxHeldChild {
-    fn terminate(&mut self) -> Result<(), PlatformError> {
-        self.release_fd.take();
-        if let Some(mut child) = self.child.take() {
-            match child.kill() {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {}
-                Err(error) => return Err(error.into()),
-            }
-            let _ = child.wait();
-        }
-        Ok(())
-    }
-}
-impl Drop for LinuxHeldChild {
-    fn drop(&mut self) {
-        let _ = self.terminate();
-    }
-}
-impl HeldChild for LinuxHeldChild {
-    fn pid(&self) -> u32 {
-        self.child.as_ref().map_or(0, Child::id)
-    }
-    fn release(mut self: Box<Self>) -> Result<Box<dyn ReleasedChild>, PlatformError> {
-        #[cfg(feature = "test-hold-delay")]
-        if let Some(delay) = hold_delay() {
-            std::thread::sleep(std::time::Duration::from_millis(delay.min(10_000)));
-        }
-        let fd = self.release_fd.take().ok_or(PlatformError::Invalid {
-            capability: "spawn_suspended",
-            detail: "child has already been released",
-        })?;
-        let mut remaining = &b"1\n"[..];
-        while !remaining.is_empty() {
-            match write(&fd, remaining) {
-                Ok(0) => {
-                    return Err(PlatformError::Invalid {
-                        capability: "spawn_suspended",
-                        detail: "gate accepted no release data",
-                    })
-                }
-                Ok(written) => remaining = &remaining[written..],
-                Err(error) => return Err(io::Error::from_raw_os_error(error as i32).into()),
-            }
-        }
-        let child = self.child.take().ok_or(PlatformError::Invalid {
-            capability: "spawn_suspended",
-            detail: "held child is unavailable",
-        })?;
-        Ok(Box::new(LinuxReleasedChild { child }))
-    }
-    fn abort(&mut self) -> Result<(), PlatformError> {
-        self.terminate()
-    }
-}
-
-#[cfg(feature = "test-hold-delay")]
-fn hold_delay() -> Option<u64> {
-    std::env::var("AW_TEST_HOLD_DELAY_MS")
-        .ok()?
-        .parse::<u64>()
-        .ok()
-        .map(|delay| delay.min(10_000))
-}
-impl ReleasedChild for LinuxReleasedChild {
-    fn pid(&self) -> u32 {
-        self.child.id()
-    }
-    fn try_reap(&mut self) -> Result<ReapOutcome, PlatformError> {
-        Ok(self
-            .child
-            .try_wait()?
-            .map_or(ReapOutcome::StillRunning, reap_outcome))
-    }
-    fn wait(mut self: Box<Self>) -> Result<ReapOutcome, PlatformError> {
-        Ok(reap_outcome(self.child.wait()?))
-    }
-}
-
-fn spawn_gate(request: &SpawnRequest) -> Result<Box<dyn HeldChild>, PlatformError> {
-    let (read_fd, write_fd) =
-        pipe2(OFlag::O_CLOEXEC).map_err(|error| io::Error::from_raw_os_error(error as i32))?;
-    let fd_number = read_fd.as_raw_fd();
-    let flags = fcntl(&read_fd, FcntlArg::F_GETFD)
-        .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
-    let flags = FdFlag::from_bits_truncate(flags) & !FdFlag::FD_CLOEXEC;
-    fcntl(&read_fd, FcntlArg::F_SETFD(flags))
-        .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
-    let (program, args) = request
-        .command
-        .split_first()
-        .ok_or(PlatformError::Invalid {
-            capability: "spawn_suspended",
-            detail: "empty command",
-        })?;
-    // The shell exits before exec on EOF. The inherited descriptor is closed
-    // before target exec, so released programs have no daemon-death coupling.
-    let script =
-        format!("IFS= read -r _ <&{fd_number} || exit 125; exec {fd_number}<&-; exec \"$@\"");
-    let mut command = Command::new("/bin/sh");
-    command
-        .arg("-c")
-        .arg(script)
-        .arg("aw-platform")
-        .arg(program)
-        .args(args);
-    if let Some(cwd) = &request.cwd {
-        command.current_dir(cwd);
-    }
-    command.envs(request.env.iter().map(|(key, value)| (key, value)));
-    command.env_remove(GATE_FD_ENV);
-    let child = command.spawn()?;
-    drop(read_fd);
-    Ok(Box::new(LinuxHeldChild {
-        child: Some(child),
-        release_fd: Some(write_fd),
-    }))
+fn spawn_gate(
+    caller: &IdentifiedCaller,
+    request: &SpawnRequest,
+) -> Result<Box<dyn HeldChild>, PlatformError> {
+    // The hold stage is a forked child that blocks on a CLOEXEC pipe. Clearing
+    // FD_CLOEXEC in this process, then calling `Command::spawn`, let every other
+    // thread's spawn inherit that read end. `unix::hold` never has a
+    // non-CLOEXEC gate fd in the parent.
+    crate::unix::hold::spawn(caller, request)
 }
 
 impl Platform for CurrentPlatform {
@@ -461,7 +330,7 @@ impl Platform for CurrentPlatform {
         if caller.owner() != &self.current_owner()? {
             return Err(no("spawn_suspended_for_other_user"));
         }
-        spawn_gate(request)
+        spawn_gate(caller, request)
     }
     fn process_identity(&self, pid: u32) -> Result<Option<ProcessEntry>, PlatformError> {
         entry(pid)

@@ -15,8 +15,8 @@ nix = { version = "0.30", default-features = false, features = ["fs", "process",
 aw-collector-linux = { path = "../aw-collector-linux" }
 
 [target.'cfg(unix)'.dependencies]
-# The macOS hold stage (fork, then block before exec) is Unix-generic so Linux
-# can test it. libc 0.2.189 is already in Cargo.lock via the macOS target.
+# The hold stage (fork, then block before exec) is Unix-generic. Linux and
+# macOS both call it. libc 0.2.189 is already in Cargo.lock.
 libc = "=0.2.189"
 
 [target.'cfg(target_os = "macos")'.dependencies]

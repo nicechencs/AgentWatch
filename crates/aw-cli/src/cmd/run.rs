@@ -2769,6 +2769,143 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Fifty held children, started together from many threads, ten times.
+    ///
+    /// The old Linux gate cleared `FD_CLOEXEC` on the pipe's read end in this
+    /// process and only then called `Command::spawn`. Any sibling spawn in that
+    /// window inherited the read end, so the target's `/proc/self/fd` listed two
+    /// descriptors a plain spawn did not have, and one of those spawns failed
+    /// with 「无法启动程序：发生系统错误」. The hold stage keeps both ends
+    /// `CLOEXEC` in the parent and closes the read end before exec, so none of these
+    /// targets may see an extra descriptor, and none may fail to start.
+    #[cfg(unix)]
+    #[test]
+    fn command_spawner_concurrent_holds_leak_no_gate_fd() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const ROUNDS: usize = 10;
+        const CHILDREN: usize = 50;
+        // `/dev/fd` is the same directory on Linux and macOS. `/proc/self/fd`
+        // is not there on macOS, so a count taken from it cannot guard the
+        // macOS hold path.
+        let script = "ls /dev/fd > \"$1\"";
+        let dir = std::env::temp_dir().join(format!(
+            "aw-cli-gate-concurrent-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("test directory");
+        let baseline_path = dir.join("baseline-fds");
+        let baseline_status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .arg("aw-gate-fd-test")
+            .arg(&baseline_path)
+            .status()
+            .expect("baseline spawn");
+        assert!(
+            baseline_status.success(),
+            "baseline ls failed: {baseline_status}"
+        );
+        let plain = listed_fds(&baseline_path);
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        for round in 0..ROUNDS {
+            let mut threads = Vec::with_capacity(CHILDREN);
+            for index in 0..CHILDREN {
+                let failures = Arc::clone(&failures);
+                let dir = dir.clone();
+                let plain = plain.clone();
+                threads.push(std::thread::spawn(move || {
+                    let fds = dir.join(format!("fds-{round}-{index}"));
+                    let command = vec![
+                        "sh".to_owned(),
+                        "-c".to_owned(),
+                        script.to_owned(),
+                        "aw-gate-fd-test".to_owned(),
+                        fds.to_string_lossy().into_owned(),
+                    ];
+                    let spec = match RunSpec::new(command) {
+                        Ok(spec) => spec,
+                        Err(error) => {
+                            failures
+                                .lock()
+                                .expect("failures")
+                                .push(format!("round {round} child {index}: spec {error}"));
+                            return;
+                        }
+                    };
+                    let mut child = match super::CommandSpawner.spawn(&spec) {
+                        Ok(child) => child,
+                        Err((_, message)) => {
+                            failures
+                                .lock()
+                                .expect("failures")
+                                .push(format!("round {round} child {index}: spawn {message}"));
+                            return;
+                        }
+                    };
+                    if let Err(message) = child.release() {
+                        failures
+                            .lock()
+                            .expect("failures")
+                            .push(format!("round {round} child {index}: release {message}"));
+                        child.kill_and_reap();
+                        return;
+                    }
+                    match child.wait() {
+                        Ok(0) => {}
+                        Ok(code) => {
+                            failures
+                                .lock()
+                                .expect("failures")
+                                .push(format!("round {round} child {index}: exit {code}"));
+                            return;
+                        }
+                        Err(message) => {
+                            failures
+                                .lock()
+                                .expect("failures")
+                                .push(format!("round {round} child {index}: wait {message}"));
+                            return;
+                        }
+                    }
+                    let gated = listed_fds(&fds);
+                    if gated.iter().any(|fd| !plain.contains(fd)) {
+                        failures.lock().expect("failures").push(format!(
+                            "round {round} child {index}: leaked fd gated {gated:?} plain {plain:?}"
+                        ));
+                    }
+                }));
+            }
+            for thread in threads {
+                thread.join().expect("spawner thread");
+            }
+        }
+        let failures = failures.lock().expect("failures");
+        assert!(
+            failures.is_empty(),
+            "{} of {} spawns failed:\n{}",
+            failures.len(),
+            ROUNDS * CHILDREN,
+            failures.join("\n")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        fn listed_fds(path: &std::path::Path) -> Vec<u32> {
+            let mut open_fds: Vec<u32> = std::fs::read_to_string(path)
+                .expect("fd list")
+                .lines()
+                .filter_map(|fd| fd.parse().ok())
+                .collect();
+            open_fds.sort_unstable();
+            open_fds
+        }
+    }
+
     #[test]
     fn collector_unavailable_suggests_the_local_mode_without_spawning() {
         let command = vec!["tool".to_owned()];

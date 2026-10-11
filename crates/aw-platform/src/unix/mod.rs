@@ -1,11 +1,13 @@
 //! Unix pieces shared by more than one platform module.
 //!
-//! [`hold`] is the macOS suspended launch: a forked child that switches
-//! account, then blocks on a pipe before exec. It lives here, not under
-//! `macos/`, because the same code has to be tested on Linux. Linux's own
-//! launch does not call it.
+//! [`hold`] is the suspended launch: a forked child that switches account,
+//! then blocks on a pipe before exec. It lives here, not under `macos/`,
+//! because Linux uses the same stage. A shell gate that cleared `FD_CLOEXEC`
+//! in the parent was inherited by every sibling spawn running at the same time.
 
-// Linux compiles this so the hold can be tested here; only the macOS
-// `Platform` calls it, so production code on Linux never references it.
-#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+// Linux and macOS both call this. Other Unix targets compile it for the tests.
+#[cfg_attr(
+    not(any(test, target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
 pub(crate) mod hold;

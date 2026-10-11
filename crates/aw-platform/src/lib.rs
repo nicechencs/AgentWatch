@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
-// The macOS hold stage is a forked child, not a re-exec. It is Unix-generic so
-// Linux can test the same code; only the macOS `Platform` calls it. Linux
-// launch behavior is unchanged.
+// The hold stage is a forked child, not a re-exec. It is Unix-generic: macOS
+// and Linux both call it. The gate pipe stays CLOEXEC in the parent, so a
+// sibling spawn cannot inherit it.
 #[cfg(unix)]
 pub(crate) mod unix;
 #[cfg(target_os = "windows")]

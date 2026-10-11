@@ -15,9 +15,11 @@
 //! 2. `chdir` to the caller's directory only after that switch.
 //! 3. Block on a `read` of the gate pipe. EOF (the creator died, or aborted
 //!    before release) `_exit`s without exec. One byte means release: close the
-//!    pipe and `execve` the target with the caller's environment. That
-//!    environment is applied at `execve`, after the switch, and is not this
-//!    process's environment while it is still root.
+//!    pipe and `execve` the target. The target inherits this process's
+//!    environment with the caller's pairs applied over it, at `execve` and
+//!    not before. `DYLD_INSERT_LIBRARIES` and `LD_PRELOAD` are unset in the
+//!    hold stage itself, so a caller-controlled loader is not in force while
+//!    the process is still privileged.
 //!
 //! The gate pipe is `CLOEXEC` on both ends from the moment `pipe` returns. The
 //! read end is inherited across the fork (close-on-exec applies at exec, not
@@ -52,7 +54,8 @@ struct Prepared {
     cwd: Option<std::ffi::CString>,
     program: std::ffi::CString,
     argv: Vec<std::ffi::CString>,
-    /// `NAME=value`, the caller's environment, applied only at `execve`.
+    /// `NAME=value`. This process's environment, then the caller's overrides.
+    /// Applied only at `execve`.
     env: Vec<std::ffi::CString>,
     /// Read end of the gate pipe. Closed in the child before exec.
     gate_read: std::os::fd::RawFd,
@@ -118,9 +121,18 @@ pub(crate) fn spawn(
             "argument contains NUL",
         )?);
     }
-    // The target's environment, and nothing of ours. Applied at execve only.
-    let mut env = Vec::with_capacity(request.env.len());
-    for (key, value) in &request.env {
+    // The target inherits this process's environment, then the caller's
+    // overrides. Linux `aw run` used to do the same through `Command`: a child
+    // of `sh -c 'exit "$AW_TEST_CODE"'` with only `AW_TEST_CODE` set still saw
+    // `PATH`. Replacing the environment outright would drop that. `DYLD_*` and
+    // `LD_PRELOAD` are still cleared in the hold stage before it reads the
+    // gate, and come back only if the caller named them here.
+    let mut env_pairs: Vec<(String, String)> = std::env::vars()
+        .filter(|(key, _)| !request.env.iter().any(|(name, _)| name == key))
+        .collect();
+    env_pairs.extend(request.env.iter().cloned());
+    let mut env = Vec::with_capacity(env_pairs.len());
+    for (key, value) in &env_pairs {
         let pair = format!("{key}={value}");
         env.push(ffi::c_string(
             std::ffi::OsStr::new(&pair),

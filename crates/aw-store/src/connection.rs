@@ -14,6 +14,23 @@ use rusqlite::{Connection, OpenFlags};
 /// How long SQLite waits for an existing writer before returning `SQLITE_BUSY`.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// VFS for every on-disk connection.
+///
+/// On macOS the default `unix` VFS picks a locking style from the filesystem
+/// name (`sqlite3.c` `autolockIoFinderImpl`). That table names `hfs` and `ufs`
+/// and nothing newer: APFS (`f_fstypename` `apfs`) misses it, the `F_GETLK`
+/// probe can fail on that volume, and the file then uses dot-file locking.
+/// `dotlockLock` turns `mkdir` `EEXIST` into `SQLITE_BUSY` and returns. The
+/// busy handler never runs, so `busy_timeout` does not wait. `unix-posix`
+/// is the POSIX advisory-lock VFS on every platform that builds it (it is
+/// registered whenever `SQLITE_ENABLE_LOCKING_STYLE` is on, which Apple builds
+/// turn on and this bundled build leaves off elsewhere). Linux and Windows
+/// have no such VFS; they keep SQLite's default.
+#[cfg(target_os = "macos")]
+const DISK_VFS: Option<&str> = Some("unix-posix");
+#[cfg(not(target_os = "macos"))]
+const DISK_VFS: Option<&str> = None;
+
 /// Configure a newly opened SQLite connection.
 ///
 /// This must remain the first database operation on every connection.  The
@@ -25,9 +42,7 @@ pub fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
 
 /// Open a connection with the shared busy timeout installed first.
 pub fn open_connection(path: impl AsRef<Path>) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
-    configure_connection(&conn)?;
-    Ok(conn)
+    open_connection_with_flags(path, OpenFlags::default())
 }
 
 /// Open an in-memory connection with the shared busy timeout installed first.
@@ -44,7 +59,10 @@ pub fn open_connection_with_flags(
     path: impl AsRef<Path>,
     flags: OpenFlags,
 ) -> rusqlite::Result<Connection> {
-    let conn = Connection::open_with_flags(path, flags)?;
+    let conn = match DISK_VFS {
+        Some(vfs) => Connection::open_with_flags_and_vfs(path, flags, vfs)?,
+        None => Connection::open_with_flags(path, flags)?,
+    };
     configure_connection(&conn)?;
     Ok(conn)
 }

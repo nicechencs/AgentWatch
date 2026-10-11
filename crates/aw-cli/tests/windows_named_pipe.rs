@@ -116,6 +116,8 @@ fn mismatched_pipe_server_image_receives_zero_request_bytes() {
         &path,
         &PipeServiceStatus::Installed {
             binary_path: image.clone(),
+            process_id: std::process::id(),
+            running: true,
         },
     )
     .expect_err("mismatched server image must be refused");

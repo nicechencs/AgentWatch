@@ -55,8 +55,9 @@ use windows::Win32::System::Pipes::{
     GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, ImpersonateNamedPipeClient,
 };
 use windows::Win32::System::Services::{
-    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceConfigW, QUERY_SERVICE_CONFIGW,
-    SC_MANAGER_CONNECT, SERVICE_QUERY_CONFIG,
+    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceConfigW, QueryServiceStatusEx,
+    QUERY_SERVICE_CONFIGW, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_QUERY_CONFIG,
+    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS_PROCESS,
 };
 #[allow(unused_imports)] // Kept with the named-pipe-fix import set for its boot-time helpers.
 use windows::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
@@ -1930,9 +1931,8 @@ impl Drop for PipeImpersonation {
     }
 }
 
-/// Verify that the connected pipe belongs to the executable configured for
-/// the installed AgentWatch service. A pipe object's owner is insufficient:
-/// another LocalSystem process can create one with the same owner.
+/// Verify that the connected pipe belongs to the running installed AgentWatch
+/// service, or to the caller in explicit foreground/dev mode.
 pub fn verify_pipe_server(
     handle: std::os::windows::io::RawHandle,
 ) -> Result<(), PipeServerVerificationError> {
@@ -1950,33 +1950,86 @@ pub fn verify_pipe_server_with_service_status(
     handle: std::os::windows::io::RawHandle,
     service_status: &PipeServiceStatus,
 ) -> Result<(), PipeServerVerificationError> {
-    if matches!(service_status, PipeServiceStatus::NotInstalled) {
-        // No installed service means no service image to compare against:
-        // this is a foreground/dev daemon run by the caller. Trust only a
-        // pipe whose owner is the calling account itself; a LocalSystem or
-        // other-account pipe is refused before any request byte is sent.
-        let owner_sid = pipe_owner_sid(HANDLE(handle as isize))?;
-        let current_sid = current_pipe_client_sid()?;
-        return if not_installed_pipe_owner_trusted(&owner_sid, &current_sid) {
-            Ok(())
-        } else {
-            Err(PipeServerVerificationError::NotDaemon {
-                detail: Some(
-                    "AgentWatch service is not installed and the pipe is not owned by the calling account"
-                        .to_owned(),
-                ),
-            })
-        };
+    let pipe = HANDLE(handle as isize);
+    // All trust observations are made through this already-connected client
+    // handle. Never reopen the public name between checking it and writing.
+    let owner_sid = pipe_owner_sid(pipe)?;
+    match service_status {
+        PipeServiceStatus::NotInstalled => {
+            // No installed service is the foreground/dev-mode case. A
+            // LocalSystem pipe is deliberately *not* a dev daemon: only the
+            // caller's own SID can own an accepted pipe here.
+            let current_sid = current_pipe_client_sid()?;
+            if pipe_server_is_trusted(&owner_sid, Some(&current_sid), false, 0, service_status) {
+                Ok(())
+            } else {
+                Err(PipeServerVerificationError::NotDaemon {
+                    detail: Some(
+                        "AgentWatch service is not installed and the pipe is not owned by the calling account"
+                            .to_owned(),
+                    ),
+                })
+            }
+        }
+        PipeServiceStatus::Installed { binary_path, .. } => {
+            let (server_pid, server_image) = pipe_server_identity(pipe)?;
+            let image_matches_service = pipe_server_images_match(&server_image, binary_path)?;
+            if pipe_server_is_trusted(
+                &owner_sid,
+                None,
+                image_matches_service,
+                server_pid,
+                service_status,
+            ) {
+                Ok(())
+            } else {
+                Err(PipeServerVerificationError::NotDaemon {
+                    detail: Some(
+                        "pipe owner, server image, or server process does not match the running AgentWatch service"
+                            .to_owned(),
+                    ),
+                })
+            }
+        }
+        PipeServiceStatus::QueryFailed {
+            operation,
+            win32_error,
+        } => Err(PipeServerVerificationError::CannotQuery {
+            operation,
+            win32_error: *win32_error,
+            detail: Some("AgentWatch service status could not be queried".to_owned()),
+        }),
     }
-    let installed_image = service_image_from_status(service_status)?;
-    let server_image = pipe_server_image_path(HANDLE(handle as isize))?;
-    verify_pipe_server_images(&server_image, installed_image)
 }
 
-/// Without an installed service, only a pipe owned by the calling account is
-/// a daemon this caller started itself.
-fn not_installed_pipe_owner_trusted(owner_sid: &str, current_sid: &str) -> bool {
-    owner_sid == current_sid
+/// Pure trust decision for an already-collected connected-pipe observation.
+///
+/// The installed-service path needs all three independent facts: the pipe is
+/// LocalSystem-owned, its server image is the configured service executable,
+/// and the server PID is SCM's nonzero running service PID. Foreground/dev
+/// mode intentionally has a smaller rule: only the caller may own its pipe.
+fn pipe_server_is_trusted(
+    owner_sid: &str,
+    current_sid: Option<&str>,
+    image_matches_service: bool,
+    server_pid: u32,
+    service_status: &PipeServiceStatus,
+) -> bool {
+    match service_status {
+        PipeServiceStatus::NotInstalled => current_sid == Some(owner_sid),
+        PipeServiceStatus::Installed {
+            process_id,
+            running,
+            ..
+        } => {
+            owner_sid == SYSTEM_SID
+                && image_matches_service
+                && *running
+                && *process_id != 0
+                && *process_id == server_pid
+        }
+        PipeServiceStatus::QueryFailed { .. } => false,
+    }
 }
 
 fn current_pipe_client_sid() -> Result<String, PipeServerVerificationError> {
@@ -2041,8 +2094,13 @@ fn service_status_from_scm() -> PipeServiceStatus {
     // SAFETY: `service_name` is NUL-terminated and `manager` is the live SCM
     // handle obtained above.
     #[allow(unsafe_code)]
-    let service =
-        unsafe { OpenServiceW(manager, PCWSTR(service_name.as_ptr()), SERVICE_QUERY_CONFIG) };
+    let service = unsafe {
+        OpenServiceW(
+            manager,
+            PCWSTR(service_name.as_ptr()),
+            SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
+        )
+    };
     // SAFETY: `manager` is an owned SCM handle and no longer used after this.
     #[allow(unsafe_code)]
     let _ = unsafe { CloseServiceHandle(manager) };
@@ -2053,8 +2111,15 @@ fn service_status_from_scm() -> PipeServiceStatus {
         }
         Err(error) => return service_query_failed("OpenServiceW(AgentWatch)", error),
     };
-    let status = match service_binary_path(service) {
-        Ok(binary_path) => PipeServiceStatus::Installed { binary_path },
+    let status = match service_binary_path(service).and_then(|binary_path| {
+        service_process_status(service)
+            .map(|(process_id, running)| (binary_path, process_id, running))
+    }) {
+        Ok((binary_path, process_id, running)) => PipeServiceStatus::Installed {
+            binary_path,
+            process_id,
+            running,
+        },
         Err((operation, win32_error)) => PipeServiceStatus::QueryFailed {
             operation,
             win32_error,
@@ -2111,6 +2176,47 @@ fn service_binary_path(
     service_image_from_command(&command).ok_or(("QueryServiceConfigW(binary path)", 0))
 }
 
+fn service_process_status(
+    service: windows::Win32::Security::SC_HANDLE,
+) -> Result<(u32, bool), (&'static str, u32)> {
+    // SAFETY: SERVICE_STATUS_PROCESS is a C POD output structure. The byte
+    // slice covers exactly that live, aligned storage for the synchronous API
+    // call and is not used until the call has returned.
+    #[allow(unsafe_code)]
+    let mut status: SERVICE_STATUS_PROCESS = unsafe { zeroed() };
+    // SAFETY: `status` remains live for the call and the slice exactly spans
+    // its representation, as required by QueryServiceStatusEx.
+    #[allow(unsafe_code)]
+    let buffer = unsafe {
+        std::slice::from_raw_parts_mut(
+            (&mut status as *mut SERVICE_STATUS_PROCESS).cast::<u8>(),
+            size_of::<SERVICE_STATUS_PROCESS>(),
+        )
+    };
+    let mut bytes_needed = 0_u32;
+    // SAFETY: `service` is a live SCM handle with SERVICE_QUERY_STATUS and
+    // `buffer` is writable storage of the documented structure size.
+    #[allow(unsafe_code)]
+    unsafe {
+        QueryServiceStatusEx(
+            service,
+            SC_STATUS_PROCESS_INFO,
+            Some(buffer),
+            &mut bytes_needed,
+        )
+    }
+    .map_err(|error| {
+        (
+            "QueryServiceStatusEx(SC_STATUS_PROCESS_INFO)",
+            win32_error(error),
+        )
+    })?;
+    if bytes_needed < size_of::<SERVICE_STATUS_PROCESS>() as u32 {
+        return Err(("QueryServiceStatusEx(SC_STATUS_PROCESS_INFO)", 0));
+    }
+    Ok((status.dwProcessId, status.dwCurrentState == SERVICE_RUNNING))
+}
+
 fn service_image_from_command(command: &str) -> Option<PathBuf> {
     let command = command.trim();
     if let Some(quoted) = command.strip_prefix('"') {
@@ -2153,28 +2259,7 @@ fn win32_error(error: Error) -> u32 {
     error.code().0 as u32 & 0xffff
 }
 
-fn service_image_from_status(
-    status: &PipeServiceStatus,
-) -> Result<&Path, PipeServerVerificationError> {
-    match status {
-        PipeServiceStatus::Installed { binary_path } => Ok(binary_path),
-        PipeServiceStatus::NotInstalled => Err(PipeServerVerificationError::CannotQuery {
-            operation: "OpenServiceW(AgentWatch)",
-            win32_error: ERROR_SERVICE_DOES_NOT_EXIST.0,
-            detail: Some("AgentWatch service is not installed".to_owned()),
-        }),
-        PipeServiceStatus::QueryFailed {
-            operation,
-            win32_error,
-        } => Err(PipeServerVerificationError::CannotQuery {
-            operation,
-            win32_error: *win32_error,
-            detail: Some("AgentWatch service configuration could not be queried".to_owned()),
-        }),
-    }
-}
-
-fn pipe_server_image_path(pipe: HANDLE) -> Result<PathBuf, PipeServerVerificationError> {
+fn pipe_server_identity(pipe: HANDLE) -> Result<(u32, PathBuf), PipeServerVerificationError> {
     let mut pid = 0_u32;
     // SAFETY: `pipe` is the connected client handle. The PID output is valid
     // for the duration of this call.
@@ -2212,20 +2297,27 @@ fn pipe_server_image_path(pipe: HANDLE) -> Result<PathBuf, PipeServerVerificatio
         }
     });
     close(process);
-    image
+    image.map(|image| (pid, image))
 }
 
+fn pipe_server_images_match(
+    server_image: &Path,
+    installed_image: &Path,
+) -> Result<bool, PipeServerVerificationError> {
+    let server_image = canonical_image_path(server_image, "canonicalize(pipe server image)")?;
+    let installed_image = canonical_image_path(installed_image, "canonicalize(service image)")?;
+    Ok(server_image
+        .as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&installed_image.as_os_str().to_string_lossy()))
+}
+
+#[cfg(test)]
 fn verify_pipe_server_images(
     server_image: &Path,
     installed_image: &Path,
 ) -> Result<(), PipeServerVerificationError> {
-    let server_image = canonical_image_path(server_image, "canonicalize(pipe server image)")?;
-    let installed_image = canonical_image_path(installed_image, "canonicalize(service image)")?;
-    if server_image
-        .as_os_str()
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&installed_image.as_os_str().to_string_lossy())
-    {
+    if pipe_server_images_match(server_image, installed_image)? {
         Ok(())
     } else {
         Err(PipeServerVerificationError::NotDaemon {
@@ -2240,6 +2332,9 @@ fn canonical_image_path(
     path: &Path,
     operation: &'static str,
 ) -> Result<PathBuf, PipeServerVerificationError> {
+    // Windows canonicalize resolves the existing object through the kernel,
+    // normalizing extended-length (`\\?\\`) and 8.3 spellings before this
+    // value is compared case-insensitively above.
     std::fs::canonicalize(path).map_err(|error| PipeServerVerificationError::CannotQuery {
         operation,
         win32_error: error.raw_os_error().unwrap_or_default() as u32,
@@ -2484,14 +2579,15 @@ mod tests {
     use super::{
         account_base_env, account_base_env_from_profile, account_base_env_name, close,
         current_token_owner, data_dir_policy_for_token, environment_from,
-        filter_profile_environment_entries, fixed_path, not_installed_pipe_owner_trusted,
-        open_data_object, secure_data_dir_with_policy, service_image_from_command,
-        set_data_dir_dacl, sid_text, verify_pipe_server_images, windows_reserved_env_name,
-        CurrentPlatform, DataDirAcl, DataDirPolicy, ADMINISTRATORS_SID, SYSTEM_SID,
+        filter_profile_environment_entries, fixed_path, open_data_object, pipe_server_is_trusted,
+        secure_data_dir_with_policy, service_image_from_command, set_data_dir_dacl, sid_text,
+        verify_pipe_server_images, windows_reserved_env_name, CurrentPlatform, DataDirAcl,
+        DataDirPolicy, ADMINISTRATORS_SID, SYSTEM_SID,
     };
     use crate::{
         platform, Capability, CapabilityStatus, IdentifiedCaller, IntegrityLevel, Owner,
-        PeerIdentity, Platform, PlatformError, ReapOutcome, SpawnRequest, UnsupportedKind,
+        PeerIdentity, PipeServiceStatus, Platform, PlatformError, ReapOutcome, SpawnRequest,
+        UnsupportedKind,
     };
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
@@ -3359,12 +3455,87 @@ mod tests {
     }
 
     #[test]
-    fn not_installed_service_trusts_only_a_pipe_owned_by_the_caller() {
+    fn pipe_server_decision_requires_all_installed_service_checks() {
         let user = "S-1-5-21-10-20-30-1001";
         let other = "S-1-5-21-10-20-30-1002";
-        assert!(not_installed_pipe_owner_trusted(user, user));
-        assert!(!not_installed_pipe_owner_trusted(other, user));
-        assert!(!not_installed_pipe_owner_trusted(SYSTEM_SID, user));
+        let installed = PipeServiceStatus::Installed {
+            binary_path: PathBuf::from(r"C:\Program Files\AgentWatch\agentwatchd.exe"),
+            process_id: 100,
+            running: true,
+        };
+
+        // A caller-owned pipe running the right image is still not the
+        // LocalSystem service.
+        assert!(!pipe_server_is_trusted(
+            user,
+            Some(user),
+            true,
+            100,
+            &installed
+        ));
+        // A LocalSystem-owned pipe running the right image is not the service
+        // when SCM says a different PID is serving AgentWatch.
+        assert!(!pipe_server_is_trusted(
+            SYSTEM_SID,
+            Some(user),
+            true,
+            101,
+            &installed
+        ));
+        assert!(pipe_server_is_trusted(
+            SYSTEM_SID,
+            Some(user),
+            true,
+            100,
+            &installed
+        ));
+        let stopped = PipeServiceStatus::Installed {
+            binary_path: PathBuf::from(r"C:\Program Files\AgentWatch\agentwatchd.exe"),
+            process_id: 100,
+            running: false,
+        };
+        assert!(!pipe_server_is_trusted(
+            SYSTEM_SID,
+            Some(user),
+            true,
+            100,
+            &stopped
+        ));
+        let zero_pid = PipeServiceStatus::Installed {
+            binary_path: PathBuf::from(r"C:\Program Files\AgentWatch\agentwatchd.exe"),
+            process_id: 0,
+            running: true,
+        };
+        assert!(!pipe_server_is_trusted(
+            SYSTEM_SID,
+            Some(user),
+            true,
+            0,
+            &zero_pid
+        ));
+
+        let no_service = PipeServiceStatus::NotInstalled;
+        assert!(pipe_server_is_trusted(
+            user,
+            Some(user),
+            false,
+            0,
+            &no_service
+        ));
+        assert!(!pipe_server_is_trusted(
+            other,
+            Some(user),
+            false,
+            0,
+            &no_service
+        ));
+        assert!(!pipe_server_is_trusted(
+            SYSTEM_SID,
+            Some(user),
+            false,
+            0,
+            &no_service
+        ));
     }
 
     #[test]

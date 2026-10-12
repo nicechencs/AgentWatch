@@ -36,7 +36,6 @@ if ($wasRunning) {
     }
     if ($wasRunning) {
         Write-Host "daemon 在 20 秒内没有退出。日志在 $dataDir\agentwatchd.log"
-        Read-Host "按回车关闭"
         exit 1
     }
 } else {

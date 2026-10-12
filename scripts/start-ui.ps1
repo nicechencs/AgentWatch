@@ -38,7 +38,6 @@ if (-not (Test-Path -LiteralPath $exe)) {
     & cargo build -p aw-daemon --release --bin agentwatchd
     if ($LASTEXITCODE -ne 0) {
         Write-Host "编译失败，退出码 $LASTEXITCODE。"
-        Read-Host "按回车关闭"
         exit $LASTEXITCODE
     }
 }
@@ -76,7 +75,6 @@ if (-not $running) {
 
 if (-not $running) {
     Write-Host "daemon 没有在 30 秒内开始响应。日志在 $dataDir\agentwatchd.log"
-    Read-Host "按回车关闭"
     exit 1
 }
 

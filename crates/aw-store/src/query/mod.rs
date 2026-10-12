@@ -11,7 +11,6 @@
 //! one statement, not a long transaction. Set `PRAGMA query_only` on a
 //! connection you own before lending it if you want SQLite to reject writes.
 
-mod ast;
 mod compile;
 mod error;
 mod filter;
@@ -25,9 +24,9 @@ use crate::query::filter::{parse, Expr};
 // `pub(crate)` so `export` can compile a filter without copying the SQL builder.
 pub(crate) use sql::{compile, Param, Target};
 
-pub use ast::{
-    Expr as StoreExpr, Field as StoreField, Op as StoreOp, Term as StoreTerm, Value as StoreValue,
-};
+/// The filter tree the SQL compiler reads. This is [`aw_core::Expr`]: the same
+/// grammar the API, the CLI, and the rule engine parse. There is no second AST.
+pub use aw_core::Expr as StoreExpr;
 pub use compile::{
     around_sql, compile as compile_store_expr, compile_predicate, keyset_suffix, search_sql,
     search_sql_instr, CompileCtx, Compiled, Param as StoreParam, Target as StoreTarget,

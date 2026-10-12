@@ -74,8 +74,7 @@ pub use query::{
     DnsPage, FileGroupBy, FilePage, FileQuery, FileRow, FilterExpr, FlowBucket, FlowGroupBy,
     FlowQuery, FlowRow, FlowSort, GapItem, HistBucket, ProcessDetail, ProcessImage, ProcessNode,
     QueryError, SearchHit, SessionCounts, SessionFilter, SessionListItem, SessionSummary,
-    StoreExpr, StoreField, StoreOp, StoreParam, StoreTarget, StoreTerm, StoreValue, TimelinePage,
-    TimelineQuery, TimelineRow, TrafficBucket,
+    StoreExpr, StoreParam, StoreTarget, TimelinePage, TimelineQuery, TimelineRow, TrafficBucket,
 };
 pub use sink::{
     apply_file_schema, DnsRow, GapRow, NetFlowBucketRow, NetFlowRow, ProcessImageRow, ProcessRow,

@@ -12,7 +12,8 @@
 //!
 //! No new index is created here.
 
-use super::ast::{Expr, Field, Op, Term, Value};
+use aw_core::filter::{Expr, FieldRef, Op, Term, Value};
+
 use super::error::QueryError;
 use crate::fts;
 
@@ -155,7 +156,7 @@ fn walk_kind<'a>(expr: &'a Expr, found: &mut Option<&'a str>) -> bool {
         Expr::And(left, right) => walk_kind(left, found) && walk_kind(right, found),
         Expr::Or(_, _) | Expr::Not(_) => !contains_kind(expr),
         Expr::Term(term) => {
-            if term.field != Field::Kind {
+            if term.field.name() != "kind" {
                 return true;
             }
             if term.values.len() != 1 {
@@ -180,7 +181,7 @@ fn walk_kind<'a>(expr: &'a Expr, found: &mut Option<&'a str>) -> bool {
 fn contains_kind(expr: &Expr) -> bool {
     match expr {
         Expr::True => false,
-        Expr::Term(term) => term.field == Field::Kind,
+        Expr::Term(term) => term.field.name() == "kind",
         Expr::And(a, b) | Expr::Or(a, b) => contains_kind(a) || contains_kind(b),
         Expr::Not(inner) => contains_kind(inner),
     }
@@ -244,7 +245,7 @@ fn compile_expr(
             Ok(format!("({a}) OR ({b})"))
         }
         Expr::Term(term) => {
-            if drop_pinned_kind && term.field == Field::Kind && pins_this_target(term, target) {
+            if drop_pinned_kind && term.field.name() == "kind" && pins_this_target(term, target) {
                 // The table choice already applied this kind. Emitting `cat = ?`
                 // would be wrong on file_access, which has no `cat`.
                 return Ok("1".to_string());
@@ -278,24 +279,21 @@ fn compile_term(
     params: &mut Vec<Param>,
     warnings: &mut Vec<String>,
 ) -> Result<String, QueryError> {
-    if matches!(term.field, Field::Other(_)) {
-        return Err(QueryError::UnknownField {
-            field: term.field.name().to_string(),
-        });
-    }
+    // The shared parser rejects a name that is not in the field registry, so
+    // a term that reaches here already names a known field or is bare.
     if term.values.is_empty() {
         return Err(QueryError::BadField {
             field: term.field.name().to_string(),
             message: "missing value",
         });
     }
-    if term.field == Field::Subtree {
+    if term.field.name() == "subtree" {
         return subtree_sql(term, target, params);
     }
-    if term.field == Field::Bare {
+    if matches!(term.field, FieldRef::Bare) {
         return bare_sql(term, target, ctx, params);
     }
-    let Some(column) = column_for(&term.field, target) else {
+    let Some(column) = column_for(term.field.name(), target) else {
         warnings.push(format!(
             "{} does not apply to {}",
             term.field.name(),
@@ -318,71 +316,70 @@ enum Col {
     Path { sql: &'static str, dir: bool },
 }
 
-fn column_for(field: &Field, target: Target) -> Option<Col> {
+fn column_for(field: &str, target: Target) -> Option<Col> {
     use Col::{Bool, Int, Path, Text};
     let file = matches!(target, Target::Files | Target::Timeline);
     let net = matches!(target, Target::Flows | Target::Timeline);
     let dns = matches!(target, Target::Dns | Target::Timeline);
     let http = matches!(target, Target::Http | Target::Timeline);
     let proc = matches!(target, Target::Procs | Target::Timeline);
+    let sessions = matches!(target, Target::Sessions);
     Some(match (field, target) {
-        (Field::Kind, Target::Timeline) => Text("cat"),
-        (Field::Time, Target::Timeline) => Int("ts_ns"),
-        (Field::Time, Target::Files) => Int("first_ns"),
-        (Field::Time, Target::Flows) => Int("start_ns"),
-        (Field::Time, Target::Dns | Target::Http) => Int("ts_ns"),
-        (Field::Time, Target::Procs) => Int("start_ns"),
-        (Field::Time, Target::Sessions) => Int("started_ns"),
-        (Field::Evidence, Target::Sessions) => return None,
-        (Field::Evidence, _) => Text("evidence"),
-        (Field::Source, Target::Sessions) => return None,
-        (Field::Source, _) => Text("source"),
-        (Field::Proc, _) if proc || net || file || dns || http => Text(proc_basename(target)),
-        (Field::Pid, _) if proc || net || file || dns || http => Int(pid_column(target)),
-        (Field::ProcUid, Target::Timeline) => Int("proc_uid"),
-        (Field::ProcUid, Target::Files | Target::Flows | Target::Dns | Target::Http) => {
-            Int("proc_uid")
-        }
-        (Field::ProcUid, Target::Procs) => Int("proc_uid"),
-        (Field::Tag, Target::Files) => Text("sensitive_rule"),
-        (Field::Tag, Target::Timeline) => Text(tag_column()),
-        (Field::Exe, _) if proc => Text(exe_column(target)),
-        (Field::Argv, _) if proc => Text(argv_column(target)),
-        (Field::Cwd, _) if proc => Text(cwd_column(target)),
-        (Field::Path, _) if file => Path {
+        ("kind", Target::Timeline) => Text("cat"),
+        ("time", Target::Timeline) => Int("ts_ns"),
+        ("time", Target::Files) => Int("first_ns"),
+        ("time", Target::Flows) => Int("start_ns"),
+        ("time", Target::Dns | Target::Http) => Int("ts_ns"),
+        ("time", Target::Procs) => Int("start_ns"),
+        ("time", Target::Sessions) => Int("started_ns"),
+        ("evidence", _) if sessions => return None,
+        ("evidence", _) => Text("evidence"),
+        ("source", _) if sessions => return None,
+        ("source", _) => Text("source"),
+        ("proc", _) if proc || net || file || dns || http => Text(proc_basename(target)),
+        ("pid", _) if proc || net || file || dns || http => Int(pid_column(target)),
+        ("proc_uid", Target::Timeline) => Int("proc_uid"),
+        ("proc_uid", Target::Files | Target::Flows | Target::Dns | Target::Http) => Int("proc_uid"),
+        ("proc_uid", Target::Procs) => Int("proc_uid"),
+        ("tag", Target::Files) => Text("sensitive_rule"),
+        ("tag", Target::Timeline) => Text(tag_column()),
+        ("exe", _) if proc => Text(exe_column(target)),
+        ("argv", _) if proc => Text(argv_column(target)),
+        ("cwd", _) if proc => Text(cwd_column(target)),
+        ("path", _) if file => Path {
             sql: path_column(target),
             dir: false,
         },
-        (Field::Dir, _) if file => Path {
+        ("dir", _) if file => Path {
             sql: path_column(target),
             dir: true,
         },
-        (Field::FileOp, Target::Files) => Text("op"),
-        (Field::FileOp, Target::Timeline) => Text(file_scalar("op")),
-        (Field::Access, _) if file => Text(file_text("access", target)),
-        (Field::BytesRead, _) if file => Int(file_int("bytes_read", target)),
-        (Field::BytesWritten, _) if file => Int(file_int("bytes_written", target)),
-        (Field::Domain, Target::Flows) => Text("domain"),
-        (Field::Domain, Target::Dns) => Text("qname"),
-        (Field::Domain, Target::Timeline) => Text(domain_case()),
-        (Field::Ip | Field::RemoteIp, _) if net => Text(flow_text("remote_ip", target)),
-        (Field::Port | Field::RemotePort, _) if net => Int(flow_int("remote_port", target)),
-        (Field::LocalPort, _) if net => Int(flow_int("local_port", target)),
-        (Field::Proto, _) if net => Text(flow_text("proto", target)),
-        (Field::BytesUp, _) if net => Int(flow_int("bytes_up", target)),
-        (Field::BytesDown, _) if net => Int(flow_int("bytes_down", target)),
-        (Field::Direct, _) if net => Bool(flow_int("direct", target)),
-        (Field::ViaProxy, _) if net => Bool(flow_int("via_proxy", target)),
-        (Field::Qname, _) if dns => Text(dns_text("qname", target)),
-        (Field::Qtype, _) if dns => Int(dns_int("qtype", target)),
-        (Field::Rcode, _) if dns => Int(dns_int("rcode", target)),
-        (Field::Method, _) if http => Text(http_text("method", target)),
-        (Field::Url, _) if http => Text(http_text("url", target)),
-        (Field::Host, _) if http => Text(http_text("host", target)),
-        (Field::Status, _) if http => Int(http_int("status", target)),
-        (Field::ReqBytes, _) if http => Int(http_int("req_body_bytes", target)),
-        (Field::RespBytes, _) if http => Int(http_int("resp_body_bytes", target)),
-        (Field::Agent, Target::Sessions) => Text("agent"),
+        ("op", Target::Files) => Text("op"),
+        ("op", Target::Timeline) => Text(file_scalar("op")),
+        ("access", _) if file => Text(file_text("access", target)),
+        ("bytes_read", _) if file => Int(file_int("bytes_read", target)),
+        ("bytes_written", _) if file => Int(file_int("bytes_written", target)),
+        ("domain", Target::Flows) => Text("domain"),
+        ("domain", Target::Dns) => Text("qname"),
+        ("domain", Target::Timeline) => Text(domain_case()),
+        ("ip" | "remote.ip", _) if net => Text(flow_text("remote_ip", target)),
+        ("port" | "remote.port", _) if net => Int(flow_int("remote_port", target)),
+        ("local.port", _) if net => Int(flow_int("local_port", target)),
+        ("proto", _) if net => Text(flow_text("proto", target)),
+        ("bytes_up", _) if net => Int(flow_int("bytes_up", target)),
+        ("bytes_down", _) if net => Int(flow_int("bytes_down", target)),
+        ("direct", _) if net => Bool(flow_int("direct", target)),
+        ("via_proxy", _) if net => Bool(flow_int("via_proxy", target)),
+        ("qname", _) if dns => Text(dns_text("qname", target)),
+        ("qtype", _) if dns => Int(dns_int("qtype", target)),
+        ("rcode", _) if dns => Int(dns_int("rcode", target)),
+        ("method", _) if http => Text(http_text("method", target)),
+        ("url", _) if http => Text(http_text("url", target)),
+        ("host", _) if http => Text(http_text("host", target)),
+        ("status", _) if http => Int(http_int("status", target)),
+        ("req_bytes", _) if http => Int(http_int("req_body_bytes", target)),
+        ("resp_bytes", _) if http => Int(http_int("resp_body_bytes", target)),
+        ("agent", Target::Sessions) => Text("agent"),
         _ => return None,
     })
 }
@@ -745,16 +742,16 @@ fn bare_sql(
     let text = expect_text(&term.values[0], "bare")?;
     // A bare word is a substring over path, argv, url, and domain (§4.2).
     let mut parts = Vec::new();
-    if let Some(Col::Path { sql, .. }) = column_for(&Field::Path, target) {
+    if let Some(Col::Path { sql, .. }) = column_for("path", target) {
         parts.push(contains_sql(sql, &text, ctx, params, FtsSourceHint::File)?);
     }
-    if let Some(Col::Text(sql)) = column_for(&Field::Domain, target) {
+    if let Some(Col::Text(sql)) = column_for("domain", target) {
         parts.push(contains_sql(sql, &text, ctx, params, FtsSourceHint::None)?);
     }
-    if let Some(Col::Text(sql)) = column_for(&Field::Argv, target) {
+    if let Some(Col::Text(sql)) = column_for("argv", target) {
         parts.push(contains_sql(sql, &text, ctx, params, FtsSourceHint::Image)?);
     }
-    if let Some(Col::Text(sql)) = column_for(&Field::Url, target) {
+    if let Some(Col::Text(sql)) = column_for("url", target) {
         parts.push(contains_sql(sql, &text, ctx, params, FtsSourceHint::Http)?);
     }
     if parts.is_empty() {
@@ -888,7 +885,7 @@ fn any_of_text(
     params: &mut Vec<Param>,
     force_dir: bool,
 ) -> Result<String, QueryError> {
-    let fold = matches!(term.field, Field::Path | Field::Dir);
+    let fold = matches!(term.field.name(), "path" | "dir");
     let mut parts = Vec::with_capacity(term.values.len());
     for value in &term.values {
         let mut text = expect_text(value, term.field.name())?;
@@ -1023,7 +1020,7 @@ fn resolve_number(value: &Value, term: &Term, ctx: &CompileCtx) -> Result<i64, Q
             from_session_start,
             nanos,
         } => {
-            if term.field != Field::Time {
+            if term.field.name() != "time" {
                 return Err(QueryError::BadField {
                     field: term.field.name().to_string(),
                     message: "relative time is only valid for time",

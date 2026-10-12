@@ -13,11 +13,11 @@
 
 use std::collections::BTreeMap;
 
-use aw_core::filter::{self, Expr as CoreExpr, Op as CoreOp, Value as CoreValue};
+use aw_core::filter;
 use aw_pipeline::wording::Lang;
 use aw_store::{
     compile_predicate, redact_host_field, redact_host_text, redact_user_paths, CompileCtx, Store,
-    StoreExpr, StoreField, StoreOp, StoreParam, StoreTarget, StoreTerm, StoreValue,
+    StoreParam, StoreTarget,
 };
 use rusqlite::OptionalExtension;
 
@@ -122,12 +122,9 @@ fn compile_http_filter(
             params: Vec::new(),
         });
     }
-    // aw-store's public `parse_filter` returns `FilterExpr`, which is not the
-    // AST `compile_predicate` accepts (`StoreExpr`, no public parser). The core
-    // parser is the shared grammar; map that tree onto `StoreExpr` here.
-    let core = filter::parse(filter)
+    // The store compiler reads the shared AST. There is no second tree to map onto.
+    let expr = filter::parse(filter)
         .map_err(|err| error_response(400, "bad_filter", &format!("filter: {err}")))?;
-    let expr = core_to_store(&core);
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -533,109 +530,6 @@ pub(crate) fn json_response(status: u16, value: &serde_json::Value) -> ApiRespon
         status,
         headers,
         body,
-    }
-}
-
-fn core_to_store(expr: &CoreExpr) -> StoreExpr {
-    match expr {
-        CoreExpr::True => StoreExpr::True,
-        CoreExpr::And(left, right) => StoreExpr::And(
-            Box::new(core_to_store(left)),
-            Box::new(core_to_store(right)),
-        ),
-        CoreExpr::Or(left, right) => StoreExpr::Or(
-            Box::new(core_to_store(left)),
-            Box::new(core_to_store(right)),
-        ),
-        CoreExpr::Not(inner) => StoreExpr::Not(Box::new(core_to_store(inner))),
-        CoreExpr::Term(term) => StoreExpr::Term(StoreTerm {
-            field: store_field(term.field.name()),
-            op: store_op(term.op),
-            values: term.values.iter().map(store_value).collect(),
-            offset: term.offset,
-        }),
-    }
-}
-
-fn store_op(op: CoreOp) -> StoreOp {
-    match op {
-        CoreOp::Match => StoreOp::Match,
-        CoreOp::Eq => StoreOp::Eq,
-        CoreOp::Ne => StoreOp::Ne,
-        CoreOp::Gt => StoreOp::Gt,
-        CoreOp::Ge => StoreOp::Ge,
-        CoreOp::Lt => StoreOp::Lt,
-        CoreOp::Le => StoreOp::Le,
-        CoreOp::Contains => StoreOp::Contains,
-        CoreOp::In => StoreOp::In,
-    }
-}
-
-fn store_value(value: &CoreValue) -> StoreValue {
-    match value {
-        CoreValue::Text(text) => StoreValue::Text(text.clone()),
-        CoreValue::Number(n) => StoreValue::Number(*n),
-        CoreValue::RelativeTime {
-            from_session_start,
-            nanos,
-        } => StoreValue::RelativeTime {
-            from_session_start: *from_session_start,
-            nanos: *nanos,
-        },
-        CoreValue::Bool(flag) => StoreValue::Bool(*flag),
-    }
-}
-
-fn store_field(name: &str) -> StoreField {
-    match name {
-        "" => StoreField::Bare,
-        "kind" => StoreField::Kind,
-        "time" => StoreField::Time,
-        "evidence" => StoreField::Evidence,
-        "source" => StoreField::Source,
-        "proc" => StoreField::Proc,
-        "pid" => StoreField::Pid,
-        "proc_uid" => StoreField::ProcUid,
-        "subtree" => StoreField::Subtree,
-        "tag" => StoreField::Tag,
-        "exe" => StoreField::Exe,
-        "argv" => StoreField::Argv,
-        "cwd" => StoreField::Cwd,
-        "path" => StoreField::Path,
-        "dir" => StoreField::Dir,
-        "op" => StoreField::FileOp,
-        "access" => StoreField::Access,
-        "bytes_read" => StoreField::BytesRead,
-        "bytes_written" => StoreField::BytesWritten,
-        "domain" => StoreField::Domain,
-        "ip" => StoreField::Ip,
-        "port" => StoreField::Port,
-        "remote.ip" => StoreField::RemoteIp,
-        "remote.port" => StoreField::RemotePort,
-        "local.port" => StoreField::LocalPort,
-        "proto" => StoreField::Proto,
-        "bytes_up" => StoreField::BytesUp,
-        "bytes_down" => StoreField::BytesDown,
-        "direct" => StoreField::Direct,
-        "via_proxy" => StoreField::ViaProxy,
-        "qname" => StoreField::Qname,
-        "qtype" => StoreField::Qtype,
-        "rcode" => StoreField::Rcode,
-        "method" => StoreField::Method,
-        "url" => StoreField::Url,
-        "host" => StoreField::Host,
-        "status" => StoreField::Status,
-        "req_bytes" => StoreField::ReqBytes,
-        "resp_bytes" => StoreField::RespBytes,
-        "tool" => StoreField::Tool,
-        "agent" => StoreField::Agent,
-        "ipc_kind" => StoreField::IpcKind,
-        "peer" => StoreField::Peer,
-        "channel" => StoreField::Channel,
-        "target" => StoreField::Target,
-        "rule" => StoreField::Rule,
-        "severity" => StoreField::Severity,
-        other => StoreField::Other(other.to_owned()),
     }
 }
 

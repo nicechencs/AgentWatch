@@ -34,8 +34,8 @@ use aw_store::{
 };
 
 // Every method calls a function `aw-store` exports. A filter string is parsed
-// by `aw_core` and folded into the store AST, which has the same shape. An
-// unknown public id is resolved with `session_by_public_id` and remembered;
+// by `aw_core` and passed through: the store compiler reads that same tree.
+// An unknown public id is resolved with `session_by_public_id` and remembered;
 // `None` from that lookup is "not found", not a guessed id.
 
 /// One page, plus the cursor the client sends back as `?cursor=`.
@@ -1701,127 +1701,20 @@ pub(crate) fn session_label(name: Option<&str>, argv: Option<&str>) -> Option<St
         .map(|argv| argv.join(" "))
 }
 
-/// Parse a filter string with the shared grammar and fold it into the store AST.
+/// Parse a filter string with the shared grammar.
 ///
-/// `None` and an empty string are no constraint. The two ASTs have the same
-/// shape; only the field representation differs, and that is a name lookup.
+/// `None` and an empty string are no constraint. The store compiler reads
+/// [`aw_core::Expr`] directly, so the parsed tree is not copied into a second AST.
 fn store_expr(filter: Option<&str>) -> Result<Option<StoreExpr>, QueryBackendError> {
     let Some(text) = filter.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
-    let parsed = aw_core::parse_filter(text).map_err(|err| QueryBackendError::Filter {
-        offset: Some(err.offset()),
-        message: err.to_string(),
-    })?;
-    Ok(Some(fold_expr(&parsed)))
-}
-
-fn fold_expr(expr: &aw_core::Expr) -> StoreExpr {
-    match expr {
-        aw_core::Expr::True => StoreExpr::True,
-        aw_core::Expr::And(left, right) => {
-            StoreExpr::And(Box::new(fold_expr(left)), Box::new(fold_expr(right)))
-        }
-        aw_core::Expr::Or(left, right) => {
-            StoreExpr::Or(Box::new(fold_expr(left)), Box::new(fold_expr(right)))
-        }
-        aw_core::Expr::Not(inner) => StoreExpr::Not(Box::new(fold_expr(inner))),
-        aw_core::Expr::Term(term) => StoreExpr::Term(aw_store::StoreTerm {
-            field: fold_field(term.field.name()),
-            op: fold_op(term.op),
-            values: term.values.iter().map(fold_value).collect(),
-            offset: term.offset,
-        }),
-    }
-}
-
-fn fold_field(name: &str) -> aw_store::StoreField {
-    use aw_store::StoreField::{
-        Access, Agent, Argv, Bare, BytesDown, BytesRead, BytesUp, BytesWritten, Channel, Cwd, Dir,
-        Direct, Domain, Evidence, Exe, FileOp, Host, Ip, IpcKind, Kind, LocalPort, Method, Other,
-        Path, Peer, Pid, Port, Proc, ProcUid, Proto, Qname, Qtype, Rcode, RemoteIp, RemotePort,
-        ReqBytes, RespBytes, Rule, Severity, Source, Status, Subtree, Tag, Target, Time, Tool, Url,
-        ViaProxy,
-    };
-    match name {
-        "" => Bare,
-        "kind" => Kind,
-        "time" => Time,
-        "evidence" => Evidence,
-        "source" => Source,
-        "proc" => Proc,
-        "pid" => Pid,
-        "proc_uid" => ProcUid,
-        "subtree" => Subtree,
-        "tag" => Tag,
-        "exe" => Exe,
-        "argv" => Argv,
-        "cwd" => Cwd,
-        "path" => Path,
-        "dir" => Dir,
-        "op" => FileOp,
-        "access" => Access,
-        "bytes_read" => BytesRead,
-        "bytes_written" => BytesWritten,
-        "domain" => Domain,
-        "ip" => Ip,
-        "port" => Port,
-        "remote.ip" => RemoteIp,
-        "remote.port" => RemotePort,
-        "local.port" => LocalPort,
-        "proto" => Proto,
-        "bytes_up" => BytesUp,
-        "bytes_down" => BytesDown,
-        "direct" => Direct,
-        "via_proxy" => ViaProxy,
-        "qname" => Qname,
-        "qtype" => Qtype,
-        "rcode" => Rcode,
-        "method" => Method,
-        "url" => Url,
-        "host" => Host,
-        "status" => Status,
-        "req_bytes" => ReqBytes,
-        "resp_bytes" => RespBytes,
-        "tool" => Tool,
-        "agent" => Agent,
-        "ipc_kind" => IpcKind,
-        "peer" => Peer,
-        "channel" => Channel,
-        "target" => Target,
-        "rule" => Rule,
-        "severity" => Severity,
-        other => Other(other.to_owned()),
-    }
-}
-
-fn fold_op(op: aw_core::Op) -> aw_store::StoreOp {
-    match op {
-        aw_core::Op::Match => aw_store::StoreOp::Match,
-        aw_core::Op::Eq => aw_store::StoreOp::Eq,
-        aw_core::Op::Ne => aw_store::StoreOp::Ne,
-        aw_core::Op::Gt => aw_store::StoreOp::Gt,
-        aw_core::Op::Ge => aw_store::StoreOp::Ge,
-        aw_core::Op::Lt => aw_store::StoreOp::Lt,
-        aw_core::Op::Le => aw_store::StoreOp::Le,
-        aw_core::Op::Contains => aw_store::StoreOp::Contains,
-        aw_core::Op::In => aw_store::StoreOp::In,
-    }
-}
-
-fn fold_value(value: &aw_core::Value) -> aw_store::StoreValue {
-    match value {
-        aw_core::Value::Text(text) => aw_store::StoreValue::Text(text.clone()),
-        aw_core::Value::Number(n) => aw_store::StoreValue::Number(*n),
-        aw_core::Value::RelativeTime {
-            from_session_start,
-            nanos,
-        } => aw_store::StoreValue::RelativeTime {
-            from_session_start: *from_session_start,
-            nanos: *nanos,
-        },
-        aw_core::Value::Bool(b) => aw_store::StoreValue::Bool(*b),
-    }
+    aw_core::parse_filter(text)
+        .map(Some)
+        .map_err(|err| QueryBackendError::Filter {
+            offset: Some(err.offset()),
+            message: err.to_string(),
+        })
 }
 
 fn gap_json(row: &aw_store::GapItem) -> serde_json::Value {

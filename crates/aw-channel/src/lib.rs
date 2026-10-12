@@ -1356,8 +1356,13 @@ mod windows_pipe_server_tests {
         error
     }
 
+    /// The pipe is created with the test account's own SDDL, so the owner
+    /// check refuses it before the image path is ever compared. This proves
+    /// the client sends zero bytes and does not retry; it does not prove the
+    /// image check. That check is
+    /// `injected_service_status_decision_requires_all_installed_service_checks`.
     #[test]
-    fn mismatched_service_image_refuses_without_sending_or_falling_back() {
+    fn installed_service_with_another_image_sends_zero_bytes_and_does_not_retry() {
         let _lock = PIPE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1366,7 +1371,7 @@ mod windows_pipe_server_tests {
                 "aw-channel-mismatched-image-{}.exe",
                 std::process::id()
             ));
-            std::fs::write(&image, b"not-the-test-server").expect("mismatched service image");
+            std::fs::write(&image, b"not-the-test-server").expect("other service image");
             let error = refuse_without_sending_or_falling_back(PipeServiceStatus::Installed {
                 binary_path: image.clone(),
                 process_id: std::process::id(),

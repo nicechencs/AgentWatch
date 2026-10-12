@@ -3542,6 +3542,15 @@ mod tests {
             100,
             &installed
         ));
+        // Owner and SCM PID both match. Only the image does not, so this must
+        // still refuse. Deleting the image comparison would leave this green.
+        assert!(!pipe_server_is_trusted(
+            SYSTEM_SID,
+            Some(user),
+            false,
+            100,
+            &installed
+        ));
         let stopped = PipeServiceStatus::Installed {
             binary_path: PathBuf::from(r#""C:\Program Files\AgentWatch\agentwatchd.exe""#),
             process_id: 100,

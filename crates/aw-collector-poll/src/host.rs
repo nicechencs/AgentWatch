@@ -203,11 +203,40 @@ fn read_netstat() -> Result<ConnectionSnapshot, SourceError> {
         .args(["-ano"])
         .output()
         .map_err(|_| SourceError::disconnected())?;
-    if !output.status.success() {
-        return Err(SourceError::permission());
+    classify_netstat(&output.stdout, output.status.success(), output.status.code())
+}
+
+/// Turn one finished `netstat -ano` into a snapshot.
+///
+/// A spawn that never ran is the caller's [`SourceError::disconnected`]. Once
+/// it ran, the exit decides the class, and the class is not guessed:
+///
+/// - `5` (`ERROR_ACCESS_DENIED`) is [`SourceFailure::Permission`]. This crate
+///   does not retry with elevation.
+/// - any other non-zero exit is [`SourceFailure::Failed`]. It is not recorded
+///   as a permission refusal: the platform did not say it refused.
+/// - success with bytes that are not UTF-8, or a TCP/UDP line that is not two
+///   endpoints, is [`SourceFailure::Parse`].
+///
+/// `stderr` is not a parameter. It can echo a path, and a diagnostic does not
+/// keep one.
+#[cfg(windows)]
+fn classify_netstat(
+    stdout: &[u8],
+    success: bool,
+    code: Option<i32>,
+) -> Result<ConnectionSnapshot, SourceError> {
+    if !success {
+        // 5 is ERROR_ACCESS_DENIED. Anything else (1, a missing command's
+        // shell status, a crash) is a failed sample, not a refusal.
+        return Err(if code == Some(5) {
+            SourceError::permission()
+        } else {
+            SourceError::failed()
+        });
     }
     // Lossy would invent characters inside an address. Non-UTF8 is a failed sample.
-    let text = std::str::from_utf8(&output.stdout).map_err(|_| SourceError::parse())?;
+    let text = std::str::from_utf8(stdout).map_err(|_| SourceError::parse())?;
     crate::netstat::parse_netstat_ano(text)
 }
 
@@ -329,7 +358,44 @@ pub fn host_process_table() -> Option<Vec<HostProcess>> {
 #[cfg(test)]
 mod tests {
     use super::keep_subtrees;
-    use crate::source::{ProcessRow, ProcessSource, ProcessStartTime};
+    use crate::source::{ProcessRow, ProcessSource, ProcessStartTime, SourceFailure};
+
+    /// A non-zero `netstat` used to be recorded as `permission` whatever the
+    /// exit was. Only access denied (exit 5) is a refusal; the rest failed.
+    #[cfg(windows)]
+    #[test]
+    fn netstat_exit_is_permission_only_when_access_is_denied() {
+        let denied = super::classify_netstat(b"", false, Some(5));
+        assert_eq!(denied.expect_err("denied").kind, SourceFailure::Permission);
+
+        let other = super::classify_netstat(b"", false, Some(1));
+        assert_eq!(other.expect_err("other").kind, SourceFailure::Failed);
+
+        // No code at all (terminated by a signal) is still not a refusal.
+        let none = super::classify_netstat(b"", false, None);
+        assert_eq!(none.expect_err("no code").kind, SourceFailure::Failed);
+    }
+
+    /// Success that is not a table is a parse gap, not a refusal and not a drop.
+    #[cfg(windows)]
+    #[test]
+    fn netstat_success_with_a_broken_line_is_a_parse_failure() {
+        let broken = super::classify_netstat(b"  TCP    127.0.0.1:1\n", true, Some(0));
+        assert_eq!(broken.expect_err("broken").kind, SourceFailure::Parse);
+
+        let garbage = super::classify_netstat(&[0xff, 0xfe], true, Some(0));
+        assert_eq!(garbage.expect_err("not utf-8").kind, SourceFailure::Parse);
+    }
+
+    /// A header and one established row is a snapshot, not a gap.
+    #[cfg(windows)]
+    #[test]
+    fn netstat_success_with_one_row_is_a_snapshot() {
+        let text = b"Active Connections\r\n\r\n  TCP    127.0.0.1:443   127.0.0.1:9   ESTABLISHED   42\r\n";
+        let snap = super::classify_netstat(text, true, Some(0)).expect("row");
+        assert_eq!(snap.rows.len(), 1);
+        assert_eq!(snap.rows[0].pid, Some(42));
+    }
 
     fn row(pid: u32, ppid: Option<u32>) -> ProcessRow {
         ProcessRow::bare(pid, ppid, ProcessStartTime::UnixSeconds(1_700_000_000))

@@ -644,6 +644,9 @@ where
             SourceFailure::Disconnected => GapKind::CollectorDisconnected,
             SourceFailure::Parse => GapKind::ParseError,
             SourceFailure::Permission => GapKind::Permission,
+            // The command ran and exited non-zero, but nothing said the
+            // platform refused. `Unknown` names no cause this crate did not see.
+            SourceFailure::Failed => GapKind::Unknown,
         };
         let seq = self.next_seq();
         let event = gap_event(GapStamp {

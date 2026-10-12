@@ -49,6 +49,13 @@ const SESSION_DB_ID: i64 = 1;
 /// How often a sample is due. The stop-file loop sleeps less than this.
 const SAMPLE_EVERY: Duration = Duration::from_millis(250);
 
+/// How long the same collector and gap kind stay one row (pipeline.md §4.1).
+///
+/// Same length as `aw_pipeline::gaps::MERGE_WINDOW_NS`. Compared against wall
+/// time, because that is what the `gaps` table stores. The pipeline merger
+/// counts monotonic ticks and never sees the rows this sampler writes.
+const GAP_MERGE_WINDOW_NS: i64 = 5_000_000_000;
+
 /// Bound on events kept from one tick. A full sink becomes a gap inside the
 /// collector; this process does not drop the rest quietly.
 const SINK_CAPACITY: usize = 8_192;
@@ -185,6 +192,10 @@ pub struct HostSampler {
     root_uid: Option<ProcUid>,
     /// Wall time of the last sample that was taken and stored.
     last_sample_ns: Option<i64>,
+    /// Collector gaps still inside the 5 s merge window (pipeline.md §4.1).
+    /// One sample is one batch, so the window has to outlive the batch; closing
+    /// it per sample wrote one `gaps` row per failed tick.
+    open_gaps: BTreeMap<GapMergeKey, OpenGap>,
 }
 
 impl HostSampler {
@@ -209,6 +220,7 @@ impl HostSampler {
             imaged: BTreeSet::new(),
             root_uid: None,
             last_sample_ns: None,
+            open_gaps: BTreeMap::new(),
         }
     }
 
@@ -399,10 +411,38 @@ impl HostSampler {
     }
 
     /// Stop emitting. The collector has no thread of its own.
+    ///
+    /// Merge windows still open are written first. Leaving them in memory
+    /// would drop the last few seconds of a failure when the process stops.
     pub fn stop(&mut self) {
+        self.write_open_gaps();
         if self.started {
             let _ = Collector::stop(&mut self.collector);
             self.started = false;
+        }
+    }
+
+    /// Write every open merge window. A failed write puts them back, so the
+    /// next sample can still extend the same window instead of losing it.
+    fn write_open_gaps(&mut self) {
+        if self.open_gaps.is_empty() {
+            return;
+        }
+        let session = Some(self.target.db_id);
+        let taken = std::mem::take(&mut self.open_gaps);
+        let mut batch = WriteBatch::default();
+        for (key, open) in &taken {
+            batch.gaps.push(open.clone().into_row(key, session));
+        }
+        let written = (|| -> io::Result<()> {
+            let mut store = Store::open_runtime(&self.db_path).map_err(|err| store_io(&err))?;
+            let mut writer = SqliteSink::new(&mut store).map_err(|err| store_io(&err))?;
+            writer.write_batch(&batch).map_err(|err| store_io(&err))?;
+            Ok(())
+        })();
+        if let Err(err) = written {
+            tracing::warn!(error = %err, "open gap write failed");
+            self.open_gaps = taken;
         }
     }
 
@@ -611,8 +651,98 @@ impl HostSampler {
         self.seq
     }
 
+    /// Collector gaps from `events`, merged with the ones still open.
+    ///
+    /// pipeline.md §4.1: the same collector and the same [`GapKind`] inside 5 s
+    /// is one row, and `count` is the number of failures. A poll sample fails
+    /// once per tick (250 ms), so writing each event would be the storm that
+    /// rule exists to stop. A window that has not ended stays on `open_gaps`
+    /// and is not written yet; the next sample extends it or closes it.
+    ///
+    /// `count: None` means the collector did not know how many it lost. One
+    /// such event is one failed sample, so it counts as 1. Adding `None` to
+    /// `None` would leave the stored count unknown for a whole outage.
+    fn take_merged_gaps(&mut self, events: &[aw_core::RawEvent], wall_ns: i64) -> Vec<GapRow> {
+        let mut closed: Vec<(GapMergeKey, OpenGap)> = Vec::new();
+        for event in events {
+            let EventKind::Gap(gap) = &event.kind else {
+                continue;
+            };
+            let key = GapMergeKey {
+                collector: gap.collector.as_str().to_owned(),
+                // The wire name, not the enum: `GapKind` has no order, and the
+                // stored column is this same string.
+                kind: gaps::gap_kind_name(gap.gap_kind).to_owned(),
+                proc_uid: event.proc.as_ref().map(|proc| proc.uid.0),
+            };
+            // Wall time, which is what `gaps.from_ns` stores. The monotonic
+            // tick is not a unix time. A gap with no wall reading uses this
+            // sample's clock rather than 0.
+            let at = if event.ts_wall_ns > 0 {
+                event.ts_wall_ns
+            } else {
+                wall_ns
+            };
+            let count = gap.count.unwrap_or(1);
+            match self.open_gaps.get_mut(&key) {
+                Some(open) if at.saturating_sub(open.to_ns) <= GAP_MERGE_WINDOW_NS => {
+                    open.to_ns = open.to_ns.max(at);
+                    open.count = open.count.saturating_add(count);
+                }
+                Some(_) => {
+                    let fresh = OpenGap {
+                        from_ns: at,
+                        to_ns: at,
+                        count,
+                        affects: json_string_array(&gap.affects),
+                        detail: gap.detail.clone(),
+                    };
+                    if let Some(done) = self.open_gaps.insert(key.clone(), fresh) {
+                        closed.push((key, done));
+                    }
+                }
+                None => {
+                    self.open_gaps.insert(
+                        key,
+                        OpenGap {
+                            from_ns: at,
+                            to_ns: at,
+                            count,
+                            affects: json_string_array(&gap.affects),
+                            detail: gap.detail.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        // Anything quiet for the whole window is over. `wall_ns` is this
+        // sample's clock, so a collector that simply stopped reporting still
+        // closes instead of staying open for the rest of the session.
+        let due: Vec<GapMergeKey> = self
+            .open_gaps
+            .iter()
+            .filter(|(_, open)| wall_ns.saturating_sub(open.to_ns) > GAP_MERGE_WINDOW_NS)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in due {
+            if let Some(done) = self.open_gaps.remove(&key) {
+                closed.push((key, done));
+            }
+        }
+        let session = Some(self.target.db_id);
+        closed
+            .into_iter()
+            .map(|(key, open)| open.into_row(&key, session))
+            .collect()
+    }
+
     fn persist(&mut self, events: &[aw_core::RawEvent], wall_ns: i64) -> io::Result<()> {
-        let output = Pipeline::replay(events.iter().cloned(), PipelineConfig::default());
+        let mut output = Pipeline::replay(events.iter().cloned(), PipelineConfig::default());
+        // Aggregate copies every gap event onto `output.gaps` unchanged
+        // (stage.rs). This sampler merges those across ticks. Keeping the copy
+        // stored one row per sample. A gap the pipeline created itself has no
+        // matching input event and stays.
+        strip_copied_gaps(&mut output, events);
         // `Pipeline::replay` does not inject a scope root, so an open scope
         // remembers the process and emits no `ProcessRec` (scope.rs
         // `remember_open`). The events were still redacted and counted.
@@ -622,6 +752,12 @@ impl HostSampler {
             wall_ns,
         };
         let mut batch = map_events(events, wall_ns);
+        // `map_events` drops `EventKind::Gap`: replay has no sink, so the
+        // batcher never merges them either. Fold them here. A burst of the
+        // same failure (one per 250 ms sample) closes as one row per 5 s.
+        batch
+            .gaps
+            .extend(self.take_merged_gaps(events, wall_ns));
         batch.process_images = image_rows(events, &self.imaged, wall_ns);
         let from_output = map_output(&output, clock);
         batch.processes.extend(from_output.processes);
@@ -674,6 +810,41 @@ impl HostSampler {
                 self.pending_store_failure = true;
                 Err(store_io(&err))
             }
+        }
+    }
+}
+
+/// One open merge window. Collector-wide gaps have no process.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GapMergeKey {
+    collector: String,
+    /// Wire name (`permission`, `parse_error`). `GapKind` has no `Ord`.
+    kind: String,
+    proc_uid: Option<u64>,
+}
+
+/// A window not written yet. `count` is how many failures it holds.
+#[derive(Clone)]
+struct OpenGap {
+    from_ns: i64,
+    to_ns: i64,
+    count: u64,
+    affects: String,
+    detail: Option<String>,
+}
+
+impl OpenGap {
+    fn into_row(self, key: &GapMergeKey, session_id: Option<i64>) -> GapRow {
+        GapRow {
+            id: None,
+            session_id,
+            collector: key.collector.clone(),
+            kind: key.kind.clone(),
+            affects: self.affects,
+            from_ns: self.from_ns,
+            to_ns: self.to_ns,
+            count: Some(i64::try_from(self.count).unwrap_or(i64::MAX)),
+            detail: self.detail,
         }
     }
 }
@@ -1041,6 +1212,8 @@ fn map_events(events: &[aw_core::RawEvent], now_ns: i64) -> WriteBatch {
                     });
                 }
             }
+            // Merged across samples in `HostSampler::take_merged_gaps`.
+            // Mapping one here would store one row per tick.
             EventKind::Gap(_) => {}
             _ => {}
         }
@@ -1106,6 +1279,36 @@ fn walk_pid(parent: &BTreeMap<u32, Option<u32>>, pid: u32) -> Option<i64> {
             }
         }
     }
+}
+
+/// Drop gap records that are copies of `events`.
+///
+/// Matched on sequence, collector, and kind. The aggregate copy uses the
+/// event's own sequence. A rate-limit or degrade gap does not, so it stays.
+fn strip_copied_gaps(output: &mut Output, events: &[aw_core::RawEvent]) {
+    let copies: BTreeSet<(u64, String, String)> = events
+        .iter()
+        .filter_map(|event| {
+            let EventKind::Gap(gap) = &event.kind else {
+                return None;
+            };
+            Some((
+                event.seq,
+                gap.collector.as_str().to_owned(),
+                gaps::gap_kind_name(gap.gap_kind).to_owned(),
+            ))
+        })
+        .collect();
+    if copies.is_empty() {
+        return;
+    }
+    output.gaps.retain(|gap| {
+        !copies.contains(&(
+            gap.seq,
+            gap.collector.as_str().to_owned(),
+            gaps::gap_kind_name(gap.gap_kind).to_owned(),
+        ))
+    });
 }
 
 fn map_output(output: &Output, clock: Clock) -> WriteBatch {
@@ -1849,6 +2052,125 @@ mod depth_tests {
         let mut restarted = super::HostSampler::new(&db);
         restarted.start();
         assert!(!restarted.started);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn gap_at(seq: u64, wall_ns: i64, kind: aw_core::GapKind) -> aw_core::RawEvent {
+        let source = aw_core::Source::new("poll/netstat");
+        let gap = aw_core::Gap::new(
+            source.clone(),
+            kind,
+            vec!["net".to_owned()],
+            1,
+            1,
+            None,
+            Some("sample failed".to_owned()),
+        );
+        aw_core::RawEvent::try_new(aw_core::RawEventParts {
+            seq,
+            ts_mono_ns: 1,
+            ts_wall_ns: wall_ns,
+            session_id: Some(aw_core::SessionId(1)),
+            proc: None,
+            source,
+            evidence: aw_core::Evidence::E1,
+            kind: aw_core::EventKind::Gap(gap),
+        })
+        .expect("gap event")
+    }
+
+    /// `(kind, count, from_ns, to_ns, collector, detail)` in storage order.
+    fn stored_gaps(
+        db: &std::path::Path,
+    ) -> Vec<(String, Option<i64>, i64, i64, String, Option<String>)> {
+        let store = aw_store::Store::open(db).expect("open");
+        let mut stmt = store
+            .connection()
+            .prepare("SELECT kind, count, from_ns, to_ns, collector, detail FROM gaps")
+            .expect("prepare");
+        stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rows")
+    }
+
+    /// One failed sample per tick used to be one `gaps` row. The same collector
+    /// and kind inside 5 s is one row, and `count` is how many ticks failed.
+    #[test]
+    fn repeated_sample_failures_merge_into_one_gap() {
+        let (dir, db) = temp_db("gap-merge");
+        drop(aw_store::Store::open_startup(&db).expect("startup store"));
+        let mut sampler = super::HostSampler::new(&db);
+        let base = 1_700_000_000_000_000_000_i64;
+        let step = 250_000_000_i64;
+        let mut events = Vec::new();
+        for i in 0..19_i64 {
+            events.push(gap_at(
+                i as u64,
+                base + i * step,
+                aw_core::GapKind::Unknown,
+            ));
+        }
+        let last = base + 19 * step;
+        events.push(gap_at(19, last, aw_core::GapKind::ParseError));
+        sampler.persist(&events, last).expect("batch");
+        let early = stored_gaps(&db);
+        assert_eq!(early.len(), 0, "{early:?}");
+
+        sampler.stop();
+        let rows = stored_gaps(&db);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let unknown = rows.iter().find(|row| row.0 == "unknown").expect("unknown");
+        assert_eq!(unknown.1, Some(19));
+        assert_eq!(unknown.2, base);
+        assert_eq!(unknown.3, base + 18 * step);
+        assert_eq!(unknown.4, "poll/netstat");
+        assert_eq!(unknown.5.as_deref(), Some("sample failed"));
+        let parse = rows
+            .iter()
+            .find(|row| row.0 == "parse_error")
+            .expect("parse");
+        assert_eq!(parse.1, Some(1));
+        assert_eq!((parse.2, parse.3), (last, last));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failure more than 5 s after the open window closes that window and
+    /// starts another. Exactly 5 s would still extend it.
+    #[test]
+    fn a_sample_failure_after_the_window_is_a_second_gap() {
+        let (dir, db) = temp_db("gap-window");
+        drop(aw_store::Store::open_startup(&db).expect("startup store"));
+        let mut sampler = super::HostSampler::new(&db);
+        let base = 1_700_000_000_000_000_000_i64;
+        let first = gap_at(1, base, aw_core::GapKind::Unknown);
+        sampler
+            .persist(std::slice::from_ref(&first), base)
+            .expect("first");
+        let later = base + 5_000_000_001;
+        let second = gap_at(2, later, aw_core::GapKind::Unknown);
+        sampler
+            .persist(std::slice::from_ref(&second), later)
+            .expect("second");
+        let rows = stored_gaps(&db);
+        assert_eq!(rows.len(), 1, "only the closed window is written");
+        assert_eq!(rows[0].1, Some(1));
+        assert_eq!(rows[0].2, base);
+
+        sampler.stop();
+        let rows = stored_gaps(&db);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().all(|row| row.1 == Some(1)));
+        assert!(rows.iter().any(|row| row.2 == later));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

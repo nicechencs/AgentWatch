@@ -30,6 +30,10 @@ pub enum SourceFailure {
     Parse,
     /// The platform refused the read. This crate does not retry with elevation.
     Permission,
+    /// The probe ran and failed for a reason this crate did not classify
+    /// (a non-zero exit that was not access denied, for example). Not a
+    /// permission failure: calling it one would claim the platform refused.
+    Failed,
 }
 
 impl SourceError {
@@ -49,6 +53,13 @@ impl SourceError {
     pub(crate) const fn permission() -> Self {
         Self {
             kind: SourceFailure::Permission,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) const fn failed() -> Self {
+        Self {
+            kind: SourceFailure::Failed,
         }
     }
 }

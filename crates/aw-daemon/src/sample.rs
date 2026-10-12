@@ -215,6 +215,36 @@ pub struct HostSampler {
     /// Wall time of the tick currently being stored. A flow first seen inside
     /// that tick, and not marked preexisting, is stamped with this.
     last_wall_ns: i64,
+    /// macOS only. Diffs `nettop -L 1` samples into the same flow rows the poll
+    /// collector cannot produce here: its connection table is
+    /// `NA(collector_unavailable)` on every target except Windows. Absent on
+    /// other targets, and when `nettop` cannot be started.
+    #[cfg(target_os = "macos")]
+    nettop: Option<aw_collector_macos::NettopDecoder>,
+    /// Wall time of the last nettop sample. The poll tick is 250 ms; nettop is a
+    /// 1 s sample, and running it on every tick would block the foreground loop.
+    #[cfg(target_os = "macos")]
+    nettop_at: Option<i64>,
+    /// One long-running `nettop -L 0` and the thread that drains its stdout.
+    /// Logging mode never exits on its own. The thread blocks on the pipe so the
+    /// foreground loop never does. Restarted when it dies.
+    #[cfg(target_os = "macos")]
+    nettop_child: Option<NettopFeed>,
+    /// Files each in-scope process held open at the previous sample, keyed by
+    /// pid. macOS only: it is the one target where `sampling_open_files` returns
+    /// a list. The first sample is the baseline and records nothing, because a
+    /// file already open at attach was not opened during the session.
+    #[cfg(target_os = "macos")]
+    open_files: BTreeMap<u32, BTreeSet<std::path::PathBuf>>,
+    /// Wall time of the last open-file sample. The poll tick is 250 ms; the file
+    /// snapshot is a 2 s sample (fallback-poll.md §2).
+    #[cfg(target_os = "macos")]
+    files_at: Option<i64>,
+    /// Set once the DNS limitation has been written. pktap needs root, which this
+    /// daemon does not have, so domain stays unavailable and that fact is one gap
+    /// rather than a domain that was never observed.
+    #[cfg(target_os = "macos")]
+    dns_gap_written: bool,
 }
 
 impl HostSampler {
@@ -244,6 +274,18 @@ impl HostSampler {
             preexisting: BTreeSet::new(),
             flow_seen_wall: BTreeMap::new(),
             last_wall_ns: 0,
+            #[cfg(target_os = "macos")]
+            nettop: None,
+            #[cfg(target_os = "macos")]
+            nettop_at: None,
+            #[cfg(target_os = "macos")]
+            nettop_child: None,
+            #[cfg(target_os = "macos")]
+            open_files: BTreeMap::new(),
+            #[cfg(target_os = "macos")]
+            files_at: None,
+            #[cfg(target_os = "macos")]
+            dns_gap_written: false,
         }
     }
 
@@ -318,6 +360,20 @@ impl HostSampler {
                     self.pending_store_failure = true;
                 } else {
                     self.last_sample_ns = Some(wall_ns);
+                }
+                // The first nettop sample is a baseline and emits nothing. Taking
+                // it here means the next tick can already diff. A missing binary
+                // leaves the field unset; the poll sampler still runs.
+                #[cfg(target_os = "macos")]
+                {
+                    self.nettop = Some(aw_collector_macos::NettopDecoder::new());
+                    self.sample_nettop(wall_ns);
+                    // The first file snapshot is the baseline: files already open
+                    // are not opens this session observed. Later ticks diff it.
+                    self.sample_open_files(wall_ns);
+                    // No unprivileged DNS source exists here. Record that once,
+                    // so the session says why domain is unavailable.
+                    self.note_dns_unavailable(wall_ns);
                 }
             }
             Err(err) => {
@@ -612,6 +668,13 @@ impl HostSampler {
         } else {
             self.last_sample_ns = Some(wall_ns);
         }
+        // After the poll batch. `persist` hands the aggregator this tick's
+        // monotonic time; a nettop event stamped with the same time is not
+        // "before the last one" and is kept. One stamped earlier is dropped.
+        #[cfg(target_os = "macos")]
+        self.sample_nettop(wall_ns);
+        #[cfg(target_os = "macos")]
+        self.sample_open_files(wall_ns);
     }
 
     /// Turn `snapshot`'s starts into events the pipeline can replay.
@@ -790,6 +853,300 @@ impl HostSampler {
     fn next_seq(&mut self) -> u64 {
         self.seq = self.seq.saturating_add(1);
         self.seq
+    }
+
+    /// One `nettop -L 1` sample, diffed against the previous one and written
+    /// through the same flow rows as a poll connect.
+    ///
+    /// The poll collector reports no connections on macOS
+    /// (`NA(collector_unavailable)`), so this is the only net source a session
+    /// has. Counts stay evidence S: nettop is a 1 s sample, and a flow that
+    /// opens and closes inside the interval is not invented. A sample that
+    /// cannot be read becomes one `Gap`, not a silent skip.
+    #[cfg(target_os = "macos")]
+    fn sample_nettop(&mut self, wall_ns: i64) {
+        // One sample a second. The decoder diffs cumulative counters, so a
+        // shorter gap adds no information and spends the second inside nettop.
+        const NETTOP_EVERY_NS: i64 = 1_000_000_000;
+        if self
+            .nettop_at
+            .is_some_and(|at| wall_ns.saturating_sub(at) < NETTOP_EVERY_NS)
+        {
+            return;
+        }
+        self.nettop_at = Some(wall_ns);
+        if self.nettop.is_none() {
+            return;
+        }
+        let text = match self.read_nettop_sample() {
+            Ok(text) => text,
+            Err(detail) => {
+                tracing::warn!(error = %detail, "nettop sample failed");
+                let event = self.gap_event(GapKind::Restart, "net", Some(1), &detail, wall_ns);
+                if let Err(err) = self.persist(&[event], wall_ns) {
+                    tracing::warn!(error = %err, "nettop gap write failed");
+                }
+                return;
+            }
+        };
+        let pids: Vec<u32> = subtree_of(proc_table(), self.target.root_pid)
+            .into_iter()
+            .map(|row| row.pid)
+            .collect();
+        if pids.is_empty() {
+            return;
+        }
+        let scope = aw_collector_macos::ProcessScope::new(pids);
+        let clock = aw_collector_macos::NetSample {
+            ts_mono_ns: self.mono_ns,
+            ts_wall_ns: Some(wall_ns),
+        };
+        let Some(decoder) = self.nettop.as_mut() else {
+            return;
+        };
+        let events = match decoder.push_sample(&text, &scope, clock) {
+            Ok(events) => events,
+            Err(_) => return,
+        };
+        if events.is_empty() {
+            return;
+        }
+        // nettop gives a pid and not a start time, so the decoder leaves `proc`
+        // empty and marks it NA. A flow row requires the ProcUid (the column is
+        // NOT NULL), and this session already recorded one per pid. Fill it from
+        // that row. A pid with no recorded process is left NA and the row is
+        // dropped, rather than hashed from the pid alone.
+        let uids = self.proc_uids(&events);
+        let raw: Vec<RawEvent> = events
+            .into_iter()
+            .map(|ev| self.with_proc(ev, &uids))
+            .collect();
+        if let Err(err) = self.persist(&raw, wall_ns) {
+            tracing::warn!(error = %err, "nettop sample write failed");
+            self.pending_store_failure = true;
+            return;
+        }
+        // `persist` folds the events in, so the open flows now hold this
+        // sample's bytes. The aggregator would not emit them for 30 s. nettop's
+        // counters are already observed, so the snapshot is written here and
+        // upserted onto the same id next sample.
+        self.write_open_flows();
+    }
+
+    /// Files newly open since the previous snapshot, written at evidence S.
+    ///
+    /// fallback-poll.md §2: an open-file sample every 2 s, diffed. A file present
+    /// in the first snapshot was already open at attach, so it is the baseline
+    /// and not an event. A file that appears later is one `access` row. The
+    /// access mode and the byte counts are not in a descriptor listing, so they
+    /// stay `None` and are marked `NA(collector_unavailable)` rather than guessed.
+    /// No file content is read.
+    #[cfg(target_os = "macos")]
+    fn sample_open_files(&mut self, wall_ns: i64) {
+        const FILES_EVERY_NS: i64 = 2_000_000_000;
+        if self
+            .files_at
+            .is_some_and(|at| wall_ns.saturating_sub(at) < FILES_EVERY_NS)
+        {
+            return;
+        }
+        self.files_at = Some(wall_ns);
+        let pids: Vec<u32> = subtree_of(proc_table(), self.target.root_pid)
+            .into_iter()
+            .map(|row| row.pid)
+            .collect();
+        let mut rows = Vec::new();
+        let mut current: BTreeMap<u32, BTreeSet<std::path::PathBuf>> = BTreeMap::new();
+        for pid in pids {
+            let Some(paths) = aw_platform::platform()
+                .sampling_open_files(pid)
+                .ok()
+                .flatten()
+            else {
+                // Unreadable this tick. Keep the previous snapshot, so the next
+                // readable one does not report every still-open file as new.
+                if let Some(prev) = self.open_files.get(&pid) {
+                    current.insert(pid, prev.clone());
+                }
+                continue;
+            };
+            let fresh: BTreeSet<std::path::PathBuf> = paths.into_iter().collect();
+            if let Some(prev) = self.open_files.get(&pid) {
+                let uid = self.proc_uid_for(pid);
+                for path in fresh.difference(prev) {
+                    if let Some(row) = self.file_row(uid, path, wall_ns) {
+                        rows.push(row);
+                    }
+                }
+            }
+            current.insert(pid, fresh);
+        }
+        self.open_files = current;
+        if rows.is_empty() {
+            return;
+        }
+        let batch = WriteBatch {
+            file_access: rows,
+            ..WriteBatch::default()
+        };
+        if let Err(err) = write_one_batch(&self.db_path, &batch) {
+            tracing::warn!(error = %err, "open file write failed");
+        }
+    }
+
+    /// `processes.proc_uid` for one pid, when this session recorded it.
+    #[cfg(target_os = "macos")]
+    fn proc_uid_for(&self, pid: u32) -> Option<i64> {
+        let conn = aw_store::open_connection(&self.db_path).ok()?;
+        conn.query_row(
+            "SELECT proc_uid FROM processes WHERE session_id = ?1 AND pid = ?2 \
+             ORDER BY start_ns DESC LIMIT 1",
+            (self.target.db_id, i64::from(pid)),
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+    }
+
+    /// One `file_access` row for a file a snapshot showed newly open.
+    ///
+    /// The id is a hash of the process and the path, so the same file reported
+    /// twice upserts onto one row instead of colliding with another session's
+    /// sequential ids. `opens` counts occurrences; the upsert adds them.
+    #[cfg(target_os = "macos")]
+    fn file_row(
+        &self,
+        proc_uid: Option<i64>,
+        path: &std::path::Path,
+        wall_ns: i64,
+    ) -> Option<aw_store::FileAccessRow> {
+        use std::hash::{Hash, Hasher};
+        let proc_uid = proc_uid?;
+        let path = path.to_string_lossy();
+        if path.is_empty() {
+            return None;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        proc_uid.hash(&mut hasher);
+        path.hash(&mut hasher);
+        let mut fields = BTreeMap::new();
+        let unavailable = Evidence::NA(NaReason::CollectorUnavailable);
+        for field in ["access", "reads", "bytes_read", "writes", "bytes_written"] {
+            fields.insert(field.to_owned(), unavailable.clone());
+        }
+        Some(aw_store::FileAccessRow {
+            id: i64::from_ne_bytes(hasher.finish().to_ne_bytes()),
+            session_id: self.target.db_id,
+            proc_uid,
+            op: "access".to_owned(),
+            path: path.into_owned(),
+            path_to: None,
+            access: None,
+            first_ns: wall_ns,
+            last_ns: wall_ns,
+            opens: 1,
+            reads: None,
+            bytes_read: None,
+            writes: None,
+            bytes_written: None,
+            created: None,
+            truncated: None,
+            modified: None,
+            result: None,
+            partial: 0,
+            sensitive_rule: None,
+            evidence: gaps::evidence_code(&Evidence::S).to_owned(),
+            na_reason: None,
+            field_evidence: field_evidence_json(&fields),
+            source: "macos.libproc/fd".to_owned(),
+        })
+    }
+
+    /// One gap recording that domain cannot be observed without privilege.
+    ///
+    /// pktap (the DNS and SNI source on macOS) needs root, and this daemon does
+    /// not run as root. There is no unprivileged substitute, so the session
+    /// records the limitation instead of leaving domain silently empty.
+    #[cfg(target_os = "macos")]
+    fn note_dns_unavailable(&mut self, wall_ns: i64) {
+        if self.dns_gap_written {
+            return;
+        }
+        self.dns_gap_written = true;
+        let event = self.gap_event(
+            GapKind::Permission,
+            "dns",
+            Some(1),
+            "pktap 需要 root，当前进程无权抓取 DNS，域名不可得",
+            wall_ns,
+        );
+        if let Err(err) = self.persist(&[event], wall_ns) {
+            tracing::warn!(error = %err, "dns gap write failed");
+            self.dns_gap_written = false;
+        }
+    }
+
+    /// `processes.proc_uid` for the pids in this sample. Empty when the read fails.
+    #[cfg(target_os = "macos")]
+    fn proc_uids(&self, events: &[aw_collector_macos::NettopEvent]) -> BTreeMap<u32, ProcUid> {
+        let mut out = BTreeMap::new();
+        let Ok(conn) = aw_store::open_connection(&self.db_path) else {
+            return out;
+        };
+        for ev in events {
+            let Some(pid) = ev.pid else { continue };
+            if out.contains_key(&pid) {
+                continue;
+            }
+            let Ok(uid) = conn.query_row(
+                "SELECT proc_uid FROM processes WHERE session_id = ?1 AND pid = ?2 \
+                 ORDER BY start_ns DESC LIMIT 1",
+                (self.target.db_id, i64::from(pid)),
+                |row| row.get::<_, i64>(0),
+            ) else {
+                continue;
+            };
+            out.insert(pid, ProcUid(u64::from_ne_bytes(uid.to_ne_bytes())));
+        }
+        out
+    }
+
+    /// Put the recorded ProcUid on one nettop event. The pid was observed; the
+    /// uid is the one this session already stored for that pid.
+    #[cfg(target_os = "macos")]
+    fn with_proc(
+        &self,
+        ev: aw_collector_macos::NettopEvent,
+        uids: &BTreeMap<u32, ProcUid>,
+    ) -> RawEvent {
+        let mut event = ev.event;
+        if let Some(uid) = ev.pid.and_then(|pid| uids.get(&pid).copied()) {
+            event.proc = Some(ProcRef {
+                uid,
+                pid: ev.pid.unwrap_or(0),
+                tid: None,
+            });
+            event.field_evidence.remove("proc");
+        }
+        event
+    }
+
+    /// Lines `nettop` has printed since the previous read. Starts the child on
+    /// the first call and again after it exits.
+    #[cfg(target_os = "macos")]
+    fn read_nettop_sample(&mut self) -> Result<String, String> {
+        if self.nettop_child.is_none() {
+            self.nettop_child = Some(NettopFeed::spawn()?);
+        }
+        let Some(child) = self.nettop_child.as_mut() else {
+            return Err("nettop 未能启动".to_owned());
+        };
+        match child.take() {
+            Ok(text) => Ok(text),
+            Err(err) => {
+                self.nettop_child = None;
+                Err(err)
+            }
+        }
     }
 
     /// Collector gaps from `events`, merged with the ones still open.
@@ -1020,7 +1377,14 @@ fn sample_period_ns() -> u64 {
 
 fn wall_now_ns() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX),
+        // Microseconds, then to nanoseconds. `as_nanos` does not fit an `i64`
+        // (it overflows around 2262, and `try_from` turns that into `i64::MAX`),
+        // which made every later sample look like it was still inside the
+        // throttle window. Microseconds fit for the next few thousand years, and
+        // the stored resolution stays nanoseconds.
+        Ok(duration) => i64::try_from(duration.as_micros())
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1_000),
         // Before the epoch. Not an observed unix time, so it is not 0.
         Err(_) => i64::MIN,
     }
@@ -1129,6 +1493,112 @@ fn store_reason(err: &aw_store::StoreError) -> String {
 /// [`ProcUid`] of pid 1, hashed the way the poll collector hashes a row.
 ///
 /// `None` when the boot id or the start time cannot be read. Not a zero hash.
+/// A `nettop` child and the text its reader thread has collected.
+///
+/// The thread blocks on stdout, which is what a pipe read does. The foreground
+/// loop only takes the text already collected, so it never waits on nettop.
+#[cfg(target_os = "macos")]
+struct NettopFeed {
+    child: std::process::Child,
+    text: std::sync::Arc<std::sync::Mutex<String>>,
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(target_os = "macos")]
+impl NettopFeed {
+    /// `nettop -L 0` prints forever, one CSV sample a second. `-n` keeps
+    /// addresses numeric. `-x` prints full counts. `-J` keeps the two cumulative
+    /// columns the decoder diffs. The command line is fixed.
+    fn spawn() -> Result<Self, String> {
+        let mut child = std::process::Command::new("nettop")
+            .args(["-L", "0", "-s", "1", "-x", "-n", "-J", "bytes_in,bytes_out"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|err| format!("nettop 未能启动：{err}"))?;
+        let mut stdout = child.stdout.take().ok_or("nettop 没有输出")?;
+        let text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sink = std::sync::Arc::clone(&text);
+        let flag = std::sync::Arc::clone(&alive);
+        std::thread::Builder::new()
+            .name("nettop-read".to_owned())
+            .spawn(move || {
+                use std::io::Read;
+                let mut buf = [0_u8; 65_536];
+                loop {
+                    match stdout.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let Ok(chunk) = std::str::from_utf8(&buf[..n]) else {
+                                break;
+                            };
+                            if let Ok(mut held) = sink.lock() {
+                                held.push_str(chunk);
+                            }
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                flag.store(false, std::sync::atomic::Ordering::Relaxed);
+            })
+            .map_err(|err| format!("nettop 读取线程未能启动：{err}"))?;
+        Ok(Self { child, text, alive })
+    }
+
+    /// One whole sample, or `Ok("")` when the next sample has not finished.
+    ///
+    /// nettop reprints the table every second, starting each one with the
+    /// `,bytes_in,bytes_out,` banner. A read can stop in the middle of a table,
+    /// so the text up to the second banner is one sample and the rest stays for
+    /// the next call. An error means the child is gone.
+    fn take(&mut self) -> Result<String, String> {
+        if !self.alive.load(std::sync::atomic::Ordering::Relaxed) {
+            let status = self
+                .child
+                .try_wait()
+                .ok()
+                .flatten()
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| "未知".to_owned());
+            return Err(format!("nettop 已退出：{status}"));
+        }
+        let mut held = self
+            .text
+            .lock()
+            .map_err(|_| "nettop 输出不可读".to_owned())?;
+        let Some(first) = held.find(",bytes_in,bytes_out,") else {
+            return Ok(String::new());
+        };
+        let Some(second) = held[first + 1..].find(",bytes_in,bytes_out,") else {
+            return Ok(String::new());
+        };
+        let end = first + 1 + second;
+        let mut sample = held[first..end].to_owned();
+        held.replace_range(..end, "");
+        drop(held);
+        // The second banner can arrive while nettop is still writing the last
+        // line before it, so that line is a fragment such as `udp4 *:5`. It is
+        // not a flow yet. Dropping it keeps it out of the parse gaps; the next
+        // sample repeats the whole table, so nothing is lost.
+        if !sample.ends_with('\n') {
+            if let Some(cut) = sample.rfind('\n') {
+                sample.truncate(cut + 1);
+            }
+        }
+        Ok(sample)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for NettopFeed {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Live processes under pid 1, keyed the same way the poll collector keys them.
 fn proc_table() -> Vec<ProcFact> {
     aw_platform::platform()
@@ -1589,10 +2059,17 @@ fn flow_row(flow: &NetFlowRec) -> Option<NetFlowRow> {
         .and_then(|SessionId(id)| i64::try_from(id).ok())
         .unwrap_or(SESSION_DB_ID);
     Some(NetFlowRow {
-        id: flow
-            .flow_id
-            .and_then(|id| i64::try_from(id).ok())
-            .unwrap_or_else(|| flow_key(flow)),
+        // nettop has no socket id, so the aggregator numbers its flows 1, 2, 3…
+        // Those collide with every other session's rows, and the upsert does not
+        // change `session_id`, so the new session's bytes landed on an old row.
+        // A flow with no socket id is keyed by its addresses instead.
+        id: if flow.source.as_str() == "macos.nettop/flow" {
+            flow_key(flow)
+        } else {
+            flow.flow_id
+                .and_then(|id| i64::try_from(id).ok())
+                .unwrap_or_else(|| flow_key(flow))
+        },
         session_id,
         proc_uid,
         proto,

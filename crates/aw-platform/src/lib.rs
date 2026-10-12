@@ -568,6 +568,15 @@ pub trait Platform: Send + Sync {
     fn process_table(&self) -> Result<Vec<ProcessEntry>, PlatformError>;
     fn sampling_process(&self, pid: u32) -> Result<Option<SamplingProcess>, PlatformError>;
     fn sampling_process_table(&self) -> Result<Vec<SamplingProcess>, PlatformError>;
+    /// Files a process currently holds open, as a sample.
+    ///
+    /// `Ok(None)` means this platform has no such listing. An empty `Ok(Some)`
+    /// means the process was readable and held no files. macOS reads this from
+    /// libproc without elevation; the other targets have not grown one.
+    fn sampling_open_files(&self, pid: u32) -> Result<Option<Vec<PathBuf>>, PlatformError> {
+        let _ = pid;
+        Ok(None)
+    }
     /// Create and secure the daemon data directory before the daemon opens
     /// any file below it. Implementations reject a pre-existing directory
     /// owned by somebody other than the account allowed for that location,

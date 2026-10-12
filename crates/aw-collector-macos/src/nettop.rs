@@ -6,13 +6,15 @@
 //! behind `cfg(target_os = "macos")` and is not implemented here: this crate is
 //! built on hosts that do not have that binary.
 //!
-//! ## Assumed input format
+//! ## Input formats
 //!
 //! macos.md §1.2 names the command and says the output is CSV, and that the
 //! process column is `name.pid`. It does **not** name the columns. SPIKE-03 is
-//! 「未开始」, so nothing here treats a column as measured. The text this decoder
-//! accepts is the column layout `nettop -P -L 1 -x` prints on macOS 13, which is
-//! the layout the task card asks to assume when the document does not give one:
+//! 「未开始」. Two layouts are accepted. Neither is treated as a measured byte
+//! error; both are decoded as written.
+//!
+//! The column layout `nettop -P -L 1 -x` was assumed to print, which is what the
+//! task card asks to assume when the document does not give one:
 //!
 //! ```text
 //! time,process,interface,state,proto,local,remote,bytes_in,bytes_out
@@ -20,17 +22,39 @@
 //! 1.000,curl.4242,,,udp,,,,,
 //! ```
 //!
+//! The layout `nettop -L 1 -x -n -J bytes_in,bytes_out` actually prints on this
+//! Mac (macOS, logging mode, no name resolution). A process row carries the
+//! cumulative counters. Each following row whose first cell is a flow belongs to
+//! that process, until the next process row:
+//!
+//! ```text
+//! ,bytes_in,bytes_out,
+//! 2.1.296.51854,3943,123596,
+//! tcp4 192.168.8.53:60034<->198.18.3.149:443,3943,123596,
+//! ```
+//!
+//! A flow cell is `tcp4`, `tcp6`, `udp4`, or `udp6`, then a space, then
+//! `local<->remote`. `*` and `*.*` are an unspecified address. `.` separates an
+//! IPv6 address from its port (`::1.8021`); `:` separates an IPv4 address from
+//! its port. Bytes on a flow row are that flow's own cumulative counters. A flow
+//! row with empty counters is a socket with no byte reading (a listener, for
+//! example), not a zero transfer.
+//!
 //! Rules:
 //!
 //! - One sample is the lines between two blank lines, or one shot of lines passed
 //!   to [`NettopDecoder::push_sample`]. A line whose first cell is `time` is a
 //!   header and is skipped. A line that is empty or starts with `#` is skipped.
+//!   A line whose only cells are empty or the names `bytes_in` / `bytes_out` is
+//!   the column banner of `-J` and is skipped.
 //! - Cells are split on `,`. A cell may be quoted with `"`; a doubled `""` inside
 //!   quotes is one quote. Whitespace around a cell is trimmed.
 //! - `process` is `name.pid`. The pid is the trailing `.` plus a decimal integer.
 //!   A name that itself contains `.` is fine (`com.apple.curl.4242` → pid 4242).
 //!   A row whose process cell has no trailing pid is not a flow and is dropped
-//!   with a counted parse gap, not guessed as pid 0.
+//!   with a counted parse gap, not guessed as pid 0. A flow row with no preceding
+//!   process row in the same sample is the same kind of gap: the pid was not in
+//!   the text.
 //! - `proto` is `tcp` or `udp` (ASCII, case-insensitive). Anything else, including
 //!   an empty cell, is `L4Proto::Unknown`. UDP inclusion is 【待验证】 in macos.md
 //!   §1.2, so a `udp` cell is accepted and not invented when the cell is empty.
@@ -211,7 +235,9 @@ impl FlowId {
     }
 
     fn is_connection(&self) -> bool {
-        !self.rollup && self.local.is_some() && self.remote.is_some()
+        // A listener has a local address and no remote (`*:*`). That is still a
+        // socket, not a process rollup. A rollup has neither address.
+        !self.rollup && (self.local.is_some() || self.remote.is_some())
     }
 }
 
@@ -312,14 +338,19 @@ impl NettopDecoder {
     ) -> Vec<NettopEvent> {
         let mut out = Vec::new();
         let mut current: BTreeMap<FlowId, NettopRow> = BTreeMap::new();
+        // The logging layout prints a process row, then its flows. The pid is on
+        // the process row only, so a flow row inherits the last one in this sample.
+        let mut current_pid: Option<(String, u32)> = None;
         for (line_no, raw_line) in text.lines().enumerate() {
             let line = raw_line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            match parse_line(line) {
+            match parse_line(line, current_pid.clone()) {
                 LineParse::Header | LineParse::Skip => {}
+                LineParse::Process(name, pid) => current_pid = Some((name, pid)),
                 LineParse::Row(row) => {
+                    current_pid = Some((row.name.clone(), row.pid));
                     if !scope.contains(row.pid) {
                         continue;
                     }
@@ -598,17 +629,34 @@ fn stamp(
 enum LineParse {
     Header,
     Skip,
+    /// A process row in the logging layout. Its flows follow on later lines.
+    Process(String, u32),
     Row(NettopRow),
-    Bad { detail: &'static str },
+    Bad {
+        detail: &'static str,
+    },
 }
 
-fn parse_line(line: &str) -> LineParse {
+/// `current` is the process row this flow belongs to, when the sample has
+/// printed one. The nine-column layout carries the pid on every row, so it
+/// ignores `current`.
+fn parse_line(line: &str, current: Option<(String, u32)>) -> LineParse {
     let cells = split_csv(line);
-    if cells.is_empty() {
+    if cells.is_empty() || cells.iter().all(|cell| cell.is_empty()) {
         return LineParse::Skip;
     }
     if cells[0].eq_ignore_ascii_case("time") {
         return LineParse::Header;
+    }
+    // `,bytes_in,bytes_out,` — the banner `-J` prints above the first process.
+    if cells
+        .iter()
+        .all(|cell| cell.is_empty() || cell == "bytes_in" || cell == "bytes_out")
+    {
+        return LineParse::Skip;
+    }
+    if let Some(parsed) = parse_logging_line(&cells, current) {
+        return parsed;
     }
     if cells.len() < 9 {
         return LineParse::Bad {
@@ -664,6 +712,120 @@ fn parse_line(line: &str) -> LineParse {
         bytes_in,
         bytes_out,
     })
+}
+
+/// The logging layout (`nettop -L -J bytes_in,bytes_out`).
+///
+/// A process cell (`name.pid`) with no `tcp4`/`udp6` prefix is a process row.
+/// A flow cell belongs to `current`. `None` means this line is not that layout,
+/// so the caller tries the nine-column layout.
+fn parse_logging_line(cells: &[String], current: Option<(String, u32)>) -> Option<LineParse> {
+    let first = cells.first()?.as_str();
+    if let Some((prefix, rest)) = split_flow_prefix(first) {
+        let (name, pid) = current?;
+        let (local, remote) = split_endpoints(rest)?;
+        let proto = if prefix.starts_with("tcp") {
+            L4Proto::Tcp
+        } else {
+            L4Proto::Udp
+        };
+        let v6 = prefix.ends_with('6');
+        let local = match parse_endpoint(local, v6) {
+            Ok(addr) => addr,
+            Err(()) => {
+                return Some(LineParse::Bad {
+                    detail: "local address is not ip:port",
+                })
+            }
+        };
+        let remote = match parse_endpoint(remote, v6) {
+            Ok(addr) => addr,
+            Err(()) => {
+                return Some(LineParse::Bad {
+                    detail: "remote address is not ip:port",
+                })
+            }
+        };
+        let bytes_in = parse_counter(cells.get(1).map(String::as_str).unwrap_or("")).ok()?;
+        let bytes_out = parse_counter(cells.get(2).map(String::as_str).unwrap_or("")).ok()?;
+        return Some(LineParse::Row(NettopRow {
+            name,
+            pid,
+            interface: None,
+            state: None,
+            proto,
+            local,
+            remote,
+            bytes_in,
+            bytes_out,
+        }));
+    }
+    // A process rollup: the first cell is `name.pid` and the next is a byte
+    // counter. nettop prints the two cumulative counters here, and sometimes
+    // more cells than the two `-J` asked for, so the cell count does not decide
+    // this. The nine-column layout also has `name.pid`, but in its second cell
+    // and followed by an interface name, so it does not match and falls through.
+    let second_is_counter = cells
+        .get(1)
+        .is_some_and(|cell| cell.is_empty() || cell.bytes().all(|b| b.is_ascii_digit()));
+    if second_is_counter {
+        if let Some((name, pid)) = split_name_pid(first) {
+            return Some(LineParse::Process(name, pid));
+        }
+    }
+    None
+}
+
+/// `tcp4 10.0.0.1:1<->10.0.0.2:2` → `("tcp4", "10.0.0.1:1<->10.0.0.2:2")`.
+///
+/// `None` when the cell is not a flow. A process name is not a flow.
+fn split_flow_prefix(cell: &str) -> Option<(&str, &str)> {
+    let (prefix, rest) = cell.split_once(' ')?;
+    if matches!(prefix, "tcp4" | "tcp6" | "udp4" | "udp6") {
+        Some((prefix, rest))
+    } else {
+        None
+    }
+}
+
+/// Split `local<->remote`. The marker is the separator nettop prints.
+fn split_endpoints(cell: &str) -> Option<(&str, &str)> {
+    cell.split_once("<->")
+}
+
+/// One side of a flow cell.
+///
+/// `*`, `*.*`, and an empty port are an unspecified address: `Ok(None)`, not
+/// `0.0.0.0:0`. IPv4 uses `ip:port`. IPv6 uses `ip.port`, because the address
+/// itself contains `:`. A side that is present but not that shape is `Err`.
+fn parse_endpoint(cell: &str, v6: bool) -> Result<Option<std::net::SocketAddr>, ()> {
+    let cell = cell.trim();
+    if cell.is_empty() || cell == "*" || cell == "*.*" {
+        return Ok(None);
+    }
+    if v6 {
+        let (addr, port) = cell.rsplit_once('.').ok_or(())?;
+        // `*.*` and `*.5353`: the address is unspecified. Same as the IPv4 `*:`.
+        if addr == "*" {
+            return Ok(None);
+        }
+        let port: u16 = port.parse().map_err(|_| ())?;
+        // Link-local addresses carry the interface as `%en0`. The address is the
+        // part before it; the zone is not part of the IP and is dropped.
+        let addr = addr.split_once('%').map(|(ip, _)| ip).unwrap_or(addr);
+        let ip: std::net::Ipv6Addr = addr.parse().map_err(|_| ())?;
+        return Ok(Some(std::net::SocketAddr::from((ip, port))));
+    }
+    let (addr, port) = cell.rsplit_once(':').ok_or(())?;
+    // `*:*` is the whole address unspecified, and `*:5353` is an unspecified
+    // address with only a port. Neither is an IP, so both are "not observed"
+    // rather than a parse error.
+    if addr == "*" {
+        return Ok(None);
+    }
+    let port: u16 = port.parse().map_err(|_| ())?;
+    let ip: std::net::IpAddr = addr.parse().map_err(|_| ())?;
+    Ok(Some(std::net::SocketAddr::from((ip, port))))
 }
 
 fn non_empty(cell: &str) -> Option<String> {
@@ -914,6 +1076,123 @@ mod tests {
             other => panic!("expected net_close, got {}", other.kind_name()),
         }
         assert_eq!(events[0].event.evidence, Evidence::S);
+    }
+
+    /// `nettop -L 1 -x -n -J bytes_in,bytes_out` as printed on this Mac.
+    /// The process row carries the same totals as its one flow.
+    const LOGGING: &str = "\
+,bytes_in,bytes_out,
+2.1.296.51854,3943,123596,
+tcp4 192.168.8.53:60034<->198.18.3.149:443,3943,123596,
+";
+
+    #[test]
+    fn logging_layout_first_sample_is_a_baseline() {
+        let events = parse_nettop(LOGGING, &scope(&[51854]), CLOCK).expect("sample");
+        assert!(
+            events.is_empty(),
+            "a connection already open at the first look is not a new connect"
+        );
+    }
+
+    #[test]
+    fn logging_layout_growth_is_a_delta_at_evidence_s() {
+        let mut dec = NettopDecoder::new();
+        let _ = dec
+            .push_sample(LOGGING, &scope(&[51854]), CLOCK)
+            .expect("baseline");
+        let grown = LOGGING.replace("3943,123596,", "4000,124000,");
+        let events = dec
+            .push_sample(&grown, &scope(&[51854]), CLOCK)
+            .expect("delta");
+        let sends: Vec<_> = events
+            .iter()
+            .filter(|ev| matches!(ev.event.kind, EventKind::NetSend(_)))
+            .collect();
+        let recvs: Vec<_> = events
+            .iter()
+            .filter(|ev| matches!(ev.event.kind, EventKind::NetRecv(_)))
+            .collect();
+        assert_eq!(sends.len(), 1, "the process rollup is not a second flow");
+        assert_eq!(recvs.len(), 1);
+        match &sends[0].event.kind {
+            EventKind::NetSend(send) => assert_eq!(send.bytes, 404),
+            _ => unreachable!(),
+        }
+        match &recvs[0].event.kind {
+            EventKind::NetRecv(recv) => assert_eq!(recv.bytes, 57),
+            _ => unreachable!(),
+        }
+        assert_eq!(sends[0].event.evidence, Evidence::S);
+        assert_eq!(sends[0].pid, Some(51854));
+        match &sends[0].event.kind {
+            EventKind::NetSend(send) => {
+                assert_eq!(
+                    send.flow.remote,
+                    SocketAddr::socket("198.18.3.149:443".parse().unwrap())
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn logging_layout_listener_has_no_address_and_no_bytes() {
+        let text = "\
+,bytes_in,bytes_out,
+launchd.1,0,0,
+tcp4 127.0.0.1:8021<->*:*,,,
+";
+        let mut dec = NettopDecoder::new();
+        let _ = dec.push_sample("", &scope(&[1]), CLOCK).expect("arm");
+        let events = dec.push_sample(text, &scope(&[1]), CLOCK).expect("sample");
+        assert!(
+            events
+                .iter()
+                .any(|ev| matches!(ev.event.kind, EventKind::NetConnect(_))),
+            "a socket that was not in the baseline is a connect"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|ev| !matches!(ev.event.kind, EventKind::NetSend(_) | EventKind::NetRecv(_))),
+            "empty counters are not a zero-byte transfer"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|ev| !matches!(ev.event.kind, EventKind::Gap(_))),
+            "`*:*` is an unspecified address, not a parse error"
+        );
+    }
+
+    #[test]
+    #[test]
+    fn logging_layout_process_row_with_extra_cells_is_not_a_gap() {
+        // A process row can carry more than the two counters `-J` asked for.
+        // That is still the process, not a flow, and not a parse error.
+        let text = "\
+,bytes_in,bytes_out,
+rapportd.656,46530,41102,7,
+";
+        let events = parse_nettop(text, &scope(&[656]), CLOCK).expect("sample");
+        assert!(
+            events
+                .iter()
+                .all(|ev| !matches!(ev.event.kind, EventKind::Gap(_))),
+            "extra cells on a process row are not a parse error"
+        );
+    }
+
+    fn logging_layout_flow_without_a_process_is_a_gap() {
+        let text = "tcp4 192.168.8.53:60034<->198.18.3.149:443,3943,123596,\n";
+        let events = parse_nettop(text, &scope(&[51854]), CLOCK).expect("sample");
+        assert!(
+            events
+                .iter()
+                .any(|ev| matches!(ev.event.kind, EventKind::Gap(_))),
+            "a flow row with no process row has no pid"
+        );
     }
 
     #[test]

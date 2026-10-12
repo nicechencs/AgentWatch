@@ -61,6 +61,31 @@ struct ResolvedDataDir {
     missing: Vec<std::ffi::OsString>,
 }
 
+/// Files `pid` currently holds open, one path per vnode descriptor.
+///
+/// `Ok(None)` means the descriptor table could not be read (the process
+/// exited, or it is not readable). `Ok(Some)` is a real snapshot: empty when
+/// the process holds no files. A vnode whose path cannot be read is left out
+/// rather than recorded as an empty path. Sockets and pipes are not files and
+/// are not listed. The same path held twice appears once.
+fn open_files(pid: u32) -> Result<Option<Vec<PathBuf>>, PlatformError> {
+    let Some(fds) = ffi::fd_list(pid) else {
+        return Ok(None);
+    };
+    let mut paths = Vec::new();
+    for (fd, kind) in fds {
+        if kind != libc::PROX_FDTYPE_VNODE as u32 {
+            continue;
+        }
+        if let Some(path) = ffi::vnode_path(pid, fd) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    Ok(Some(paths))
+}
+
 fn invalid<T>(detail: &'static str) -> Result<T, PlatformError> {
     Err(PlatformError::Invalid {
         capability: "secure_data_dir",
@@ -370,6 +395,10 @@ impl Platform for CurrentPlatform {
         Ok(self.process_table()?.iter().map(sampling_from).collect())
     }
 
+    fn sampling_open_files(&self, pid: u32) -> Result<Option<Vec<PathBuf>>, PlatformError> {
+        open_files(pid)
+    }
+
     fn secure_data_dir(&self, path: &Path) -> Result<PathBuf, PlatformError> {
         // Use only the daemon's kernel-provided IDs. Do not derive a policy
         // from a requester, environment variable, or command-line argument.
@@ -661,6 +690,126 @@ mod ffi {
         unsafe {
             // SAFETY: `buf` is writable and `bytes` is its length.
             libc::proc_listallpids(buf.as_mut_ptr().cast::<libc::c_void>(), bytes)
+        }
+    }
+
+    /// Byte count `proc_pidinfo(PROC_PIDLISTFDS)` would write for `pid`. `None`
+    /// when the process cannot be read (it exited, or it belongs to another
+    /// user). A count of 0 is a real answer: the process holds no descriptors.
+    pub(super) fn fd_list_bytes(pid: u32) -> Option<usize> {
+        let wrote = unsafe {
+            // SAFETY: a null buffer asks for the byte count only; nothing is written.
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDLISTFDS,
+                0,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if wrote < 0 {
+            None
+        } else {
+            Some(wrote as usize)
+        }
+    }
+
+    /// The descriptors `pid` holds, as `(fd, type)` pairs. `None` when the
+    /// process cannot be read. An empty vector means it was readable and held
+    /// none. A list that keeps growing across retries is refused rather than
+    /// trusted: a descriptor table has no reason to triple in one call.
+    pub(super) fn fd_list(pid: u32) -> Option<Vec<(i32, u32)>> {
+        // `proc_fdinfo` is 8 bytes (verified against the SDK header). The call
+        // returns a byte count, so the buffer is sized in bytes and read back in
+        // whole entries only.
+        const ENTRY: usize = std::mem::size_of::<libc::proc_fdinfo>();
+        let mut bytes = fd_list_bytes(pid)?;
+        for _ in 0..8 {
+            if bytes == 0 {
+                return Some(Vec::new());
+            }
+            // Headroom for a descriptor opened between the count and the read.
+            let cap = bytes.saturating_add(ENTRY.saturating_mul(16));
+            let mut buf = vec![0u8; cap];
+            let wrote = unsafe {
+                // SAFETY: `buf` is writable and `cap` is its length. The kernel
+                // writes at most that many bytes of `proc_fdinfo` entries.
+                libc::proc_pidinfo(
+                    pid as libc::c_int,
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    cap as libc::c_int,
+                )
+            };
+            if wrote < 0 {
+                return None;
+            }
+            let wrote = wrote as usize;
+            if wrote <= cap {
+                let (chunks, _) = buf[..wrote].as_chunks::<ENTRY>();
+                let mut out = Vec::with_capacity(chunks.len());
+                for chunk in chunks {
+                    // SAFETY: `chunk` is `ENTRY` bytes copied out of a buffer the
+                    // kernel filled, and `proc_fdinfo` is two integers, so every
+                    // byte is defined and the type has no padding to worry about.
+                    let info = unsafe {
+                        std::ptr::read_unaligned(chunk.as_ptr().cast::<libc::proc_fdinfo>())
+                    };
+                    out.push((info.proc_fd, info.proc_fdtype));
+                }
+                return Some(out);
+            }
+            bytes = wrote;
+        }
+        None
+    }
+
+    /// The path of one vnode descriptor, or `None` when it has none.
+    ///
+    /// The flavor is `PROC_PIDFDVNODEINFO` (2). It fills a `vnode_fdinfowithpath`
+    /// even though its name does not say so: the path is present, and it is the
+    /// flavor that actually returns one. `PROC_PIDVNODEPATHINFO` (9) returns
+    /// nothing for a descriptor on this kernel. libc declares neither the flavor
+    /// constant nor the struct, so both are fixed here from the SDK header: the
+    /// buffer is 1200 bytes and the path is at offset 176 (`MAXPATHLEN` = 1024),
+    /// which was checked against a live call. A short or empty result is "no
+    /// path", never a zero-filled buffer reported as one.
+    pub(super) fn vnode_path(pid: u32, fd: i32) -> Option<std::path::PathBuf> {
+        const PROC_PIDFDVNODEINFO: libc::c_int = 2;
+        const VNODE_WITH_PATH: usize = 1200;
+        const PATH_OFFSET: usize = 176;
+        const PATH_LEN: usize = 1024;
+        let mut buf = vec![0u8; VNODE_WITH_PATH];
+        let wrote = unsafe {
+            // SAFETY: `buf` is writable storage of one `vnode_fdinfowithpath` and
+            // that size is what we pass. `fd` selects the descriptor. The kernel
+            // fills the buffer in place.
+            libc::proc_pidfdinfo(
+                pid as libc::c_int,
+                fd,
+                PROC_PIDFDVNODEINFO,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                VNODE_WITH_PATH as libc::c_int,
+            )
+        };
+        if (wrote as usize) < VNODE_WITH_PATH {
+            return None;
+        }
+        path_at(&buf, PATH_OFFSET, PATH_LEN)
+    }
+
+    /// A NUL-terminated path inside `buf`, or `None` when the slice is empty or
+    /// not valid text. Lossy conversion would invent a path the kernel did not
+    /// return, so invalid bytes are "no path".
+    fn path_at(buf: &[u8], offset: usize, len: usize) -> Option<std::path::PathBuf> {
+        let bytes = buf.get(offset..offset + len)?;
+        let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+        let text = std::str::from_utf8(&bytes[..end]).ok()?;
+        if text.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(text))
         }
     }
 

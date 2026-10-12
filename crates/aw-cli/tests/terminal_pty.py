@@ -26,7 +26,10 @@ def read_for(fd, seconds):
             continue
         try:
             part = os.read(fd, 4096)
-        except OSError:
+        except OSError as error:
+            # mac129 diagnosis: an EIO here is the slave closing. Keep what was
+            # already captured instead of discarding it.
+            data += ("\n[read EIO errno=%s]\n" % error.errno).encode()
             break
         if not part:
             break
@@ -56,11 +59,22 @@ def spawn(mode, argv):
 def interactive(mode, label, argv, inputs, expected):
     pid, fd = spawn(mode, argv)
     output = read_for(fd, 0.3)
-    for text in inputs:
-        os.write(fd, text)
-        output += read_for(fd, 0.35)
-    os.write(fd, b"\x04")
-    output += read_for(fd, 1.5)
+    try:
+        for text in inputs:
+            os.write(fd, text)
+            output += read_for(fd, 0.35)
+        os.write(fd, b"\x04")
+        output += read_for(fd, 1.5)
+    except OSError as error:
+        # mac129 diagnosis: the write itself failed (macOS EIO is errno 5).
+        # Print everything aw already produced, then aw's exit code.
+        sys.stderr.write(
+            "mac129-pty: %s write failed errno=%s; captured so far:\n%s\n"
+            % (label, error.errno, output)
+        )
+        code = wait_for_exit(pid, 3, label)
+        sys.stderr.write("mac129-pty: %s aw exit code after failed write: %s\n" % (label, code))
+        raise
     code = wait_for_exit(pid, 3, label)
     os.close(fd)
     for item in expected:

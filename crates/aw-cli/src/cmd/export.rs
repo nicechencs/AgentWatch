@@ -204,7 +204,9 @@ impl<F: ExportFetch> ExportSource for DaemonExport<F> {
                 detail: "还没有你的会话，@last 无处可指".to_owned(),
             }),
             Err(ExportFetchError::Failed { detail }) => Err(ExportError::Failed { detail }),
-            Err(ExportFetchError::Unreachable { detail }) => Err(ExportError::Unreachable { detail }),
+            Err(ExportFetchError::Unreachable { detail }) => {
+                Err(ExportError::Unreachable { detail })
+            }
         }
     }
 

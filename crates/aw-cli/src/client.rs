@@ -20,8 +20,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::endpoint::{Endpoint, HttpBase};
-use crate::secret::Secret;
 use crate::exit::{self, from_http_status};
+use crate::secret::Secret;
 
 /// One HTTP request, already decided by a command. Header values are not logged.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -468,7 +468,8 @@ fn roundtrip<S: Read + Write>(stream: &mut S, bytes: &[u8]) -> Result<ApiReply, 
     // port nobody listens on: the daemon is unreachable. A reset or a short
     // read after the peer did speak stays a broken connection.
     stream.read_to_end(&mut buf).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::TimedOut || err.kind() == std::io::ErrorKind::WouldBlock
+        if err.kind() == std::io::ErrorKind::TimedOut
+            || err.kind() == std::io::ErrorKind::WouldBlock
         {
             ClientError::Unreachable {
                 detail: format!("读取响应超时：{err}"),
@@ -609,9 +610,7 @@ impl Transport for MemoryTransport {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{
-        encode_request, parse_response, ApiRequest, Client, ClientError, MemoryTransport,
-    };
+    use super::{encode_request, parse_response, ApiRequest, Client, ClientError, MemoryTransport};
     use crate::endpoint::{resolve, EndpointInput};
     use crate::exit;
     use std::time::Duration;

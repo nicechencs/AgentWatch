@@ -211,7 +211,8 @@ impl TicketStore {
         let Some(secret) = random_secret("t-") else {
             return Err(TicketError::RandomUnavailable);
         };
-        self.tickets.insert(Secret::new(secret.clone()), ticket.clone());
+        self.tickets
+            .insert(Secret::new(secret.clone()), ticket.clone());
         Ok((ticket, secret))
     }
 

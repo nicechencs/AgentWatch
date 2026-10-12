@@ -275,8 +275,7 @@ fn is_loopback_host(host: &str) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        parse_loopback_http, resolve, Endpoint, EndpointError, EndpointInput,
-        DEFAULT_HTTP_PORT,
+        parse_loopback_http, resolve, Endpoint, EndpointError, EndpointInput, DEFAULT_HTTP_PORT,
     };
 
     fn input(

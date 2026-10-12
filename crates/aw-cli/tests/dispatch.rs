@@ -82,10 +82,7 @@ fn ps_without_a_daemon_exits_3() {
 /// not a general error. The sentence stays the reviewed one.
 #[test]
 fn missing_socket_query_commands_exit_3() {
-    let missing = std::env::temp_dir().join(format!(
-        "aw-cli-missing-{}.sock",
-        std::process::id()
-    ));
+    let missing = std::env::temp_dir().join(format!("aw-cli-missing-{}.sock", std::process::id()));
     let socket = missing.to_str().expect("socket path");
     for args in [
         &["--socket", socket, "sessions", "list"][..],
@@ -95,10 +92,7 @@ fn missing_socket_query_commands_exit_3() {
         let out = aw().args(args).output().expect("spawn aw");
         let err = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(3), "{args:?}: {err}");
-        assert!(
-            err.contains("连不上后台"),
-            "{args:?}: {err}"
-        );
+        assert!(err.contains("连不上后台"), "{args:?}: {err}");
     }
 }
 

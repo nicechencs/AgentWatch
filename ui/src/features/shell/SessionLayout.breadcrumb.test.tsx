@@ -1,5 +1,5 @@
 /**
- * The session header links back to the session list: 「会话 / <title>」.
+ * The session header links back to the session list: 「记录 / <title>」.
  */
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
@@ -32,7 +32,7 @@ vi.mock("@tanstack/react-router", async (importOriginal) => ({
 }));
 
 describe("session breadcrumb", () => {
-  it("links 「会话」 to the session list", async () => {
+  it("links 「记录」 to the session list", async () => {
     const { SessionLayout } = await import("@/features/shell/SessionLayout");
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     client.setQueryData(["session", "s-1"], toSession({ id: "s-1", session_id: 1, name: "sleep 60", mode: "launch", started_ns: 1, ended_ns: 2, collectors: [] }));

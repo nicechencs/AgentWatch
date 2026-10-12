@@ -15,12 +15,17 @@ import { sessionTitle } from "@/lib/session-title";
 import { sessionStatus } from "@/lib/session-status";
 import { useI18n } from "@/lib/i18n";
 
+// 第一眼只回答三个问题：它做了什么、动过哪些文件、连过哪里。
+// 时间线、进程、值得注意、它自己的说法、没记录到的，都在「更多」里，页面本身还在。
 const TABS = [
   { to: "/s/$sid", key: "nav.overview", exact: true },
-  { to: "/s/$sid/timeline", key: "nav.timeline" },
-  { to: "/s/$sid/processes", key: "nav.processes" },
   { to: "/s/$sid/files", key: "nav.files" },
   { to: "/s/$sid/network", key: "nav.network" },
+] as const;
+
+const MORE_TABS = [
+  { to: "/s/$sid/timeline", key: "nav.timeline" },
+  { to: "/s/$sid/processes", key: "nav.processes" },
   { to: "/s/$sid/findings", key: "nav.findings" },
   { to: "/s/$sid/self-report", key: "nav.selfReport" },
   { to: "/s/$sid/gaps", key: "nav.gaps" },
@@ -180,9 +185,31 @@ export function SessionLayout() {
             activeProps={{ className: "border-b-2 border-accent px-2 py-1.5 text-xs text-ink" }}
           >
             {t(tab.key)}
-            {tab.key === "nav.gaps" && data.stats?.gap_count ? ` (${data.stats.gap_count})` : ""}
           </Link>
         ))}
+        <Dropdown.Root>
+          <Dropdown.Trigger className="border-b-2 border-transparent px-2 py-1.5 text-xs text-ink-soft data-[state=open]:text-ink [&:has([data-status=active])]:border-accent [&:has([data-status=active])]:text-ink">
+            {t("nav.more")} ▾
+          </Dropdown.Trigger>
+          <Dropdown.Portal>
+            <Dropdown.Content className="rounded border border-line bg-paper p-1 text-xs shadow">
+              {MORE_TABS.map((tab) => (
+                <Dropdown.Item key={tab.key} asChild>
+                  <Link
+                    to={tab.to}
+                    params={{ sid }}
+                    search={{}}
+                    className="block cursor-pointer rounded px-2 py-1 text-ink-soft hover:bg-paper-sunken"
+                    activeProps={{ "data-status": "active", className: "block cursor-pointer rounded bg-paper-sunken px-2 py-1 text-ink" }}
+                  >
+                    {t(tab.key)}
+                    {tab.key === "nav.gaps" && data.stats?.gap_count ? ` (${data.stats.gap_count})` : ""}
+                  </Link>
+                </Dropdown.Item>
+              ))}
+            </Dropdown.Content>
+          </Dropdown.Portal>
+        </Dropdown.Root>
       </nav>
       <FilterBar query={query} patch={patch} />
       {histogram.data ? (

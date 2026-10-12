@@ -4,9 +4,12 @@
 //! thread. [`PollCollector::poll_once`] is one tick. Tests pass the timestamp and
 //! the snapshots, so this module never sleeps and never reads the host clock.
 //!
-//! The first successful process sample and the first successful connection sample
-//! are baselines: rows already present are not reported as new. A failed sample is
-//! a [`Gap`] and is not stored as an empty baseline, so the next success does not
+//! The first successful process sample is a baseline: rows already present are
+//! not reported as new, because a poll cannot say when they started. The first
+//! successful connection sample is recorded. Each established row of a watched
+//! pid is a [`EventKind::NetConnect`] marked [`NaReason::Preexisting`]: the table
+//! shows the flow is open and does not say when it opened. A failed sample is a
+//! [`Gap`] and is not stored as an empty baseline, so the next success does not
 //! look like every process just started.
 
 use std::time::Duration;
@@ -393,7 +396,13 @@ where
         let unowned = unowned_connection_count(&sample);
         let filtered = filter_connections(&sample, &self.watched);
         if self.conn_baseline.is_none() {
+            // The first table is a reading, not a silence. Every established row
+            // of a watched pid was already open when observation started, so it
+            // is recorded and marked preexisting. Storing the table alone made a
+            // live flow indistinguishable from no flow.
+            let preexisting = filtered.clone();
             self.conn_baseline = Some(filtered);
+            self.emit_preexisting(&preexisting, sink, mono_ns, wall_ns)?;
             self.emit_unowned_gaps(sink, unowned, mono_ns, wall_ns)?;
             return Ok(());
         }
@@ -430,6 +439,53 @@ where
         }
         self.conn_baseline = Some(filtered);
         self.emit_unowned_gaps(sink, unowned, mono_ns, wall_ns)?;
+        Ok(())
+    }
+
+    /// Record every established row of the first connection sample.
+    ///
+    /// Each event is a [`EventKind::NetConnect`] at evidence S, with `start_ns`
+    /// marked [`NaReason::Preexisting`]: the table shows the flow is open and
+    /// does not say when it opened. A row this helper cannot build becomes a
+    /// parse gap, the same as a later delta it cannot build. Listeners never
+    /// reach here; [`filter_connections`] keeps them out of the baseline.
+    fn emit_preexisting(
+        &mut self,
+        sample: &ConnectionSnapshot,
+        sink: &mut dyn EventSink,
+        mono_ns: u64,
+        wall_ns: i64,
+    ) -> Result<(), CollectorError> {
+        let source = Source::new(NET_SOURCE);
+        let procs = self.proc_baseline.clone();
+        for row in &sample.rows {
+            if row.listening || row.remote.is_none() {
+                continue;
+            }
+            let Some(pid) = row.pid else {
+                continue;
+            };
+            if !self.watched.contains(&pid) {
+                continue;
+            }
+            let proc = procs.as_ref().and_then(|snap| proc_of(snap, pid));
+            let seq = self.next_seq();
+            let delta = ConnectionDelta::Connected(row.clone());
+            match build_connection_event(&delta, seq, mono_ns, wall_ns, &source, proc) {
+                Ok(mut event) => {
+                    event.mark_na("start_ns", NaReason::Preexisting);
+                    self.emit(sink, event, mono_ns, wall_ns)?;
+                }
+                Err(()) => self.emit_source_gap(
+                    sink,
+                    NET_SOURCE,
+                    SourceFailure::Parse,
+                    "net",
+                    mono_ns,
+                    wall_ns,
+                )?,
+            }
+        }
         Ok(())
     }
 
@@ -711,7 +767,9 @@ where
         self.remember_scope(scope);
         self.seq = 0;
         self.last_error = None;
-        // Baselines only. No ProcessStart / NetConnect for rows already present.
+        // Process rows already present stay a baseline: a poll cannot say when
+        // they started. Connections already present are recorded, marked as
+        // preexisting, because a table row is an observation of a live flow.
         // A failed first sample leaves the baseline empty and emits a gap; the
         // collector is still running so a later poll_once can try again.
         // `clock` was set by `start_at`. The trait has no timestamp, so a direct
@@ -861,7 +919,7 @@ fn proc_of(sample: &ProcessSnapshot, pid: u32) -> Option<ProcRef> {
     use crate::source::ProcessStartTime;
     use aw_core::proc::{ProcessIdentity, StartTimeUnit};
 
-    let boot = sample.boot_id.as_deref()?;
+    let boot = sample.boot_id.as_deref().unwrap_or(b"");
     let row = sample.rows.iter().find(|row| row.pid == pid)?;
     let ProcessStartTime::UnixSeconds(secs) = row.start else {
         return None;
@@ -1201,6 +1259,63 @@ mod tests {
         assert_eq!(gap.gap_kind, GapKind::CollectorDisconnected);
         assert_eq!(sink.events()[0].ts_mono_ns, MONO);
         assert_ne!(sink.events()[0].evidence, Evidence::S);
+    }
+
+    /// A flow that is already established when observation starts used to be
+    /// stored as the baseline and never emitted, so a live connection and no
+    /// connection looked the same. It is recorded, and `start_ns` says the open
+    /// time was not observed.
+    #[test]
+    fn connection_present_at_start_is_recorded_as_preexisting() {
+        let procs = snap(vec![row(10, Some(1))]);
+        let open = ConnectionSnapshot::new(vec![flow(10, 4000, 443)]);
+        let mut c = collector(vec![procs.clone(), procs], vec![open.clone(), open]);
+        let mut sink = VecSink::with_capacity(4);
+        c.start_at(
+            &Scope::attach([uid_of(10)]).expect("root"),
+            &mut sink,
+            MONO,
+            WALL,
+        )
+        .expect("start");
+        assert_eq!(kinds(&sink), vec!["net_connect"]);
+        let event = &sink.events()[0];
+        assert_eq!(event.evidence, Evidence::S);
+        assert_eq!(event.source.as_str(), "poll/netstat");
+        assert_eq!(
+            event.field_evidence.get("start_ns"),
+            Some(&Evidence::NA(NaReason::Preexisting))
+        );
+        assert!(
+            event.proc.is_some(),
+            "the watched pid is in the process baseline"
+        );
+
+        // The same row on the next tick is not a second connect.
+        c.poll_once(&mut sink, MONO + 1, WALL).expect("tick");
+        assert_eq!(kinds(&sink), vec!["net_connect"]);
+    }
+
+    /// The platform returns no boot id when it cannot name the boot (Windows
+    /// without the right to read the System process). That is an empty input,
+    /// not "no identity": the daemon hashes its roots with the same empty input.
+    /// Dropping it matched nothing, so the watch never started.
+    #[test]
+    fn an_empty_boot_id_still_resolves_the_root() {
+        let procs = ProcessSnapshot::without_boot_id(vec![row(10, Some(1))]);
+        let uid = ProcessIdentity::from_parts(b"", 10, 1_700_000_000, StartTimeUnit::Seconds)
+            .expect("an empty boot id is a valid input")
+            .uid;
+        let open = ConnectionSnapshot::new(vec![flow(10, 4000, 443)]);
+        let mut c = collector(vec![procs.clone(), procs], vec![open.clone(), open]);
+        let mut sink = VecSink::with_capacity(4);
+        c.start_at(&Scope::attach([uid]).expect("root"), &mut sink, MONO, WALL)
+            .expect("start");
+        assert_eq!(
+            kinds(&sink),
+            vec!["net_connect"],
+            "a root hashed with an empty boot id is still watched"
+        );
     }
 
     #[test]

@@ -199,11 +199,21 @@ fn platform_net_unavailable() -> Option<NaReason> {
 
 #[cfg(windows)]
 fn read_netstat() -> Result<ConnectionSnapshot, SourceError> {
-    let output = std::process::Command::new("netstat")
-        .args(["-ano"])
+    // `netstat` writes its header in the console output code page. A process
+    // with no console gets the system ANSI code page, which is not UTF-8 on a
+    // Chinese Windows, so the header bytes are not UTF-8 and the whole table
+    // was rejected as a parse failure. `chcp 65001` switches that one console
+    // to UTF-8 before `netstat` runs. It does not change this process's code
+    // page, and it does not need elevation.
+    let output = std::process::Command::new("cmd")
+        .args(["/d", "/c", "chcp 65001 >nul & netstat -ano"])
         .output()
         .map_err(|_| SourceError::disconnected())?;
-    classify_netstat(&output.stdout, output.status.success(), output.status.code())
+    classify_netstat(
+        &output.stdout,
+        output.status.success(),
+        output.status.code(),
+    )
 }
 
 /// Turn one finished `netstat -ano` into a snapshot.

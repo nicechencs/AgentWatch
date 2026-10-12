@@ -218,6 +218,25 @@ impl NetAggregator {
         self.bucket_ns = secs.saturating_mul(1_000_000_000);
     }
 
+    /// One record per flow that has not closed.
+    ///
+    /// A caller that persists one tick at a time uses this: a `NetConnect`
+    /// alone does not emit a row, and one tick never reaches the 30 s partial
+    /// flush. The record is the same snapshot a partial flush writes (`partial`
+    /// is `true`, `end_ns` is `None`). Closed flows are not included; their
+    /// final row was emitted when they closed.
+    pub fn open_records(&self) -> Vec<NetFlowRec> {
+        let mut rows = Vec::new();
+        for acc in self.open.values() {
+            if !acc.closed {
+                rows.push(acc.snapshot(true));
+            }
+        }
+        // `flow_id` grows by one per new flow, so the newest is last.
+        rows.sort_by_key(|rec| rec.flow_id.unwrap_or(0));
+        rows
+    }
+
     /// Group every flow this aggregator has seen, open and closed.
     pub fn summarize(&self, by: FlowGroupBy) -> Vec<FlowSummary> {
         // A closed flow stays in `open` and is also copied into `closed`.

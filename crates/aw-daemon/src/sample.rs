@@ -34,7 +34,9 @@ use aw_core::{
     RawEvent, RawEventParts, Scope, SessionId, Source, StartHow, VecSink,
 };
 use aw_pipeline::gaps::{self, DEPTH_UNOBSERVED_DETAIL, STORE_FAILURE_DETAIL};
-use aw_pipeline::{GapRec, NetFlowRec, Output, Pipeline, PipelineConfig, ProcessRec};
+use aw_pipeline::{
+    GapRec, NetAggregator, NetFlowRec, Output, Pipeline, PipelineConfig, ProcessRec,
+};
 use aw_store::{
     DnsRow, GapRow, NetFlowBucketRow, NetFlowRow, ProcessImageRow, ProcessRow, RecordSink,
     SessionRow, SqliteSink, Store, WriteBatch,
@@ -196,6 +198,23 @@ pub struct HostSampler {
     /// One sample is one batch, so the window has to outlive the batch; closing
     /// it per sample wrote one `gaps` row per failed tick.
     open_gaps: BTreeMap<GapMergeKey, OpenGap>,
+    /// Connections still open. [`Pipeline::replay`] finishes one tick and drops
+    /// them: a `NetConnect` only becomes a `net_flows` row 30 s later, or when
+    /// it closes, and neither happens inside one 250 ms batch. The next tick
+    /// continues the same flow instead of starting it again.
+    open_flows: NetAggregator,
+    /// Flow ids whose first event said the open time was not observed
+    /// (`NA(preexisting)`). The id is the one [`NetAggregator`] assigns, which
+    /// is also the `net_flows` upsert key, so the mark follows the row.
+    preexisting: BTreeSet<u64>,
+    /// Wall time (unix nanoseconds) of the sample that first saw each flow.
+    ///
+    /// The aggregator only keeps the monotonic tick. The `net_flows.start_ns`
+    /// column is wall time (storage.md §3), so the tick is not what gets stored.
+    flow_seen_wall: BTreeMap<u64, i64>,
+    /// Wall time of the tick currently being stored. A flow first seen inside
+    /// that tick, and not marked preexisting, is stamped with this.
+    last_wall_ns: i64,
 }
 
 impl HostSampler {
@@ -221,6 +240,10 @@ impl HostSampler {
             root_uid: None,
             last_sample_ns: None,
             open_gaps: BTreeMap::new(),
+            open_flows: NetAggregator::new(5),
+            preexisting: BTreeSet::new(),
+            flow_seen_wall: BTreeMap::new(),
+            last_wall_ns: 0,
         }
     }
 
@@ -412,13 +435,136 @@ impl HostSampler {
 
     /// Stop emitting. The collector has no thread of its own.
     ///
-    /// Merge windows still open are written first. Leaving them in memory
-    /// would drop the last few seconds of a failure when the process stops.
+    /// Connections and merge windows still open are written first. Leaving
+    /// them in memory would drop a flow that was open at attach, and the last
+    /// few seconds of a failure, when the process stops.
     pub fn stop(&mut self) {
+        self.write_open_flows();
         self.write_open_gaps();
         if self.started {
             let _ = Collector::stop(&mut self.collector);
             self.started = false;
+        }
+    }
+
+    /// Fold this tick's connects and closes into the flow that outlives the tick.
+    ///
+    /// A connect marked `NA(preexisting)` is remembered by its flow id. The mark
+    /// says the table showed the flow already open; it does not say when the
+    /// flow opened, so the stored row's `preexisting` column is 1 and `start_ns`
+    /// is the wall time the flow was first seen, not the monotonic tick.
+    ///
+    /// `observe` writes a finished row (a close, or a UDP idle close) into the
+    /// scratch output and then drops the flow from the open map. That scratch is
+    /// not the replay, so those rows are returned and written with this tick.
+    /// Leaving them in the scratch would drop the close.
+    fn carry_flows(&mut self, events: &[aw_core::RawEvent], wall_ns: i64) -> Vec<NetFlowRow> {
+        let mut scratch = Output::empty();
+        for event in events {
+            let marked = matches!(&event.kind, EventKind::NetConnect(_))
+                && event
+                    .field_evidence
+                    .get("start_ns")
+                    .is_some_and(|grade| grade == &Evidence::NA(NaReason::Preexisting));
+            let before = if marked {
+                self.open_flows.open_records().len()
+            } else {
+                0
+            };
+            self.open_flows.observe(event, &mut scratch);
+            if !marked {
+                continue;
+            }
+            // A preexisting connect opens exactly one flow, and ids grow by one,
+            // so the new record is the last. A connect for a flow already open
+            // does not add one; its mark is already stored.
+            let open = self.open_flows.open_records();
+            if open.len() == before + 1 {
+                if let Some(id) = open.last().and_then(|rec| rec.flow_id) {
+                    self.preexisting.insert(id);
+                    self.flow_seen_wall.insert(id, wall_ns);
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        for rec in &scratch.net_flows {
+            let Some(mut row) = flow_row(rec) else {
+                continue;
+            };
+            self.stamp_flow(&mut row);
+            // `end_ns` is the monotonic tick of the close, and the column is wall
+            // time. The close is in this tick, so the tick's wall time is the end.
+            if row.end_ns.is_some() {
+                row.end_ns = Some(wall_ns);
+            }
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// Rows for flows still open after this tick. A flow this tick closed is not
+    /// here: [`NetAggregator::open_records`] skips closed flows, and
+    /// [`Self::carry_flows`] already returned that close's final row.
+    fn carried_flow_rows(&mut self) -> Vec<NetFlowRow> {
+        let mut rows = Vec::new();
+        for rec in self.open_flows.open_records() {
+            if let Some(id) = rec.flow_id {
+                self.flow_seen_wall.entry(id).or_insert(self.last_wall_ns);
+            }
+            let Some(mut row) = flow_row(&rec) else {
+                continue;
+            };
+            self.stamp_flow(&mut row);
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// Put the preexisting mark and the wall time onto one row.
+    ///
+    /// `flow_row` stores the aggregator's monotonic `start_ns`, which the `gaps`
+    /// page and the timeline read as unix time. A poll flow's open instant is the
+    /// wall time of the sample that first saw it. For a flow already open at
+    /// attach that instant is "first seen", not "opened": `preexisting` stays 1
+    /// so the two are not confused. The mark is not in the store's UPDATE clause,
+    /// so a later snapshot of the same id cannot clear it.
+    fn stamp_flow(&self, row: &mut NetFlowRow) {
+        let id = u64::try_from(row.id).ok();
+        if let Some(wall) = id.and_then(|id| self.flow_seen_wall.get(&id).copied()) {
+            row.start_ns = wall;
+        }
+        if id.is_some_and(|id| self.preexisting.contains(&id)) {
+            row.preexisting = 1;
+        }
+    }
+
+    /// Write every connection still open, then keep following it.
+    ///
+    /// A poll flow has no close of its own until the row leaves the table, and
+    /// one tick never reaches the 30 s partial flush. Writing the open snapshot
+    /// here is what puts a flow that was already established at attach into
+    /// `net_flows`. The aggregator is not cleared: the next tick still has the
+    /// flow, and the store upserts onto the same id. The preexisting mark is
+    /// not cleared either, so a later snapshot of the same flow does not say
+    /// the open time was observed.
+    fn write_open_flows(&mut self) {
+        let mut batch = WriteBatch::default();
+        for rec in self.open_flows.open_records() {
+            let Some(mut row) = flow_row(&rec) else {
+                continue;
+            };
+            self.stamp_flow(&mut row);
+            let own = self.target.db_id;
+            if own != SESSION_DB_ID {
+                row.session_id = own;
+            }
+            batch.net_flows.push(row);
+        }
+        if batch.net_flows.is_empty() {
+            return;
+        }
+        if let Err(err) = write_one_batch(&self.db_path, &batch) {
+            tracing::warn!(error = %err, "open flow write failed");
         }
     }
 
@@ -434,12 +580,7 @@ impl HostSampler {
         for (key, open) in &taken {
             batch.gaps.push(open.clone().into_row(key, session));
         }
-        let written = (|| -> io::Result<()> {
-            let mut store = Store::open_runtime(&self.db_path).map_err(|err| store_io(&err))?;
-            let mut writer = SqliteSink::new(&mut store).map_err(|err| store_io(&err))?;
-            writer.write_batch(&batch).map_err(|err| store_io(&err))?;
-            Ok(())
-        })();
+        let written = write_one_batch(&self.db_path, &batch);
         if let Err(err) = written {
             tracing::warn!(error = %err, "open gap write failed");
             self.open_gaps = taken;
@@ -755,12 +896,17 @@ impl HostSampler {
         // `map_events` drops `EventKind::Gap`: replay has no sink, so the
         // batcher never merges them either. Fold them here. A burst of the
         // same failure (one per 250 ms sample) closes as one row per 5 s.
-        batch
-            .gaps
-            .extend(self.take_merged_gaps(events, wall_ns));
+        batch.gaps.extend(self.take_merged_gaps(events, wall_ns));
         batch.process_images = image_rows(events, &self.imaged, wall_ns);
         let from_output = map_output(&output, clock);
         batch.processes.extend(from_output.processes);
+        // One replay ends before a connect becomes a row (the 30 s partial
+        // flush never arrives inside a tick). Carry the flow across ticks and
+        // write the ones still open. A close the carry observed is a finished
+        // row of its own; the open snapshot upserts onto the same id.
+        self.last_wall_ns = wall_ns;
+        batch.net_flows.extend(self.carry_flows(events, wall_ns));
+        batch.net_flows.extend(self.carried_flow_rows());
         batch.net_flows.extend(from_output.net_flows);
         batch.net_flow_buckets.extend(from_output.net_flow_buckets);
         batch.dns.extend(from_output.dns);
@@ -783,6 +929,15 @@ impl HostSampler {
                 row.session_id = Some(own);
             }
             for row in &mut batch.process_images {
+                row.session_id = own;
+            }
+            for row in &mut batch.net_flows {
+                row.session_id = own;
+            }
+            for row in &mut batch.net_flow_buckets {
+                row.session_id = own;
+            }
+            for row in &mut batch.dns {
                 row.session_id = own;
             }
         }
@@ -1497,6 +1652,15 @@ fn ip_is_loopback(ip: &str) -> bool {
     matches!(ip.parse::<IpAddr>(), Ok(addr) if addr.is_loopback())
 }
 
+/// Write one batch and drop the connection. Used for the rows a tick does not
+/// carry in its own `persist` batch: the open flows at stop, and a gap window
+/// closed after the last sample.
+fn write_one_batch(db_path: &std::path::Path, batch: &WriteBatch) -> io::Result<()> {
+    let mut store = Store::open_runtime(db_path).map_err(|err| store_io(&err))?;
+    let mut writer = SqliteSink::new(&mut store).map_err(|err| store_io(&err))?;
+    writer.write_batch(batch).map_err(|err| store_io(&err))
+}
+
 fn bucket_row(bucket: &aw_pipeline::FlowBucketRec) -> Option<NetFlowBucketRow> {
     let (bytes_up, bytes_down) = match (bucket.bytes_up, bucket.bytes_down) {
         (None, None) => return None,
@@ -1700,6 +1864,138 @@ mod depth_tests {
             source: Source::new("poll/test"),
             agent: None,
         }
+    }
+
+    /// A connection already open at attach used to be the baseline and never a
+    /// row, so the session looked like it had no traffic. It is stored, the
+    /// open time is marked unobserved, and a second tick of the same flow does
+    /// not insert another row.
+    #[test]
+    fn a_connection_open_at_attach_is_stored_as_preexisting() {
+        let (dir, db) = temp_db("preexisting");
+        drop(aw_store::Store::open_startup(&db).expect("startup store"));
+        let mut sampler = super::HostSampler::new(&db);
+        let mut event = connect_event(1, 42);
+        event.mark_na("start_ns", aw_core::NaReason::Preexisting);
+        let seen = 1_700_000_000_000_000_000_i64;
+        sampler.persist(&[event.clone()], seen).expect("first tick");
+        sampler
+            .persist(&[event], seen + 1_000)
+            .expect("same flow again");
+
+        let store = aw_store::Store::open(&db).expect("open");
+        let row: (i64, Option<i64>, Option<i64>, i64, i64, String) = store
+            .connection()
+            .query_row(
+                "SELECT preexisting, bytes_up, bytes_down, start_ns, COUNT(*), evidence \
+                 FROM net_flows",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("one flow row");
+        assert_eq!(row.0, 1, "open at attach");
+        assert_eq!(row.1, None, "bytes sent were not read");
+        assert_eq!(row.2, None, "bytes received were not read");
+        assert_eq!(row.3, seen, "start is the wall time it was first seen");
+        assert_eq!(row.4, 1, "the same flow is one row, not one per tick");
+        assert_eq!(row.5, "S");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A flow that leaves the table is a close. The carry used to drop that row
+    /// into an output it then threw away, so the session never recorded the end.
+    #[test]
+    fn a_flow_that_closes_is_stored_once_with_its_end() {
+        let (dir, db) = temp_db("flow-close");
+        drop(aw_store::Store::open_startup(&db).expect("startup store"));
+        let mut sampler = super::HostSampler::new(&db);
+        let open = connect_event(1, 42);
+        let seen = 1_700_000_000_000_000_000_i64;
+        sampler.persist(&[open], seen).expect("open");
+        let closed = close_event(2, 42);
+        sampler
+            .persist(&[closed], seen + 250_000_000)
+            .expect("close");
+
+        let store = aw_store::Store::open(&db).expect("open");
+        let rows: Vec<(i64, Option<i64>, i64)> = {
+            let mut stmt = store
+                .connection()
+                .prepare("SELECT preexisting, end_ns, COUNT(*) FROM net_flows GROUP BY id")
+                .expect("prepare");
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("rows")
+        };
+        assert_eq!(rows.len(), 1, "the close updates the open row");
+        assert_eq!(rows[0].0, 0, "this flow was not open at attach");
+        assert!(rows[0].1.is_some(), "the close recorded an end");
+        assert_eq!(rows[0].2, 1);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn connect_event(seq: u64, pid: u32) -> aw_core::RawEvent {
+        let flow = aw_core::FlowKey::new(
+            aw_core::L4Proto::Tcp,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 4000)),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 443)),
+            None,
+        );
+        aw_core::RawEvent::try_new(aw_core::RawEventParts {
+            seq,
+            ts_mono_ns: seq * 1_000,
+            ts_wall_ns: 1_700_000_000_000_000_000,
+            session_id: Some(aw_core::SessionId(1)),
+            proc: Some(aw_core::ProcRef {
+                uid: ProcUid(u64::from(pid) + 0x5000),
+                pid,
+                tid: None,
+            }),
+            source: Source::new("poll/netstat"),
+            evidence: Evidence::S,
+            kind: aw_core::EventKind::NetConnect(aw_core::NetConnect::new(
+                flow,
+                aw_core::FlowDirection::Unknown,
+                None,
+            )),
+        })
+        .expect("event")
+    }
+
+    fn close_event(seq: u64, pid: u32) -> aw_core::RawEvent {
+        let flow = aw_core::FlowKey::new(
+            aw_core::L4Proto::Tcp,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 4000)),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 443)),
+            None,
+        );
+        aw_core::RawEvent::try_new(aw_core::RawEventParts {
+            seq,
+            ts_mono_ns: seq * 1_000,
+            ts_wall_ns: 1_700_000_000_000_000_000,
+            session_id: Some(aw_core::SessionId(1)),
+            proc: Some(aw_core::ProcRef {
+                uid: ProcUid(u64::from(pid) + 0x5000),
+                pid,
+                tid: None,
+            }),
+            source: Source::new("poll/netstat"),
+            evidence: Evidence::S,
+            kind: aw_core::EventKind::NetClose(aw_core::NetClose::new(flow, None, None)),
+        })
+        .expect("event")
     }
 
     fn proc_event(seq: u64, pid: u32, kind: aw_core::EventKind) -> aw_core::RawEvent {
@@ -2114,11 +2410,7 @@ mod depth_tests {
         let step = 250_000_000_i64;
         let mut events = Vec::new();
         for i in 0..19_i64 {
-            events.push(gap_at(
-                i as u64,
-                base + i * step,
-                aw_core::GapKind::Unknown,
-            ));
+            events.push(gap_at(i as u64, base + i * step, aw_core::GapKind::Unknown));
         }
         let last = base + 19 * step;
         events.push(gap_at(19, last, aw_core::GapKind::ParseError));

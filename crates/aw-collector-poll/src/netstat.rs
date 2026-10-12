@@ -87,6 +87,10 @@ fn parse_endpoint(word: &str) -> Option<SocketAddr> {
     }
     if let Some(rest) = word.strip_prefix('[') {
         let (addr, port) = rest.split_once("]:")?;
+        // Windows appends a zone id to link-local addresses (`fe80::1%12`).
+        // The address is the part before it; the zone names an interface, not
+        // a different host, and a flow does not record it.
+        let addr = addr.split_once('%').map(|(addr, _)| addr).unwrap_or(addr);
         let ip = addr.parse::<Ipv6Addr>().ok()?;
         let port = port.parse::<u16>().ok()?;
         return Some(SocketAddr::new(IpAddr::V6(ip), port));
@@ -159,6 +163,33 @@ Active Connections\n\n  Proto  Local Address          Foreign Address        Sta
         assert_eq!(udp.proto, L4Proto::Udp);
         assert!(udp.listening);
         assert_eq!(udp.pid, Some(53));
+    }
+
+    /// Windows prints a zone id on link-local addresses (`fe80::1%12`). The
+    /// address is the part before it. One such row used to fail the whole
+    /// table, so every TCP row in the same sample was dropped with it.
+    #[test]
+    fn link_local_zone_id_is_parsed_and_not_kept() {
+        let text = "\
+Active Connections\n\n  Proto  Local Address          Foreign Address        State           PID\n  UDP    [fe80::1%12]:5353      *:*                                    42\n  TCP    127.0.0.1:443          127.0.0.1:51000        ESTABLISHED     7\n";
+        let snap = parse_netstat_ano(text).expect("zone id is not a broken line");
+        assert_eq!(
+            snap.rows.len(),
+            2,
+            "the TCP row survives the link-local row"
+        );
+        let udp = &snap.rows[0];
+        assert_eq!(udp.proto, L4Proto::Udp);
+        assert_eq!(udp.pid, Some(42));
+        assert!(udp.listening);
+        assert_eq!(
+            udp.local,
+            SocketAddr::new(IpAddr::V6("fe80::1".parse().expect("addr")), 5353)
+        );
+        assert!(
+            !udp.local.to_string().contains('%'),
+            "the zone id is an interface, not part of the address"
+        );
     }
 
     #[test]

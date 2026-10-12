@@ -344,9 +344,11 @@ pub(crate) fn parent_uid(row: &ProcessRow, snapshot: &ProcessSnapshot) -> Option
 
 /// Pid of every row whose identity hash equals one of `uids`.
 pub(crate) fn pids_for_uids(snapshot: &ProcessSnapshot, uids: &[ProcUid]) -> Vec<u32> {
-    let Some(boot) = snapshot.boot_id.as_deref() else {
-        return Vec::new();
-    };
+    // `None` is an empty boot id, not "no identity". An empty slice hashes to a
+    // real uid (the platform returns one when it cannot name the boot), and the
+    // caller hashed its roots the same way. Treating it as missing matched
+    // nothing, so the watch never started and no connection was recorded.
+    let boot = snapshot.boot_id.as_deref().unwrap_or(b"");
     let mut pids = Vec::new();
     for row in &snapshot.rows {
         let ProcessStartTime::UnixSeconds(secs) = row.start else {

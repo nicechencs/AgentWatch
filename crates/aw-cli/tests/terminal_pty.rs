@@ -82,6 +82,7 @@ fn answer(stream: &mut UnixStream) {
     } else if request.starts_with("POST /api/v1/sessions/s-pty/adopt ")
         || request.starts_with("POST /api/v1/sessions/s-pty/commit ")
         || request.starts_with("POST /api/v1/sessions/s-pty/exit ")
+        || request.starts_with("POST /api/v1/sessions/s-pty/leftovers ")
     {
         (200, "{}")
     } else {

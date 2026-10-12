@@ -44,6 +44,8 @@ pub struct Watchdog {
     program_pid: u32,
     released: bool,
     cleanup: Option<CleanupReport>,
+    pending: PendingSignals,
+    registrations: Vec<signal_hook::SigId>,
 }
 
 /// Bounded cleanup data that can safely cross the private watchdog socket and
@@ -65,6 +67,7 @@ enum SupervisorEvent {
 struct PendingSignals {
     interrupt: Arc<AtomicBool>,
     terminate: Arc<AtomicBool>,
+    hangup: Arc<AtomicBool>,
 }
 
 impl PendingSignals {
@@ -72,10 +75,11 @@ impl PendingSignals {
         Self {
             interrupt: Arc::new(AtomicBool::new(false)),
             terminate: Arc::new(AtomicBool::new(false)),
+            hangup: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn take_all(&self) -> [Option<Signal>; 2] {
+    fn take_all(&self) -> [Option<Signal>; 3] {
         [
             self.interrupt
                 .swap(false, Ordering::SeqCst)
@@ -83,6 +87,9 @@ impl PendingSignals {
             self.terminate
                 .swap(false, Ordering::SeqCst)
                 .then_some(Signal::SIGTERM),
+            self.hangup
+                .swap(false, Ordering::SeqCst)
+                .then_some(Signal::SIGHUP),
         ]
     }
 }
@@ -202,8 +209,13 @@ fn run_inner(control: &mut UnixStream, died: &AtomicBool) -> i32 {
     }
 
     let (events_tx, events) = mpsc::channel();
-    if let Ok(mut watch) = control.try_clone() {
+    // The cleanup report is written on `control` after the target exits, so
+    // the parent reads it from the socket it already holds. A cloned reader
+    // would consume that report and the parent would treat a normal exit as a
+    // missing report.
+    if let Ok(watch) = control.try_clone() {
         std::thread::spawn(move || {
+            let mut watch = watch;
             let mut byte = [0_u8; 1];
             loop {
                 match watch.read(&mut byte) {
@@ -227,7 +239,7 @@ fn run_inner(control: &mut UnixStream, died: &AtomicBool) -> i32 {
     loop {
         // Reap adopted short-lived descendants continuously. Waiting only
         // after the root exits lets zombies accumulate under the subreaper.
-        aw_platform::reap_watchdog_children();
+        aw_platform::reap_watchdog_children(pid);
         if died.load(Ordering::Relaxed) {
             return finish_cleanup(control, 1);
         }
@@ -336,6 +348,23 @@ impl Watchdog {
     /// Spawn a held watchdog. Its target exists but cannot exec until release.
     pub fn spawn(spec: &RunSpec, terminal_handoff: bool) -> Result<Self, WatchdogError> {
         aw_platform::prepare_watchdog_fallback().map_err(|_| WatchdogError::Unavailable)?;
+        // Register before the target is released. The default action for each
+        // of these exits aw, and a signal arriving before `wait` would be
+        // reported as aw's own death instead of the program's exit code.
+        // Do not preset SIG_IGN: signal-hook chains the disposition it finds,
+        // and chaining SIG_IGN jumps to address 1.
+        let pending = PendingSignals::new();
+        let mut registrations = Vec::new();
+        for (signal, flag) in [
+            (Signal::SIGINT, &pending.interrupt),
+            (Signal::SIGTERM, &pending.terminate),
+            (Signal::SIGHUP, &pending.hangup),
+        ] {
+            registrations.push(
+                signal_hook::flag::register(signal as i32, Arc::clone(flag))
+                    .map_err(|_| WatchdogError::Unavailable)?,
+            );
+        }
         let bytes = serde_json::to_vec(&Request::from_run(spec, terminal_handoff))
             .map_err(|_| WatchdogError::Unavailable)?;
         let (mut parent, child_control) =
@@ -362,6 +391,8 @@ impl Watchdog {
             program_pid: u32::from_be_bytes(reply[1..].try_into().unwrap_or([0; 4])),
             released: false,
             cleanup: None,
+            pending,
+            registrations,
         })
     }
 
@@ -412,22 +443,16 @@ impl Watchdog {
     /// target group. Terminal Ctrl-C is not used here: interactive launches
     /// retain the terminal-specific path instead.
     pub fn wait(&mut self) -> Result<i32, WatchdogError> {
-        let pending = PendingSignals::new();
-        let mut registrations = Vec::new();
-        // No controlling terminal means a SIGHUP can be a shell/job-control
-        // notification, not a terminal disconnect.  Only the terminal waiter
-        // forwards real SIGHUP events to the watchdog.
-        registrations.push(
-            signal_hook::flag::register(Signal::SIGINT as i32, Arc::clone(&pending.interrupt))
-                .map_err(|_| WatchdogError::Unavailable)?,
-        );
-        registrations.push(
-            signal_hook::flag::register(Signal::SIGTERM as i32, Arc::clone(&pending.terminate))
-                .map_err(|_| WatchdogError::Unavailable)?,
-        );
+        // The handlers were installed in `spawn`, before the target could run,
+        // so a signal delivered while the daemon adopted the pid is still
+        // waiting in the flags. This waiter runs only when aw has no terminal
+        // of its own, so a SIGHUP here was delivered to aw directly and is
+        // forwarded like the others. A real terminal disconnect is observed by
+        // the terminal waiter instead, which forwards that one SIGHUP over the
+        // control socket.
         let result = loop {
             let mut relay_error = None;
-            for signal in pending.take_all().into_iter().flatten() {
+            for signal in self.pending.take_all().into_iter().flatten() {
                 if let Err(error) = self.forward(signal) {
                     relay_error = Some(error);
                     break;
@@ -465,7 +490,7 @@ impl Watchdog {
                 None => std::thread::sleep(SIGNAL_POLL),
             }
         };
-        for id in registrations {
+        for id in self.registrations.drain(..) {
             let _ = signal_hook::low_level::unregister(id);
         }
         result
@@ -485,10 +510,8 @@ impl Watchdog {
             let _ = self.child.kill();
         }
         let _ = self.child.wait();
-        if self.released {
-            if self.read_cleanup_report().is_err() {
-                self.record_fallback_cleanup();
-            }
+        if self.released && self.read_cleanup_report().is_err() {
+            self.record_fallback_cleanup();
         }
     }
 
@@ -502,14 +525,8 @@ impl Watchdog {
     /// Consume the cleanup status exactly once after `wait`. A missing value
     /// means the cleanup completed within its budget; callers must not invent
     /// a zero-count report.
-    pub(crate) fn cleanup_leftovers(&mut self) -> Option<crate::cmd::attach::CleanupLeftovers> {
-        self.cleanup
-            .take()
-            .map(|report| crate::cmd::attach::CleanupLeftovers {
-                count: report.count,
-                pids: report.pids,
-                eperm_pid: report.eperm_pid,
-            })
+    pub(crate) fn cleanup_leftovers(&mut self) -> Option<CleanupReport> {
+        self.cleanup.take()
     }
 
     fn read_cleanup_report(&mut self) -> Result<(), WatchdogError> {

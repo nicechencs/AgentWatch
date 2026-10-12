@@ -983,6 +983,7 @@ fn move_and_wait(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod launch_tests {
+    use super::super::terminal::TerminalDecision;
     use super::*;
 
     /// `cgroup.procs` refuses the pid (here: the session directory is gone):

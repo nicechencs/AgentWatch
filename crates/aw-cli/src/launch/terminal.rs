@@ -507,7 +507,7 @@ impl TerminalChild {
         #[cfg(target_os = "linux")]
         if let SignalRoute::Watchdog(control) = &mut self.signal_route {
             use std::io::Write;
-            let _ = control.write_all(&[b'A']);
+            let _ = control.write_all(b"A");
             let _ = control.flush();
         }
     }
@@ -630,7 +630,7 @@ mod tests {
 
     use nix::sys::signal::kill;
 
-    use super::{Signal, TerminalChild, TerminalDecision};
+    use super::{TerminalChild, TerminalDecision};
 
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

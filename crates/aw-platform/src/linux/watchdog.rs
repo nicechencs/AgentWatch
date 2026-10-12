@@ -43,7 +43,9 @@ pub enum WatchdogPrepareError {
 pub fn prepare_watchdog_fallback() -> io::Result<()> {
     let result = unsafe {
         // SAFETY: PR_SET_CHILD_SUBREAPER changes only this process's Linux
-        // child-reaping role and uses no caller pointers.
+        // child-reaping role and uses no caller pointers. SIGHUP is deliberately
+        // left at its default disposition: signal-hook chains whatever it finds
+        // here, and chaining SIG_IGN jumps to address 1 and kills the process.
         libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
     };
     if result == 0 {
@@ -155,7 +157,7 @@ pub fn cleanup_watchdog_descendants() -> WatchdogCleanup {
     }
     let deadline = Instant::now() + LEFTOVER_GRACE;
     while Instant::now() < deadline {
-        reap_children();
+        reap_children(0);
         if descendants_of(self_pid, &process_snapshot()).is_empty() {
             return WatchdogCleanup::default();
         }
@@ -166,7 +168,7 @@ pub fn cleanup_watchdog_descendants() -> WatchdogCleanup {
         let snapshot = process_snapshot();
         let targets = descendants_of(self_pid, &snapshot);
         if targets.is_empty() {
-            reap_children();
+            reap_children(0);
             if descendants_of(self_pid, &process_snapshot()).is_empty() {
                 return WatchdogCleanup::default();
             }
@@ -184,7 +186,7 @@ pub fn cleanup_watchdog_descendants() -> WatchdogCleanup {
         for target in descendants_of(self_pid, &process_snapshot()) {
             signal_if_same(target, libc::SIGKILL, &mut denied);
         }
-        reap_children();
+        reap_children(0);
         if Instant::now() >= cleanup_deadline {
             return remaining_cleanup(self_pid, &denied);
         }
@@ -195,8 +197,8 @@ pub fn cleanup_watchdog_descendants() -> WatchdogCleanup {
 /// Reap every exited direct/adopted child without waiting.  The watchdog calls
 /// this during normal execution so short-lived background programs cannot pile
 /// up as zombies until the root exits.
-pub fn reap_watchdog_children() {
-    reap_children();
+pub fn reap_watchdog_children(except_pid: u32) {
+    reap_children(except_pid as libc::pid_t);
 }
 
 fn process_snapshot() -> Vec<ProcessIdentity> {
@@ -277,6 +279,7 @@ fn remaining_cleanup(root: libc::pid_t, denied: &BTreeSet<libc::pid_t>) -> Watch
     }
 }
 
+#[allow(unsafe_code)]
 fn signal_if_same(
     target: ProcessIdentity,
     signal: libc::c_int,
@@ -301,9 +304,42 @@ fn signal_if_same(
 }
 
 #[allow(unsafe_code)]
-fn reap_children() {
+fn reap_children(except_pid: libc::pid_t) {
     loop {
         let mut status = 0;
+        if except_pid != 0 {
+            let mut info = unsafe {
+                // SAFETY: a zeroed siginfo_t is the documented initial value for
+                // `waitid(WNOHANG)`, where the kernel leaves it zero when no
+                // child state is available.
+                std::mem::MaybeUninit::<libc::siginfo_t>::zeroed().assume_init()
+            };
+            // SAFETY: `info` is writable storage. WNOWAIT only observes which
+            // child exited, so the launched program's status stays available to
+            // its own waiter. Any other child is reaped below.
+            let seen = unsafe {
+                libc::waitid(
+                    libc::P_ALL,
+                    0,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if seen != 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return;
+            }
+            let exited = unsafe {
+                // SAFETY: `waitid` initialized `info`; the accessor returns zero
+                // when WNOHANG found no exited child.
+                info.si_pid()
+            };
+            if exited == 0 || exited == except_pid {
+                return;
+            }
+        }
         // SAFETY: this process is the only owner/reaper for its own children;
         // `status` is a valid mutable `c_int` for `waitpid` to fill.
         let result = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };

@@ -26,7 +26,10 @@ def read_for(fd, seconds):
             continue
         try:
             part = os.read(fd, 4096)
-        except OSError:
+        except OSError as error:
+            # mac129 diagnosis: an EIO here is the slave closing. Keep what was
+            # already captured instead of discarding it.
+            data += ("\n[read EIO errno=%s]\n" % error.errno).encode()
             break
         if not part:
             break
@@ -73,8 +76,7 @@ def interactive(mode, label, argv, inputs, expected):
         except BaseException:
             code = "unavailable"
         raise AssertionError(
-            "%s pty I/O failed (%s); aw exit=%s; output=%r"
-            % (label, error, code, output)
+            "%s pty I/O failed (%s); aw exit=%s; output=%r" % (label, error, code, output)
         )
     finally:
         os.close(fd)

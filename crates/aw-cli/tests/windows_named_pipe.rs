@@ -80,8 +80,14 @@ fn separate_aw_processes_are_identified_and_each_get_a_fresh_pipe_instance() {
     server.join().expect("server thread");
 }
 
+/// The server is this test process, so the pipe owner is the test account.
+/// With an installed service, that owner check refuses before the image
+/// path is compared. This asserts zero request bytes, not the image check.
+/// The image check is
+/// `injected_service_status_decision_requires_all_installed_service_checks`
+/// in `aw-platform`.
 #[test]
-fn mismatched_pipe_server_image_receives_zero_request_bytes() {
+fn caller_owned_pipe_for_installed_service_receives_zero_request_bytes() {
     let path = pipe_name();
     let name = path.as_os_str().to_owned();
     let sddl = pipe_sddl().expect("pipe SDDL");
@@ -116,6 +122,8 @@ fn mismatched_pipe_server_image_receives_zero_request_bytes() {
         &path,
         &PipeServiceStatus::Installed {
             binary_path: image.clone(),
+            process_id: std::process::id(),
+            running: true,
         },
     )
     .expect_err("mismatched server image must be refused");

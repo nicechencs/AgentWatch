@@ -431,7 +431,7 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 port: 7456,
             },
-            token: "unit-token".to_owned(),
+            token: crate::secret::Secret::new("unit-token"),
         };
         let out = ui(&endpoint, reply(200, "{}"), None, true, false, &mut opener);
         assert_eq!(out.code, exit::USAGE);

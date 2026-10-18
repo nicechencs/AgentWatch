@@ -64,6 +64,22 @@ impl TerminalDecision {
     }
 }
 
+// Temporary mac129 diagnosis. Enabled only while `AW_MAC129_DIAG` is set, and
+// only in test builds, so a production binary never prints it.
+#[cfg(test)]
+macro_rules! mac129_diag {
+    ($($arg:tt)*) => {
+        if std::env::var_os("AW_MAC129_DIAG").is_some() {
+            eprintln!("mac129-diag: {}", format_args!($($arg)*));
+        }
+    };
+}
+
+#[cfg(not(test))]
+macro_rules! mac129_diag {
+    ($($arg:tt)*) => {};
+}
+
 /// A released child and the terminal state that belongs to the foreground
 /// `aw run` invocation.  Dropping it restores `aw`'s group before unregistering
 /// signal handlers, including during unwinding on an error path.
@@ -246,6 +262,11 @@ impl TerminalChild {
         loop {
             for signal in self.take_pending_signals().into_iter().flatten() {
                 saw_hup |= signal == Signal::SIGHUP;
+                mac129_diag!(
+                    "forward sender_pid={} target_group={} signal={signal:?} saw_hup={saw_hup}",
+                    std::process::id(),
+                    self.child_group
+                );
                 // Keep a foreground target foreground while forwarding
                 // SIGTERM: terminal applications often restore terminal modes
                 // in their handler and must not be stopped with SIGTTOU.
@@ -256,6 +277,11 @@ impl TerminalChild {
                     // below will make a second best-effort restoration.
                 }
                 if self.forward_signal(signal).is_err() {
+                    mac129_diag!(
+                        "forward-failed sender_pid={} target_group={} signal={signal:?} saw_hup={saw_hup}",
+                        std::process::id(),
+                        self.child_group
+                    );
                     if saw_hup {
                         self.cleanup_after_error();
                         return Ok(128 + Signal::SIGHUP as i32);
@@ -297,19 +323,29 @@ impl TerminalChild {
                 self.direct_child,
                 Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED),
             ) {
-                Ok(WaitStatus::Exited(_, code)) => {
+                Ok(_status @ WaitStatus::Exited(_, code)) => {
                     // `waitid(WNOWAIT)` above is the normal exit path. Keep
                     // this defensive fallback for a transition that races its
                     // no-hang poll.
+                    mac129_diag!(
+                        "target_group={} wait_status={_status:?} group_exists_before_cleanup={}",
+                        self.child_group,
+                        killpg(self.child_group, Option::<Signal>::None).is_ok()
+                    );
                     self.finish_after_exit(std::time::Instant::now() + CLEANUP_LIMIT);
                     return Ok(code);
                 }
-                Ok(WaitStatus::Signaled(_, signal, _)) => {
+                Ok(_status @ WaitStatus::Signaled(_, signal, _)) => {
                     // With a real terminal, Ctrl+C is delivered by the tty
                     // driver straight to the foreground child group, rather
                     // than to aw's relay.  Clean the group in that case too:
                     // a descendant that ignored SIGINT must not survive after
                     // its group leader has ended.
+                    mac129_diag!(
+                        "target_group={} wait_status={_status:?} group_exists_before_cleanup={}",
+                        self.child_group,
+                        killpg(self.child_group, Option::<Signal>::None).is_ok()
+                    );
                     self.finish_after_exit(std::time::Instant::now() + CLEANUP_LIMIT);
                     return Ok(128 + signal as i32);
                 }
@@ -326,11 +362,16 @@ impl TerminalChild {
                 Ok(WaitStatus::PtraceEvent(_, _, _)) | Ok(WaitStatus::PtraceSyscall(_)) => {
                     std::thread::sleep(SIGNAL_POLL);
                 }
-                Err(_) if saw_hup => {
+                Err(_error) if saw_hup => {
                     // The controlling terminal may have vanished before this
                     // polling waiter can reap the child. Do not leave a direct
                     // child running merely because the kernel reports EIO or
                     // ECHILD during terminal teardown.
+                    mac129_diag!(
+                        "wait-err-after-hup sender_pid={} target_group={} error={_error} -> 129",
+                        std::process::id(),
+                        self.child_group
+                    );
                     self.cleanup_after_error();
                     return Ok(128 + Signal::SIGHUP as i32);
                 }
@@ -394,6 +435,15 @@ impl TerminalChild {
     }
 
     fn cleanup_leftovers(&self, cleanup_deadline: std::time::Instant) {
+        // The child group is named by its leader PID, so it cannot be reused
+        // while an in-group descendant remains. ESRCH just means the target
+        // already ended every group member. Run this even after normal exit:
+        // a shell may otherwise leave a direct background child behind.
+        mac129_diag!(
+            "cleanup sender_pid={} target_group={} signal=SIGTERM",
+            std::process::id(),
+            self.child_group
+        );
         let _ = killpg(self.child_group, Signal::SIGTERM);
         let grace_deadline =
             std::cmp::min(cleanup_deadline, std::time::Instant::now() + LEFTOVER_GRACE);
@@ -403,6 +453,11 @@ impl TerminalChild {
         if group_exists(self.child_group) {
             // Freeze before SIGKILL so a forking survivor cannot add another
             // member between the survivor check and the kill.
+            mac129_diag!(
+                "cleanup sender_pid={} target_group={} signal=SIGKILL",
+                std::process::id(),
+                self.child_group
+            );
             let _ = killpg(self.child_group, Signal::SIGSTOP);
             let _ = killpg(self.child_group, Signal::SIGKILL);
         }
@@ -452,7 +507,7 @@ impl TerminalChild {
         #[cfg(target_os = "linux")]
         if let SignalRoute::Watchdog(control) = &mut self.signal_route {
             use std::io::Write;
-            let _ = control.write_all(&[b'A']);
+            let _ = control.write_all(b"A");
             let _ = control.flush();
         }
     }
@@ -549,6 +604,10 @@ pub(crate) fn forward_to_group(pid: u32, signal: Signal) -> Result<(), String> {
 }
 
 fn forward_group(group: Pid, signal: Signal) -> Result<(), String> {
+    mac129_diag!(
+        "killpg sender_pid={} target_group={group} signal={signal:?}",
+        std::process::id()
+    );
     match killpg(group, signal) {
         Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
         Err(_) => Err("无法转发信号给子进程".to_owned()),
@@ -571,7 +630,7 @@ mod tests {
 
     use nix::sys::signal::kill;
 
-    use super::{Signal, TerminalChild, TerminalDecision};
+    use super::{TerminalChild, TerminalDecision};
 
     fn guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -628,6 +687,12 @@ mod tests {
             .pending_signals
             .interrupt
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        mac129_diag!(
+            "test_pid={} root_pid={} grandchild_pid={} queued_signal=SIGINT program=python3",
+            std::process::id(),
+            child.id(),
+            grandchild
+        );
         drop(child);
         assert_eq!(terminal.wait().expect("wait target"), 130);
         let gone_by = Instant::now() + Duration::from_secs(2);
@@ -640,5 +705,73 @@ mod tests {
             "grandchild {grandchild} survived the forwarded interrupt"
         );
         let _ = std::fs::remove_file(marker);
+    }
+
+    /// mac129 diagnosis. Reproduces the historical program
+    /// `sh -c 'sleep 300 & echo $! > "$1"; wait'` but with a recorder in place
+    /// of both the waited job and its background child, so the macOS log shows
+    /// signo and si_pid for every signal either process receives. The
+    /// assertion stays 130 on purpose: a 129 is the evidence, not a pass.
+    #[test]
+    fn mac129_sh_background_child_records_signals() {
+        let _guard = guard();
+        let stamp = Instant::now().elapsed().as_nanos();
+        let marker = std::env::temp_dir().join(format!(
+            "aw-mac129-grandchild-{}-{stamp}",
+            std::process::id()
+        ));
+        let parent_log = std::env::temp_dir().join(format!(
+            "aw-mac129-parent-{}-{stamp}.log",
+            std::process::id()
+        ));
+        let child_log = std::env::temp_dir().join(format!(
+            "aw-mac129-child-{}-{stamp}.log",
+            std::process::id()
+        ));
+        let recorder =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mac129_sigrec.py");
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            "exec \"$1\" \"$2\" parent \"$3\" child",
+            "sh",
+            &recorder.to_string_lossy(),
+            &parent_log.to_string_lossy(),
+            &child_log.to_string_lossy(),
+        ]);
+        command.env("AW_MAC129_MARKER", &marker);
+        command.process_group(0);
+        let child = command.spawn().expect("spawn sh recorder");
+        let mut terminal = TerminalChild::new(child.id(), TerminalDecision::before_fork())
+            .expect("terminal relay");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !marker.is_file() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.is_file(), "sh recorder did not publish child pid");
+        let grandchild: i32 = std::fs::read_to_string(&marker)
+            .expect("grandchild pid")
+            .trim()
+            .parse()
+            .expect("numeric grandchild pid");
+        mac129_diag!(
+            "sh-test test_pid={} root_pid={} grandchild_pid={} queued_signal=SIGINT",
+            std::process::id(),
+            child.id(),
+            grandchild
+        );
+        terminal
+            .pending_signals
+            .interrupt
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(child);
+        let status = terminal.wait().expect("wait sh recorder");
+        let parent_text = std::fs::read_to_string(&parent_log).unwrap_or_default();
+        let child_text = std::fs::read_to_string(&child_log).unwrap_or_default();
+        mac129_diag!("sh-test status={status}\nparent-log:\n{parent_text}child-log:\n{child_text}");
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&parent_log);
+        let _ = std::fs::remove_file(&child_log);
+        assert_eq!(status, 130);
     }
 }

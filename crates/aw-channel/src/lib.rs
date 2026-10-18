@@ -198,8 +198,8 @@ pub enum DialError {
     Unreachable(String),
     /// The socket or pipe exists but this user may not open it.
     Forbidden(String),
-    /// A Windows named pipe opened, but the server image did not match the
-    /// installed service image. No request bytes were sent.
+    /// A Windows named pipe opened, but its owner, image, or PID did not
+    /// match the installed service. No request bytes were sent.
     UntrustedServer(String),
     /// A Windows named pipe opened, but its server image or the installed
     /// service image could not be queried before a request was sent. This is
@@ -508,7 +508,8 @@ pub fn exchange_raw(path: &Path, request: &[u8], timeout: Duration) -> Result<Ve
 }
 
 /// Open a Windows named-pipe client with identification-only SQOS and verify
-/// the connected server image before any bytes are written.
+/// the connected server owner, image, and service PID before any bytes are
+/// written.
 ///
 /// This is the only production entry point for opening an AgentWatch named
 /// pipe. It is Windows-only because Unix-domain sockets do not use `File`.
@@ -528,8 +529,8 @@ pub fn open_pipe_client_with_service_status_for_test(
 }
 
 /// Opens a Windows pipe at `SECURITY_ANONYMOUS` for daemon integration tests.
-/// It still checks the server image before returning the handle. Product code
-/// must use [`open_pipe_client`], which always uses identification SQOS.
+/// It still checks the server trust facts before returning the handle. Product
+/// code must use [`open_pipe_client`], which always uses identification SQOS.
 #[cfg(all(windows, any(test, feature = "test-support")))]
 pub fn open_anonymous_pipe_client_for_test(path: &Path) -> Result<std::fs::File, DialError> {
     platform::open_pipe_client_with_qos(path, 0)
@@ -741,7 +742,7 @@ mod platform {
         match checked {
             Ok(()) => Ok(pipe),
             Err(error @ aw_platform::PipeServerVerificationError::CannotQuery { .. }) => {
-                Err(DialError::ServerVerificationUnavailable(error.to_string()))
+                Err(DialError::UntrustedServer(error.to_string()))
             }
             Err(error @ aw_platform::PipeServerVerificationError::NotDaemon { .. }) => {
                 Err(DialError::UntrustedServer(error.to_string()))
@@ -1355,8 +1356,13 @@ mod windows_pipe_server_tests {
         error
     }
 
+    /// The pipe is created with the test account's own SDDL, so the owner
+    /// check refuses it before the image path is ever compared. This proves
+    /// the client sends zero bytes and does not retry; it does not prove the
+    /// image check. That check is
+    /// `injected_service_status_decision_requires_all_installed_service_checks`.
     #[test]
-    fn mismatched_service_image_refuses_without_sending_or_falling_back() {
+    fn installed_service_with_another_image_sends_zero_bytes_and_does_not_retry() {
         let _lock = PIPE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1365,9 +1371,11 @@ mod windows_pipe_server_tests {
                 "aw-channel-mismatched-image-{}.exe",
                 std::process::id()
             ));
-            std::fs::write(&image, b"not-the-test-server").expect("mismatched service image");
+            std::fs::write(&image, b"not-the-test-server").expect("other service image");
             let error = refuse_without_sending_or_falling_back(PipeServiceStatus::Installed {
                 binary_path: image.clone(),
+                process_id: std::process::id(),
+                running: true,
             })
             .await;
             assert!(matches!(error, DialError::UntrustedServer(_)), "{error}");
@@ -1386,15 +1394,31 @@ mod windows_pipe_server_tests {
                 win32_error: 5,
             })
             .await;
+            assert!(matches!(error, DialError::UntrustedServer(_)), "{error}");
+        });
+    }
+
+    #[test]
+    fn installed_service_rejects_a_caller_owned_pipe_before_sending() {
+        let _lock = PIPE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        runtime().block_on(async {
+            let error = refuse_without_sending_or_falling_back(PipeServiceStatus::Installed {
+                binary_path: std::env::current_exe().expect("test server image"),
+                process_id: std::process::id(),
+                running: true,
+            })
+            .await;
             assert!(
-                matches!(error, DialError::ServerVerificationUnavailable(_)),
-                "{error}"
+                matches!(error, DialError::UntrustedServer(_)),
+                "installed service must reject caller-owned pipe: {error}"
             );
         });
     }
 
     #[test]
-    fn matching_service_image_accepts_the_connected_pipe() {
+    fn no_service_allows_a_same_user_development_pipe() {
         let _lock = PIPE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1405,14 +1429,12 @@ mod windows_pipe_server_tests {
             tokio::pin!(connected);
             let client = open_pipe_client_with_service_status_for_test(
                 std::path::Path::new(WINDOWS_PIPE),
-                &PipeServiceStatus::Installed {
-                    binary_path: std::env::current_exe().expect("test server image"),
-                },
+                &PipeServiceStatus::NotInstalled,
             );
             connected.await.expect("test server connection");
             assert!(
                 client.is_ok(),
-                "matching service image must be accepted: {client:?}"
+                "caller-owned foreground/dev pipe must be accepted: {client:?}"
             );
         });
     }

@@ -471,7 +471,7 @@ fn injected_session_command(
             host: "127.0.0.1".to_owned(),
             port: 9,
         },
-        token: cli.token.clone().unwrap_or_default(),
+        token: crate::secret::Secret::new(cli.token.clone().unwrap_or_default()),
     };
     Some(stop::run(
         session,

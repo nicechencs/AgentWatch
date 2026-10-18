@@ -115,7 +115,7 @@ impl Default for WindowsServiceDef {
             service_name: "AgentWatch",
             account: "LocalSystem",
             start: "delayed-auto",
-            bin_path: r"C:\Program Files\AgentWatch\agentwatchd.exe --foreground",
+            bin_path: r#""C:\Program Files\AgentWatch\agentwatchd.exe" --foreground"#,
             users_group: "AgentWatch Users",
             failure_actions: [
                 WindowsFailureAction {
@@ -188,6 +188,23 @@ impl WindowsServiceDef {
             "# --purge describes deleting %ProgramData%\\AgentWatch. P1 has no proxy CA."
         );
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WindowsServiceDef;
+
+    #[test]
+    fn default_windows_service_definition_quotes_the_executable_path() {
+        let definition = WindowsServiceDef::default();
+        assert_eq!(
+            definition.bin_path,
+            r#""C:\Program Files\AgentWatch\agentwatchd.exe" --foreground"#
+        );
+        assert!(definition
+            .render()
+            .contains(r#"bin_path="C:\Program Files\AgentWatch\agentwatchd.exe" --foreground"#));
     }
 }
 

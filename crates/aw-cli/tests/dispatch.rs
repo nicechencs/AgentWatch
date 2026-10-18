@@ -78,6 +78,119 @@ fn ps_without_a_daemon_exits_3() {
     assert!(err.contains("--no-daemon"), "{err}");
 }
 
+/// A socket nobody listens on is "daemon unreachable" for every query command,
+/// not a general error. The sentence stays the reviewed one.
+#[test]
+fn missing_socket_query_commands_exit_3() {
+    let missing = std::env::temp_dir().join(format!(
+        "aw-cli-missing-{}.sock",
+        std::process::id()
+    ));
+    let socket = missing.to_str().expect("socket path");
+    for args in [
+        &["--socket", socket, "sessions", "list"][..],
+        &["--socket", socket, "sessions", "show", "@last"][..],
+        &["--socket", socket, "procs", "@last"][..],
+    ] {
+        let out = aw().args(args).output().expect("spawn aw");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "{args:?}: {err}");
+        assert!(
+            err.contains("连不上后台"),
+            "{args:?}: {err}"
+        );
+    }
+}
+
+/// Connection refused (closed port) exits 3 and names no token. A listener that
+/// accepts and never answers is the timeout path: whatever the client has
+/// written before the deadline must also name no token. Both forbid `token`,
+/// `ticket`, `len=`, and any 3+ character fragment of the secret.
+#[test]
+fn http_failures_hide_the_token() {
+    let token = "bad-ticket-value-XYZ";
+    let closed = closed_port();
+    let out = http_sessions(closed, token, std::time::Duration::from_secs(15));
+    let combined = combined_output(&out);
+    assert_eq!(out.status.code(), Some(3), "{combined}");
+    assert!(combined.contains("连不上后台"), "{combined}");
+    assert_no_secret(&combined, token);
+
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let silent_port = silent.local_addr().expect("addr").port();
+    let hold = std::thread::spawn(move || {
+        let _accepted = silent.accept();
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    });
+    // The client waits out its own deadline on a peer that never answers. Stop
+    // it before that and check the bytes it already produced: a leak is written
+    // at connect time, not at the deadline.
+    let out = http_sessions(silent_port, token, std::time::Duration::from_secs(2));
+    let combined = combined_output(&out);
+    assert_no_secret(&combined, token);
+    drop(hold);
+}
+
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+    port
+}
+
+fn http_sessions(port: u16, token: &str, limit: std::time::Duration) -> std::process::Output {
+    let url = format!("http://127.0.0.1:{port}");
+    let mut child = aw();
+    child
+        .args(["--http", &url, "--token", token, "sessions", "list"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = child.spawn().expect("spawn aw");
+    if !wait_child(&mut child, limit) {
+        let _ = child.kill();
+    }
+    child.wait_with_output().expect("wait aw")
+}
+
+fn combined_output(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+fn assert_no_secret(rendered: &str, secret: &str) {
+    assert!(!rendered.contains("token"), "{rendered}");
+    assert!(!rendered.contains("ticket"), "{rendered}");
+    assert!(!rendered.contains("len="), "{rendered}");
+    assert_no_fragment(rendered, secret);
+}
+
+fn assert_no_fragment(rendered: &str, secret: &str) {
+    let chars: Vec<char> = secret.chars().collect();
+    for window in chars.windows(3) {
+        let piece: String = window.iter().collect();
+        assert!(
+            !rendered.contains(&piece),
+            "output contains secret fragment `{piece}`: {rendered}"
+        );
+    }
+}
+
+fn wait_child(child: &mut std::process::Child, limit: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < limit {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => return false,
+        }
+    }
+    let _ = child.kill();
+    false
+}
+
 #[test]
 fn unknown_command_exits_2() {
     let out = output(&["not-a-command"]);

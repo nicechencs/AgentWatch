@@ -84,7 +84,7 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 port: 9,
             },
-            token: "test-token".to_owned(),
+            token: crate::secret::Secret::new("test-token"),
         }
     }
 

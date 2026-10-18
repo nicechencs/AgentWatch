@@ -1080,6 +1080,11 @@ mod tests {
 /// listener with the AgentWatch DACL, and dial it with `aw_channel` — the
 /// client `aw` (cmd → client.rs → aw_channel) and the desktop app
 /// (app/src-tauri → aw_channel) both use.
+///
+/// These two tests open the production client, which queries the real SCM.
+/// They pass only when this machine has no AgentWatch service installed, so
+/// the client takes the same-user development path. On a machine where the
+/// service is installed they refuse the caller-owned pipe and fail.
 #[cfg(all(test, windows))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod pipe_tests {

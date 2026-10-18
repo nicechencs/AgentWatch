@@ -417,7 +417,7 @@ fn windows_install_plan() -> WindowsPlanView {
         start_mode: "delayed-auto",
         account: "LocalSystem",
         sid_type: "restricted",
-        bin_path: r"C:\Program Files\AgentWatch\agentwatchd.exe --foreground",
+        bin_path: r#""C:\Program Files\AgentWatch\agentwatchd.exe" --foreground"#,
         first_delay_ms: 5_000,
         second_delay_ms: 5_000,
         third_delay_ms: 60_000,
@@ -435,7 +435,7 @@ fn windows_acl_lines() -> Vec<String> {
 #[cfg(target_os = "windows")]
 fn windows_sc_text() -> String {
     "\
-sc.exe create AgentWatch binPath= \"C:\\Program Files\\AgentWatch\\agentwatchd.exe --foreground\" start= delayed-auto obj= LocalSystem DisplayName= \"AgentWatch Daemon\"
+sc.exe create AgentWatch binPath= \"\\\"C:\\Program Files\\AgentWatch\\agentwatchd.exe\\\" --foreground\" start= delayed-auto obj= LocalSystem DisplayName= \"AgentWatch Daemon\"
 sc.exe failure AgentWatch reset= 86400 actions= restart/5000/restart/5000/restart/60000
 sc.exe sidtype AgentWatch restricted
 sc.exe description AgentWatch \"AgentWatch process-behavior audit daemon\"
@@ -566,6 +566,18 @@ mod tests {
             "{text}"
         );
         assert!(control.seen.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_text_quotes_the_executable_path() {
+        assert_eq!(
+            super::windows_install_plan().bin_path,
+            r#""C:\Program Files\AgentWatch\agentwatchd.exe" --foreground"#
+        );
+        assert!(super::windows_sc_text().contains(
+            "binPath= \"\\\"C:\\Program Files\\AgentWatch\\agentwatchd.exe\\\" --foreground\""
+        ));
     }
 
     #[test]

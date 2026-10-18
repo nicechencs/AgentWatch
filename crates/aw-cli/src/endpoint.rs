@@ -31,6 +31,8 @@ use std::env;
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::secret::Secret;
+
 /// Default UI listen port from api-and-cli §1. Used only to recognise the
 /// documented URL; this crate never binds it.
 #[allow(dead_code)]
@@ -81,7 +83,8 @@ pub enum Endpoint {
     /// Windows named pipe. Authenticated by the client SID, not a bearer token.
     Pipe { path: PathBuf },
     /// Loopback HTTP. `token` is the bearer value without the `Bearer ` prefix.
-    Http { base: HttpBase, token: String },
+    /// [`Secret`] redacts it in [`Debug`] and [`Display`].
+    Http { base: HttpBase, token: Secret },
 }
 
 /// Loopback origin the HTTP transport may dial. Non-loopback URLs never construct this.
@@ -161,7 +164,10 @@ pub fn resolve(input: &EndpointInput) -> Result<Endpoint, EndpointError> {
             Some(token) => token,
             None => return Err(EndpointError::MissingToken),
         };
-        return Ok(Endpoint::Http { base, token });
+        return Ok(Endpoint::Http {
+            base,
+            token: Secret::new(token),
+        });
     }
     match platform_default() {
         Some(endpoint) => Ok(endpoint),
@@ -265,32 +271,11 @@ fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("127.0.0.1") || host.eq_ignore_ascii_case("localhost")
 }
 
-/// Length and last four characters. Short tokens show the length only.
-#[must_use]
-pub fn token_hint(token: &str) -> String {
-    let len = token.chars().count();
-    let tail: String = token
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    if len > 4 {
-        format!("len={len} …{tail}")
-    } else if len == 0 {
-        "len=0".to_owned()
-    } else {
-        format!("len={len}")
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        parse_loopback_http, resolve, token_hint, Endpoint, EndpointError, EndpointInput,
+        parse_loopback_http, resolve, Endpoint, EndpointError, EndpointInput,
         DEFAULT_HTTP_PORT,
     };
 
@@ -355,7 +340,7 @@ mod tests {
         assert!(!shown.contains("env-secret-value"), "{shown}");
         assert!(!shown.contains("token"), "{shown}");
         match endpoint {
-            Endpoint::Http { token, .. } => assert_eq!(token, "flag-secret-value"),
+            Endpoint::Http { token, .. } => assert_eq!(token.expose(), "flag-secret-value"),
             other => panic!("expected http, got {other}"),
         }
     }
@@ -372,7 +357,7 @@ mod tests {
         match endpoint {
             Endpoint::Http { base, token } => {
                 assert_eq!(base.port, 9);
-                assert_eq!(token, "env-token-xyz");
+                assert_eq!(token.expose(), "env-token-xyz");
             }
             other => panic!("expected http, got {other}"),
         }
@@ -386,15 +371,6 @@ mod tests {
         assert!(parse_loopback_http("https://127.0.0.1:7456").is_err());
         let ok = parse_loopback_http("http://127.0.0.1:7456").expect("ok");
         assert_eq!(ok.port, DEFAULT_HTTP_PORT);
-    }
-
-    #[test]
-    fn token_hint_never_returns_the_whole_token() {
-        let hint = token_hint("abcdefghij");
-        assert_eq!(hint, "len=10 …ghij");
-        assert!(!hint.contains("abcdefghij"));
-        assert_eq!(token_hint("ab"), "len=2");
-        assert_eq!(token_hint(""), "len=0");
     }
 
     #[test]

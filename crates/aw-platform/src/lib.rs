@@ -224,11 +224,11 @@ impl PlatformError {
 
 /// Why a client could not establish that a connected Windows named pipe is an
 /// AgentWatch daemon pipe. The client must send no request bytes on either
-/// outcome, but the stable categories intentionally differ for diagnostics.
+/// outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipeServerVerificationError {
-    /// The service image, pipe-server process, or either canonical path could
-    /// not be queried.
+    /// A required pipe-owner, server-process, SCM, or canonical-path fact
+    /// could not be queried.
     CannotQuery {
         operation: &'static str,
         win32_error: u32,
@@ -236,7 +236,7 @@ pub enum PipeServerVerificationError {
         /// wording stays with the channel error category.
         detail: Option<String>,
     },
-    /// Both images were read successfully but do not identify the same daemon.
+    /// The owner, image, or PID observations do not identify the same daemon.
     NotDaemon {
         /// Diagnostic detail for logs and JSON output only. This may name a
         /// local image path, never a request or credential.
@@ -254,7 +254,7 @@ impl fmt::Display for PipeServerVerificationError {
             } => {
                 write!(
                     f,
-                    "named-pipe server image query failed: {operation} (Win32 error {win32_error})"
+                    "named-pipe server verification query failed: {operation} (Win32 error {win32_error})"
                 )?;
                 if let Some(detail) = detail {
                     write!(f, "; {detail}")?;
@@ -262,7 +262,7 @@ impl fmt::Display for PipeServerVerificationError {
                 Ok(())
             }
             Self::NotDaemon { detail } => {
-                f.write_str("named-pipe server image is not the installed daemon")?;
+                f.write_str("named-pipe server is not the installed daemon")?;
                 if let Some(detail) = detail {
                     write!(f, ": {detail}")?;
                 }
@@ -276,18 +276,22 @@ impl std::error::Error for PipeServerVerificationError {}
 
 /// The observed installation state for the Windows `AgentWatch` SCM service.
 ///
-/// Every state other than a configured executable fails server verification.
-/// Keeping the states distinct preserves the diagnostic for `--json` without
-/// making a missing or unreadable service a development-mode exception.
+/// An installed service records both its configured executable and its live
+/// SCM process status. A missing service is the explicit foreground/dev-mode
+/// case; an unreadable SCM observation always fails closed.
 #[cfg(windows)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipeServiceStatus {
     /// The SCM reports that the service does not exist.
     NotInstalled,
-    /// The service exists, whether or not it is currently running.
+    /// The configured service and its process status were queried from SCM.
     Installed {
         /// The executable parsed from `QueryServiceConfigW`.
         binary_path: PathBuf,
+        /// `SERVICE_STATUS_PROCESS.dwProcessId` from `QueryServiceStatusEx`.
+        process_id: u32,
+        /// Whether SCM reported `SERVICE_RUNNING` for that process.
+        running: bool,
     },
     /// SCM could not determine whether the service exists or read its config.
     /// Verification refuses it and retains the detail for diagnostics.
@@ -605,10 +609,11 @@ pub fn identify_pipe_peer(
     windows::identify_pipe_peer(handle)
 }
 
-/// Refuse a Windows named-pipe server unless the process holding it has the
-/// same canonical image path as the installed `AgentWatch` service. The
-/// comparison fails closed when the service, process, or either image path
-/// cannot be queried.
+/// Refuse a Windows named-pipe server unless its connected pipe owner is
+/// LocalSystem, its canonical image matches the installed `AgentWatch`
+/// service, and its PID is SCM's running service PID. With no installed
+/// service, only a pipe owned by the caller is accepted for foreground/dev
+/// mode. Every unavailable fact fails closed before a request is sent.
 #[cfg(windows)]
 pub fn verify_pipe_server(
     handle: std::os::windows::io::RawHandle,

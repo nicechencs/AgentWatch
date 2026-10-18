@@ -608,7 +608,13 @@ impl SpawnedChild for LinuxWatchdogChild {
     }
 
     fn cleanup_leftovers(&mut self) -> Option<CleanupLeftovers> {
-        self.watchdog.cleanup_leftovers()
+        self.watchdog
+            .cleanup_leftovers()
+            .map(|report| CleanupLeftovers {
+                count: report.count,
+                pids: report.pids,
+                eperm_pid: report.eperm_pid,
+            })
     }
 }
 

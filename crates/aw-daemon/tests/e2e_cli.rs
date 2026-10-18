@@ -625,7 +625,22 @@ fn aw_run_attach_stop_against_a_real_daemon() {
 #[test]
 fn two_hundred_missing_aw_runs_leave_no_sessions() {
     let daemon = Daemon::start(As::Me);
-    let before = daemon.sessions().len();
+    // The daemon's own poll sampler writes its `daemon-sample` session on
+    // the first tick, which lands after the socket is already accepting. Count
+    // from after that row exists, so it is not mistaken for an empty launch.
+    let ready = Instant::now();
+    let before = loop {
+        let count = daemon.sessions().len();
+        if count > 0 {
+            break count;
+        }
+        assert!(
+            ready.elapsed() < Duration::from_secs(5),
+            "daemon sample session did not appear: {}",
+            daemon.log()
+        );
+        sleep(Duration::from_millis(50));
+    };
     for round in 0..200 {
         let out = daemon.aw(&["run", "-q", "--", "/no/such/aw-e2e-program"]);
         assert_eq!(

@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::endpoint::{token_hint, Endpoint, HttpBase};
+use crate::endpoint::{Endpoint, HttpBase};
+use crate::secret::Secret;
 use crate::exit::{self, from_http_status};
 
 /// One HTTP request, already decided by a command. Header values are not logged.
@@ -126,7 +127,7 @@ impl Transport for Box<dyn Transport> {
 
 /// Why a call did not produce a successful reply.
 ///
-/// `Display` never includes a token. HTTP failures include [`token_hint`] only.
+/// `Display` never includes a token, its length, or any fragment of it.
 #[derive(Debug)]
 pub enum ClientError {
     /// The daemon did not answer. Exit 3.
@@ -328,7 +329,7 @@ fn status_waited_seconds(reply: &ApiReply) -> Option<u64> {
 /// request, reads one response, and drops the socket.
 ///
 /// The bearer token is written to the socket and nowhere else. Connect failures
-/// name the host and port, never the token.
+/// name the host and port. They do not name the token, its length, or a hint.
 #[derive(Clone)]
 pub struct LoopbackHttp {
     target: Target,
@@ -338,7 +339,7 @@ pub struct LoopbackHttp {
 /// Where [`LoopbackHttp`] dials.
 #[derive(Clone)]
 enum Target {
-    Http { base: HttpBase, token: String },
+    Http { base: HttpBase, token: Secret },
     Socket { path: std::path::PathBuf },
     Pipe { path: std::path::PathBuf },
 }
@@ -367,6 +368,14 @@ impl LoopbackHttp {
             timeout: Duration::from_secs(12),
         })
     }
+
+    /// Replace the dial deadline. Tests use a short one for a peer that accepts
+    /// and never answers; production keeps the 12 second deadline from [`Self::new`].
+    #[cfg(test)]
+    fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
 }
 
 impl Transport for LoopbackHttp {
@@ -381,7 +390,7 @@ impl Transport for LoopbackHttp {
 
 fn http_exchange(
     base: &HttpBase,
-    token: &str,
+    token: &Secret,
     timeout: Duration,
     request: &ApiRequest,
 ) -> Result<ApiReply, ClientError> {
@@ -389,11 +398,7 @@ fn http_exchange(
     let addr = SocketAddr::from(([127, 0, 0, 1], base.port));
     let mut stream =
         TcpStream::connect_timeout(&addr, timeout).map_err(|_| ClientError::Unreachable {
-            detail: format!(
-                "连接 {} 超时或被拒绝（token {}）",
-                base.origin(),
-                token_hint(token)
-            ),
+            detail: format!("连接 {} 超时或被拒绝", base.origin()),
         })?;
     stream
         .set_read_timeout(Some(timeout))
@@ -434,7 +439,9 @@ fn local_exchange(
     let order = aw_channel::dial_order(path, &|key| std::env::var(key).ok());
     let (_, reply) = aw_channel::exchange_first(&order, &encode_local_request(request), timeout)
         .map_err(|err| match err {
-            DialError::Unreachable(detail) => ClientError::Unreachable { detail },
+            DialError::Unreachable(detail) | DialError::Timeout(detail) => {
+                ClientError::Unreachable { detail }
+            }
             DialError::Forbidden(detail) => ClientError::Forbidden { detail },
             DialError::UntrustedServer(detail) => ClientError::UntrustedServer { detail },
             DialError::ServerVerificationUnavailable(detail) => {
@@ -457,11 +464,21 @@ fn roundtrip<S: Read + Write>(stream: &mut S, bytes: &[u8]) -> Result<ApiReply, 
             detail: format!("写入请求失败：{err}"),
         })?;
     let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .map_err(|err| ClientError::Transport {
-            detail: format!("读取响应失败：{err}"),
-        })?;
+    // A peer that accepted and then never answers is the same failure as a
+    // port nobody listens on: the daemon is unreachable. A reset or a short
+    // read after the peer did speak stays a broken connection.
+    stream.read_to_end(&mut buf).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::TimedOut || err.kind() == std::io::ErrorKind::WouldBlock
+        {
+            ClientError::Unreachable {
+                detail: format!("读取响应超时：{err}"),
+            }
+        } else {
+            ClientError::Transport {
+                detail: format!("读取响应失败：{err}"),
+            }
+        }
+    })?;
     parse_response(&buf).map_err(|detail| ClientError::Transport { detail })
 }
 
@@ -488,7 +505,7 @@ fn encode_local_request(request: &ApiRequest) -> Vec<u8> {
 }
 
 /// HTTP/1.1 request bytes. `Authorization` is included. Callers must not log `bytes`.
-fn encode_request(base: &HttpBase, token: &str, request: &ApiRequest) -> Vec<u8> {
+fn encode_request(base: &HttpBase, token: &Secret, request: &ApiRequest) -> Vec<u8> {
     let path = if request.query.is_empty() {
         request.path.clone()
     } else {
@@ -499,7 +516,7 @@ fn encode_request(base: &HttpBase, token: &str, request: &ApiRequest) -> Vec<u8>
         method = request.method,
         path = path,
         host = base.host_header(),
-        token = token,
+        token = token.expose(),
     );
     if !request.body.is_empty() {
         head.push_str("Content-Type: application/json\r\n");
@@ -593,11 +610,11 @@ impl Transport for MemoryTransport {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        encode_request, parse_response, token_hint, ApiRequest, Client, ClientError,
-        MemoryTransport,
+        encode_request, parse_response, ApiRequest, Client, ClientError, MemoryTransport,
     };
     use crate::endpoint::{resolve, EndpointInput};
     use crate::exit;
+    use std::time::Duration;
 
     fn http_endpoint() -> crate::endpoint::Endpoint {
         resolve(&EndpointInput {
@@ -638,8 +655,8 @@ mod tests {
         assert!(text.contains("没有通过后台的身份验证"), "{text}");
         assert!(text.contains("bearer token required"), "{text}");
         assert!(!text.contains("unit-test-token"), "{text}");
-        assert!(!text.contains("ABCD") || text.contains("len="), "{text}");
-        let _ = token_hint("unit-test-token-ABCD");
+        assert!(!text.contains("ABCD"), "{text}");
+        assert!(!text.contains("len="), "{text}");
     }
 
     #[test]
@@ -660,6 +677,91 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("aw daemon start"), "{text}");
         assert!(text.contains("--no-daemon"), "{text}");
+    }
+
+    /// A peer that accepts and then says nothing is a timeout, not a refused
+    /// connect. The message is the same unreachable sentence and still carries
+    /// none of the token.
+    #[test]
+    fn silent_peer_timeout_message_never_contains_the_token() {
+        let token = "bad-ticket-value-XYZ";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let hold = std::thread::spawn(move || {
+            let _accepted = listener.accept();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let endpoint = resolve(&EndpointInput {
+            socket: None,
+            http: Some(format!("http://127.0.0.1:{port}")),
+            token: Some(token.to_owned()),
+            token_env: None,
+        })
+        .expect("http");
+        let transport = super::LoopbackHttp::new(&endpoint)
+            .expect("transport")
+            .with_timeout(Duration::from_millis(200));
+        let mut client = Client::new(endpoint, transport);
+        let err = client
+            .call(&ApiRequest::get("/health"))
+            .expect_err("silent peer");
+        assert_eq!(err.exit_code(), exit::UNREACHABLE);
+        let text = err.to_string();
+        let debug = format!("{err:?}");
+        for rendered in [text.as_str(), debug.as_str()] {
+            assert!(!rendered.contains("token"), "{rendered}");
+            assert!(!rendered.contains("ticket"), "{rendered}");
+            assert!(!rendered.contains("len="), "{rendered}");
+            assert_no_secret_fragment(rendered, token);
+        }
+        assert!(text.contains("连不上后台"), "{text}");
+        drop(hold);
+    }
+
+    /// A closed loopback port is unreachable. The message names the address and
+    /// must not name the bearer, its length, or any 3+ character fragment of it.
+    #[test]
+    fn closed_port_unreachable_message_never_contains_the_token() {
+        let token = "bad-ticket-value-XYZ";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let endpoint = resolve(&EndpointInput {
+            socket: None,
+            http: Some(format!("http://127.0.0.1:{port}")),
+            token: Some(token.to_owned()),
+            token_env: None,
+        })
+        .expect("http");
+        let transport = super::LoopbackHttp::new(&endpoint).expect("transport");
+        let mut client = Client::new(endpoint, transport);
+        let err = client
+            .call(&ApiRequest::get("/health"))
+            .expect_err("closed port");
+        assert_eq!(err.exit_code(), exit::UNREACHABLE);
+        let text = err.to_string();
+        let debug = format!("{err:?}");
+        for rendered in [text.as_str(), debug.as_str()] {
+            assert!(!rendered.contains("token"), "{rendered}");
+            assert!(!rendered.contains("ticket"), "{rendered}");
+            assert!(!rendered.contains("len="), "{rendered}");
+            assert_no_secret_fragment(rendered, token);
+        }
+        assert!(text.contains("连不上后台"), "{text}");
+        assert!(text.contains("超时或被拒绝"), "{text}");
+        assert!(!text.contains("（token"), "{text}");
+    }
+
+    /// Any 3+ character piece of `secret` is a leak, including a prefix or tail.
+    fn assert_no_secret_fragment(rendered: &str, secret: &str) {
+        let chars: Vec<char> = secret.chars().collect();
+        for window in chars.windows(3) {
+            let piece: String = window.iter().collect();
+            assert!(
+                !rendered.contains(&piece),
+                "rendered message contains secret fragment `{piece}`: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -797,7 +899,7 @@ mod tests {
     fn encode_request_carries_host_and_bearer_and_parse_roundtrips() {
         let endpoint = http_endpoint();
         let (base, token) = match &endpoint {
-            crate::endpoint::Endpoint::Http { base, token } => (base, token.as_str()),
+            crate::endpoint::Endpoint::Http { base, token } => (base, token),
             _ => panic!("http"),
         };
         let bytes = encode_request(base, token, &ApiRequest::get("/health"));

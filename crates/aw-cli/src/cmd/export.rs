@@ -70,7 +70,8 @@ pub(crate) trait ExportSource {
     /// # Errors
     ///
     /// A source-level failure. The message must not contain argv, URLs, or tokens.
-    fn load(&mut self, query: &ExportQuery) -> Result<Option<ExportBatch>, String>;
+    /// [`ExportError::Unreachable`] is exit 3; everything else is a general error.
+    fn load(&mut self, query: &ExportQuery) -> Result<Option<ExportBatch>, ExportError>;
 
     /// Body of a daemon export, after a successful [`Self::load`].
     ///
@@ -89,8 +90,32 @@ pub(crate) trait ExportSource {
 pub(crate) struct EmptyExport;
 
 impl ExportSource for EmptyExport {
-    fn load(&mut self, _query: &ExportQuery) -> Result<Option<ExportBatch>, String> {
+    fn load(&mut self, _query: &ExportQuery) -> Result<Option<ExportBatch>, ExportError> {
         Ok(None)
+    }
+}
+
+/// Why [`ExportSource::load`] failed. Distinct from "not found" (`Ok(None)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExportError {
+    /// The daemon did not answer. Exit 3.
+    Unreachable { detail: String },
+    /// Anything else the source could not complete. Exit 1.
+    Failed { detail: String },
+}
+
+impl ExportError {
+    fn detail(&self) -> &str {
+        match self {
+            Self::Unreachable { detail } | Self::Failed { detail } => detail,
+        }
+    }
+
+    fn exit_code(&self) -> i32 {
+        match self {
+            Self::Unreachable { .. } => exit::UNREACHABLE,
+            Self::Failed { .. } => exit::GENERAL,
+        }
     }
 }
 
@@ -103,6 +128,8 @@ pub(crate) enum ExportFetchError {
     NoSessions,
     /// The daemon refused the query, or the channel failed. Already Chinese.
     Failed { detail: String },
+    /// Nothing answered. Exit 3, same as [`crate::client::ClientError::Unreachable`].
+    Unreachable { detail: String },
 }
 
 /// `GET /api/v1/sessions/{session}/export`. The body is the daemon's file,
@@ -146,7 +173,7 @@ impl<F: ExportFetch> DaemonExport<F> {
 }
 
 impl<F: ExportFetch> ExportSource for DaemonExport<F> {
-    fn load(&mut self, query: &ExportQuery) -> Result<Option<ExportBatch>, String> {
+    fn load(&mut self, query: &ExportQuery) -> Result<Option<ExportBatch>, ExportError> {
         let session = session_key(&query.session);
         let mut pairs = vec![("format", self.format)];
         if let Some(filter) = query.filter.as_deref() {
@@ -173,8 +200,11 @@ impl<F: ExportFetch> ExportSource for DaemonExport<F> {
                 }))
             }
             Err(ExportFetchError::NotFound { .. }) => Ok(None),
-            Err(ExportFetchError::NoSessions) => Err("还没有你的会话，@last 无处可指".to_owned()),
-            Err(ExportFetchError::Failed { detail }) => Err(detail),
+            Err(ExportFetchError::NoSessions) => Err(ExportError::Failed {
+                detail: "还没有你的会话，@last 无处可指".to_owned(),
+            }),
+            Err(ExportFetchError::Failed { detail }) => Err(ExportError::Failed { detail }),
+            Err(ExportFetchError::Unreachable { detail }) => Err(ExportError::Unreachable { detail }),
         }
     }
 
@@ -240,6 +270,9 @@ impl<T: Transport> ExportFetch for HttpExport<T> {
             }) if code == "no_sessions" => Err(ExportFetchError::NoSessions),
             Err(ClientError::Status { status: 404, .. }) => Err(ExportFetchError::NotFound {
                 session: session.to_owned(),
+            }),
+            Err(ClientError::Unreachable { detail }) => Err(ExportFetchError::Unreachable {
+                detail: clip(&detail),
             }),
             Err(err) => Err(ExportFetchError::Failed {
                 detail: clip(&err.to_string()),
@@ -484,7 +517,9 @@ pub(crate) fn run_to(
                 json,
             );
         }
-        Err(detail) => return error_outcome(exit::GENERAL, "export", &detail, json),
+        Err(err) => {
+            return error_outcome(err.exit_code(), "export", err.detail(), json);
+        }
     };
     // A daemon export is already a file. Writing `batch` would drop it: that
     // source returns no records of its own.
@@ -718,7 +753,7 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 port: 9,
             },
-            token: "test-token".to_owned(),
+            token: crate::secret::Secret::new("test-token"),
         }
     }
 

@@ -1972,15 +1972,23 @@ pub fn verify_pipe_server_with_service_status(
             }
         }
         PipeServiceStatus::Installed { binary_path, .. } => {
-            let (server_pid, server_image) = pipe_server_identity(pipe)?;
+            // Keep the opened process handle alive until after the SCM PID
+            // comparison. Reopening by PID would admit a PID-reuse race.
+            let server = pipe_server_process(pipe)?;
+            let server_image = server.image_path()?;
             let image_matches_service = pipe_server_images_match(&server_image, binary_path)?;
-            if pipe_server_is_trusted(
+            let trusted = pipe_server_is_trusted(
                 &owner_sid,
                 None,
                 image_matches_service,
-                server_pid,
+                server.pid,
                 service_status,
-            ) {
+            );
+            // This is deliberately after both the image query and PID
+            // comparison, so `server` always denotes the process observed on
+            // the connected pipe for every installed-service trust check.
+            drop(server);
+            if trusted {
                 Ok(())
             } else {
                 Err(PipeServerVerificationError::NotDaemon {
@@ -2259,7 +2267,34 @@ fn win32_error(error: Error) -> u32 {
     error.code().0 as u32 & 0xffff
 }
 
-fn pipe_server_identity(pipe: HANDLE) -> Result<(u32, PathBuf), PipeServerVerificationError> {
+/// One process held open from a connected named-pipe server PID observation.
+///
+/// Holding this handle prevents a later PID reuse from changing the process
+/// whose image was checked before the SCM PID check completes.
+struct PipeServerProcess {
+    pid: u32,
+    handle: HANDLE,
+}
+
+impl PipeServerProcess {
+    fn image_path(&self) -> Result<PathBuf, PipeServerVerificationError> {
+        image_for_process_checked(self.handle).map_err(|error| {
+            PipeServerVerificationError::CannotQuery {
+                operation: "QueryFullProcessImageNameW(pipe server)",
+                win32_error: win32_error(error),
+                detail: None,
+            }
+        })
+    }
+}
+
+impl Drop for PipeServerProcess {
+    fn drop(&mut self) {
+        close(self.handle);
+    }
+}
+
+fn pipe_server_process(pipe: HANDLE) -> Result<PipeServerProcess, PipeServerVerificationError> {
     let mut pid = 0_u32;
     // SAFETY: `pipe` is the connected client handle. The PID output is valid
     // for the duration of this call.
@@ -2279,7 +2314,8 @@ fn pipe_server_identity(pipe: HANDLE) -> Result<(u32, PathBuf), PipeServerVerifi
         });
     }
     // SAFETY: this asks only for limited query access to the named-pipe server
-    // process. The returned handle is closed before this helper returns.
+    // process. `PipeServerProcess` closes the returned handle only after the
+    // caller has completed image and SCM-PID checks.
     #[allow(unsafe_code)]
     let process =
         unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.map_err(|error| {
@@ -2289,27 +2325,42 @@ fn pipe_server_identity(pipe: HANDLE) -> Result<(u32, PathBuf), PipeServerVerifi
                 detail: None,
             }
         })?;
-    let image = image_for_process_checked(process).map_err(|error| {
-        PipeServerVerificationError::CannotQuery {
-            operation: "QueryFullProcessImageNameW(pipe server)",
-            win32_error: win32_error(error),
-            detail: None,
-        }
-    });
-    close(process);
-    image.map(|image| (pid, image))
+    Ok(PipeServerProcess {
+        pid,
+        handle: process,
+    })
 }
 
 fn pipe_server_images_match(
     server_image: &Path,
     installed_image: &Path,
 ) -> Result<bool, PipeServerVerificationError> {
-    let server_image = canonical_image_path(server_image, "canonicalize(pipe server image)")?;
-    let installed_image = canonical_image_path(installed_image, "canonicalize(service image)")?;
+    let server_image = canonical_image_path(
+        &unquoted_image_path(server_image),
+        "canonicalize(pipe server image)",
+    )?;
+    let installed_image = canonical_image_path(
+        &unquoted_image_path(installed_image),
+        "canonicalize(service image)",
+    )?;
     Ok(server_image
         .as_os_str()
         .to_string_lossy()
         .eq_ignore_ascii_case(&installed_image.as_os_str().to_string_lossy()))
+}
+
+/// SCM `binPath` values are commonly quoted, while
+/// `QueryFullProcessImageNameW` values are not. Quotes are syntax rather than
+/// part of a Windows path, so remove only a matched surrounding pair before
+/// canonicalization.
+fn unquoted_image_path(path: &Path) -> PathBuf {
+    let image = path.as_os_str().to_string_lossy();
+    let image = image.trim();
+    let image = image
+        .strip_prefix('"')
+        .and_then(|image| image.strip_suffix('"'))
+        .unwrap_or(image);
+    PathBuf::from(image)
 }
 
 #[cfg(test)]
@@ -3455,11 +3506,13 @@ mod tests {
     }
 
     #[test]
-    fn pipe_server_decision_requires_all_installed_service_checks() {
+    fn injected_service_status_decision_requires_all_installed_service_checks() {
         let user = "S-1-5-21-10-20-30-1001";
         let other = "S-1-5-21-10-20-30-1002";
         let installed = PipeServiceStatus::Installed {
-            binary_path: PathBuf::from(r"C:\Program Files\AgentWatch\agentwatchd.exe"),
+            // SCM preserves surrounding binPath quotes in the injected
+            // observation. The path comparison strips them before deciding.
+            binary_path: PathBuf::from(r#""C:\Program Files\AgentWatch\agentwatchd.exe""#),
             process_id: 100,
             running: true,
         };
@@ -3490,7 +3543,7 @@ mod tests {
             &installed
         ));
         let stopped = PipeServiceStatus::Installed {
-            binary_path: PathBuf::from(r"C:\Program Files\AgentWatch\agentwatchd.exe"),
+            binary_path: PathBuf::from(r#""C:\Program Files\AgentWatch\agentwatchd.exe""#),
             process_id: 100,
             running: false,
         };
@@ -3502,7 +3555,7 @@ mod tests {
             &stopped
         ));
         let zero_pid = PipeServiceStatus::Installed {
-            binary_path: PathBuf::from(r"C:\Program Files\AgentWatch\agentwatchd.exe"),
+            binary_path: PathBuf::from(r#""C:\Program Files\AgentWatch\agentwatchd.exe""#),
             process_id: 0,
             running: true,
         };
@@ -3539,9 +3592,9 @@ mod tests {
     }
 
     #[test]
-    fn pipe_server_image_decision_requires_matching_canonical_paths() {
-        let root = temp_dir("pipe-image");
-        let installed_dir = root.join("installed");
+    fn pipe_server_image_comparison_accepts_quoted_spaced_scm_path_case_insensitively() {
+        let root = temp_dir("pipe image");
+        let installed_dir = root.join("Program Files").join("AgentWatch");
         let other_dir = root.join("other");
         std::fs::create_dir_all(&installed_dir).expect("installed dir");
         std::fs::create_dir_all(&other_dir).expect("other dir");
@@ -3550,17 +3603,23 @@ mod tests {
         std::fs::write(&installed, b"").expect("installed image");
         std::fs::write(&same_name_elsewhere, b"").expect("other image");
         let different_case = PathBuf::from(installed.to_string_lossy().to_ascii_uppercase());
+        let quoted_scm_path = PathBuf::from(format!("\"{}\"", installed.display()));
+        let quoted_server_path = PathBuf::from(format!("\"{}\"", different_case.display()));
 
         assert!(
-            verify_pipe_server_images(&different_case, &installed).is_ok(),
-            "canonical comparison must ignore path case"
+            verify_pipe_server_images(&different_case, &quoted_scm_path).is_ok(),
+            "canonical comparison must strip SCM quotes and ignore path case"
+        );
+        assert!(
+            verify_pipe_server_images(&quoted_server_path, &quoted_scm_path).is_ok(),
+            "canonical comparison must strip surrounding quotes from both paths"
         );
         assert!(matches!(
-            verify_pipe_server_images(&same_name_elsewhere, &installed),
+            verify_pipe_server_images(&same_name_elsewhere, &quoted_scm_path),
             Err(crate::PipeServerVerificationError::NotDaemon { .. })
         ));
         assert!(matches!(
-            verify_pipe_server_images(&root.join("missing.exe"), &installed),
+            verify_pipe_server_images(&root.join("missing.exe"), &quoted_scm_path),
             Err(crate::PipeServerVerificationError::CannotQuery { .. })
         ));
 

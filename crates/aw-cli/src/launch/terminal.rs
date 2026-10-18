@@ -209,13 +209,13 @@ impl TerminalChild {
                 Ok(WaitStatus::PtraceEvent(_, _, _)) | Ok(WaitStatus::PtraceSyscall(_)) => {
                     std::thread::sleep(SIGNAL_POLL);
                 }
-                Err(error) if saw_hup => {
+                Err(_error) if saw_hup => {
                     // The controlling terminal may have vanished before this
                     // polling waiter can reap the child. Do not leave a direct
                     // child running merely because the kernel reports EIO or
                     // ECHILD during terminal teardown.
                     mac129_diag!(
-                        "wait-err-after-hup sender_pid={} target_group={} error={error} -> 129",
+                        "wait-err-after-hup sender_pid={} target_group={} error={_error} -> 129",
                         std::process::id(),
                         self.child_group
                     );

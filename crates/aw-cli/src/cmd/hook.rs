@@ -303,19 +303,32 @@ fn apply_decision(
             "判定结果无法按这个 agent 的格式输出",
         );
     };
-    let audited = audit_decision(
+    let original = original_text(&subject, &value);
+    let (audited, posted) = audit_decision(
         &subject,
         &decided,
         session,
-        &original_text(&subject, &value),
+        &original,
         rewritten_text.as_deref(),
         endpoint,
         deadline,
     );
-    // A rewrite that could not be audited is a deny. Re-render that deny.
-    if audited.delivered == aw_pipeline::Delivered::Dropped && decided.effective == Action::Rewrite
-    {
-        let downgraded = audited.downgrade_rewrite(&decided);
+    // A rewrite the client cannot confirm was stored is a deny. A local backup
+    // counts as stored, so that path still rewrites. `stored: false`, a missed
+    // deadline, and a daemon that never answered do not.
+    //
+    // The daemon may have the row anyway: its write can finish after this
+    // client gave up, and that row says `rewrite`. Append the refusal so the
+    // last line matches what ran.
+    let rewrite_unconfirmed = decided.effective == Action::Rewrite && audited.client_unconfirmed;
+    if rewrite_unconfirmed {
+        let downgraded = downgrade_unconfirmed(&decided);
+        let _ = intercept_audit::correct_delivered(
+            audit_env_path().as_deref(),
+            Some(endpoint),
+            &posted,
+            &downgraded,
+        );
         let (again, _) = render_decision(agent, &subject, &downgraded, &value);
         return again.and_then(|body| json_stdout(&body));
     }
@@ -346,7 +359,8 @@ fn on_error_from_decide(
             None,
             endpoint,
             deadline,
-        );
+        )
+        .0;
         return None;
     }
     let value = Value::Null;
@@ -359,7 +373,8 @@ fn on_error_from_decide(
         None,
         endpoint,
         deadline,
-    );
+    )
+    .0;
     rendered.and_then(|body| json_stdout(&body))
 }
 
@@ -393,13 +408,15 @@ fn apply_on_error(
     if decision.effective == Action::Allow {
         let _ = audit_decision(
             &subject, &decision, session, &original, None, endpoint, deadline,
-        );
+        )
+        .0;
         return None;
     }
     let (rendered, _) = render_decision(agent, &subject, &decision, &value);
     let _ = audit_decision(
         &subject, &decision, session, &original, None, endpoint, deadline,
-    );
+    )
+    .0;
     rendered.and_then(|body| json_stdout(&body))
 }
 
@@ -434,6 +451,25 @@ fn on_error_decision(on_error: OnError, reason: &str) -> Decision {
     }
 }
 
+/// A rewrite whose audit the client could not confirm, printed as a deny.
+///
+/// The rule's action stays `rewrite`, so the row shows what was asked and
+/// what ran. The reason keeps the rule's sentence and says why it changed.
+fn downgrade_unconfirmed(decision: &Decision) -> Decision {
+    let extra = "审计写不进去，改写已改为拒绝";
+    Decision {
+        rule_id: decision.rule_id.clone(),
+        action: decision.action,
+        effective: Action::Deny,
+        downgraded: true,
+        reason: Some(match decision.reason.as_deref() {
+            Some(text) if !text.is_empty() => format!("{text}（{extra}）"),
+            _ => extra.to_owned(),
+        }),
+        fields: Vec::new(),
+    }
+}
+
 fn audit_decision(
     subject: &Subject,
     decision: &Decision,
@@ -442,7 +478,7 @@ fn audit_decision(
     rewritten: Option<&str>,
     endpoint: &Endpoint,
     deadline: Instant,
-) -> AuditDelivery {
+) -> (AuditDelivery, aw_pipeline::AuditRecord) {
     // A session id is the salt when one exists. Without one, the salt is
     // process-local and `'static`, so the two paths cannot share one binding.
     let mut record = if let Some(id) = session.filter(|text| !text.is_empty()) {
@@ -466,12 +502,13 @@ fn audit_decision(
     };
     let remaining = deadline.saturating_duration_since(Instant::now());
     let backup = intercept_audit::backup_path(audit_env_path().as_deref(), None);
-    intercept_audit::deliver(
+    let delivery = intercept_audit::deliver(
         Some(endpoint),
         backup.as_deref(),
         &mut record,
         remaining.min(Duration::from_millis(50)),
-    )
+    );
+    (delivery, record)
 }
 
 fn audit_env_path() -> Option<std::path::PathBuf> {
@@ -1217,8 +1254,17 @@ action = "ask"
             if ok {
                 saved.lock().expect("bodies").push(value);
             }
-            let status = if ok { "200 OK" } else { "400 Bad Request" };
-            let reply = format!("HTTP/1.1 {status}\r\nContent-Length: 2\r\n\r\n{{}}");
+            // `{}` is a 200 the old client treated as stored. The route's
+            // success body is `{"stored": true}`; anything else is not a row.
+            let (status, reply_body) = if ok {
+                ("200 OK", "{\"stored\":true}")
+            } else {
+                ("400 Bad Request", "{}")
+            };
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{reply_body}",
+                reply_body.len()
+            );
             let _ = stream.write_all(reply.as_bytes());
         });
         let endpoint = endpoint::resolve(&EndpointInput {
@@ -1628,5 +1674,195 @@ action = "ask"
         assert!(reason.contains("审计写不进去"), "{reason}");
         assert!(reason.contains("只允许 plan"), "{reason}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 200 with `{"stored": false}` used to count as delivered, so the rewrite
+    /// ran and nothing was in the database. It is a deny.
+    #[test]
+    fn stored_false_downgrades_a_rewrite() {
+        let _guard = policy_file::env_lock();
+        let _home = home_guard();
+        let dir = scratch("stored-false");
+        let path = dir.join("policy.toml");
+        fs::write(
+            &path,
+            "enabled = true\n[[rule]]\nid = \"force-dry-run\"\nlayer = [\"hook\"]\n\
+             tool = [\"Bash\"]\nmatch.command = { prefix = \"terraform apply\" }\n\
+             action = \"rewrite\"\n\
+             rewrite.command = { replace = [\"terraform apply\", \"terraform plan\"] }\n",
+        )
+        .unwrap();
+        let _policy = policy_file::EnvVarGuard::set(policy_file::POLICY_ENV, &path);
+        let _audit = policy_file::EnvVarGuard::unset(intercept_audit::AUDIT_ENV);
+        let (endpoint, _bodies) = stored_false_stand_in();
+        let payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"terraform apply"}}"#;
+        let mut transport = Scripted {
+            sent: Vec::new(),
+            ok: true,
+        };
+        let outcome = run(input("claude-code", payload, &endpoint), &mut transport);
+        let body: Value = serde_json::from_slice(&outcome.stdout).unwrap_or_else(|_| {
+            panic!(
+                "stored:false still rewrote: {}",
+                String::from_utf8_lossy(&outcome.stdout)
+            )
+        });
+        assert_eq!(
+            body["hookSpecificOutput"]["hookEventName"],
+            json!("PreToolUse"),
+            "{body}"
+        );
+        assert_eq!(
+            body["hookSpecificOutput"]["permissionDecision"],
+            json!("deny"),
+            "{body}"
+        );
+        assert!(body["hookSpecificOutput"].get("updatedInput").is_none());
+        let reason = body["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or("");
+        assert!(reason.contains("审计写不进去"), "{reason}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Answers 200 and `{"stored": false}`, the body the daemon sends when no
+    /// database is open.
+    fn stored_false_stand_in() -> (Endpoint, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0_u8; 8 * 1024];
+            let _ = stream.read(&mut buf);
+            let reply_body = "{\"stored\":false,\"storage\":\"not_ready\"}";
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{reply_body}",
+                reply_body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        });
+        let endpoint = endpoint::resolve(&EndpointInput {
+            socket: None,
+            http: Some(format!("http://127.0.0.1:{port}")),
+            token: Some("hook-stored-false".to_owned()),
+            token_env: None,
+        })
+        .expect("loopback endpoint");
+        (endpoint, bodies)
+    }
+
+    /// The daemon stored the rewrite, then answered slower than the post
+    /// budget. The client downgrades to a deny. The stored row must not be the
+    /// last word: the correction line says `deny`.
+    #[test]
+    fn slow_daemon_rewrite_is_corrected_to_deny() {
+        let _guard = policy_file::env_lock();
+        let _home = home_guard();
+        let dir = scratch("slow-daemon");
+        let path = dir.join("policy.toml");
+        fs::write(
+            &path,
+            "enabled = true\n[[rule]]\nid = \"force-dry-run\"\nlayer = [\"hook\"]\n\
+             tool = [\"Bash\"]\nmatch.command = { prefix = \"terraform apply\" }\n\
+             action = \"rewrite\"\n\
+             rewrite.command = { replace = [\"terraform apply\", \"terraform plan\"] }\n\
+             reason = \"只允许 plan\"\n",
+        )
+        .unwrap();
+        let _policy = policy_file::EnvVarGuard::set(policy_file::POLICY_ENV, &path);
+        // No local backup. The daemon's row is the only copy, and it says
+        // rewrite until the correction arrives.
+        let _audit = policy_file::EnvVarGuard::unset(intercept_audit::AUDIT_ENV);
+        let (endpoint, bodies) = slow_intercept_stand_in();
+        let payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"terraform apply"}}"#;
+        let mut started = input("claude-code", payload, &endpoint);
+        // Inside the 200 ms hook budget, past the 50 ms the audit post is
+        // allowed. The post times out after the daemon has the row.
+        started.started = Instant::now() - Duration::from_millis(160);
+        let mut transport = Scripted {
+            sent: Vec::new(),
+            ok: true,
+        };
+        let outcome = run(started, &mut transport);
+        let body: Value = serde_json::from_slice(&outcome.stdout).unwrap_or_else(|_| {
+            panic!(
+                "slow daemon still rewrote: {}",
+                String::from_utf8_lossy(&outcome.stdout)
+            )
+        });
+        assert_eq!(
+            body["hookSpecificOutput"]["permissionDecision"],
+            json!("deny"),
+            "{body}"
+        );
+        assert!(body["hookSpecificOutput"].get("updatedInput").is_none());
+        // The correction is posted after the first answer is given up. The
+        // stand-in is still in its slow reply then, so it accepts the second
+        // post only after that. Wait for it.
+        thread::sleep(Duration::from_millis(500));
+        let posted = bodies.lock().expect("stand-in").clone();
+        assert_eq!(posted.len(), 2, "daemon saw {posted:?}");
+        assert_eq!(
+            posted[0]["effective_action"],
+            json!("rewrite"),
+            "{posted:?}"
+        );
+        assert_eq!(posted[1]["effective_action"], json!("deny"), "{posted:?}");
+        assert_eq!(posted[1]["action"], json!("rewrite"), "{posted:?}");
+        assert_eq!(posted[1]["downgraded"], json!(true), "{posted:?}");
+        assert!(posted[1]["after_summary"].is_null(), "{posted:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Answers `{"stored": true}` after the client's post budget, and keeps the
+    /// body. The row is in the database; the client has timed out.
+    fn slow_intercept_stand_in() -> (Endpoint, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let saved = std::sync::Arc::clone(&bodies);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for attempt in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0_u8; 16 * 1024];
+                let Ok(n) = stream.read(&mut buf) else {
+                    return;
+                };
+                let text = String::from_utf8_lossy(&buf[..n]);
+                let json_at = text.find("\r\n\r\n").map(|pos| pos + 4).unwrap_or(0);
+                saved
+                    .lock()
+                    .expect("bodies")
+                    .push(serde_json::from_str::<Value>(&text[json_at..]).unwrap_or(Value::Null));
+                // The first answer lands after the client gave up. The
+                // correction is the second post, and that one is answered.
+                if attempt == 0 {
+                    thread::sleep(Duration::from_millis(400));
+                }
+                let reply_body = "{\"stored\":true}";
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{reply_body}",
+                    reply_body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        let endpoint = endpoint::resolve(&EndpointInput {
+            socket: None,
+            http: Some(format!("http://127.0.0.1:{port}")),
+            token: Some("hook-slow-test".to_owned()),
+            token_env: None,
+        })
+        .expect("loopback endpoint");
+        (endpoint, bodies)
     }
 }

@@ -78,6 +78,19 @@ fn read_urandom(bytes: &mut [u8]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AuditDelivery {
     pub delivered: Delivered,
+    /// The daemon answered `stored: true` for the row as posted.
+    ///
+    /// Distinct from [`Delivered::Daemon`]: a local backup that also reached
+    /// the daemon is `Daemon` too, and this says the database has the row.
+    /// A later downgrade has to correct that row, because it says the rewrite
+    /// happened. `stored: false` (no database) leaves this false.
+    pub daemon_stored: bool,
+    /// The client did not see a `stored: true` before its own deadline.
+    ///
+    /// The daemon may still have the row: a slow write answers after the
+    /// client gave up. A rewrite is refused in that case, and the row that
+    /// says `rewrite` needs [`correct_delivered`].
+    pub client_unconfirmed: bool,
 }
 
 impl AuditDelivery {
@@ -124,6 +137,8 @@ pub(crate) fn deliver(
             record.delivered = Some(Delivered::Daemon);
             return AuditDelivery {
                 delivered: Delivered::Daemon,
+                daemon_stored: true,
+                client_unconfirmed: false,
             };
         }
     }
@@ -131,12 +146,52 @@ pub(crate) fn deliver(
         record.delivered = Some(Delivered::LocalBackup);
         return AuditDelivery {
             delivered: Delivered::LocalBackup,
+            daemon_stored: false,
+            // The local line is stored (design §5.3). A daemon that did not
+            // confirm does not un-store it, so the rewrite still runs.
+            client_unconfirmed: false,
         };
     }
     record.delivered = Some(Delivered::Dropped);
     AuditDelivery {
         delivered: Delivered::Dropped,
+        daemon_stored: false,
+        client_unconfirmed: endpoint.is_some(),
     }
+}
+
+/// The caller stored `posted` and then could not perform it.
+///
+/// A rewrite whose audit post timed out, or whose fields could not be written
+/// back, is refused. The row already in the daemon (or the local line) still
+/// says `effective_action = rewrite`, which is not what ran. Append one line
+/// for the decision that did run. A reader that takes the last line for this
+/// decision sees the refusal.
+///
+/// Posted again, once. The first post is what ran out of time, and the row it
+/// left says `rewrite`. This one says what ran. A slow daemon can miss it too;
+/// the local line is the copy that does not depend on that. `true` when either
+/// copy was written.
+pub(crate) fn correct_delivered(
+    backup: Option<&Path>,
+    endpoint: Option<&Endpoint>,
+    posted: &AuditRecord,
+    actual: &Decision,
+) -> bool {
+    // Keep the posted row's subject, summary, and hash. Rebuilding them would
+    // hash an empty string and disagree with the row already stored. A
+    // downgraded rewrite has no `after`: nothing was rewritten.
+    let mut corrected = posted.clone();
+    corrected.action = actual.action.as_str().to_owned();
+    corrected.effective_action = actual.effective.as_str().to_owned();
+    corrected.downgraded = actual.downgraded;
+    corrected.reason = actual.reason.clone();
+    corrected.after_summary = None;
+    corrected.after_hash = None;
+    let local = backup.is_some_and(|path| append_backup(path, &corrected));
+    let daemon = endpoint
+        .is_some_and(|endpoint| post_daemon(endpoint, &corrected, Duration::from_millis(50)));
+    local || daemon
 }
 
 /// Backup path: `AW_INTERCEPT_AUDIT`, else `<session_dir>/intercept-audit.jsonl`.
@@ -157,7 +212,23 @@ fn post_daemon(endpoint: &Endpoint, record: &AuditRecord, timeout: Duration) -> 
     let body = record_json(record, Delivered::Daemon);
     let request = ApiRequest::post_json("/api/v1/agent/intercept", &body);
     let mut client = Client::new(endpoint.clone(), transport);
-    client.call(&request).is_ok()
+    match client.call(&request) {
+        Ok(reply) => body_says_stored(&reply.body),
+        Err(_) => false,
+    }
+}
+
+/// `true` when the daemon's body says the row was written.
+///
+/// A 200 with `{"stored": false}` means the database is not open. The status
+/// alone used to count as delivered, so a rewrite went ahead with nothing
+/// stored. A body that is not JSON, or that omits `stored`, is also not a
+/// stored row: this route's success body always says `stored: true`.
+fn body_says_stored(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("stored").and_then(Value::as_bool))
+        == Some(true)
 }
 
 fn append_backup(path: &Path, record: &AuditRecord) -> bool {
@@ -269,10 +340,82 @@ mod tests {
         );
     }
 
+    /// The daemon answered 200 and `stored: false` (no database). That used to
+    /// count as delivered, so the rewrite ran with no row. It is a drop.
+    #[test]
+    fn stored_false_is_not_delivered() {
+        assert!(!body_says_stored(
+            br#"{"stored":false,"storage":"not_ready"}"#
+        ));
+        assert!(!body_says_stored(br#"{"accepted":0}"#));
+        assert!(!body_says_stored(b"not json"));
+        assert!(body_says_stored(br#"{"stored":true}"#));
+    }
+
+    /// A rewrite the daemon did store, which the caller then had to refuse
+    /// (the post outran the hook budget, or the bytes could not be written
+    /// back). The row already says `rewrite`. Appending the downgraded record
+    /// is what a later reader sees last, and it says `deny`.
+    #[test]
+    fn downgraded_rewrite_appends_a_deny_line() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("audit-tests")
+            .join(format!("downgrade-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("intercept-audit.jsonl");
+        let subject = Subject {
+            layer: Layer::Hook,
+            agent: Some("claude-code".to_owned()),
+            tool: Some("Bash".to_owned()),
+            event: Some("PreToolUse".to_owned()),
+            command: Some("terraform apply".to_owned()),
+            phase: Phase::Pre,
+            ..Subject::default()
+        };
+        let mut record = record_for(
+            &subject,
+            &decision(Action::Rewrite),
+            b"salt",
+            "terraform apply",
+            Some("terraform plan"),
+            Some("s-1"),
+        );
+        // Pretend the daemon post already landed this rewrite. The caller then
+        // finds it cannot perform the rewrite and downgrades.
+        record.delivered = Some(Delivered::Daemon);
+        let downgraded = AuditDelivery {
+            delivered: Delivered::Dropped,
+            daemon_stored: true,
+            client_unconfirmed: true,
+        }
+        .downgrade_rewrite(&decision(Action::Rewrite));
+        assert!(correct_delivered(
+            Some(path.as_path()),
+            None,
+            &record,
+            &downgraded
+        ));
+        let text = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let row: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(row["effective_action"], json!("deny"), "{row}");
+        assert_eq!(row["action"], json!("rewrite"), "{row}");
+        assert_eq!(row["downgraded"], json!(true), "{row}");
+        assert_eq!(row["delivered"], json!("local_backup"), "{row}");
+        assert!(row["after_summary"].is_null(), "{row}");
+        assert_eq!(row["session"], json!("s-1"), "{row}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn dropped_rewrite_becomes_deny() {
         let delivery = AuditDelivery {
             delivered: Delivered::Dropped,
+            daemon_stored: false,
+            client_unconfirmed: true,
         };
         let next = delivery.downgrade_rewrite(&decision(Action::Rewrite));
         assert_eq!(next.effective, Action::Deny);

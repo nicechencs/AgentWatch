@@ -550,12 +550,21 @@ fn decide_and_apply(line: &str, gate: &mut Gate<'_, impl Write>) -> FrameAction 
         } else {
             None
         };
+    // A rewrite the client cannot confirm was stored is a deny. The daemon can
+    // still have written the `rewrite` row after this side gave up; the
+    // correction line is what a later reader sees last.
     let decision = match audited {
-        Some(delivery)
-            if delivery.delivered == aw_pipeline::Delivered::Dropped
-                && decision.effective == Action::Rewrite =>
+        Some((delivery, posted))
+            if delivery.client_unconfirmed && decision.effective == Action::Rewrite =>
         {
-            delivery.downgrade_rewrite(&decision)
+            let downgraded = unconfirmed_rewrite(&decision);
+            let _ = super::intercept_audit::correct_delivered(
+                audit_backup().as_deref(),
+                gate.endpoint,
+                &posted,
+                &downgraded,
+            );
+            downgraded
         }
         _ => decision,
     };
@@ -844,6 +853,37 @@ fn deny_decision(reason: &str) -> Decision {
     }
 }
 
+/// A rewrite whose audit this process could not confirm, as a deny.
+///
+/// The rule's action stays `rewrite`. The sentence keeps the rule's reason and
+/// says why the bytes did not change.
+fn unconfirmed_rewrite(decision: &Decision) -> Decision {
+    let extra = "审计写不进去，改写已改为拒绝";
+    Decision {
+        rule_id: decision.rule_id.clone(),
+        action: decision.action,
+        effective: Action::Deny,
+        downgraded: true,
+        reason: Some(match decision.reason.as_deref() {
+            Some(text) if !text.is_empty() => format!("{text}（{extra}）"),
+            _ => extra.to_owned(),
+        }),
+        fields: Vec::new(),
+    }
+}
+
+/// `AW_INTERCEPT_AUDIT`, else nothing. mcp-tap has no session directory of its
+/// own; `aw run` passes one through the environment when it has one.
+fn audit_backup() -> Option<std::path::PathBuf> {
+    super::intercept_audit::backup_path(
+        std::env::var_os(super::intercept_audit::AUDIT_ENV)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+        None,
+    )
+}
+
 /// Record one deny, rewrite, ask, or downgrade, then post it.
 ///
 /// The local backup is written first. The daemon post uses `endpoint` (the
@@ -857,7 +897,10 @@ fn audit_mcp(
     endpoint: Option<&Endpoint>,
     frame: Option<&str>,
     direction: &str,
-) -> super::intercept_audit::AuditDelivery {
+) -> (
+    super::intercept_audit::AuditDelivery,
+    aw_pipeline::AuditRecord,
+) {
     // `before` is the field summary the audit stores. It is not a JSON-RPC
     // frame: parsing it again leaves tool, method, and event empty. Labels
     // come from the original line (`frame`); the direction is the copy that
@@ -910,7 +953,7 @@ fn audit_mcp(
             "mcp-tap：拦截审计写不进去（intercept_audit_dropped）"
         );
     }
-    delivery
+    (delivery, record)
 }
 
 enum McpPolicy {

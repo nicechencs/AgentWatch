@@ -100,6 +100,8 @@ pub(crate) struct DeferredFlags<'a> {
     pub include_proc: bool,
     /// `--group` was set. Groups are a later card.
     pub group: bool,
+    /// `--intercept`. Writes a temp Claude Code settings file for this launch.
+    pub intercept: bool,
 }
 
 /// How much of the summary to print.
@@ -1407,7 +1409,96 @@ fn prepare(
     spec.env = env;
     spec.no_follow_children = args.no_follow_children;
     spec.no_daemon = args.no_daemon;
+    if let Some(outcome) = inject_claude_intercept(args, deferred, &mut spec) {
+        return Err(outcome);
+    }
     Ok((level, spec))
+}
+
+/// Claude Code intercept injection (P5-SEC-02).
+///
+/// Off unless `--intercept` was passed or the policy file is enabled. A temp
+/// settings file is written under the system temp directory (not `~/.claude/`)
+/// and `--settings <path>` is appended. The hook command is this binary's
+/// absolute path, `args` are `["hook", "claude-code"]`, and `onFailure` is
+/// `block`. Codex is not injected: that path is unverified, and the manual
+/// fragment lives in the adapter.
+///
+/// Returns `Some` only when the settings file could not be written. That is a
+/// failed launch, not a launch without the hook the operator asked for.
+fn inject_claude_intercept(
+    args: &RunArgs<'_>,
+    deferred: DeferredFlags,
+    spec: &mut crate::launch::RunSpec,
+) -> Option<Outcome> {
+    let agent = args.agent.unwrap_or("");
+    let looks_like_claude = agent == "claude-code"
+        || agent == "claude"
+        || spec
+            .command
+            .first()
+            .is_some_and(|program| program.rsplit(['/', '\\']).next() == Some("claude"));
+    if !looks_like_claude {
+        return None;
+    }
+    let policy = super::policy_file::load_policy(
+        std::env::var_os(super::policy_file::POLICY_ENV)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+        super::policy_file::user_config_home().as_deref(),
+    );
+    let enabled = deferred.intercept || matches!(policy, super::policy_file::PolicyLoad::On(_));
+    if !enabled {
+        return None;
+    }
+    if matches!(policy, super::policy_file::PolicyLoad::Broken) && !deferred.intercept {
+        // A broken file with no explicit switch still denies inside `aw hook`.
+        // Injecting is what makes that deny run. Inject.
+    }
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aw"));
+    let command = exe.display().to_string();
+    let doc = aw_agent_adapters::agents::claude_code::decision::intercept_settings_json(
+        &command,
+        &["hook", "claude-code"],
+        true,
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "aw-intercept-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return Some(super::error_outcome(
+            exit::GENERAL,
+            "intercept",
+            "拦截的临时设置目录写不了，这次没有启动",
+            args.json,
+        ));
+    }
+    let path = dir.join("claude-settings.json");
+    if std::fs::write(&path, doc).is_err() {
+        return Some(super::error_outcome(
+            exit::GENERAL,
+            "intercept",
+            "拦截的临时设置文件写不了，这次没有启动",
+            args.json,
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    spec.command.push("--settings".to_owned());
+    spec.command.push(path.display().to_string());
+    // `AW_SESSION` is not set here. The daemon assigns the public id after
+    // this function returns, and this process does not know it yet. The hook
+    // falls back to `--session` when a later card threads the id through.
+    None
 }
 
 /// Whether the pin result is known after a completed run.
@@ -2204,6 +2295,7 @@ mod tests {
             unsafe_no_redact: false,
             include_proc: false,
             group: false,
+            intercept: false,
         }
     }
 

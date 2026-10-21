@@ -371,10 +371,9 @@ impl LoopbackHttp {
 
     /// Replace the dial deadline. Tests use a short one for a peer that accepts
     /// and never answers; production keeps the 12 second deadline from [`Self::new`].
-    #[cfg(test)]
-    fn with_timeout(mut self, timeout: Duration) -> Self {
+    /// `aw hook` also shortens it so the audit post stays inside the 200 ms budget.
+    pub(crate) fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
-        self
     }
 }
 
@@ -697,9 +696,8 @@ mod tests {
             token_env: None,
         })
         .expect("http");
-        let transport = super::LoopbackHttp::new(&endpoint)
-            .expect("transport")
-            .with_timeout(Duration::from_millis(200));
+        let mut transport = super::LoopbackHttp::new(&endpoint).expect("transport");
+        transport.set_timeout(Duration::from_millis(200));
         let mut client = Client::new(endpoint, transport);
         let err = client
             .call(&ApiRequest::get("/health"))

@@ -95,6 +95,8 @@ pub(crate) enum Command {
         raw: Option<String>,
         #[arg(long, help = "关闭脱敏（本版本未接入）")]
         unsafe_no_redact: bool,
+        #[arg(long, help = "本次启动按规则拦截（Claude Code 注入临时 hooks）")]
+        intercept: bool,
         /// 要启动的程序及其参数
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,

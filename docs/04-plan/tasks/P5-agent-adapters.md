@@ -33,6 +33,10 @@
 | P5-PIPE-02 | 用户自定义规则与告警（REQ-10） | PIPE | M | P3：关联引擎 | A |
 | P5-UI-02 | 多会话对比 | UI | M | P5-AGENT-01 | B |
 | P5-DOC-01 | 适配器贡献指南与模板 | DOC | S | P5-AGENT-03 | D |
+| P5-SEC-01 | 拦截规则：格式、判定、审计记录 | SEC | M | ADR-0014 | A |
+| P5-SEC-02 | `aw hook` 按规则拒绝 / 改写 / 问用户（Claude Code、Codex）与 Claude 启动注入 | AGENT | M | P5-SEC-01 | B |
+| P5-SEC-03 | `aw mcp-tap` 按规则拒绝与改写 | AGENT | S | P5-SEC-01 | B |
+| P5-SEC-04 | 网络代理按规则拒绝 | PROXY | S | P5-SEC-01 | B |
 
 并行组：同组任务之间文件不重叠。C 组的各个适配器分别位于 `crates/aw-agent-adapters/src/agents/<id>/`，可以完全并行。
 
@@ -119,7 +123,7 @@ flowchart LR
 - 入库写 `agent_events` 表：`evidence = 'E3'`，`source` 为 `agent.<id>/hook` 或 `agent.<id>/otel`。
 
 **限制**：
-- hook 子命令不返回任何会改变 Agent 行为的输出（例如 deny 决策）。
+- 拦截规则关闭（缺省）时，hook 子命令不返回任何会改变 Agent 行为的输出（例如 deny 决策）。规则开启后的行为见 P5-SEC-02、ADR-0014。
 - OTLP 接收器不转发数据到任何外部端点。
 
 **验收标准**：
@@ -460,3 +464,49 @@ flowchart LR
 - [ ] docs/README.md 的索引已更新。
 
 **参考文档**：[process-tracking](../../01-architecture/process-tracking.md)、[SPIKE-07](../../06-research/SPIKE-07-agent-hooks.md)、[github-workflow](../../05-dev/github-workflow.md)
+
+### P5-SEC-01 拦截规则：格式、判定、审计记录
+
+- **AREA**: SEC
+- **平台**: all
+- **类型**: feature
+- **优先级**: S
+- **规模**: M
+- **依赖**: ADR-0014
+- **关联**: REQ-12、ADR-0012、ADR-0014
+- **文件范围**: 规则与判定模块（平台无关 crate，由实现者选定并在 PR 写明）、`crates/aw-store/migrations/0012_intercept_events.sql`、`crates/aw-daemon/src/api/`（新路由）、相关测试
+
+**背景**：见 [拦截方案 §5](../../proposals/aw-intercept-design.md)。
+
+**实现要点**：TOML 规则；动作 allow / deny / rewrite / ask；多条命中取最严 `deny > ask > rewrite > allow`；改写后复检；`on_error`；审计记录脱敏摘要 + 加盐哈希；后台不在时写会话目录本地备份。
+
+**限制**：规则缺省关闭；不存原文；不引入平台代码。
+
+**验收标准**：见 [拦截方案 §8](../../proposals/aw-intercept-design.md) 中规则与审计相关条目。
+
+### P5-SEC-02 `aw hook` 按规则拒绝 / 改写 / 问用户
+
+- **AREA**: AGENT
+- **平台**: all
+- **依赖**: P5-SEC-01
+- **文件范围**: `crates/aw-cli/src/cmd/hook.rs`、`crates/aw-cli/src/cmd/run.rs`、`crates/aw-agent-adapters/src/agents/claude_code/`、`crates/aw-agent-adapters/src/agents/codex/`
+
+**要点**：Claude Code 输出 `permissionDecision` / `updatedInput` / `updatedToolOutput`；Codex 输出 deny 与 `allow + updatedInput`，`ask` 降级为 deny；Claude 启动注入用 exec 形式 + `onFailure: block`；修正默认 socket / 管道发送格式。规则关闭时输出与现在逐字节一致。
+
+### P5-SEC-03 `aw mcp-tap` 按规则拒绝与改写
+
+- **AREA**: AGENT
+- **平台**: all
+- **依赖**: P5-SEC-01
+- **文件范围**: `crates/aw-cli/src/cmd/mcp_tap.rs`、`crates/aw-agent-adapters/src/mcp_tap/`
+
+**要点**：deny 回 JSON-RPC 错误（同一 `id`），不转给服务端；rewrite 改请求参数或结果；规则关闭时逐字节透传。
+
+### P5-SEC-04 网络代理按规则拒绝
+
+- **AREA**: PROXY
+- **平台**: all
+- **依赖**: P5-SEC-01
+- **文件范围**: `crates/aw-proxy/src/server/`
+
+**要点**：命中 deny 回 403 和中文原因，不连上游；第一步不改写；代理接入 `aw run` 启动链路是后续任务。

@@ -12,9 +12,14 @@
 //! Content hashes of argument values are not computed. A chunk hash would
 //! require holding the value, and this module does not keep values.
 
+mod decide;
 mod extract;
 mod frame;
 
+pub use decide::{
+    apply_request, apply_response, subject_from_frame, FieldChange, FrameAction, FrameDecision,
+    FrameSubject, FrameVerdict,
+};
 pub use extract::{extract, ArgType, ExtractGap, RpcExtract, MAX_KEY_SCALARS};
 pub use frame::{push_frames, FrameError, FrameOutcome, Splitter, MAX_FRAME_BYTES};
 

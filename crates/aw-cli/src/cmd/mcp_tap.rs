@@ -17,12 +17,15 @@
 use std::io::{self, Read, Write};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use aw_agent_adapters::{
-    extract, ExtractGap, FrameOutcome, RpcExtract, Splitter, DIR_C2S, DIR_S2C,
+    apply_request, apply_response, extract, subject_from_frame, ExtractGap, FieldChange,
+    FrameAction, FrameDecision, FrameOutcome, FrameVerdict, RpcExtract, Splitter, DIR_C2S, DIR_S2C,
 };
+use aw_pipeline::{decide, Action, Decision, Layer, OnError, Phase, Subject};
 use serde_json::{json, Value};
 
 use crate::exit;
@@ -82,6 +85,7 @@ fn spawn_and_copy(program: &str, args: &[String]) -> io::Result<Outcome> {
         .spawn()
         .map_err(|err| io::Error::other(err.to_string()))?;
 
+    let policy = Arc::new(load_mcp_policy());
     let child_stdin = child
         .stdin
         .take()
@@ -100,19 +104,28 @@ fn spawn_and_copy(program: &str, args: &[String]) -> io::Result<Outcome> {
     let (tx, rx) = mpsc::sync_channel::<CopyNote>(64);
 
     let stdin_tx = tx.clone();
+    let stdin_policy = Arc::clone(&policy);
     let stdin_thread = thread::Builder::new()
         .name("aw-mcp-tap-stdin".to_owned())
         .spawn(move || {
-            let result = copy_parent_to_child(io::stdin(), child_stdin, DIR_C2S, &stdin_tx);
+            let result =
+                copy_parent_to_child(io::stdin(), child_stdin, DIR_C2S, &stdin_tx, &stdin_policy);
             let _ = stdin_tx.send(CopyNote::Done(result));
         })
         .map_err(|err| io::Error::other(err.to_string()))?;
 
     let stdout_tx = tx.clone();
+    let stdout_policy = policy;
     let stdout_thread = thread::Builder::new()
         .name("aw-mcp-tap-stdout".to_owned())
         .spawn(move || {
-            let result = copy_child_to_parent(child_stdout, io::stdout(), DIR_S2C, &stdout_tx);
+            let result = copy_child_to_parent(
+                child_stdout,
+                io::stdout(),
+                DIR_S2C,
+                &stdout_tx,
+                &stdout_policy,
+            );
             let _ = stdout_tx.send(CopyNote::Done(result));
         })
         .map_err(|err| io::Error::other(err.to_string()))?;
@@ -185,23 +198,304 @@ fn exit_code_from(status: ExitStatus, copy_error: bool) -> i32 {
 }
 
 /// Copy parent stdin onto the child, and note each completed line.
+///
+/// Policy off: every byte is forwarded before it is parsed. Policy on: a
+/// completed line is decided first. A deny is not written to the child; the
+/// JSON-RPC error is written to this process's stdout (the MCP client).
 fn copy_parent_to_child<R: Read, W: Write>(
     mut from: R,
     mut to: W,
     direction: &'static str,
     tx: &SyncSender<CopyNote>,
+    policy: &McpPolicy,
 ) -> io::Result<()> {
-    copy_parsed(&mut from, &mut to, direction, tx)
+    copy_with_policy(&mut from, &mut to, direction, tx, policy, true)
 }
 
 /// Copy child stdout onto the parent, and note each completed line.
+///
+/// Policy off: every byte is forwarded before it is parsed. Policy on: a
+/// completed line may be rewritten. A deny on the way back is still forwarded;
+/// the tool already ran.
 fn copy_child_to_parent<R: Read, W: Write>(
     mut from: R,
     mut to: W,
     direction: &'static str,
     tx: &SyncSender<CopyNote>,
+    policy: &McpPolicy,
 ) -> io::Result<()> {
-    copy_parsed(&mut from, &mut to, direction, tx)
+    copy_with_policy(&mut from, &mut to, direction, tx, policy, false)
+}
+
+fn copy_with_policy<R: Read, W: Write>(
+    from: &mut R,
+    to: &mut W,
+    direction: &'static str,
+    tx: &SyncSender<CopyNote>,
+    policy: &McpPolicy,
+    to_client: bool,
+) -> io::Result<()> {
+    match policy {
+        McpPolicy::Off => copy_parsed(from, to, direction, tx),
+        McpPolicy::On(policy) => copy_gated(from, to, direction, tx, policy, to_client),
+    }
+}
+
+/// Policy on. Complete lines are decided before they are written.
+///
+/// `to_client` is true on the parent-to-child copy: a deny's JSON-RPC error
+/// is written to this process's stdout (the MCP client), not to the child.
+/// The child-to-parent copy never denies; a rewrite of a result is written
+/// to `to` (the client).
+fn copy_gated<R: Read, W: Write>(
+    from: &mut R,
+    to: &mut W,
+    direction: &'static str,
+    tx: &SyncSender<CopyNote>,
+    policy: &aw_pipeline::Policy,
+    to_client: bool,
+) -> io::Result<()> {
+    if to_client {
+        copy_gated_client(from, to, &mut io::stdout(), direction, tx, policy)
+    } else {
+        copy_gated_client(from, to, io::sink(), direction, tx, policy)
+    }
+}
+
+fn copy_gated_client<R: Read, W: Write, C: Write>(
+    from: &mut R,
+    to: &mut W,
+    mut client: C,
+    direction: &'static str,
+    tx: &SyncSender<CopyNote>,
+    policy: &aw_pipeline::Policy,
+) -> io::Result<()> {
+    let mut splitter = Splitter::new();
+    let mut buf = [0_u8; 8 * 1024];
+    loop {
+        let n = from.read(&mut buf)?;
+        if n == 0 {
+            if let Some(outcome) = splitter.finish() {
+                gate_one(&outcome, to, &mut client, direction, tx, policy, true)?;
+            }
+            to.flush()?;
+            return Ok(());
+        }
+        for outcome in splitter.push(&buf[..n]) {
+            gate_one(&outcome, to, &mut client, direction, tx, policy, false)?;
+        }
+    }
+}
+
+fn gate_one<W: Write, C: Write>(
+    outcome: &FrameOutcome,
+    to: &mut W,
+    client: &mut C,
+    direction: &'static str,
+    tx: &SyncSender<CopyNote>,
+    policy: &aw_pipeline::Policy,
+    eof: bool,
+) -> io::Result<()> {
+    match outcome {
+        FrameOutcome::Gap(_) => {
+            // The splitter dropped an oversize line's bytes. There is nothing
+            // left to forward. The notice is the only record.
+            note_frame(outcome, direction, tx);
+            Ok(())
+        }
+        FrameOutcome::Frame(frame) => {
+            let text = String::from_utf8_lossy(frame);
+            let line = text.trim_end_matches('\r');
+            let decision = decide_line(policy, line, direction);
+            let changes = field_changes(&decision);
+            let frame_decision = FrameDecision {
+                verdict: verdict_of(&decision),
+                reason: decision.reason.as_deref(),
+                fields: &changes,
+            };
+            let action = if direction == DIR_C2S {
+                apply_request(line, &frame_decision)
+            } else {
+                apply_response(line, &frame_decision)
+            };
+            write_action(&action, frame, to, Some(client), eof)?;
+            if decision.effective != Action::Allow || decision.action != Action::Allow {
+                audit_mcp(&decision, line, action_after(&action));
+            }
+            note_frame(outcome, direction, tx);
+            Ok(())
+        }
+    }
+}
+
+fn action_after(action: &FrameAction) -> Option<&str> {
+    match action {
+        FrameAction::Rewrite { bytes } => Some(bytes.as_str()),
+        FrameAction::Forward | FrameAction::Reject { .. } => None,
+    }
+}
+
+fn write_action<W: Write>(
+    action: &FrameAction,
+    original: &[u8],
+    to: &mut W,
+    client: Option<&mut dyn Write>,
+    eof: bool,
+) -> io::Result<()> {
+    let newline: &[u8] = if eof { b"" } else { b"\n" };
+    match action {
+        FrameAction::Forward => {
+            to.write_all(original)?;
+            to.write_all(newline)?;
+            to.flush()?;
+        }
+        FrameAction::Rewrite { bytes } => {
+            to.write_all(bytes.as_bytes())?;
+            to.write_all(newline)?;
+            to.flush()?;
+        }
+        FrameAction::Reject { response } => {
+            // Not written to the child. A request deny answers the MCP client.
+            // The production caller passes stdout. A response deny is not
+            // produced (`apply_response` forwards those bytes).
+            if let Some(client) = client {
+                if !response.is_empty() {
+                    client.write_all(response.as_bytes())?;
+                    client.write_all(b"\n")?;
+                    client.flush()?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decide_line(policy: &aw_pipeline::Policy, frame: &str, direction: &str) -> Decision {
+    let Some(labels) = subject_from_frame(frame) else {
+        return match policy.on_error() {
+            OnError::Allow => allow_decision(),
+            // Non-JSON is not a call a rule named. Forwarding it keeps a
+            // session intact. `on_error` applies when a rewrite cannot be
+            // applied, not when the line has no labels.
+            OnError::Deny => allow_decision(),
+        };
+    };
+    let subject = Subject {
+        layer: Layer::Mcp,
+        tool: labels.tool.clone(),
+        method: labels.method.clone(),
+        mcp_method: labels.method,
+        mcp_tool: labels.tool,
+        command: labels.command,
+        args: labels.args,
+        event: Some(direction.to_owned()),
+        phase: Phase::Pre,
+        ..Subject::default()
+    };
+    match decide(policy, &subject) {
+        Ok(decision) => decision,
+        Err(_) => match policy.on_error() {
+            OnError::Allow => allow_decision(),
+            OnError::Deny => deny_decision("判定出错，已按拒绝处理"),
+        },
+    }
+}
+
+fn verdict_of(decision: &Decision) -> FrameVerdict {
+    match decision.effective {
+        Action::Deny | Action::Ask => FrameVerdict::Deny,
+        Action::Rewrite => FrameVerdict::Rewrite,
+        Action::Allow => FrameVerdict::Allow,
+    }
+}
+
+fn field_changes(decision: &Decision) -> Vec<FieldChange> {
+    decision
+        .fields
+        .iter()
+        .map(|(field, value)| FieldChange {
+            field: field.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+fn allow_decision() -> Decision {
+    Decision {
+        rule_id: None,
+        action: Action::Allow,
+        effective: Action::Allow,
+        downgraded: false,
+        reason: None,
+        fields: Vec::new(),
+    }
+}
+
+fn deny_decision(reason: &str) -> Decision {
+    Decision {
+        rule_id: None,
+        action: Action::Deny,
+        effective: Action::Deny,
+        downgraded: false,
+        reason: Some(reason.to_owned()),
+        fields: Vec::new(),
+    }
+}
+
+fn audit_mcp(decision: &Decision, before: &str, after: Option<&str>) {
+    let subject = subject_from_frame(before)
+        .map(|labels| Subject {
+            layer: Layer::Mcp,
+            tool: labels.tool.clone(),
+            method: labels.method.clone(),
+            mcp_method: labels.method,
+            mcp_tool: labels.tool,
+            command: labels.command,
+            args: labels.args,
+            ..Subject::default()
+        })
+        .unwrap_or(Subject {
+            layer: Layer::Mcp,
+            ..Subject::default()
+        });
+    let backup = super::intercept_audit::backup_path(
+        std::env::var_os(super::intercept_audit::AUDIT_ENV)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+        None,
+    );
+    let mut record =
+        super::intercept_audit::record_for(&subject, decision, b"", before, after, None);
+    let _ = super::intercept_audit::deliver(
+        None,
+        backup.as_deref(),
+        &mut record,
+        std::time::Duration::from_millis(20),
+    );
+}
+
+enum McpPolicy {
+    Off,
+    On(aw_pipeline::Policy),
+}
+
+fn load_mcp_policy() -> McpPolicy {
+    let env = std::env::var_os(super::policy_file::POLICY_ENV)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from);
+    match super::policy_file::load_policy(
+        env.as_deref(),
+        super::policy_file::user_config_home().as_deref(),
+    ) {
+        super::policy_file::PolicyLoad::On(policy) => McpPolicy::On(policy),
+        super::policy_file::PolicyLoad::Off | super::policy_file::PolicyLoad::Broken => {
+            // Broken: the file did not name which calls to stop. Non-JSON and
+            // unnamed frames stay forwarded, same as off. A later card can
+            // deny the whole tap; step 1 does not invent that.
+            McpPolicy::Off
+        }
+    }
 }
 
 fn copy_parsed<R: Read, W: Write>(
@@ -309,4 +603,129 @@ fn extract_json(extracted: &RpcExtract) -> Value {
         "arg_types": extracted.arg_types.iter().map(|kind| kind.to_string()).collect::<Vec<_>>(),
         "arg_lengths": extracted.arg_lengths,
     })
+}
+
+/// Gate one direction without spawning. Tests use this so a deny never has to
+/// touch a real child. `client` receives a request deny's JSON-RPC error.
+#[cfg(test)]
+fn copy_gated_for_test(
+    input: &[u8],
+    direction: &'static str,
+    policy_text: &str,
+    to_client: bool,
+) -> io::Result<GatedCopy> {
+    let policy = match aw_pipeline::load_str(policy_text) {
+        Ok(aw_pipeline::PolicyState::On(policy)) => policy,
+        _ => {
+            return Err(io::Error::other("test policy is not enabled"));
+        }
+    };
+    let (tx, _rx) = mpsc::sync_channel(8);
+    let mut child = Vec::new();
+    let mut client = Vec::new();
+    let mut splitter_input = io::Cursor::new(input);
+    if to_client {
+        copy_gated_client(
+            &mut splitter_input,
+            &mut child,
+            &mut client,
+            direction,
+            &tx,
+            &policy,
+        )?;
+    } else {
+        copy_gated_client(
+            &mut splitter_input,
+            &mut child,
+            io::sink(),
+            direction,
+            &tx,
+            &policy,
+        )?;
+    }
+    Ok(GatedCopy { child, client })
+}
+
+/// Bytes a gated copy would write. `child` is what the server sees. `client`
+/// is a JSON-RPC error for a denied request, empty otherwise.
+#[cfg(test)]
+struct GatedCopy {
+    /// Forwarded or rewritten lines, including their newlines.
+    pub child: Vec<u8>,
+    /// JSON-RPC errors for denied requests. Not written to `child`.
+    pub client: Vec<u8>,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    const DENY_RM: &str = r#"
+version = 1
+enabled = true
+on_error = "deny"
+
+[[rule]]
+id = "no-rm"
+layer = ["mcp"]
+match.mcp_method = { exact = "tools/call" }
+match.command = { prefix = "rm " }
+action = "deny"
+reason = "不允许删除"
+"#;
+
+    const REWRITE: &str = r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "plan-only"
+layer = ["mcp"]
+match.command = { prefix = "terraform apply" }
+action = "rewrite"
+rewrite.command = { replace = ["terraform apply", "terraform plan"] }
+"#;
+
+    #[test]
+    fn deny_is_not_forwarded_and_the_error_keeps_the_id() {
+        let frame = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"run\",\"arguments\":{\"command\":\"rm -rf /tmp\"}}}\n";
+        let copy = copy_gated_for_test(frame, DIR_C2S, DENY_RM, true).unwrap();
+        assert!(copy.child.is_empty(), "denied frame reached the child");
+        let text = String::from_utf8(copy.client).unwrap();
+        assert!(text.contains("\"id\":7"));
+        assert!(!text.contains("rm -rf"));
+        assert!(text.contains("不允许删除"));
+    }
+
+    #[test]
+    fn rewrite_reaches_the_child_and_a_miss_is_unchanged() {
+        let apply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"run\",\"arguments\":{\"command\":\"terraform apply\",\"dry\":false}}}\n";
+        let copy = copy_gated_for_test(apply, DIR_C2S, REWRITE, true).unwrap();
+        let child = String::from_utf8(copy.child).unwrap();
+        assert!(child.contains("terraform plan"));
+        assert!(child.contains("\"dry\":false"));
+        assert!(copy.client.is_empty());
+
+        let ping = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n";
+        let copy = copy_gated_for_test(ping, DIR_C2S, REWRITE, true).unwrap();
+        assert_eq!(copy.child, ping);
+    }
+
+    #[test]
+    fn policy_off_forwards_before_parsing() {
+        let (tx, _rx) = mpsc::sync_channel(4);
+        let mut child = Vec::new();
+        let input = b"not json\n{\"a\":1}\n";
+        copy_with_policy(
+            &mut io::Cursor::new(&input[..]),
+            &mut child,
+            DIR_C2S,
+            &tx,
+            &McpPolicy::Off,
+            true,
+        )
+        .unwrap();
+        assert_eq!(child, input);
+    }
 }

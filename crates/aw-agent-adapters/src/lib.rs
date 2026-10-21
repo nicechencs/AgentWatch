@@ -24,8 +24,9 @@ pub use channel::{
 };
 pub use identify::{identify, identify_with, AgentMatch, Inference, MatchHit, ProcInfo};
 pub use mcp_tap::{
-    extract, push_frames, ArgType, ExtractGap, FrameError, FrameOutcome, RpcExtract, Splitter,
-    DIR_C2S, DIR_S2C, MAX_FRAME_BYTES, MAX_KEY_SCALARS,
+    apply_request, apply_response, extract, push_frames, subject_from_frame, ArgType, ExtractGap,
+    FieldChange, FrameAction, FrameDecision, FrameError, FrameOutcome, FrameSubject, FrameVerdict,
+    RpcExtract, Splitter, DIR_C2S, DIR_S2C, MAX_FRAME_BYTES, MAX_KEY_SCALARS,
 };
 pub use profile::{
     load_profiles, AgentProfile, ChildRole, ChildrenRules, MatchRules, ProfileError, ProfileSet,

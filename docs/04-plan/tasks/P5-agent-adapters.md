@@ -491,7 +491,11 @@ flowchart LR
 - **依赖**: P5-SEC-01
 - **文件范围**: `crates/aw-cli/src/cmd/hook.rs`、`crates/aw-cli/src/cmd/run.rs`、`crates/aw-agent-adapters/src/agents/claude_code/`、`crates/aw-agent-adapters/src/agents/codex/`
 
-**要点**：Claude Code 输出 `permissionDecision` / `updatedInput` / `updatedToolOutput`；Codex 输出 deny 与 `allow + updatedInput`，`ask` 降级为 deny；Claude 启动注入用 exec 形式 + `onFailure: block`；修正默认 socket / 管道发送格式。规则关闭时输出与现在逐字节一致。
+**要点**：Claude Code 在 PreToolUse 输出 `permissionDecision` / `updatedInput`；Codex 输出 deny 与 `allow + updatedInput`，`ask` 降级为 deny；Claude 启动注入用 exec 形式 + `onFailure: block`；修正默认 socket / 管道发送格式。规则关闭时输出与现在逐字节一致。
+
+改写输出的是 `allow + updatedInput`。Claude Code 把这个 `allow` 当作批准，命中的命令不再弹权限提示，比用户自己设的权限宽。`aw run` 在拦截开启且规则含 `rewrite` 时于 stderr 提示一行。不用 `ask`：`claude -p` 没有人应答。以后可以加 `auto_approve` 开关（默认关时改走 `ask`），第一步没有。
+
+PostToolUse、SessionStart、SessionEnd 不输出判定、不改写、不写拒绝审计（规则文件坏了也一样）。`permissionDecision` 只属于 PreToolUse；PostToolUse 的 `updatedToolOutput` 第一步不做，规则里还没有阶段字段。
 
 实现差（2026-10-21）：`aw run --intercept`，或规则已开、或规则文件损坏且目标像 Claude（`--agent claude-code|claude` 或 argv0 `claude`）时才写临时 settings。损坏也注入，否则 hook 的拒绝不会跑。不改 `~/.claude/`。不注入 `AW_SESSION`。Codex 不自动改配置，只有手动片段。输出的 `hookSpecificOutput` 带 `hookEventName`。
 

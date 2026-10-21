@@ -197,10 +197,16 @@ reason = "不允许连这个网站"
 |---|---|---|---|---|
 | 放行 `allow` | 不输出决定（走 agent 自己的权限流程），**不是**自动批准 | 同左 | 原样转发 | 原样转发 |
 | 拒绝 `deny` | `permissionDecision: deny` + 原因 | `permissionDecision: deny` + 原因 | 不转给服务端，直接回一个 JSON-RPC 错误 | 回 403 + 原因 |
-| 改写 `rewrite` | `allow` + `updatedInput`（PreToolUse）；`updatedToolOutput`（PostToolUse） | `allow` + `updatedInput`（PreToolUse） | 改写请求参数或返回结果后转发 | 第一步不支持，按 `deny` 处理并在审计里写明 |
+| 改写 `rewrite` | `allow` + `updatedInput`（只在 PreToolUse） | `allow` + `updatedInput`（只在 PreToolUse） | 改写请求参数或返回结果后转发 | 第一步不支持，按 `deny` 处理并在审计里写明 |
 | 问用户 `ask` | `permissionDecision: ask` | 降级为 `deny`（见 §4.2） | 第一步降级为 `deny` | 第一步降级为 `deny` |
 
-注意「放行」不等于「自动批准」：aw 不替用户点同意，只是不插手。
+注意「放行」不等于「自动批准」：aw 不替用户点同意，只是不插手。不命中规则时 stdout 为空，Claude Code 走它自己的权限流程。
+
+改写是例外，而且要写在界面上。`allow` 加 `updatedInput` 是 Claude Code 规定的改参数方式，而官方文档写明 `permissionDecision: "allow"` 会跳过权限提示（2026-10-21 核对，<https://code.claude.com/docs/en/hooks>）。所以一条命中改写的命令会带着改后的参数直接执行，不再问用户，比用户自己在 Claude Code 里设的权限宽。`aw run` 在拦截开启且规则里有 `rewrite` 时，往 stderr 打一行提示。
+
+不用 `ask` 加 `updatedInput` 做默认：`claude -p` 这类非交互运行没有人应答，工具会停在那里。以后可以加 `auto_approve` 开关，默认关掉时改写改走 `ask`；第一步没有这个开关。
+
+第一步也不做 PostToolUse 的 `updatedToolOutput`。官方文档里 `permissionDecision` 只属于 PreToolUse；PostToolUse 只能改模型看到的结果，工具已经跑完。SessionStart 和 SessionEnd 只能附加上下文，不能允许或拒绝。所以这三种事件上 `aw hook` 不输出、不改写、不写拒绝审计（规则文件坏了也一样）。规则里还没有「只在某个阶段生效」的字段；要做执行后改写，得先加这个字段，并按 `updatedToolOutput` 的结构输出。
 
 ### 5.3 后台挂了 / 判定出错时：默认放行还是拒绝
 

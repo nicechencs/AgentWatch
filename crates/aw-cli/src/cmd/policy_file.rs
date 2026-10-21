@@ -59,6 +59,13 @@ impl EnvVarGuard {
         std::env::set_var(self.key, value);
     }
 
+    /// Remember the current value, then set `key` to a string.
+    pub(crate) fn set_text(key: &'static str, value: &std::path::Path) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+
     /// Remember the current value, then remove `key`.
     pub(crate) fn unset(key: &'static str) -> Self {
         let previous = std::env::var_os(key);

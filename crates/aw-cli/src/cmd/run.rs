@@ -1251,10 +1251,12 @@ pub(crate) fn run(
         Ok(prepared) => prepared,
         Err(outcome) => return outcome,
     };
-    let intercept_dir = match inject_claude_intercept(args, deferred, &mut spec) {
-        Ok(dir) => dir,
+    let (intercept_dir, rewrites) = match inject_claude_intercept(args, deferred, &mut spec) {
+        Ok(Some((dir, rewrites))) => (Some(dir), rewrites),
+        Ok(None) => (None, false),
         Err(outcome) => return outcome,
     };
+    let notice = rewrite_notice(rewrites);
 
     let launched = match launcher.launch(&spec) {
         Ok(launched) => launched,
@@ -1283,7 +1285,7 @@ pub(crate) fn run(
         let mut outcome = Outcome {
             code: launched.code,
             stdout: Vec::new(),
-            stderr: Vec::new(),
+            stderr: notice.unwrap_or("").as_bytes().to_vec(),
         };
         append_cleanup_note(&mut outcome, cleanup);
         return outcome;
@@ -1316,6 +1318,9 @@ pub(crate) fn run(
         stdout: Vec::new(),
         stderr,
     };
+    if let Some(notice) = notice {
+        outcome.stderr.extend_from_slice(notice.as_bytes());
+    }
     append_cleanup_note(&mut outcome, cleanup);
     outcome
 }
@@ -1459,12 +1464,13 @@ fn prepare(
 /// the manual fragment lives in the adapter.
 ///
 /// `Err` means the launch must not start: the policy file could not be read.
-/// `Ok(None)` means intercept is off for this command.
+/// `Ok(None)` means intercept is off for this command. `Ok(Some(true))` means
+/// the policy that is on contains a rewrite rule.
 fn claude_intercept_enabled(
     args: &RunArgs<'_>,
     deferred: DeferredFlags,
     spec: &crate::launch::RunSpec,
-) -> Result<Option<()>, Outcome> {
+) -> Result<Option<bool>, Outcome> {
     let agent = args.agent.unwrap_or("");
     let looks_like_claude = agent == "claude-code"
         || agent == "claude"
@@ -1490,9 +1496,31 @@ fn claude_intercept_enabled(
             super::policy_file::PolicyLoad::On(_) | super::policy_file::PolicyLoad::Broken
         );
     if enabled {
-        Ok(Some(()))
+        let rewrites = match &policy {
+            super::policy_file::PolicyLoad::On(policy) => policy
+                .rules()
+                .iter()
+                .any(|rule| rule.action == aw_pipeline::Action::Rewrite),
+            _ => false,
+        };
+        Ok(Some(rewrites))
     } else {
         Ok(None)
+    }
+}
+
+/// One stderr line when a rewrite rule is in force.
+///
+/// A hook rewrite is printed as `permissionDecision: "allow"` plus
+/// `updatedInput`, and Claude Code treats that `allow` as approval: the
+/// rewritten command runs without the permission prompt. The operator asked
+/// for the rewrite, but should see that it also approves. `ask` is not the
+/// alternative: under `claude -p` nobody answers it (design §5.2).
+fn rewrite_notice(rewrites: bool) -> Option<&'static str> {
+    if rewrites {
+        Some("[aw] 提示：规则里有改写。命中的命令会带着改后的参数直接执行，不再弹出权限确认。\n")
+    } else {
+        None
     }
 }
 
@@ -1506,14 +1534,16 @@ fn claude_intercept_enabled(
 ///
 /// `Err` is a failed launch, not a launch without the hook the operator asked
 /// for. `Ok(None)` means intercept is off and nothing was written.
+/// `Ok(Some((dir, rewrites)))` wrote the settings file; `rewrites` is whether
+/// the policy contains a rewrite rule, which the caller prints once.
 fn inject_claude_intercept(
     args: &RunArgs<'_>,
     deferred: DeferredFlags,
     spec: &mut crate::launch::RunSpec,
-) -> Result<Option<std::path::PathBuf>, Outcome> {
-    if claude_intercept_enabled(args, deferred, spec)?.is_none() {
+) -> Result<Option<(std::path::PathBuf, bool)>, Outcome> {
+    let Some(rewrites) = claude_intercept_enabled(args, deferred, spec)? else {
         return Ok(None);
-    }
+    };
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aw"));
     let command = exe.display().to_string();
     let doc = aw_agent_adapters::agents::claude_code::decision::intercept_settings_json(
@@ -1557,7 +1587,7 @@ fn inject_claude_intercept(
     // `AW_SESSION` is not set here. The daemon assigns the public id after
     // this function returns, and this process does not know it yet. The hook
     // falls back to `--session` when a later card threads the id through.
-    Ok(Some(dir))
+    Ok(Some((dir, rewrites)))
 }
 
 /// Remove the temp settings directory. A failure is reported, not hidden:
@@ -1602,10 +1632,12 @@ pub(crate) fn daemon_run(
     };
     // One settings file for this launch. `preflight` already validated the
     // policy and wrote nothing, so this is the only `--settings`.
-    let intercept_dir = match inject_claude_intercept(args, deferred, &mut spec) {
-        Ok(dir) => dir,
+    let (intercept_dir, rewrites) = match inject_claude_intercept(args, deferred, &mut spec) {
+        Ok(Some((dir, rewrites))) => (Some(dir), rewrites),
+        Ok(None) => (None, false),
         Err(outcome) => return outcome,
     };
+    let notice = rewrite_notice(rewrites);
     let request = BeginRunRequest {
         argv: spec.command.clone(),
         cwd: spec.cwd.clone(),
@@ -1693,7 +1725,10 @@ pub(crate) fn daemon_run(
         .err()
         .map(|error| format!("[aw] 警告：daemon 未记录程序退出码：{error}\n"));
     if level == SummaryLevel::None || args.quiet {
-        let mut stderr = pin_warning.unwrap_or_default();
+        let mut stderr = notice.unwrap_or("").to_owned();
+        if let Some(warning) = pin_warning.clone() {
+            stderr.push_str(&warning);
+        }
         if let Some(warning) = leftovers_warning {
             stderr.push_str(&warning);
         }
@@ -1730,6 +1765,9 @@ pub(crate) fn daemon_run(
             intercept_dir.as_deref(),
             super::error_outcome(exit::GENERAL, "summary", &error.to_string(), args.json),
         );
+    }
+    if let Some(notice) = notice {
+        stderr.extend_from_slice(notice.as_bytes());
     }
     if let Some(warning) = pin_warning {
         stderr.extend_from_slice(warning.as_bytes());
@@ -2086,7 +2124,7 @@ mod intercept_inject_tests {
             intercept: false,
         };
         let outcome = inject_claude_intercept(&args, deferred, &mut spec);
-        if let Ok(Some(settings_dir)) = &outcome {
+        if let Ok(Some((settings_dir, _))) = &outcome {
             let _ = std::fs::remove_dir_all(settings_dir);
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -2165,7 +2203,7 @@ mod intercept_inject_tests {
 
         let mut spec = crate::launch::RunSpec::new(command.clone()).unwrap();
         let written = match inject_claude_intercept(&args, deferred, &mut spec) {
-            Ok(Some(dir)) => dir,
+            Ok(Some((dir, _))) => dir,
             Ok(None) => panic!("intercept did not write settings"),
             Err(_) => panic!("intercept settings could not be written"),
         };
@@ -2597,6 +2635,54 @@ mod tests {
 
     fn text(bytes: &[u8]) -> String {
         String::from_utf8(bytes.to_vec()).expect("utf8")
+    }
+
+    /// A rewrite rule prints `allow` plus the new arguments, which Claude Code
+    /// treats as approval. The launch says so once, on stderr.
+    #[test]
+    fn rewrite_rule_is_named_on_stderr() {
+        let _guard = super::super::policy_file::env_lock();
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("run-tests")
+            .join(format!("rewrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy = dir.join("policy.toml");
+        std::fs::write(
+            &policy,
+            "enabled = true\n[[rule]]\nid = \"force-dry-run\"\nlayer = [\"hook\"]\n\
+             action = \"rewrite\"\nrewrite.command = { replace = [\"a\", \"b\"] }\n",
+        )
+        .unwrap();
+        let _policy = super::super::policy_file::EnvVarGuard::set(
+            super::super::policy_file::POLICY_ENV,
+            &policy,
+        );
+        let _home = ["XDG_CONFIG_HOME", "HOME", "APPDATA"]
+            .into_iter()
+            .map(|key| super::super::policy_file::EnvVarGuard::set_text(key, &dir))
+            .collect::<Vec<_>>();
+        let command = vec!["claude".to_owned()];
+        let mut launcher = FakeLaunch {
+            code: 0,
+            sampling_seen: None,
+            forwarded: Vec::new(),
+            env_len: None,
+            fail: None,
+        };
+        let mut summary = FixedSummary(None);
+        let outcome = run(
+            &args(&command),
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut summary,
+        );
+        let err = text(&outcome.stderr);
+        assert!(err.contains("改写"), "{err}");
+        assert!(err.contains("权限确认"), "{err}");
+        assert!(!err.contains("上传了"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -180,17 +180,34 @@ fn drop_denied() -> FrameAction {
     }
 }
 
-/// Decide one server-to-client frame. Only a rewrite of the result is
-/// applied. A deny on the way back cannot un-run the tool; the wrapper
-/// forwards. Step 1 rewrites `result` fields the rule named.
+/// Decide one server-to-client frame.
+///
+/// A rewrite of `result` is written back and forwarded. Anything else that is
+/// not an allow — a deny, an ask already turned into a deny, a decision that
+/// failed — must not forward the original result. The tool has already run;
+/// handing that result to the model would be the call the rule refused. The
+/// client gets a JSON-RPC error for the same id instead, and the message is
+/// the rule's reason, which does not quote the result. A response that is not
+/// one JSON object has no id to answer, so it is dropped.
 #[must_use]
 pub fn apply_response(frame: &str, decision: &FrameDecision<'_>) -> FrameAction {
-    if decision.verdict != FrameVerdict::Rewrite {
+    if decision.verdict == FrameVerdict::Allow {
         return FrameAction::Forward;
     }
     let Ok(value) = serde_json::from_str::<Value>(frame) else {
-        return FrameAction::Forward;
+        return drop_denied();
     };
+    if !value.is_object() {
+        // A response batch is decided per element by the caller. Applying one
+        // verdict to the whole array must not forward it.
+        return drop_denied();
+    }
+    if decision.verdict == FrameVerdict::Deny {
+        let Some(response) = jsonrpc_error(&value, decision.reason) else {
+            return drop_denied();
+        };
+        return FrameAction::Reject { response };
+    }
     let Some(rewritten) = rewrite_frame(&value, decision.fields) else {
         // Same as a request: a rewrite that does not land must not forward
         // the original bytes under a rewrite verdict.
@@ -374,6 +391,51 @@ mod tests {
                 assert!(!bytes.contains("oldtool"));
             }
             other => panic!("mcp_tool was not written back: {other:?}"),
+        }
+    }
+
+    /// A deny on the way back replaces the result with an error for the same
+    /// id. The tool already ran; the result must not be what the client reads,
+    /// and the message must not quote it.
+    #[test]
+    fn deny_of_a_response_is_an_error_for_the_same_id() {
+        let frame = r#"{"jsonrpc":"2.0","id":5,"result":{"text":"SECRET"}}"#;
+        match apply_response(frame, &deny()) {
+            FrameAction::Reject { response } => {
+                let value: Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(value["id"], json!(5));
+                assert_eq!(value["error"]["code"], json!(-32000));
+                assert_eq!(value["error"]["message"], json!("不允许"));
+                assert!(value.get("result").is_none());
+                assert!(!response.contains("SECRET"));
+            }
+            other => panic!("response deny was not an error: {other:?}"),
+        }
+    }
+
+    /// A response that is not one JSON object has nowhere to write a field and
+    /// no id to answer. The original bytes must not be forwarded under a
+    /// rewrite verdict.
+    #[test]
+    fn response_rewrite_of_a_non_object_does_not_forward() {
+        let frame = r#"[{"jsonrpc":"2.0","id":5,"result":{"text":"SECRET"}}]"#;
+        let fields = [FieldChange {
+            field: "arg.text".to_owned(),
+            value: "XXX".to_owned(),
+        }];
+        let decision = FrameDecision {
+            verdict: FrameVerdict::Rewrite,
+            reason: Some("判定出错，已按拒绝处理"),
+            fields: &fields,
+        };
+        match apply_response(frame, &decision) {
+            FrameAction::Reject { response } => {
+                assert!(
+                    response.is_empty(),
+                    "a non-object still answered: {response}"
+                );
+            }
+            other => panic!("non-object rewrite was forwarded: {other:?}"),
         }
     }
 

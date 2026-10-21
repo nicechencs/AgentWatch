@@ -110,6 +110,21 @@ fn exchange_all(
     server: &std::path::Path,
     request: &str,
 ) -> (i32, String, String) {
+    exchange_all_env(policy, audit, server, request, &[])
+}
+
+/// [`exchange_all`] plus extra environment variables for the wrapped server.
+///
+/// `AW_MCP_RESULT_TEXT` is how a test asks the result stand-in to answer with
+/// text other than `SECRET`. Every other `AW_*` variable stays cleared by
+/// [`isolate`].
+fn exchange_all_env(
+    policy: Option<&std::path::Path>,
+    audit: Option<&std::path::Path>,
+    server: &std::path::Path,
+    request: &str,
+    extra_env: &[(&str, &str)],
+) -> (i32, String, String) {
     let mut cmd = aw();
     cmd.arg("--socket").arg("aw-mcp-tap-nobody");
     cmd.args(["mcp-tap", "--"]).arg(server);
@@ -118,6 +133,9 @@ fn exchange_all(
     }
     if let Some(path) = audit {
         cmd.env("AW_INTERCEPT_AUDIT", path);
+    }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -408,6 +426,273 @@ fn response_rewrite_reaches_the_client() {
     assert!(
         response_row.contains("XXX"),
         "the response audit does not name the replacement: {body}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A response-direction deny, a rewrite that does not land, and a rewrite whose
+/// audit cannot be written must all answer the client with a JSON-RPC error
+/// for the same id. The tool already ran; the result must not reach the client,
+/// and the error message must not quote it.
+const RESPONSE_REQUEST: &str = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run","arguments":{"command":"echo"}}}"#;
+
+/// The last audit row that names the response direction, or empty.
+fn last_s2c(body: &str) -> &str {
+    let mut found = "";
+    for line in body.lines() {
+        if line.contains("\"event\":\"s2c\"") {
+            found = line;
+        }
+    }
+    found
+}
+
+/// The client's stdout is one JSON-RPC error for id 5, and it does not contain
+/// `secret` (any case). `audit` is the jsonl the tap wrote, when a path was
+/// given; `None` means the test expected no file.
+fn assert_response_error(stdout: &str, audit: Option<&str>) {
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("\"error\""))
+        .unwrap_or_else(|| panic!("client did not get an error: {stdout}"));
+    let value: serde_json::Value = serde_json::from_str(line)
+        .unwrap_or_else(|err| panic!("error is not JSON ({err}): {line}"));
+    assert_eq!(value["id"], serde_json::json!(5), "{value}");
+    assert_eq!(value["error"]["code"], serde_json::json!(-32000), "{value}");
+    let message = value["error"]["message"].as_str().unwrap_or("");
+    assert!(!message.is_empty(), "error has no message: {value}");
+    assert!(
+        !message.to_ascii_lowercase().contains("secret"),
+        "error quotes the result: {message}"
+    );
+    assert!(
+        !stdout.to_ascii_lowercase().contains("secret"),
+        "original result reached the client: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"result\""),
+        "a result object reached the client: {stdout}"
+    );
+    if let Some(body) = audit {
+        let row = last_s2c(body);
+        assert!(
+            row.contains("\"effective_action\":\"deny\""),
+            "the response was not recorded as a deny: {row}"
+        );
+        // The row names the field that matched, the way a request deny names
+        // the command. It must not store the frame itself.
+        assert!(
+            !row.contains("\"result\""),
+            "audit stored the response frame: {row}"
+        );
+    }
+}
+
+/// The rule matches `secret` and rewrites only the uppercase form. The server
+/// answers `my secret`, the replacement does not land, and the client must see
+/// an error rather than the original result (N1).
+#[test]
+fn response_rewrite_that_misses_is_an_error() {
+    let dir = scratch("resp-miss");
+    let policy = write_policy(
+        &dir,
+        r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "redact-result"
+layer = ["mcp"]
+match.direction = { exact = "s2c" }
+match.arg.text = { regex = "(?i)secret" }
+action = "rewrite"
+rewrite.arg.text = { replace = ["SECRET", "XXX"] }
+"#,
+    );
+    let audit = dir.join("audit.jsonl");
+    let server = PathBuf::from(env!("CARGO_BIN_EXE_mcp_result"));
+    let (status, stdout, stderr) = exchange_all_env(
+        Some(&policy),
+        Some(&audit),
+        &server,
+        RESPONSE_REQUEST,
+        &[("AW_MCP_RESULT_TEXT", "my secret")],
+    );
+    assert_eq!(status, 0, "stderr: {stderr}");
+    let body = std::fs::read_to_string(&audit).unwrap_or_default();
+    assert_response_error(&stdout, Some(&body));
+    let row = last_s2c(&body);
+    assert!(
+        row.contains("判定出错"),
+        "audit does not say the decision failed: {row}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The rule rewrites `result.summary`, which this result does not have. The
+/// decision fails (`判定出错`), and the client must see an error for that,
+/// recorded as the deny that actually happened. `set_dotted` would invent the
+/// field if the decision ever produced one, so this path is the decision
+/// error, not a rewrite that failed to land.
+#[test]
+fn response_rewrite_of_a_missing_field_is_an_error() {
+    let dir = scratch("resp-missing");
+    let policy = write_policy(
+        &dir,
+        r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "redact-result"
+layer = ["mcp"]
+match.direction = { exact = "s2c" }
+match.arg.text = { regex = "SECRET" }
+action = "rewrite"
+rewrite.arg.summary = { replace = ["SECRET", "XXX"] }
+"#,
+    );
+    let audit = dir.join("audit.jsonl");
+    let server = PathBuf::from(env!("CARGO_BIN_EXE_mcp_result"));
+    let (status, stdout, stderr) =
+        exchange_all(Some(&policy), Some(&audit), &server, RESPONSE_REQUEST);
+    assert_eq!(status, 0, "stderr: {stderr}");
+    let body = std::fs::read_to_string(&audit).unwrap_or_default();
+    assert_response_error(&stdout, Some(&body));
+    let row = last_s2c(&body);
+    assert!(
+        row.contains("判定出错"),
+        "audit does not say the decision failed: {row}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A rewrite whose audit file cannot be created is a deny. The result must not
+/// reach the client just because the record was dropped.
+#[test]
+fn response_rewrite_with_a_dropped_audit_is_an_error() {
+    let dir = scratch("resp-dropped");
+    let policy = write_policy(
+        &dir,
+        r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "redact-result"
+layer = ["mcp"]
+match.direction = { exact = "s2c" }
+match.arg.text = { regex = "SECRET" }
+action = "rewrite"
+rewrite.arg.text = { replace = ["SECRET", "XXX"] }
+"#,
+    );
+    // A path whose parent is a file cannot be created, so both the local backup
+    // and the dead socket fail. No session directory either: isolate clears
+    // AW_SESSION and the state variables.
+    let blocked = dir.join("not-a-directory");
+    std::fs::write(&blocked, "x").expect("blocker");
+    let audit = blocked.join("audit.jsonl");
+    let server = PathBuf::from(env!("CARGO_BIN_EXE_mcp_result"));
+    let (status, stdout, stderr) =
+        exchange_all(Some(&policy), Some(&audit), &server, RESPONSE_REQUEST);
+    assert_eq!(status, 0, "stderr: {stderr}");
+    assert!(
+        stderr.contains("intercept_audit_dropped"),
+        "a dropped audit was not reported: {stderr}"
+    );
+    assert_response_error(&stdout, None);
+    assert!(
+        !audit.exists(),
+        "the unwritable audit path was created: {}",
+        audit.display()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A deny rule on the response direction must not forward the result. The tool
+/// already ran; the client gets an error for the same id and no audit of a
+/// refusal that did not happen.
+#[test]
+fn response_deny_is_an_error_and_is_audited() {
+    let dir = scratch("resp-deny");
+    let policy = write_policy(
+        &dir,
+        r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "no-secret"
+layer = ["mcp"]
+match.direction = { exact = "s2c" }
+match.arg.text = { regex = "SECRET" }
+action = "deny"
+reason = "不允许把这段结果交给模型"
+"#,
+    );
+    let audit = dir.join("audit.jsonl");
+    let server = PathBuf::from(env!("CARGO_BIN_EXE_mcp_result"));
+    let (status, stdout, stderr) =
+        exchange_all(Some(&policy), Some(&audit), &server, RESPONSE_REQUEST);
+    assert_eq!(status, 0, "stderr: {stderr}");
+    let body = std::fs::read_to_string(&audit).unwrap_or_default();
+    assert_response_error(&stdout, Some(&body));
+    assert!(
+        stdout.contains("不允许把这段结果交给模型"),
+        "deny reason missing: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A response batch with one element the rewrite cannot land on. That element
+/// becomes its own JSON-RPC error; the element that does not match is forwarded.
+#[test]
+fn response_batch_element_that_misses_is_an_error() {
+    let dir = scratch("resp-batch");
+    let policy = write_policy(
+        &dir,
+        r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "redact-result"
+layer = ["mcp"]
+match.direction = { exact = "s2c" }
+match.arg.text = { regex = "(?i)secret" }
+action = "rewrite"
+rewrite.arg.text = { replace = ["SECRET", "XXX"] }
+"#,
+    );
+    let request = concat!(
+        r#"[{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run","arguments":{"command":"echo"}}},"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"initialize","params":{}}]"#
+    );
+    let server = PathBuf::from(env!("CARGO_BIN_EXE_mcp_result"));
+    let (status, stdout, stderr) = exchange_all_env(
+        Some(&policy),
+        Some(&dir.join("audit.jsonl")),
+        &server,
+        request,
+        &[("AW_MCP_RESULT_TEXT", "my secret")],
+    );
+    assert_eq!(status, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("\"id\":5"),
+        "the missed element was not answered: {stdout}"
+    );
+    assert!(
+        stdout.contains("-32000"),
+        "the missed element was not an error: {stdout}"
+    );
+    assert!(
+        !stdout.to_ascii_lowercase().contains("secret"),
+        "the original result reached the client: {stdout}"
+    );
+    assert!(
+        stdout.contains("protocolVersion"),
+        "the unmatched element was not forwarded: {stdout}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

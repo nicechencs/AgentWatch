@@ -243,8 +243,8 @@ fn copy_parent_to_child<R: Read, W: Write>(
 /// Copy child stdout onto the parent, and note each completed line.
 ///
 /// Policy off: every byte is forwarded before it is parsed. Policy on: a
-/// completed line may be rewritten. A deny on the way back is still forwarded;
-/// the tool already ran.
+/// completed line may be rewritten. A deny on the way back cannot un-run the
+/// tool; the client is answered with a JSON-RPC error instead of the result.
 fn copy_child_to_parent<R: Read, W: Write>(
     mut from: R,
     mut to: W,
@@ -429,10 +429,10 @@ fn is_tools_call(line: &str) -> bool {
 
 /// Policy on. Complete lines are decided before they are written.
 ///
-/// `to_client` is true on the parent-to-child copy: a deny's JSON-RPC error
-/// is written to this process's stdout (the MCP client), not to the child.
-/// The child-to-parent copy never denies; a rewrite of a result is written
-/// to `to` (the client).
+/// `to_client` is true on the parent-to-child copy. A request deny's JSON-RPC
+/// error goes to this process's stdout (the MCP client), not to the child. On
+/// the child-to-parent copy the client is `to` itself, so a response deny's
+/// error is written there by [`write_gated`] and this sink is not used.
 fn copy_gated<R: Read, W: Write>(
     from: &mut R,
     to: &mut W,
@@ -445,7 +445,7 @@ fn copy_gated<R: Read, W: Write>(
     if to_client {
         copy_gated_client(from, to, &mut io::stdout(), direction, tx, policy, endpoint)
     } else {
-        copy_gated_client(from, to, io::sink(), direction, tx, policy, endpoint)
+        copy_gated_client(from, to, &mut io::sink(), direction, tx, policy, endpoint)
     }
 }
 
@@ -487,7 +487,9 @@ fn copy_gated_client<R: Read, W: Write, C: Write>(
 
 /// What one gated line needs besides the bytes it is deciding.
 struct Gate<'a, C> {
-    /// Where a denied request's JSON-RPC error is written.
+    /// Where a denied frame's JSON-RPC error is written. On a request that is
+    /// this process's stdout; on a response it is the same stream the rewritten
+    /// result would have been written to.
     client: &'a mut C,
     direction: &'static str,
     tx: &'a SyncSender<CopyNote>,
@@ -519,7 +521,7 @@ fn gate_one<W: Write, C: Write>(
                 return Ok(());
             }
             let action = decide_and_apply(line, gate);
-            write_action(&action, frame, to, Some(gate.client), gate.eof)?;
+            write_gated(&action, frame, to, gate)?;
             note_frame(outcome, gate.direction, gate.tx);
             Ok(())
         }
@@ -574,11 +576,7 @@ fn decide_and_apply(line: &str, gate: &mut Gate<'_, impl Write>) -> FrameAction 
         reason: decision.reason.as_deref(),
         fields: &changes,
     };
-    let action = if gate.direction == DIR_C2S {
-        apply_request(line, &frame_decision)
-    } else {
-        apply_response(line, &frame_decision)
-    };
+    let action = apply_frame(line, gate.direction, &frame_decision);
     realized_action(&action, &decision, line, gate)
 }
 
@@ -608,9 +606,9 @@ fn batch_elements(line: &str) -> Option<Vec<Value>> {
 ///
 /// The forwarded array keeps the elements that were allowed or rewritten, in
 /// their original order. A batch whose every element was denied writes
-/// nothing to the server. A response batch is decided the same way; a deny on
-/// the way back cannot un-run the tool, so a denied response element is
-/// dropped rather than answered (there is no second client to answer).
+/// nothing onward. A refused element, on either direction, is answered with
+/// its own JSON-RPC error: a response deny cannot un-run the tool, but the
+/// result must not be handed on inside the forwarded array.
 fn gate_batch<W: Write>(
     elements: &[Value],
     to: &mut W,
@@ -628,7 +626,15 @@ fn gate_batch<W: Write>(
                 }
             }
             FrameAction::Reject { response } => {
-                if gate.direction == DIR_C2S && !response.is_empty() {
+                if response.is_empty() {
+                    continue;
+                }
+                // A response's client is `to`: the error replaces that element
+                // on the way back. A request's error goes to the MCP client,
+                // not to the server.
+                if gate.direction == DIR_S2C {
+                    write_frame(to, response.as_bytes(), b"\n")?;
+                } else {
                     write_frame(gate.client, response.as_bytes(), b"\n")?;
                 }
             }
@@ -678,10 +684,26 @@ fn audit_before(line: &str, decision: &Decision) -> String {
             return parts.join("\n");
         }
     }
-    subject_from_frame(line)
-        .and_then(|labels| labels.command)
+    let Some(labels) = subject_from_frame(line) else {
+        return String::new();
+    };
+    if let Some(command) = labels.command.filter(|text| !text.is_empty()) {
+        return command;
+    }
+    // A response has no command. The matched text is a result field, and the
+    // whole frame would store the result this rule just refused to hand on.
+    if !labels.args.is_empty() {
+        return labels
+            .args
+            .iter()
+            .map(|(key, value)| format!("arg.{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    labels
+        .method
         .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| line.to_owned())
+        .unwrap_or_default()
 }
 
 /// What a rewrite would store as "after", before the frame is changed.
@@ -701,8 +723,9 @@ fn planned_after(decision: &Decision) -> Option<String> {
 
 /// A rewrite that [`apply_request`] / [`apply_response`] could not write back
 /// arrives as a drop. The audit row already says rewrite. Append what was
-/// actually done: the bytes were not forwarded, and the client gets a JSON-RPC
-/// error when the frame has an id.
+/// actually done, then answer with that: the bytes are not forwarded, and the
+/// client gets a JSON-RPC error for the same id on either direction. A response
+/// whose result could not be rewritten is not forwarded as the original.
 fn realized_action(
     action: &FrameAction,
     decision: &Decision,
@@ -733,11 +756,49 @@ fn realized_action(
         reason: downgraded.reason.as_deref(),
         fields: &[],
     };
-    if gate.direction == DIR_C2S {
-        apply_request(line, &frame_decision)
+    // Both directions answer the client. A response the rewrite could not land
+    // in used to be forwarded here, so the client received the original result
+    // while the audit said deny.
+    apply_frame(line, gate.direction, &frame_decision)
+}
+
+/// Apply one already-built decision to one frame, by direction.
+fn apply_frame(line: &str, direction: &str, decision: &FrameDecision<'_>) -> FrameAction {
+    if direction == DIR_C2S {
+        apply_request(line, decision)
     } else {
-        apply_response(line, &frame_decision)
+        apply_response(line, decision)
     }
+}
+
+/// Write one decided frame.
+///
+/// A request deny's error goes to `gate.client` (this process's stdout). A
+/// response deny's error goes to `to`, the stream the result would have been
+/// forwarded on: that is the client, and writing it anywhere else drops it.
+fn write_gated<W: Write, C: Write>(
+    action: &FrameAction,
+    original: &[u8],
+    to: &mut W,
+    gate: &mut Gate<'_, C>,
+) -> io::Result<()> {
+    let newline: &[u8] = if gate.eof { b"" } else { b"\n" };
+    match action {
+        FrameAction::Forward => write_frame(to, original, newline)?,
+        FrameAction::Rewrite { bytes } => write_frame(to, bytes.as_bytes(), newline)?,
+        FrameAction::Reject { response } => {
+            if response.is_empty() {
+                return Ok(());
+            }
+            let dest: &mut dyn Write = if gate.direction == DIR_S2C {
+                to
+            } else {
+                gate.client
+            };
+            write_frame(dest, response.as_bytes(), b"\n")?;
+        }
+    }
+    Ok(())
 }
 
 fn write_action<W: Write>(
@@ -1082,7 +1143,8 @@ fn extract_json(extracted: &RpcExtract) -> Value {
 }
 
 /// Gate one direction without spawning. Tests use this so a deny never has to
-/// touch a real child. `client` receives a request deny's JSON-RPC error.
+/// touch a real child. `client` receives a denied frame's JSON-RPC error, on a
+/// request and on a response.
 #[cfg(test)]
 fn copy_gated_for_test(
     input: &[u8],
@@ -1128,10 +1190,12 @@ fn copy_gated_for_test_at(
             endpoint,
         )?;
     } else {
+        // A response deny is written to `to` (the client), the same stream a
+        // rewritten result uses. `child` stays empty.
         copy_gated_client(
             &mut splitter_input,
-            &mut child,
-            io::sink(),
+            &mut client,
+            &mut io::sink(),
             direction,
             &tx,
             &policy,
@@ -1579,14 +1643,14 @@ rewrite.arg.text = { replace = ["SECRET", "XXX"] }
 "#;
         let frame = b"{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"text\":\"SECRET\"}}\n";
         let copy = copy_gated_for_test_at(frame, DIR_S2C, policy, false, None).unwrap();
-        let child = String::from_utf8(copy.child).unwrap();
+        let client = String::from_utf8(copy.client).unwrap();
         assert!(
-            child.contains("XXX"),
-            "client did not see the rewritten result: {child}"
+            client.contains("XXX"),
+            "client did not see the rewritten result: {client}"
         );
         assert!(
-            !child.contains("SECRET"),
-            "original result reached the client: {child}"
+            !client.contains("SECRET"),
+            "original result reached the client: {client}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

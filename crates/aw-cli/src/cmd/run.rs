@@ -1288,19 +1288,13 @@ pub(crate) fn run(
         let cleanup = intercept_dir
             .as_deref()
             .and_then(|dir| cleanup_intercept_dir(dir).err());
-        // `--json` asked for a document. With no summary there is nothing to
-        // print; a note here would be the only line, and not JSON.
-        let mut stderr = if args.json {
-            String::new()
-        } else {
-            notice.unwrap_or("").to_owned()
-        };
-        if !args.json {
-            if let Some(note) = omitted {
-                stderr.push_str(&note);
-            }
-            stderr.push_str(&limits);
+        // No summary document on this path, so the notes stay `[aw]` text.
+        // `--json` does not change that: there is nothing to put them inside.
+        let mut stderr = notice.unwrap_or("").to_owned();
+        if let Some(note) = omitted {
+            stderr.push_str(&note);
         }
+        stderr.push_str(&limits);
         let mut outcome = Outcome {
             code: launched.code,
             stdout: Vec::new(),
@@ -1312,6 +1306,11 @@ pub(crate) fn run(
 
     let figures = summary.summarize(args.name);
     let mut stderr = Vec::new();
+    let notes = summary_notes(&[
+        notice,
+        omitted.as_deref(),
+        Some(limits.as_str()).filter(|text| !text.is_empty()),
+    ]);
     if let Err(err) = write_summary(
         &mut stderr,
         args,
@@ -1319,7 +1318,10 @@ pub(crate) fn run(
         &launched,
         &figures,
         None,
-        PinState::Unknown,
+        SummaryTail {
+            pin: PinState::Unknown,
+            notes: &notes,
+        },
     ) {
         let cleanup = intercept_dir
             .as_deref()
@@ -1337,17 +1339,11 @@ pub(crate) fn run(
         stdout: Vec::new(),
         stderr,
     };
-    // `--json` stderr is one JSON document. A note after it is a second line,
-    // and `serde_json::from_slice` rejects that as trailing characters. The
-    // human summary still gets the notes.
+    // `--json` already carried these inside the document's `notes`. Appending
+    // them here would be a second line, and `serde_json::from_slice` rejects
+    // that as trailing characters. The human summary still gets the text.
     if !args.json {
-        if let Some(notice) = notice {
-            outcome.stderr.extend_from_slice(notice.as_bytes());
-        }
-        if let Some(note) = omitted {
-            outcome.stderr.extend_from_slice(note.as_bytes());
-        }
-        outcome.stderr.extend_from_slice(limits.as_bytes());
+        append_note_text(&mut outcome.stderr, &notes);
     }
     append_cleanup_note(&mut outcome, cleanup);
     outcome
@@ -1982,27 +1978,22 @@ pub(crate) fn daemon_run(
         .err()
         .map(|error| format!("[aw] 警告：daemon 未记录程序退出码：{error}\n"));
     if level == SummaryLevel::None || args.quiet {
-        // `--json` with no summary still emits nothing: the flag asked for a
-        // document, and there is none. Notes stay on the human path only.
-        let mut stderr = if args.json {
-            String::new()
-        } else {
-            notice.unwrap_or("").to_owned()
-        };
-        if !args.json {
-            if let Some(note) = &omitted {
-                stderr.push_str(note);
-            }
-            stderr.push_str(&limits);
-            if let Some(warning) = pin_warning.clone() {
-                stderr.push_str(&warning);
-            }
-            if let Some(warning) = leftovers_warning {
-                stderr.push_str(&warning);
-            }
-            if let Some(warning) = exit_warning {
-                stderr.push_str(&warning);
-            }
+        // No summary document on this path. The warnings stay `[aw]` text even
+        // when `--json` was set: there is no document to put them inside, and
+        // dropping them would hide a failed pin or a lost exit code.
+        let mut stderr = notice.unwrap_or("").to_owned();
+        if let Some(note) = &omitted {
+            stderr.push_str(note);
+        }
+        stderr.push_str(&limits);
+        if let Some(warning) = pin_warning.clone() {
+            stderr.push_str(&warning);
+        }
+        if let Some(warning) = leftovers_warning {
+            stderr.push_str(&warning);
+        }
+        if let Some(warning) = exit_warning {
+            stderr.push_str(&warning);
         }
         return finish_daemon(
             intercept_dir.as_deref(),
@@ -2020,6 +2011,14 @@ pub(crate) fn daemon_run(
         sampling: false,
     };
     let figures = summary.summarize(Some(&launch.public_id));
+    let notes = summary_notes(&[
+        notice,
+        omitted.as_deref(),
+        Some(limits.as_str()).filter(|text| !text.is_empty()),
+        pin_warning.as_deref(),
+        leftovers_warning.as_deref(),
+        exit_warning.as_deref(),
+    ]);
     let mut stderr = Vec::new();
     if let Err(error) = write_summary(
         &mut stderr,
@@ -2028,32 +2027,20 @@ pub(crate) fn daemon_run(
         &launched,
         &figures,
         Some(&launch.public_id),
-        pin_state,
+        SummaryTail {
+            pin: pin_state,
+            notes: &notes,
+        },
     ) {
         return finish_daemon(
             intercept_dir.as_deref(),
             super::error_outcome(exit::GENERAL, "summary", &error.to_string(), args.json),
         );
     }
-    // Same rule as `run`: one JSON document, nothing after it. Pin, leftover,
-    // and exit warnings are `[aw]` text; they stay on the human summary.
+    // Same rule as `run`: one JSON document, nothing after it. The human
+    // summary still prints the `[aw]` lines.
     if !args.json {
-        if let Some(notice) = notice {
-            stderr.extend_from_slice(notice.as_bytes());
-        }
-        if let Some(note) = omitted {
-            stderr.extend_from_slice(note.as_bytes());
-        }
-        stderr.extend_from_slice(limits.as_bytes());
-        if let Some(warning) = pin_warning {
-            stderr.extend_from_slice(warning.as_bytes());
-        }
-        if let Some(warning) = leftovers_warning {
-            stderr.extend_from_slice(warning.as_bytes());
-        }
-        if let Some(warning) = exit_warning {
-            stderr.extend_from_slice(warning.as_bytes());
-        }
+        append_note_text(&mut stderr, &notes);
     }
     finish_daemon(
         intercept_dir.as_deref(),
@@ -2266,6 +2253,47 @@ fn mentions_daemon(_: &LaunchDispatchError) -> bool {
     false
 }
 
+/// The `[aw]` lines that follow a human summary, in print order.
+///
+/// Each item still ends with `\n`, and a multi-line item (the version and flag
+/// notes) is split into one line each. [`summary_note_line`] strips the newline
+/// when the same text goes into the JSON `notes` array, so one source feeds both.
+/// `None` and `""` add nothing.
+fn summary_notes(parts: &[Option<&str>]) -> Vec<String> {
+    let mut notes = Vec::new();
+    for part in parts.iter().copied().flatten() {
+        notes.extend(
+            part.split_inclusive('\n')
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    notes
+}
+
+/// What the summary prints after its figures: the pin result, and the `[aw]`
+/// lines. Grouped so [`write_summary`] stays within the argument limit.
+struct SummaryTail<'a> {
+    pin: PinState,
+    notes: &'a [String],
+}
+
+/// One `notes` entry: the `[aw]` line without its trailing newline. A note is
+/// one sentence, so an embedded newline would only come from a warning that
+/// already folded; JSON keeps it as one string either way by flattening.
+fn summary_note_line(note: &str) -> String {
+    note.trim_end_matches(['\n', '\r'])
+        .replace(['\n', '\r'], " ")
+}
+
+/// Write the human-summary notes. Not used for `--json`: those go inside the
+/// document, and a second line after it is trailing characters.
+fn append_note_text(stderr: &mut Vec<u8>, notes: &[String]) {
+    for note in notes {
+        stderr.extend_from_slice(note.as_bytes());
+    }
+}
+
 fn write_summary(
     out: &mut dyn Write,
     args: &RunArgs<'_>,
@@ -2273,15 +2301,24 @@ fn write_summary(
     launched: &Launched,
     figures: &Result<Option<Summary>, String>,
     session_id: Option<&str>,
-    pin_state: PinState,
+    tail: SummaryTail<'_>,
 ) -> io::Result<()> {
     if args.json {
-        let body = summary_json(args, launched, figures, session_id, pin_state);
+        let mut body = summary_json(args, launched, figures, session_id, tail.pin);
+        // Always present, including `[]`. A reader can tell "nothing to say"
+        // from "this aw is old and dropped the field".
+        body["notes"] = Value::Array(
+            tail.notes
+                .iter()
+                .map(|note| Value::String(summary_note_line(note)))
+                .collect(),
+        );
         let mut bytes = serde_json::to_vec(&body)
             .map_err(|err| io::Error::other(format!("编码摘要失败：{err}")))?;
         bytes.push(b'\n');
         // The summary is an `[aw]` side channel. JSON still goes to stderr so the
-        // target's own stdout stays untouched.
+        // target's own stdout stays untouched. Nothing is written after this
+        // document: notes are a field, not a second line.
         return out.write_all(&bytes);
     }
     match figures {
@@ -2335,7 +2372,7 @@ fn write_summary(
             "[aw] 已请求采样模式（--no-daemon）；实际采集状态不可得，未经采集器确认"
         )?;
     }
-    match (args.pin, pin_state) {
+    match (args.pin, tail.pin) {
         (true, PinState::Unknown) => {
             writeln!(
                 out,
@@ -3088,6 +3125,7 @@ mod tests {
         begin: Option<ControlError>,
         adopt: Option<ControlError>,
         exit: Option<ControlError>,
+        pin: Option<ControlError>,
         seen_begin: Option<BeginRunRequest>,
         stops: Vec<String>,
         discards: Vec<String>,
@@ -3100,6 +3138,7 @@ mod tests {
                 begin: None,
                 adopt: None,
                 exit: None,
+                pin: None,
                 seen_begin: None,
                 stops: Vec::new(),
                 discards: Vec::new(),
@@ -3164,7 +3203,10 @@ mod tests {
 
         fn pin(&mut self, _: &str) -> Result<(), ControlError> {
             self.log.borrow_mut().push("pin");
-            Ok(())
+            match self.pin.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
     }
 
@@ -3359,11 +3401,11 @@ mod tests {
         assert!(err.contains("权限确认"), "{err}");
         assert!(!err.contains("上传了"), "{err}");
 
-        // The same rule under `--json` must not follow the summary. Claude Code
-        // treats a rewrite as approval; that sentence stays on the human summary.
+        // `--json` with a summary keeps the rewrite sentence inside `notes`.
+        // Claude Code treats that rewrite as approval; dropping the sentence
+        // would hide it. Nothing may follow the document.
         let mut json_args = args(&command);
         json_args.json = true;
-        json_args.quiet = true;
         let mut launcher = FakeLaunch {
             code: 0,
             sampling_seen: None,
@@ -3375,14 +3417,53 @@ mod tests {
             &json_args,
             none(),
             &mut UnixAdapter(&mut launcher),
+            &mut EmptySummary,
+        );
+        let err = text(&outcome.stderr);
+        let body: serde_json::Value = serde_json::from_str(err.trim_end()).expect(&err);
+        let notes = body["notes"]
+            .as_array()
+            .expect("notes is an array")
+            .iter()
+            .map(|item| item.as_str().expect("note string"))
+            .collect::<Vec<_>>();
+        assert!(
+            notes.iter().any(|note| {
+                note.contains("改写") && note.contains("权限确认") && !note.contains('\n')
+            }),
+            "the rewrite sentence belongs in notes: {err}"
+        );
+        assert!(!err.contains("上传了"), "{err}");
+        assert!(outcome.stdout.is_empty());
+
+        // Quiet prints no summary document, so the same sentence stays `[aw]` text.
+        let mut quiet_args = args(&command);
+        quiet_args.json = true;
+        quiet_args.quiet = true;
+        let mut launcher = FakeLaunch {
+            code: 0,
+            sampling_seen: None,
+            forwarded: Vec::new(),
+            env_len: None,
+            fail: None,
+        };
+        let outcome = run(
+            &quiet_args,
+            none(),
+            &mut UnixAdapter(&mut launcher),
             &mut FixedSummary(None),
         );
         let err = text(&outcome.stderr);
         assert!(
-            err.is_empty(),
-            "--json with no summary must not print the rewrite note: {err}"
+            err.contains(
+                "[aw] 提示：规则里有改写。命中的命令会带着改后的参数直接执行，不再弹出权限确认。"
+            ),
+            "quiet still prints the rewrite sentence: {err}"
         );
-        assert!(outcome.stdout.is_empty());
+        assert!(
+            serde_json::from_str::<serde_json::Value>(err.trim_end()).is_err(),
+            "quiet has no JSON document: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3455,8 +3536,9 @@ mod tests {
 
     /// `--json` puts one JSON document on stderr. A policy note (rules present,
     /// `enabled` never set) used to be appended after that document, so
-    /// `from_slice` failed with "trailing characters" on line 2. The note still
-    /// belongs on stderr when the summary is human text.
+    /// `from_slice` failed with "trailing characters" on line 2. The sentence
+    /// now lives in `notes`. With no summary (`--quiet` / `--summary none`)
+    /// there is no document, and the same sentence is `[aw]` text again.
     #[test]
     fn json_summary_stays_one_document_when_enabled_is_omitted() {
         // Holds the process-wide env lock and points every config home at an
@@ -3489,10 +3571,13 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(err.trim_end()).expect(&err);
         assert_eq!(body["available"], false, "{err}");
         assert_eq!(body["reason"], "摘要不可用", "{err}");
-        assert!(
-            !err.contains("enabled"),
-            "--json stderr must be the summary alone, got {err}"
+        let notes = body["notes"].as_array().expect("notes");
+        assert_eq!(notes.len(), 1, "{err}");
+        assert_eq!(
+            notes[0],
+            "[aw] 提示：规则文件里有规则，但没有写 enabled，拦截没有打开。要打开请写 enabled = true。"
         );
+        assert!(!notes[0].as_str().unwrap().contains('\n'));
         assert!(outcome.stdout.is_empty(), "{:?}", outcome.stdout);
 
         let mut human = args(&command);
@@ -3507,8 +3592,118 @@ mod tests {
         let err = text(&outcome.stderr);
         assert!(err.contains("摘要不可用"), "{err}");
         assert!(
-            err.contains("没有写 enabled") && err.contains("没有打开"),
+            err.contains("[aw] 提示：规则文件里有规则，但没有写 enabled，拦截没有打开。要打开请写 enabled = true。"),
             "the human summary must still name the missing switch: {err}"
+        );
+
+        let mut quiet = args(&command);
+        quiet.quiet = true;
+        let mut launcher = fake_exit_7();
+        let outcome = run(
+            &quiet,
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut EmptySummary,
+        );
+        let err = text(&outcome.stderr);
+        assert_eq!(
+            err,
+            "[aw] 提示：规则文件里有规则，但没有写 enabled，拦截没有打开。要打开请写 enabled = true。\n",
+            "quiet keeps the note as text: {err}"
+        );
+    }
+
+    /// Pin and exit warnings are `[aw]` text on the human summary. Under `--json`
+    /// they move into `notes` of the same document; they are not dropped.
+    #[test]
+    fn json_summary_keeps_pin_and_exit_warnings_in_notes() {
+        let _home = isolate_config();
+        let command = vec!["tool".to_owned()];
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sessions = FakeSessions::new(Rc::clone(&log));
+        sessions.pin = Some(ControlError::Unreachable {
+            detail: "pin-down".to_owned(),
+        });
+        sessions.exit = Some(ControlError::Unreachable {
+            detail: "exit-down".to_owned(),
+        });
+        let mut spawner = FakeSpawner {
+            log: Rc::clone(&log),
+            spawned: 0,
+            code: 7,
+            fail: None,
+        };
+        let mut parsed = args(&command);
+        parsed.json = true;
+        parsed.pin = true;
+        let outcome = daemon_run(
+            &parsed,
+            none(),
+            &mut sessions,
+            &mut spawner,
+            &mut EmptySummary,
+        );
+        assert_eq!(outcome.code, 7);
+        let err = text(&outcome.stderr);
+        let body: serde_json::Value = serde_json::from_str(err.trim_end()).expect(&err);
+        let notes = body["notes"]
+            .as_array()
+            .expect("notes")
+            .iter()
+            .map(|item| item.as_str().expect("note"))
+            .collect::<Vec<_>>();
+        assert!(
+            notes.contains(
+                &"[aw] 警告：后台没有保留这个会话：连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：pin-down"
+            ),
+            "{notes:?}"
+        );
+        assert!(
+            notes.contains(
+                &"[aw] 警告：daemon 未记录程序退出码：连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：exit-down"
+            ),
+            "{notes:?}"
+        );
+        assert!(notes.iter().all(|note| !note.contains('\n')));
+        assert!(outcome.stdout.is_empty());
+
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sessions = FakeSessions::new(Rc::clone(&log));
+        sessions.pin = Some(ControlError::Unreachable {
+            detail: "pin-down".to_owned(),
+        });
+        sessions.exit = Some(ControlError::Unreachable {
+            detail: "exit-down".to_owned(),
+        });
+        let mut spawner = FakeSpawner {
+            log: Rc::clone(&log),
+            spawned: 0,
+            code: 7,
+            fail: None,
+        };
+        let mut quiet = args(&command);
+        quiet.json = true;
+        quiet.quiet = true;
+        quiet.pin = true;
+        let outcome = daemon_run(
+            &quiet,
+            none(),
+            &mut sessions,
+            &mut spawner,
+            &mut EmptySummary,
+        );
+        let err = text(&outcome.stderr);
+        assert!(
+            err.contains("[aw] 警告：后台没有保留这个会话：连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：pin-down\n"),
+            "quiet still prints the pin warning: {err}"
+        );
+        assert!(
+            err.contains("[aw] 警告：daemon 未记录程序退出码：连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：exit-down\n"),
+            "quiet still prints the exit warning: {err}"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(err.trim_end()).is_err(),
+            "quiet has no JSON document: {err}"
         );
     }
 

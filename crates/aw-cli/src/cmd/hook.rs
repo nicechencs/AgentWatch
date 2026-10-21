@@ -305,12 +305,28 @@ fn on_error_from_decide(
     let _ = error;
     let decision = on_error_decision(on_error, reason);
     if decision.effective == Action::Allow {
-        let _ = audit_decision(subject, &decision, session, "", None, endpoint, deadline);
+        let _ = audit_decision(
+            subject,
+            &decision,
+            session,
+            &on_error_original(subject),
+            None,
+            endpoint,
+            deadline,
+        );
         return None;
     }
     let value = Value::Null;
     let (rendered, _) = render_decision(agent, subject, &decision, &value);
-    let _ = audit_decision(subject, &decision, session, "", None, endpoint, deadline);
+    let _ = audit_decision(
+        subject,
+        &decision,
+        session,
+        &on_error_original(subject),
+        None,
+        endpoint,
+        deadline,
+    );
     rendered.and_then(|body| json_stdout(&body))
 }
 
@@ -334,13 +350,34 @@ fn apply_on_error(
     } else {
         subject_from(agent, &value)
     };
+    let original = on_error_original(&subject);
     if decision.effective == Action::Allow {
-        let _ = audit_decision(&subject, &decision, session, "", None, endpoint, deadline);
+        let _ = audit_decision(
+            &subject, &decision, session, &original, None, endpoint, deadline,
+        );
         return None;
     }
     let (rendered, _) = render_decision(agent, &subject, &decision, &value);
-    let _ = audit_decision(&subject, &decision, session, "", None, endpoint, deadline);
+    let _ = audit_decision(
+        &subject, &decision, session, &original, None, endpoint, deadline,
+    );
     rendered.and_then(|body| json_stdout(&body))
+}
+
+/// Text stored as `before` when the decision is `on_error`, not a rule hit.
+///
+/// The observed command, path, or URL when the payload still parsed. Otherwise
+/// the reason itself: an empty string becomes an empty `before_summary`, and
+/// `POST /api/v1/agent/intercept` answers 400, so the deny never lands in
+/// `intercept_events`. The policy file's bytes are not part of this string.
+fn on_error_original(subject: &Subject) -> String {
+    subject
+        .command
+        .clone()
+        .or_else(|| subject.path.clone())
+        .or_else(|| subject.url.clone())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "（未能取得原文）".to_owned())
 }
 
 fn on_error_decision(on_error: OnError, reason: &str) -> Decision {
@@ -917,6 +954,107 @@ action = "ask"
         let audit_text = fs::read_to_string(&audit).unwrap_or_default();
         assert!(audit_text.contains("\"downgraded\":true") || audit_text.contains("downgraded"));
         assert!(!audit_text.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+        // The broken-file deny is one of those lines. Its summary is the
+        // observed command, never the policy text, and never empty: an empty
+        // before_summary is what made the daemon answer 400.
+        let broken_line = audit_text
+            .lines()
+            .find(|line| line.contains("规则文件读不了"))
+            .expect("broken-policy deny was audited");
+        assert!(broken_line.contains("rm -rf /tmp/x"), "{broken_line}");
+        assert!(!broken_line.contains("action = "), "{broken_line}");
+        let broken_row: Value = serde_json::from_str(broken_line).unwrap();
+        assert!(!broken_row["before_summary"].as_str().unwrap().is_empty());
+        assert!(!broken_row["before_hash"].as_str().unwrap().is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What the daemon used to reject. A broken policy posted an empty
+    /// `before_summary`, `POST /api/v1/agent/intercept` answered 400, and
+    /// `intercept_events` stayed empty even though the tool was denied.
+    ///
+    /// The stand-in applies the same check the route does (a present, non-empty
+    /// summary and hash) and records the body. It listens on a real socket or
+    /// pipe so the production client is what delivers the row.
+    #[test]
+    fn broken_policy_deny_posts_a_summary_the_daemon_can_store() {
+        let _guard = policy_file::env_lock();
+        let dir = aw_channel::short_temp_dir("hookbrk");
+        let broken = dir.join("broken.toml");
+        fs::write(&broken, "this is not a policy\n").unwrap();
+        let _policy_env = policy_file::EnvVarGuard::set(policy_file::POLICY_ENV, &broken);
+        let (endpoint, bodies) = intercept_stand_in();
+        let payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"echo hello"}}"#;
+        let mut transport = Scripted {
+            sent: Vec::new(),
+            ok: true,
+        };
+        let outcome = run(input("claude-code", payload, &endpoint), &mut transport);
+        let body: Value = serde_json::from_slice(&outcome.stdout).unwrap();
+        assert_eq!(
+            body["hookSpecificOutput"]["permissionDecision"],
+            json!("deny")
+        );
+        let posted = bodies.lock().expect("stand-in").clone();
+        let row = posted
+            .iter()
+            .find(|value| {
+                value["reason"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("规则文件读不了")
+            })
+            .expect("broken-policy deny was posted");
+        let summary = row["before_summary"].as_str().unwrap_or("");
+        let hash = row["before_hash"].as_str().unwrap_or("");
+        assert!(summary.contains("echo hello"), "{summary}");
+        assert!(!summary.is_empty() && !hash.is_empty(), "{row}");
+        assert!(!summary.contains("this is not a policy"), "{summary}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Accepts one loopback HTTP request and keeps the JSON body when it would
+    /// pass the daemon's field check: a present, non-empty summary and hash.
+    /// Loopback TCP is the channel that exists on all three systems without a
+    /// named pipe, so the production client is what delivers the row.
+    fn intercept_stand_in() -> (Endpoint, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let saved = std::sync::Arc::clone(&bodies);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0_u8; 16 * 1024];
+            let Ok(n) = stream.read(&mut buf) else {
+                return;
+            };
+            let text = String::from_utf8_lossy(&buf[..n]);
+            let json_at = text.find("\r\n\r\n").map(|pos| pos + 4).unwrap_or(0);
+            let value = serde_json::from_str::<Value>(&text[json_at..]).unwrap_or(Value::Null);
+            let ok = value["before_summary"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+                && value["before_hash"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty());
+            if ok {
+                saved.lock().expect("bodies").push(value);
+            }
+            let status = if ok { "200 OK" } else { "400 Bad Request" };
+            let reply = format!("HTTP/1.1 {status}\r\nContent-Length: 2\r\n\r\n{{}}");
+            let _ = stream.write_all(reply.as_bytes());
+        });
+        let endpoint = endpoint::resolve(&EndpointInput {
+            socket: None,
+            http: Some(format!("http://127.0.0.1:{port}")),
+            token: Some("hook-broken-test".to_owned()),
+            token_env: None,
+        })
+        .expect("loopback endpoint");
+        (endpoint, bodies)
     }
 }

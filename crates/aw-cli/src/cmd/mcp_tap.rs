@@ -872,15 +872,20 @@ fn unconfirmed_rewrite(decision: &Decision) -> Decision {
     }
 }
 
-/// `AW_INTERCEPT_AUDIT`, else nothing. mcp-tap has no session directory of its
-/// own; `aw run` passes one through the environment when it has one.
+/// `AW_INTERCEPT_AUDIT`, else `<session dir>/intercept-audit.jsonl`.
+///
+/// The session directory comes from `AW_SESSION` and the platform state home.
+/// `aw run` sets that variable before it starts mcp-tap.
 fn audit_backup() -> Option<std::path::PathBuf> {
+    let session = std::env::var(super::hook::SESSION_ENV)
+        .ok()
+        .filter(|id| !id.is_empty());
     super::intercept_audit::backup_path(
         std::env::var_os(super::intercept_audit::AUDIT_ENV)
             .filter(|value| !value.is_empty())
             .map(std::path::PathBuf::from)
             .as_deref(),
-        None,
+        super::intercept_audit::current_session_dir(session.as_deref()).as_deref(),
     )
 }
 
@@ -923,13 +928,7 @@ fn audit_mcp(
             event: Some(direction.to_owned()),
             ..Subject::default()
         });
-    let backup = super::intercept_audit::backup_path(
-        std::env::var_os(super::intercept_audit::AUDIT_ENV)
-            .filter(|value| !value.is_empty())
-            .map(std::path::PathBuf::from)
-            .as_deref(),
-        None,
-    );
+    let backup = audit_backup();
     // Same salt rule as the hook: a session id is the salt, so two processes
     // auditing one session hash one command the same way. No session means the
     // process-local salt, which is not comparable across restarts.
@@ -1272,6 +1271,48 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
         assert_eq!(row["before_summary"], serde_json::json!("rm -rf /tmp"), "{row}");
         assert_eq!(row["delivered"], serde_json::json!("local_backup"), "{row}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No `AW_INTERCEPT_AUDIT`: the line goes to the session directory derived
+    /// from `AW_SESSION` and `XDG_STATE_HOME`.
+    #[test]
+    fn missing_audit_env_writes_the_session_directory() {
+        let _guard = crate::cmd::policy_file::env_lock();
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "aw-mcp-session-dir-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        let state = root.join("state");
+        let _audit =
+            crate::cmd::policy_file::EnvVarGuard::unset(crate::cmd::intercept_audit::AUDIT_ENV);
+        let _state = crate::cmd::policy_file::EnvVarGuard::set_text("XDG_STATE_HOME", &state);
+        let _home = crate::cmd::policy_file::EnvVarGuard::set_text("HOME", &root);
+        let _session =
+            crate::cmd::policy_file::EnvVarGuard::set_text(crate::cmd::hook::SESSION_ENV, "s-mcp");
+        let frame = b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"run\",\"arguments\":{\"command\":\"rm -rf /tmp\"}}}\n";
+        let copy = copy_gated_for_test(frame, DIR_C2S, DENY_RM, true).unwrap();
+        assert!(copy.child.is_empty(), "denied frame reached the child");
+        let audit = state
+            .join("agentwatch")
+            .join("sessions")
+            .join("s-mcp")
+            .join("intercept-audit.jsonl");
+        let text = std::fs::read_to_string(&audit)
+            .unwrap_or_else(|_| panic!("no session backup at {}", audit.display()));
+        let row: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(row["session"], serde_json::json!("s-mcp"), "{row}");
+        assert_eq!(row["effective_action"], serde_json::json!("deny"), "{row}");
+        assert_eq!(row["delivered"], serde_json::json!("local_backup"), "{row}");
+        assert_eq!(row["layer"], serde_json::json!("mcp"), "{row}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

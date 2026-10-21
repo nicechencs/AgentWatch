@@ -1,10 +1,11 @@
 //! Deliver one intercept audit record (P5-SEC-01, design §5.4).
 //!
-//! Order: `POST /api/v1/agent/intercept`, then a local jsonl line. The local
+//! Order: a local jsonl line, then `POST /api/v1/agent/intercept`. The local
 //! file is `AW_INTERCEPT_AUDIT` when that variable is set, otherwise
-//! `<session dir>/intercept-audit.jsonl` when the caller has a session
-//! directory, otherwise a file next to the policy is not invented: with no
-//! path at all the delivery is [`Delivered::Dropped`].
+//! `<session dir>/intercept-audit.jsonl`. The session directory is
+//! `<state home>/agentwatch/sessions/<id>`: Linux and macOS use
+//! `XDG_STATE_HOME` or `$HOME/.local/state`, Windows uses `LOCALAPPDATA`.
+//! With no path at all the delivery is [`Delivered::Dropped`].
 //!
 //! The jsonl line is the redacted record. It does not contain the original
 //! command or URL. The file is created mode `0o600` on Unix.
@@ -202,6 +203,66 @@ pub(crate) fn backup_path(env_path: Option<&Path>, session_dir: Option<&Path>) -
         }
     }
     session_dir.map(|dir| dir.join("intercept-audit.jsonl"))
+}
+
+/// State directory for one platform.
+///
+/// Linux and macOS use `XDG_STATE_HOME` when it is non-empty, otherwise
+/// `$HOME/.local/state`. Windows uses `LOCALAPPDATA` only. An empty input is
+/// unset. This does not create the directory.
+pub(crate) fn state_home(
+    os: &str,
+    local_app_data: Option<&Path>,
+    xdg_state: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    fn nonempty(path: Option<&Path>) -> Option<&Path> {
+        path.filter(|path| !path.as_os_str().is_empty())
+    }
+    if os == "windows" {
+        return nonempty(local_app_data).map(Path::to_path_buf);
+    }
+    if let Some(state) = nonempty(xdg_state) {
+        return Some(state.to_path_buf());
+    }
+    nonempty(home).map(|dir| dir.join(".local").join("state"))
+}
+
+/// `<state home>/agentwatch/sessions/<id>`, or `None` when there is no session
+/// or the id is not a single path component.
+///
+/// `.`, `..`, a separator, or a NUL would write the backup outside the session
+/// directory. Those ids are refused. Anything else is one component, including
+/// a public id that contains `-`.
+pub(crate) fn session_audit_dir(
+    session: Option<&str>,
+    state_home: Option<&Path>,
+) -> Option<PathBuf> {
+    let state = state_home.filter(|path| !path.as_os_str().is_empty())?;
+    let id = session.map(str::trim).filter(|id| !id.is_empty())?;
+    if id == "." || id == ".." || id.bytes().any(|byte| byte == b'/' || byte == b'\\' || byte == 0)
+    {
+        return None;
+    }
+    Some(state.join("agentwatch").join("sessions").join(id))
+}
+
+/// Session directory for this process: [`session_audit_dir`] plus the
+/// platform's state home from the environment.
+pub(crate) fn current_session_dir(session: Option<&str>) -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let xdg = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    session_audit_dir(
+        session,
+        state_home(
+            std::env::consts::OS,
+            local.as_deref(),
+            xdg.as_deref(),
+            home.as_deref(),
+        )
+        .as_deref(),
+    )
 }
 
 fn post_daemon(endpoint: &Endpoint, record: &AuditRecord, timeout: Duration) -> bool {
@@ -408,6 +469,93 @@ mod tests {
         assert!(row["after_summary"].is_null(), "{row}");
         assert_eq!(row["session"], json!("s-1"), "{row}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// No `AW_INTERCEPT_AUDIT`: the backup is
+    /// `<state>/agentwatch/sessions/<id>/intercept-audit.jsonl`.
+    ///
+    /// Linux and macOS take `XDG_STATE_HOME`, else `$HOME/.local/state`.
+    /// Windows takes `LOCALAPPDATA` and ignores the other two. A session id
+    /// that is empty, `.`, `..`, or contains a separator is not a directory.
+    #[test]
+    fn session_backup_lands_in_the_session_directory() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        let state = root.join("audit-tests").join("state-home");
+        let home = root.join("audit-tests").join("home");
+        let local = root.join("audit-tests").join("local-app");
+
+        assert_eq!(
+            state_home("linux", None, Some(&state), Some(&home)).as_deref(),
+            Some(state.as_path())
+        );
+        assert_eq!(
+            state_home("macos", None, None, Some(&home)).as_deref(),
+            Some(home.join(".local").join("state").as_path())
+        );
+        assert_eq!(
+            state_home("windows", Some(&local), Some(&state), Some(&home)).as_deref(),
+            Some(local.as_path())
+        );
+        assert!(state_home("windows", None, Some(&state), Some(&home)).is_none());
+        assert_eq!(
+            state_home("linux", None, Some(Path::new("")), Some(&home)).as_deref(),
+            Some(home.join(".local").join("state").as_path()),
+            "an empty XDG_STATE_HOME is unset and falls back to HOME"
+        );
+        assert!(state_home("linux", None, None, None).is_none());
+
+        let dir = session_audit_dir(Some("s-public"), Some(&state)).expect("session dir");
+        assert_eq!(
+            dir,
+            state.join("agentwatch").join("sessions").join("s-public")
+        );
+        assert_eq!(
+            backup_path(None, Some(&dir)).as_deref(),
+            Some(dir.join("intercept-audit.jsonl").as_path())
+        );
+        for bad in ["", ".", "..", "../x", "a/b", "a\\b", "a\0b"] {
+            assert!(
+                session_audit_dir(Some(bad), Some(&state)).is_none(),
+                "session id {bad:?} was accepted"
+            );
+        }
+        assert!(session_audit_dir(None, Some(&state)).is_none());
+        assert!(session_audit_dir(Some("s-public"), None).is_none());
+
+        let scratch = root.join("audit-tests").join(format!(
+            "mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&scratch);
+        let out = scratch.join("intercept-audit.jsonl");
+        let subject = Subject {
+            layer: Layer::Hook,
+            agent: Some("claude-code".to_owned()),
+            tool: Some("Bash".to_owned()),
+            phase: Phase::Pre,
+            ..Subject::default()
+        };
+        let mut record = record_for(
+            &subject,
+            &decision(Action::Deny),
+            b"salt",
+            "true",
+            None,
+            Some("s-public"),
+        );
+        let delivery = deliver(None, Some(&out), &mut record, Duration::from_millis(10));
+        assert_eq!(delivery.delivered, Delivered::LocalBackup);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "backup file mode is {mode:o}");
+        }
+        let _ = fs::remove_dir_all(&scratch);
     }
 
     #[test]

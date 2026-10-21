@@ -324,7 +324,11 @@ fn apply_decision(
     if rewrite_unconfirmed {
         let downgraded = downgrade_unconfirmed(&decided);
         let _ = intercept_audit::correct_delivered(
-            audit_env_path().as_deref(),
+            intercept_audit::backup_path(
+                audit_env_path().as_deref(),
+                intercept_audit::current_session_dir(session).as_deref(),
+            )
+            .as_deref(),
             Some(endpoint),
             &posted,
             &downgraded,
@@ -501,7 +505,10 @@ fn audit_decision(
         )
     };
     let remaining = deadline.saturating_duration_since(Instant::now());
-    let backup = intercept_audit::backup_path(audit_env_path().as_deref(), None);
+    let backup = intercept_audit::backup_path(
+        audit_env_path().as_deref(),
+        intercept_audit::current_session_dir(session).as_deref(),
+    );
     let delivery = intercept_audit::deliver(
         Some(endpoint),
         backup.as_deref(),
@@ -1673,6 +1680,145 @@ action = "ask"
             .unwrap_or("");
         assert!(reason.contains("审计写不进去"), "{reason}");
         assert!(reason.contains("只允许 plan"), "{reason}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn input_session<'a>(
+        agent: &'a str,
+        payload: &'a [u8],
+        endpoint: &'a Endpoint,
+        session: &'a str,
+    ) -> HookInput<'a> {
+        let mut hooked = input(agent, payload, endpoint);
+        hooked.session_env = Some(session);
+        hooked
+    }
+
+    /// No `AW_INTERCEPT_AUDIT`. The deny line is
+    /// `<XDG_STATE_HOME>/agentwatch/sessions/<id>/intercept-audit.jsonl`.
+    #[test]
+    fn hook_without_audit_env_writes_the_session_directory() {
+        let _guard = policy_file::env_lock();
+        let _home = home_guard();
+        let dir = scratch("hook-session-dir");
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let policy = dir.join("policy.toml");
+        fs::write(
+            &policy,
+            "enabled = true\n[[rule]]\nid = \"no-rm\"\nlayer = [\"hook\"]\n\
+             tool = [\"Bash\"]\naction = \"deny\"\nreason = \"不允许\"\n",
+        )
+        .unwrap();
+        let _policy = policy_file::EnvVarGuard::set(policy_file::POLICY_ENV, &policy);
+        let _audit = policy_file::EnvVarGuard::unset(intercept_audit::AUDIT_ENV);
+        let _state = policy_file::EnvVarGuard::set_text("XDG_STATE_HOME", &state);
+        let endpoint = endpoint();
+        let payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/x"}}"#;
+        let mut transport = Scripted {
+            sent: Vec::new(),
+            ok: false,
+        };
+        let outcome = run(
+            input_session("claude-code", payload, &endpoint, "s-hook"),
+            &mut transport,
+        );
+        let body: Value = serde_json::from_slice(&outcome.stdout).unwrap_or_else(|_| {
+            panic!(
+                "deny produced no json: {}",
+                String::from_utf8_lossy(&outcome.stdout)
+            )
+        });
+        assert_eq!(
+            body["hookSpecificOutput"]["hookEventName"],
+            json!("PreToolUse"),
+            "{body}"
+        );
+        assert_eq!(
+            body["hookSpecificOutput"]["permissionDecision"],
+            json!("deny"),
+            "{body}"
+        );
+        let audit = state
+            .join("agentwatch")
+            .join("sessions")
+            .join("s-hook")
+            .join("intercept-audit.jsonl");
+        let text = fs::read_to_string(&audit)
+            .unwrap_or_else(|_| panic!("no session backup at {}", audit.display()));
+        let row: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(row["session"], json!("s-hook"), "{row}");
+        assert_eq!(row["effective_action"], json!("deny"), "{row}");
+        assert_eq!(row["delivered"], json!("local_backup"), "{row}");
+        assert_eq!(row["layer"], json!("hook"), "{row}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A local session backup is stored (design §5.3), so a rewrite still runs
+    /// when the daemon is not there.
+    #[test]
+    fn rewrite_with_a_session_backup_still_rewrites() {
+        let _guard = policy_file::env_lock();
+        let _home = home_guard();
+        let dir = scratch("hook-session-rewrite");
+        let state = dir.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let policy = dir.join("policy.toml");
+        fs::write(
+            &policy,
+            "enabled = true\n[[rule]]\nid = \"force-dry-run\"\nlayer = [\"hook\"]\n\
+             tool = [\"Bash\"]\nmatch.command = { prefix = \"terraform apply\" }\n\
+             action = \"rewrite\"\n\
+             rewrite.command = { replace = [\"terraform apply\", \"terraform plan\"] }\n\
+             reason = \"只允许 plan\"\n",
+        )
+        .unwrap();
+        let _policy = policy_file::EnvVarGuard::set(policy_file::POLICY_ENV, &policy);
+        let _audit = policy_file::EnvVarGuard::unset(intercept_audit::AUDIT_ENV);
+        let _state = policy_file::EnvVarGuard::set_text("XDG_STATE_HOME", &state);
+        let endpoint = endpoint();
+        let payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"terraform apply -auto-approve","extra":true}}"#;
+        let mut transport = Scripted {
+            sent: Vec::new(),
+            ok: false,
+        };
+        let outcome = run(
+            input_session("claude-code", payload, &endpoint, "s-hook"),
+            &mut transport,
+        );
+        let body: Value = serde_json::from_slice(&outcome.stdout).unwrap_or_else(|_| {
+            panic!(
+                "rewrite was downgraded: {}",
+                String::from_utf8_lossy(&outcome.stdout)
+            )
+        });
+        assert_eq!(
+            body["hookSpecificOutput"]["hookEventName"],
+            json!("PreToolUse"),
+            "{body}"
+        );
+        assert_eq!(
+            body["hookSpecificOutput"]["permissionDecision"],
+            json!("allow"),
+            "{body}"
+        );
+        assert_eq!(
+            body["hookSpecificOutput"]["updatedInput"]["command"],
+            json!("terraform plan -auto-approve"),
+            "{body}"
+        );
+        let audit = state
+            .join("agentwatch")
+            .join("sessions")
+            .join("s-hook")
+            .join("intercept-audit.jsonl");
+        let text = fs::read_to_string(&audit)
+            .unwrap_or_else(|_| panic!("no session backup at {}", audit.display()));
+        let row: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(row["session"], json!("s-hook"), "{row}");
+        assert_eq!(row["effective_action"], json!("rewrite"), "{row}");
+        assert_eq!(row["delivered"], json!("local_backup"), "{row}");
+        assert_eq!(row["downgraded"], json!(false), "{row}");
         let _ = fs::remove_dir_all(&dir);
     }
 

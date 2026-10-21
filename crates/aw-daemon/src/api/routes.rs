@@ -3189,6 +3189,16 @@ mod tests {
                     .unwrap_or(0)
             ));
         assert!(std::fs::create_dir_all(&dir).is_ok());
+        // A failed assertion used to return before the cleanup at the bottom,
+        // leaving this database under the crate's target tree. Drop removes it
+        // on the way out, pass or fail.
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = DirGuard(dir.clone());
         let db = dir.join("agentwatch.db");
         let opened = (|| -> Result<(), String> {
             let store = aw_store::Store::open(&db).map_err(|err| err.to_string())?;
@@ -3254,7 +3264,6 @@ mod tests {
                 .map_err(|err| err.to_string())
         })();
         assert_eq!(counted.ok(), Some(1));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -231,9 +231,10 @@ pub(crate) fn state_home(
 /// `<state home>/agentwatch/sessions/<id>`, or `None` when there is no session
 /// or the id is not a single path component.
 ///
-/// `.`, `..`, a separator, or a NUL would write the backup outside the session
-/// directory. Those ids are refused. Anything else is one component, including
-/// a public id that contains `-`.
+/// `.`, `..`, a separator, a NUL, or a `:` would write the backup outside the
+/// session directory. `:` is a drive-relative path on Windows (`C:x`). Those
+/// ids are refused. Anything else is one component, including a public id that
+/// contains `-`.
 pub(crate) fn session_audit_dir(
     session: Option<&str>,
     state_home: Option<&Path>,
@@ -244,7 +245,7 @@ pub(crate) fn session_audit_dir(
         || id == ".."
         || id
             .bytes()
-            .any(|byte| byte == b'/' || byte == b'\\' || byte == 0)
+            .any(|byte| byte == b'/' || byte == b'\\' || byte == b':' || byte == 0)
     {
         return None;
     }
@@ -517,7 +518,7 @@ mod tests {
             backup_path(None, Some(&dir)).as_deref(),
             Some(dir.join("intercept-audit.jsonl").as_path())
         );
-        for bad in ["", ".", "..", "../x", "a/b", "a\\b", "a\0b"] {
+        for bad in ["", ".", "..", "../x", "a/b", "a\\b", "a\0b", "C:x", "a:b"] {
             assert!(
                 session_audit_dir(Some(bad), Some(&state)).is_none(),
                 "session id {bad:?} was accepted"

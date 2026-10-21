@@ -21,7 +21,7 @@
 //! it still has time, and the daemon records `gap_kind = self_report_dropped`
 //! (or `intercept_audit_dropped` for an audit the local file also refused).
 
-use std::io::{self, Read};
+use std::io::{self};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -520,13 +520,16 @@ fn json_stdout(value: &Value) -> Option<Vec<u8>> {
 /// results, so those events print nothing and record nothing — a deny printed
 /// for them would be a row for a call that was not refused.
 ///
-/// A payload that names no event is treated as PreToolUse. That is the event
-/// a hook is injected for, and dropping it would let a tool run.
+/// Only PreToolUse is decided. A blacklist of the three events `aw run`
+/// registers would still print a PreToolUse deny for UserPromptSubmit or Stop
+/// when someone wires `aw hook` to those by hand. A payload that names no
+/// event is treated as PreToolUse: that is the event a hook is injected for,
+/// and dropping it would let a tool run.
 fn decides(subject: &Subject) -> bool {
-    !matches!(
-        subject.event.as_deref(),
-        Some("PostToolUse" | "SessionStart" | "SessionEnd")
-    )
+    match subject.event.as_deref() {
+        None | Some("PreToolUse") => true,
+        Some(_) => false,
+    }
 }
 
 fn render_decision(
@@ -764,7 +767,7 @@ pub(crate) fn run_from_stdio(
 ) -> Outcome {
     let started = Instant::now();
     let endpoint = endpoint::resolve(endpoint_input);
-    let read = read_stdin_capped(MAX_STDIN);
+    let read = read_stdin_capped(&mut io::stdin(), MAX_STDIN);
     let (payload, truncated, failed) = match read {
         Ok(read) => (read.bytes, read.truncated, false),
         Err(_) => (Vec::new(), false, true),
@@ -848,42 +851,38 @@ struct StdinRead {
     truncated: bool,
 }
 
-/// Read stdin until EOF or `cap`.
+/// Read stdin until EOF or `cap` bytes.
 ///
 /// Claude Code gives a command hook 600 s, and the JSON arrives as one write
 /// followed by a close. The 200 ms budget is for the audit post; cutting the
 /// read off there dropped the decision. `cap` is [`MAX_STDIN`]: past it the
-/// caller reports "too big" instead of parsing a prefix.
-fn read_stdin_capped(cap: usize) -> io::Result<StdinRead> {
+/// caller reports "too big" instead of parsing a prefix. Exactly `cap` bytes
+/// followed by EOF is the whole payload, not a truncation.
+fn read_stdin_capped(reader: &mut impl io::Read, cap: usize) -> io::Result<StdinRead> {
     let mut out = Vec::new();
     let mut buf = [0_u8; 8 * 1024];
-    let mut stdin = io::stdin();
     loop {
-        if out.len() >= cap {
-            return Ok(StdinRead {
-                bytes: out,
-                truncated: true,
-            });
-        }
         // A hook's stdin is a pipe that closes after one JSON value. On a
         // terminal this waits for the operator; `aw hook` is not meant to be
         // typed at.
-        let n = stdin.read(&mut buf)?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
+            // EOF at exactly `cap` is the whole payload. Only a byte past
+            // `cap` is a truncation, and that returns before this point.
             return Ok(StdinRead {
                 bytes: out,
                 truncated: false,
             });
         }
         let room = cap.saturating_sub(out.len());
-        let take = n.min(room);
-        out.extend_from_slice(&buf[..take]);
-        if take < n {
+        if n > room {
+            out.extend_from_slice(&buf[..room]);
             return Ok(StdinRead {
                 bytes: out,
                 truncated: true,
             });
         }
+        out.extend_from_slice(&buf[..n]);
     }
 }
 
@@ -1098,6 +1097,36 @@ action = "ask"
             fs::read_to_string(&audit).unwrap_or_default(),
             audit_before_post,
             "PostToolUse added an audit row"
+        );
+
+        // Anything other than PreToolUse is the same: no decision, no audit.
+        // A missing event name stays PreToolUse, so a deny still prints.
+        let audit_before_other = fs::read_to_string(&audit).unwrap_or_default();
+        let stop_payload = br#"{"hook_event_name":"Stop","tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/x"}}"#;
+        let stop = run(
+            input("claude-code", stop_payload, &endpoint),
+            &mut transport,
+        );
+        assert_eq!(stop.code, exit::OK);
+        assert!(
+            stop.stdout.is_empty(),
+            "Stop printed {}",
+            String::from_utf8_lossy(&stop.stdout)
+        );
+        let prompt_payload = br#"{"hook_event_name":"UserPromptSubmit","tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/x"}}"#;
+        let prompt = run(
+            input("claude-code", prompt_payload, &endpoint),
+            &mut transport,
+        );
+        assert!(
+            prompt.stdout.is_empty(),
+            "UserPromptSubmit printed {}",
+            String::from_utf8_lossy(&prompt.stdout)
+        );
+        assert_eq!(
+            fs::read_to_string(&audit).unwrap_or_default(),
+            audit_before_other,
+            "a non-PreToolUse event added an audit row"
         );
 
         let broken = dir.join("broken.toml");
@@ -1475,6 +1504,29 @@ action = "ask"
             json!("hook 载荷不是 JSON")
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Exactly `cap` bytes then EOF is the whole payload. One byte more is
+    /// truncated. The old check treated `len >= cap` as truncated before
+    /// reading the EOF, so a payload of exactly 8 MiB was refused.
+    #[test]
+    fn read_stdin_capped_keeps_exactly_cap_bytes() {
+        let cap = 64;
+        let exact = vec![b'a'; cap];
+        let read = read_stdin_capped(&mut io::Cursor::new(exact.clone()), cap).unwrap();
+        assert!(!read.truncated, "exactly {cap} bytes was truncated");
+        assert_eq!(read.bytes, exact);
+
+        let mut over = exact.clone();
+        over.push(b'b');
+        let read = read_stdin_capped(&mut io::Cursor::new(over), cap).unwrap();
+        assert!(read.truncated, "one byte past {cap} was kept whole");
+        assert_eq!(read.bytes.len(), cap);
+
+        let short = vec![b'a'; cap - 1];
+        let read = read_stdin_capped(&mut io::Cursor::new(short.clone()), cap).unwrap();
+        assert!(!read.truncated);
+        assert_eq!(read.bytes, short);
     }
 
     /// A 70 KiB Write is a normal tool call. The old 64 KiB cap turned it into

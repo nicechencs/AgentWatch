@@ -115,6 +115,41 @@ fn rm_is_deny_and_terraform_rewrites_and_push_asks() {
     assert_eq!(push.rule_id.as_deref(), Some("ask-before-push"));
 }
 
+/// `match.direction = "s2c"` names a response. The same result text on a
+/// request does not match, so a request rule and a response rule stay apart.
+#[test]
+fn direction_limits_a_rewrite_to_the_response() {
+    let text = r#"
+enabled = true
+[[rule]]
+id = "redact-result"
+layer = ["mcp"]
+match.direction = { exact = "s2c" }
+match.arg.text = { regex = "SECRET" }
+action = "rewrite"
+rewrite.arg.text = { replace = ["SECRET", "XXX"] }
+"#;
+    let PolicyState::On(policy) = load_str(text).unwrap() else {
+        panic!("on");
+    };
+    let mut response = Subject {
+        layer: Layer::Mcp,
+        event: Some("s2c".to_owned()),
+        args: vec![("text".to_owned(), "SECRET".to_owned())],
+        ..Subject::default()
+    };
+    let rewritten = decide(&policy, &response).unwrap();
+    assert_eq!(rewritten.effective, Action::Rewrite);
+    assert_eq!(
+        rewritten.fields,
+        vec![("arg.text".to_owned(), "XXX".to_owned())]
+    );
+    response.event = Some("c2s".to_owned());
+    let request = decide(&policy, &response).unwrap();
+    assert_eq!(request.effective, Action::Allow);
+    assert!(request.rule_id.is_none());
+}
+
 #[test]
 fn two_hits_keep_the_stricter_one() {
     let policy = policy();

@@ -30,6 +30,23 @@ fn isolate(cmd: &mut Command) {
     cmd.env_remove("AW_SYSTEM_SOCKET");
     cmd.env_remove("AW_INTERCEPT_AUDIT");
     cmd.env_remove("AW_HTTP");
+    cmd.env_remove("AW_SESSION");
+    // A cleared `AW_POLICY` falls through to the user config. Point that at an
+    // empty directory this process owns, so a developer machine's real policy
+    // file is not what the child reads. One directory per process: the tests
+    // in this file share it and never write a policy there.
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    let home = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("aw-mcp-home-{}", std::process::id()));
+    ONCE.call_once(|| {
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("config home");
+    });
+    cmd.env("XDG_CONFIG_HOME", &home);
+    cmd.env("HOME", &home);
+    cmd.env("APPDATA", &home);
 }
 
 fn echo_bin() -> PathBuf {
@@ -82,6 +99,42 @@ fn exchange_at(
     exchange_with(policy, socket, http, None, request)
 }
 
+/// Same as [`exchange_with`], but `server` is the wrapped program and every
+/// line the client receives is kept. A batch deny writes one error per refused
+/// element, then the server's reply, so one `read_line` is not the whole answer.
+fn exchange_all(
+    policy: Option<&std::path::Path>,
+    audit: Option<&std::path::Path>,
+    server: &std::path::Path,
+    request: &str,
+) -> (i32, String, String) {
+    let mut cmd = aw();
+    cmd.arg("--socket").arg("aw-mcp-tap-nobody");
+    cmd.args(["mcp-tap", "--"]).arg(server);
+    if let Some(path) = policy {
+        cmd.env("AW_POLICY", path);
+    }
+    if let Some(path) = audit {
+        cmd.env("AW_INTERCEPT_AUDIT", path);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn aw mcp-tap");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(request.as_bytes()).expect("write request");
+    if !request.ends_with('\n') {
+        stdin.write_all(b"\n").expect("write newline");
+    }
+    drop(stdin);
+    let stdout = child.stdout.take().expect("stdout");
+    let reader = std::thread::spawn(move || read_to_string(stdout));
+    let status = wait_child(&mut child, Duration::from_secs(15));
+    let stdout = reader.join().expect("reader");
+    let stderr = read_to_string(child.stderr.take().expect("stderr"));
+    (status, stdout, stderr)
+}
+
 /// `audit` is `AW_INTERCEPT_AUDIT`: a local jsonl line, so a rewrite has a
 /// record even when no daemon is listening. `None` leaves the variable unset.
 fn exchange_with(
@@ -110,6 +163,13 @@ fn exchange_with(
             .arg(url)
             .arg("--token")
             .arg("mcp-tap-test");
+    }
+    // No `--socket` and no `--http`: `aw` would dial the platform default and,
+    // on a machine running the daemon, write this test's audit into the real
+    // database. Give it a relative name nobody listens on. The rewrite tests
+    // pass `AW_INTERCEPT_AUDIT`, so a dead socket only drops the post.
+    if socket.is_none() && http.is_none() {
+        cmd.arg("--socket").arg("aw-mcp-tap-nobody");
     }
     cmd.args(["mcp-tap", "--"]).arg(&echo);
     if let Some(path) = policy {
@@ -274,6 +334,177 @@ fn rewrite_is_what_the_server_receives() {
         !rewritten.1.contains("terraform apply"),
         "original command reached the server: {}",
         rewritten.1
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const REDACT_RESULT: &str = r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "note-call"
+layer = ["mcp"]
+match.direction = { exact = "c2s" }
+match.mcp_method = { exact = "tools/call" }
+action = "rewrite"
+rewrite.command = { replace = ["echo", "echo"] }
+
+[[rule]]
+id = "redact-result"
+layer = ["mcp"]
+match.direction = { exact = "s2c" }
+match.arg.text = { regex = "SECRET" }
+action = "rewrite"
+rewrite.arg.text = { replace = ["SECRET", "XXX"] }
+"#;
+
+/// The server answers `{"result":{"text":"SECRET"}}`. The client must see
+/// `XXX`, and the audit row must name the tool, the method, and the direction.
+#[test]
+fn response_rewrite_reaches_the_client() {
+    let dir = scratch("resp");
+    let policy = write_policy(&dir, REDACT_RESULT);
+    let audit = dir.join("audit.jsonl");
+    let server = PathBuf::from(env!("CARGO_BIN_EXE_mcp_result"));
+    let (status, stdout, stderr) = exchange_all(
+        Some(&policy),
+        Some(&audit),
+        &server,
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run","arguments":{"command":"echo"}}}"#,
+    );
+    assert_eq!(status, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("\"text\":\"XXX\""),
+        "client did not see the rewritten result: {stdout}"
+    );
+    assert!(
+        !stdout.contains("SECRET"),
+        "original result reached the client: {stdout}"
+    );
+    let body = std::fs::read_to_string(&audit).unwrap_or_default();
+    let request_row = body
+        .lines()
+        .find(|line| line.contains("\"event\":\"c2s\""))
+        .unwrap_or("");
+    assert!(
+        request_row.contains("\"tool\":\"run\""),
+        "audit lost the tool: {body}"
+    );
+    assert!(
+        request_row.contains("\"mcp_method\":\"tools/call\""),
+        "audit lost the method: {body}"
+    );
+    let response_row = body
+        .lines()
+        .find(|line| line.contains("\"event\":\"s2c\""))
+        .unwrap_or("");
+    assert!(
+        response_row.contains("\"effective_action\":\"rewrite\""),
+        "the response rewrite was not recorded: {body}"
+    );
+    assert!(
+        response_row.contains("XXX"),
+        "the response audit does not name the replacement: {body}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One batch: the `rm` element is answered with its own id, the `echo`
+/// element is what the server receives, the `terraform` element is rewritten.
+#[test]
+fn batch_denies_rewrites_and_forwards_per_element() {
+    let dir = scratch("batch");
+    let policy = write_policy(
+        &dir,
+        r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "no-rm"
+layer = ["mcp"]
+match.command = { prefix = "rm " }
+action = "deny"
+reason = "不允许删除"
+
+[[rule]]
+id = "plan-only"
+layer = ["mcp"]
+match.command = { prefix = "terraform apply" }
+action = "rewrite"
+rewrite.command = { replace = ["terraform apply", "terraform plan"] }
+"#,
+    );
+    let request = concat!(
+        r#"[{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run","arguments":{"command":"rm -rf /"}}},"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run","arguments":{"command":"echo ok"}}},"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run","arguments":{"command":"terraform apply"}}}]"#
+    );
+    let (status, stdout, stderr) = exchange_all(
+        Some(&policy),
+        Some(&dir.join("audit.jsonl")),
+        &echo_bin(),
+        request,
+    );
+    assert_eq!(status, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("\"id\":2"),
+        "denied element did not answer with its id: {stdout}"
+    );
+    assert!(
+        stdout.contains("不允许删除"),
+        "deny reason missing: {stdout}"
+    );
+    assert!(!stdout.contains("rm -rf"), "denied text echoed: {stdout}");
+    assert!(
+        stdout.contains("echo ok"),
+        "allowed element was not answered by the server: {stdout}"
+    );
+    assert!(
+        stdout.contains("terraform plan"),
+        "rewritten element kept the original command: {stdout}"
+    );
+    assert!(
+        !stdout.contains("terraform apply"),
+        "original command reached the server: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A policy file that is not TOML. A `tools/call` inside a batch is denied;
+/// `initialize` in the same batch is forwarded.
+#[test]
+fn broken_policy_denies_tools_call_inside_a_batch() {
+    let dir = scratch("broken-batch");
+    let policy = dir.join("broken.toml");
+    std::fs::write(&policy, "this is not a policy\n").expect("policy");
+    let request = concat!(
+        r#"[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},"#,
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"run","arguments":{"command":"echo hello"}}}]"#
+    );
+    let (status, stdout, stderr) = exchange_all(
+        Some(&policy),
+        Some(&dir.join("audit.jsonl")),
+        &echo_bin(),
+        request,
+    );
+    assert_eq!(status, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("protocolVersion"),
+        "initialize was not forwarded: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"id\":9"),
+        "the tools/call was not answered: {stdout}"
+    );
+    assert!(
+        stdout.contains("规则文件读不了"),
+        "deny reason missing: {stdout}"
+    );
+    assert!(
+        !stdout.contains("echo hello"),
+        "the call reached the server: {stdout}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

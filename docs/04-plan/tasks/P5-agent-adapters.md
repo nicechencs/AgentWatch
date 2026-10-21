@@ -508,7 +508,11 @@ PostToolUse、SessionStart、SessionEnd 不输出判定、不改写、不写拒�
 
 **要点**：deny 回 JSON-RPC 错误（同一 `id`），不转给服务端；rewrite 改请求参数或结果；规则关闭时逐字节透传。
 
-实现差（2026-10-21）：规则文件损坏时，`tools/call` 回 JSON-RPC 错误（同一 `id`）并记审计；`initialize`、`tools/list`、通知和其他方法照常转发。`ask` 在判定里已降为 deny。响应方向只改写 `result` 字段，不拒绝。`aw mcp-tap -- <cmd>` 原先在分发处被「本版本未接入」截住，包装器没有启动；现已接到 `mcp_tap::run`。`aw run --mcp-tap` 仍未接入（没有按 Agent 改临时 MCP 配置）。
+实现差（2026-10-21）：规则文件损坏时，`tools/call` 回 JSON-RPC 错误（同一 `id`）并记审计；`initialize`、`tools/list`、通知和其他方法照常转发。批量（顶层 JSON 数组）里的 `tools/call` 同样拒绝，其余元素仍转发。`ask` 在判定里已降为 deny。
+
+响应方向：`match.direction = { exact = "s2c" }` 只对回包生效（`c2s` 是请求）。回包的 `result.<字段>` 用 `match.arg.<字段>` 匹配、用 `rewrite.arg.<字段>` 改写，改完转发给客户端。`rewrite.mcp_tool` 和 `rewrite.tool` 写回请求的 `params.name`。写不回帧的改写按拒绝处理，审计记实际执行的拒绝，不记「已改写」。规则开着时，读不了的一行（不是 JSON）按 `on_error` 处理，默认丢弃，不转发。JSON-RPC 批量在规则开着时逐个元素判定：拒绝的回该元素自己的 `id`，改写的改写，放行的连同其他放行元素组成一个数组转发。
+
+`aw mcp-tap -- <cmd>` 原先在分发处被「本版本未接入」截住，包装器没有启动；现已接到 `mcp_tap::run`。`aw run --mcp-tap` 仍未接入（没有按 Agent 改临时 MCP 配置）。
 
 ### P5-SEC-04 网络代理按规则拒绝
 

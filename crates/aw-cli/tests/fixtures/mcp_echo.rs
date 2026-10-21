@@ -22,6 +22,35 @@ fn main() {
         Ok(value) => value,
         Err(_) => return,
     };
+    // A batch is one array. Answer each element the same way as a single
+    // request, so a test can see which elements the tap forwarded.
+    if let Some(items) = value.as_array() {
+        let replies: Vec<serde_json::Value> = items.iter().filter_map(reply_for).collect();
+        if replies.is_empty() {
+            return;
+        }
+        let mut out = io::stdout().lock();
+        let Ok(bytes) = serde_json::to_vec(&replies) else {
+            return;
+        };
+        let _ = out.write_all(&bytes);
+        let _ = out.write_all(b"\n");
+        let _ = out.flush();
+        return;
+    }
+    let Some(reply) = reply_for(&value) else {
+        return;
+    };
+    let mut out = io::stdout().lock();
+    let Ok(bytes) = serde_json::to_vec(&reply) else {
+        return;
+    };
+    let _ = out.write_all(&bytes);
+    let _ = out.write_all(b"\n");
+    let _ = out.flush();
+}
+
+fn reply_for(value: &serde_json::Value) -> Option<serde_json::Value> {
     let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let method = value
         .get("method")
@@ -44,13 +73,7 @@ fn main() {
             "result": { "command": command }
         })
     } else {
-        return;
+        return None;
     };
-    let mut out = io::stdout().lock();
-    let Ok(bytes) = serde_json::to_vec(&reply) else {
-        return;
-    };
-    let _ = out.write_all(&bytes);
-    let _ = out.write_all(b"\n");
-    let _ = out.flush();
+    Some(reply)
 }

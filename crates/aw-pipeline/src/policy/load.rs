@@ -274,7 +274,15 @@ fn is_matcher_table(table: &toml::Table) -> bool {
 fn known_match_field(name: &str) -> bool {
     matches!(
         name,
-        "command" | "path" | "host" | "url" | "method" | "mcp_method" | "mcp_tool" | "tool"
+        "command"
+            | "path"
+            | "host"
+            | "url"
+            | "method"
+            | "mcp_method"
+            | "mcp_tool"
+            | "tool"
+            | "direction"
     ) || name.starts_with("arg.") && name.len() > "arg.".len() && !name[4..].contains('.')
 }
 
@@ -292,6 +300,13 @@ fn parse_rewrites(value: &toml::Value) -> Result<Vec<FieldRewrite>, RuleError> {
     for (key, raw) in flat {
         if !known_match_field(&key) {
             return Err(RuleError::Rewrite(format!("unknown rewrite field `{key}`")));
+        }
+        // `direction` selects which way a frame is moving. It is not a field
+        // of the frame, so a rewrite of it can never be written back.
+        if key == "direction" {
+            return Err(RuleError::Rewrite(
+                "rewrite.direction is not a frame field".to_owned(),
+            ));
         }
         let pair = raw
             .as_table()

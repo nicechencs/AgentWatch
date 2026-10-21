@@ -286,6 +286,10 @@ impl Subject {
             "mcp_method" => self.mcp_method.as_deref().or(self.method.as_deref()),
             "mcp_tool" => self.mcp_tool.as_deref().or(self.tool.as_deref()),
             "tool" => self.tool.as_deref(),
+            // `c2s` on a request, `s2c` on a response. A rule uses this to
+            // name one direction. The caller sets [`Self::event`] to that
+            // token; a subject with no direction does not match.
+            "direction" => self.event.as_deref(),
             _ => None,
         }
     }

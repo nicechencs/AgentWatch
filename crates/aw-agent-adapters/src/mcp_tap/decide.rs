@@ -1,8 +1,9 @@
 //! Apply one policy decision to one MCP JSON-RPC frame (P5-SEC-03).
 //!
 //! The wrapper still owns the bytes. This module only says what to forward.
-//! A frame that is not JSON, or not a request, is [`FrameAction::Forward`]:
-//! changing it would break a session the rule did not name.
+//! A frame that is not JSON, or not a request, is [`FrameAction::Forward`]
+//! only when the decision is allow. A deny of bytes this module cannot label
+//! drops them: forwarding a refused line would run the call.
 //!
 //! `ask` is a deny. Step 1 has no way to ask the user from a stdio tap.
 
@@ -72,8 +73,14 @@ pub struct FrameSubject {
     pub args: Vec<(String, String)>,
 }
 
-/// Labels for one request frame. `direction` is recorded by the caller; this
-/// function only reads the JSON.
+/// Labels for one request or response frame. `direction` is recorded by the
+/// caller; this function only reads the JSON.
+///
+/// A request contributes `method`, `params.name`, and string arguments. A
+/// response has none of those; its string fields under `result` become
+/// `arg.<name>` so a rule can match and rewrite the tool result. Nested
+/// objects are walked one level (`result.content.0.text` stays unreachable:
+/// only a string value is a label).
 #[must_use]
 pub fn subject_from_frame(frame: &str) -> Option<FrameSubject> {
     let value: Value = serde_json::from_str(frame).ok()?;
@@ -90,7 +97,7 @@ pub fn subject_from_frame(frame: &str) -> Option<FrameSubject> {
     let arguments = params
         .and_then(|map| map.get("arguments"))
         .and_then(Value::as_object);
-    let args = arguments
+    let mut args: Vec<(String, String)> = arguments
         .map(|map| {
             map.iter()
                 .filter_map(|(key, value)| {
@@ -99,10 +106,26 @@ pub fn subject_from_frame(frame: &str) -> Option<FrameSubject> {
                 .collect()
         })
         .unwrap_or_default();
+    if let Some(result) = object.get("result").and_then(Value::as_object) {
+        for (key, value) in result {
+            if let Some(text) = value.as_str() {
+                if !args.iter().any(|(name, _)| name == key) {
+                    args.push((key.clone(), text.to_owned()));
+                }
+            }
+        }
+    }
     let command = arguments
         .and_then(|map| map.get("command"))
         .and_then(Value::as_str)
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .or_else(|| {
+            object
+                .get("result")
+                .and_then(|result| result.get("command"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
     Some(FrameSubject {
         method,
         tool,
@@ -114,30 +137,47 @@ pub fn subject_from_frame(frame: &str) -> Option<FrameSubject> {
 /// Decide one client-to-server frame.
 ///
 /// `frame` is the line without its delimiter. `decision` is already computed;
-/// this function only applies it. A non-JSON frame is forwarded.
+/// this function only applies it. A non-JSON frame is forwarded only when the
+/// decision is allow. A deny of a line that is not one JSON object drops the
+/// line: there is no id to answer, and forwarding it would run the call.
 #[must_use]
 pub fn apply_request(frame: &str, decision: &FrameDecision<'_>) -> FrameAction {
     if decision.verdict == FrameVerdict::Allow {
         return FrameAction::Forward;
     }
     let Ok(value) = serde_json::from_str::<Value>(frame) else {
-        return FrameAction::Forward;
+        return drop_denied();
     };
+    if !value.is_object() {
+        // An array (a JSON-RPC batch) or a scalar is not one request. The
+        // caller decides each element itself; applying a single-frame deny
+        // here must not forward the whole batch.
+        return drop_denied();
+    }
     if decision.verdict == FrameVerdict::Deny {
         let Some(response) = jsonrpc_error(&value, decision.reason) else {
             // A notification has no id. There is nowhere to send an error,
             // and forwarding it would run the call. Dropping a notification
             // is the deny. The wrapper writes nothing for this frame.
-            return FrameAction::Reject {
-                response: String::new(),
-            };
+            return drop_denied();
         };
         return FrameAction::Reject { response };
     }
     let Some(rewritten) = rewrite_frame(&value, decision.fields) else {
-        return FrameAction::Forward;
+        // The rule asked for a rewrite and the frame has nowhere to put it.
+        // Forwarding the original would be the rewrite the audit already
+        // claimed, with the old bytes. Drop it; the caller treats a missing
+        // rewrite as `on_error`.
+        return drop_denied();
     };
     FrameAction::Rewrite { bytes: rewritten }
+}
+
+/// A deny that cannot be turned into a JSON-RPC error. Write nothing.
+fn drop_denied() -> FrameAction {
+    FrameAction::Reject {
+        response: String::new(),
+    }
 }
 
 /// Decide one server-to-client frame. Only a rewrite of the result is
@@ -152,7 +192,9 @@ pub fn apply_response(frame: &str, decision: &FrameDecision<'_>) -> FrameAction 
         return FrameAction::Forward;
     };
     let Some(rewritten) = rewrite_frame(&value, decision.fields) else {
-        return FrameAction::Forward;
+        // Same as a request: a rewrite that does not land must not forward
+        // the original bytes under a rewrite verdict.
+        return drop_denied();
     };
     FrameAction::Rewrite { bytes: rewritten }
 }
@@ -172,24 +214,47 @@ fn rewrite_frame(value: &Value, fields: &[FieldChange]) -> Option<String> {
     let mut next = value.clone();
     let object = next.as_object_mut()?;
     for change in fields {
-        set_dotted(object, &change.field, &change.value);
+        if !set_dotted(object, &change.field, &change.value) {
+            return None;
+        }
     }
     serde_json::to_string(&next).ok()
 }
 
-fn set_dotted(object: &mut Map<String, Value>, field: &str, text: &str) {
+/// Write one rewritten field back into the frame.
+///
+/// `arg.<name>` and `command` land in `params.arguments` on a request and in
+/// `result` on a response. `mcp_tool` and `tool` are `params.name`: a rule that
+/// rewrites the tool name has to change the name the server will call.
+/// Returns false when the frame has nowhere to put the field, so the caller
+/// does not forward the original and claim a rewrite.
+fn set_dotted(object: &mut Map<String, Value>, field: &str, text: &str) -> bool {
+    if field == "mcp_tool" || field == "tool" {
+        let Some(params) = object.get_mut("params").and_then(Value::as_object_mut) else {
+            return false;
+        };
+        params.insert("name".to_owned(), Value::String(text.to_owned()));
+        return true;
+    }
     let name = field.strip_prefix("arg.").unwrap_or(field);
-    if let Some(params) = object.get_mut("params").and_then(Value::as_object_mut) {
-        if let Some(arguments) = params.get_mut("arguments").and_then(Value::as_object_mut) {
-            if arguments.contains_key(name) || name == "command" {
-                arguments.insert(name.to_owned(), Value::String(text.to_owned()));
-                return;
-            }
-        }
+    if object.contains_key("params") {
+        let Some(params) = object.get_mut("params").and_then(Value::as_object_mut) else {
+            return false;
+        };
+        let arguments = params
+            .entry("arguments")
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(arguments) = arguments.as_object_mut() else {
+            return false;
+        };
+        arguments.insert(name.to_owned(), Value::String(text.to_owned()));
+        return true;
     }
     if let Some(result) = object.get_mut("result").and_then(Value::as_object_mut) {
         result.insert(name.to_owned(), Value::String(text.to_owned()));
+        return true;
     }
+    false
 }
 
 #[cfg(test)]
@@ -259,5 +324,73 @@ mod tests {
             apply_request(frame, &decision),
             FrameAction::Forward
         ));
+    }
+
+    /// A response rewrite names `result.text`. The client must see the
+    /// replacement, not the server's original field.
+    #[test]
+    fn rewrite_result_text_is_what_the_client_sees() {
+        let frame = r#"{"jsonrpc":"2.0","id":5,"result":{"text":"SECRET","ok":true}}"#;
+        let fields = [FieldChange {
+            field: "arg.text".to_owned(),
+            value: "XXX".to_owned(),
+        }];
+        let decision = FrameDecision {
+            verdict: FrameVerdict::Rewrite,
+            reason: None,
+            fields: &fields,
+        };
+        match apply_response(frame, &decision) {
+            FrameAction::Rewrite { bytes } => {
+                let value: Value = serde_json::from_str(&bytes).unwrap();
+                assert_eq!(value["result"]["text"], json!("XXX"));
+                assert_eq!(value["result"]["ok"], json!(true));
+                assert_eq!(value["id"], json!(5));
+                assert!(!bytes.contains("SECRET"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `mcp_tool` is `params.name`. A rewrite that cannot write that key back
+    /// must not claim the frame changed.
+    #[test]
+    fn rewrite_mcp_tool_writes_params_name() {
+        let frame = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"oldtool","arguments":{"command":"echo"}}}"#;
+        let fields = [FieldChange {
+            field: "mcp_tool".to_owned(),
+            value: "newtool".to_owned(),
+        }];
+        let decision = FrameDecision {
+            verdict: FrameVerdict::Rewrite,
+            reason: None,
+            fields: &fields,
+        };
+        match apply_request(frame, &decision) {
+            FrameAction::Rewrite { bytes } => {
+                let value: Value = serde_json::from_str(&bytes).unwrap();
+                assert_eq!(value["params"]["name"], json!("newtool"));
+                assert_eq!(value["params"]["arguments"]["command"], json!("echo"));
+                assert!(!bytes.contains("oldtool"));
+            }
+            other => panic!("mcp_tool was not written back: {other:?}"),
+        }
+    }
+
+    /// A deny of a line that is not one JSON object must not forward it.
+    #[test]
+    fn deny_of_non_json_does_not_forward() {
+        let decision = deny();
+        let action = apply_request("not json", &decision);
+        assert!(
+            matches!(action, FrameAction::Reject { .. }),
+            "non-json deny was forwarded: {action:?}"
+        );
+        let batch = r#"[{"jsonrpc":"2.0","id":2,"method":"tools/call"}]"#;
+        let action = apply_request(batch, &decision);
+        assert!(
+            matches!(action, FrameAction::Reject { .. }),
+            "array deny was forwarded: {action:?}"
+        );
     }
 }

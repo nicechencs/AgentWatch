@@ -187,7 +187,8 @@ action = "deny"
 reason = "不允许连这个网站"
 ```
 
-- 匹配字段：`tool`、`agent`、`match.command`、`match.path`、`match.host`、`match.url`、`match.method`、`match.mcp_method`、`match.mcp_tool`、`match.arg.<字段名>`；每个字段支持 `exact` / `prefix` / `glob` / `regex`。
+- 匹配字段：`tool`、`agent`、`match.command`、`match.path`、`match.host`、`match.url`、`match.method`、`match.mcp_method`、`match.mcp_tool`、`match.arg.<字段名>`、`match.direction`；每个字段支持 `exact` / `prefix` / `glob` / `regex`。
+- `match.direction` 只在 MCP 层有值：`c2s` 是客户端到服务端的请求，`s2c` 是服务端到客户端的回包。不写这个字段时两个方向都参与匹配。回包没有 `method` 和 `params`，能匹配的是 `result` 里的字符串字段，写成 `match.arg.<字段名>`（例如 `match.arg.text` 对上 `{"result":{"text":"SECRET"}}`）。`rewrite.arg.<字段名>` 写回 `result` 的同一个字段，改完转发给客户端。`rewrite.direction` 不是帧里的字段，加载时按规则损坏拒绝。
 - 规则按文件顺序检查，**多条命中时取最严**：`deny > ask > rewrite > allow`（和 Claude Code 的优先级一致）。
 - `rewrite` 只允许「字段级替换」（某个字段换值、字符串替换），不允许写脚本。改写后再用全部规则检查一遍，被 `deny` 命中就拒绝（防止改出危险命令）。
 
@@ -197,7 +198,7 @@ reason = "不允许连这个网站"
 |---|---|---|---|---|
 | 放行 `allow` | 不输出决定（走 agent 自己的权限流程），**不是**自动批准 | 同左 | 原样转发 | 原样转发 |
 | 拒绝 `deny` | `permissionDecision: deny` + 原因 | `permissionDecision: deny` + 原因 | 不转给服务端，直接回一个 JSON-RPC 错误 | 回 403 + 原因 |
-| 改写 `rewrite` | `allow` + `updatedInput`（只在 PreToolUse） | `allow` + `updatedInput`（只在 PreToolUse） | 改写请求参数或返回结果后转发 | 第一步不支持，按 `deny` 处理并在审计里写明 |
+| 改写 `rewrite` | `allow` + `updatedInput`（只在 PreToolUse） | `allow` + `updatedInput`（只在 PreToolUse） | 改写请求参数或返回结果后转发。回包用 `match.direction = "s2c"` 加 `match.arg.<字段>` / `rewrite.arg.<字段>`（见 §5.1）。写不回帧的字段按拒绝，审计记实际执行的动作 | 第一步不支持，按 `deny` 处理并在审计里写明 |
 | 问用户 `ask` | `permissionDecision: ask` | 降级为 `deny`（见 §4.2） | 第一步降级为 `deny` | 第一步降级为 `deny` |
 
 注意「放行」不等于「自动批准」：aw 不替用户点同意，只是不插手。不命中规则时 stdout 为空，Claude Code 走它自己的权限流程。

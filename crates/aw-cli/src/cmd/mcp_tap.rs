@@ -327,14 +327,20 @@ fn gate_broken<W: Write>(
     };
     let text = String::from_utf8_lossy(frame);
     let line = text.trim_end_matches('\r');
-    let tool_call = direction == DIR_C2S
-        && subject_from_frame(line)
-            .is_some_and(|labels| labels.method.as_deref() == Some("tools/call"));
+    if let Some(elements) = batch_elements(line) {
+        let mut side = BrokenSide {
+            client,
+            direction,
+            tx,
+            endpoint,
+            eof,
+        };
+        return gate_broken_batch(&elements, to, &mut side, outcome);
+    }
+    let tool_call = direction == DIR_C2S && is_tools_call(line);
     if !tool_call {
         let newline: &[u8] = if eof { b"" } else { b"\n" };
-        to.write_all(frame)?;
-        to.write_all(newline)?;
-        to.flush()?;
+        write_frame(to, frame, newline)?;
         note_frame(outcome, direction, tx);
         return Ok(());
     }
@@ -350,9 +356,75 @@ fn gate_broken<W: Write>(
     // A deny still happens when the audit cannot be stored. The notice is the
     // only record of that drop; the policy file's text is not in it. The
     // summary is the command the call carried, not the whole frame.
-    let _ = audit_mcp(&decision, &audit_before(line, &decision), None, endpoint);
+    let _ = audit_mcp(
+        &decision,
+        &audit_before(line, &decision),
+        None,
+        endpoint,
+        Some(line),
+        direction,
+    );
     note_frame(outcome, direction, tx);
     Ok(())
+}
+
+/// What one broken-policy line needs besides the bytes it is deciding.
+struct BrokenSide<'a> {
+    client: &'a mut dyn Write,
+    direction: &'static str,
+    tx: &'a SyncSender<CopyNote>,
+    endpoint: Option<&'a Endpoint>,
+    eof: bool,
+}
+
+/// One element of a batch under a broken policy. A `tools/call` is denied;
+/// anything else is kept and forwarded as one array.
+fn gate_broken_batch<W: Write>(
+    elements: &[Value],
+    to: &mut W,
+    side: &mut BrokenSide<'_>,
+    outcome: &FrameOutcome,
+) -> io::Result<()> {
+    let mut forwarded: Vec<Value> = Vec::new();
+    for element in elements {
+        let line = serde_json::to_string(element).unwrap_or_default();
+        if side.direction == DIR_C2S && is_tools_call(&line) {
+            let decision = deny_decision("规则文件读不了，已按拒绝处理");
+            let changes = field_changes(&decision);
+            let frame_decision = FrameDecision {
+                verdict: FrameVerdict::Deny,
+                reason: decision.reason.as_deref(),
+                fields: &changes,
+            };
+            if let FrameAction::Reject { response } = apply_request(&line, &frame_decision) {
+                if !response.is_empty() {
+                    write_frame(side.client, response.as_bytes(), b"\n")?;
+                }
+            }
+            let _ = audit_mcp(
+                &decision,
+                &audit_before(&line, &decision),
+                None,
+                side.endpoint,
+                Some(&line),
+                side.direction,
+            );
+        } else {
+            forwarded.push(element.clone());
+        }
+    }
+    if !forwarded.is_empty() {
+        if let Ok(bytes) = serde_json::to_vec(&Value::Array(forwarded)) {
+            let newline: &[u8] = if side.eof { b"" } else { b"\n" };
+            write_frame(to, &bytes, newline)?;
+        }
+    }
+    note_frame(outcome, side.direction, side.tx);
+    Ok(())
+}
+
+fn is_tools_call(line: &str) -> bool {
+    subject_from_frame(line).is_some_and(|labels| labels.method.as_deref() == Some("tools/call"))
 }
 
 /// Policy on. Complete lines are decided before they are written.
@@ -441,48 +513,125 @@ fn gate_one<W: Write, C: Write>(
         FrameOutcome::Frame(frame) => {
             let text = String::from_utf8_lossy(frame);
             let line = text.trim_end_matches('\r');
-            let decision = decide_line(gate.policy, line, gate.direction);
-            // Audit before the bytes move. A rewrite the daemon and the local
-            // file both refused is a deny (design §5.3): the replacement must
-            // not reach the server with no record of the change. The "before"
-            // text is the fields the rule looked at, not the whole frame: the
-            // frame can hold a sibling argument the rule did not touch.
-            let audited = if decision.effective != Action::Allow || decision.action != Action::Allow
-            {
-                Some(audit_mcp(
-                    &decision,
-                    &audit_before(line, &decision),
-                    planned_after(&decision).as_deref(),
-                    gate.endpoint,
-                ))
-            } else {
-                None
-            };
-            let decision = match audited {
-                Some(delivery)
-                    if delivery.delivered == aw_pipeline::Delivered::Dropped
-                        && decision.effective == Action::Rewrite =>
-                {
-                    delivery.downgrade_rewrite(&decision)
-                }
-                _ => decision,
-            };
-            let changes = field_changes(&decision);
-            let frame_decision = FrameDecision {
-                verdict: verdict_of(&decision),
-                reason: decision.reason.as_deref(),
-                fields: &changes,
-            };
-            let action = if gate.direction == DIR_C2S {
-                apply_request(line, &frame_decision)
-            } else {
-                apply_response(line, &frame_decision)
-            };
+            if let Some(elements) = batch_elements(line) {
+                gate_batch(&elements, to, gate)?;
+                note_frame(outcome, gate.direction, gate.tx);
+                return Ok(());
+            }
+            let action = decide_and_apply(line, gate);
             write_action(&action, frame, to, Some(gate.client), gate.eof)?;
             note_frame(outcome, gate.direction, gate.tx);
             Ok(())
         }
     }
+}
+
+/// Decide one line, record it, and turn the decision into bytes.
+///
+/// The audit is written before the bytes move. A rewrite the daemon and the
+/// local file both refused is a deny (design §5.3): the replacement must not
+/// leave with no record of the change. A line that is not one JSON object has
+/// no call to record; its deny drops the bytes, and posting it would dial the
+/// default socket for every blank or binary line. A rewrite the frame cannot
+/// hold is recorded again as the deny that actually happens.
+fn decide_and_apply(line: &str, gate: &mut Gate<'_, impl Write>) -> FrameAction {
+    let decision = decide_line(gate.policy, line, gate.direction);
+    let labeled = subject_from_frame(line).is_some();
+    let audited =
+        if labeled && (decision.effective != Action::Allow || decision.action != Action::Allow) {
+            Some(audit_mcp(
+                &decision,
+                &audit_before(line, &decision),
+                planned_after(&decision).as_deref(),
+                gate.endpoint,
+                Some(line),
+                gate.direction,
+            ))
+        } else {
+            None
+        };
+    let decision = match audited {
+        Some(delivery)
+            if delivery.delivered == aw_pipeline::Delivered::Dropped
+                && decision.effective == Action::Rewrite =>
+        {
+            delivery.downgrade_rewrite(&decision)
+        }
+        _ => decision,
+    };
+    let changes = field_changes(&decision);
+    let frame_decision = FrameDecision {
+        verdict: verdict_of(&decision),
+        reason: decision.reason.as_deref(),
+        fields: &changes,
+    };
+    let action = if gate.direction == DIR_C2S {
+        apply_request(line, &frame_decision)
+    } else {
+        apply_response(line, &frame_decision)
+    };
+    realized_action(&action, &decision, line, gate)
+}
+
+/// A JSON-RPC batch is a top-level array. `None` when the line is one object,
+/// not JSON, empty, or an array whose elements are not all objects. A response
+/// batch is split the same way as a request batch.
+///
+/// MCP 2025-03-26 required servers to accept a batch; 2025-06-18 removed that.
+/// A client can still send one. Each element is decided on its own: a deny
+/// answers that element's id, a rewrite rewrites that element, an allow is
+/// forwarded. Elements the tap cannot label follow `on_error`.
+fn batch_elements(line: &str) -> Option<Vec<Value>> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    let items = value.as_array()?;
+    if items.is_empty() {
+        return None;
+    }
+    if items.iter().all(Value::is_object) {
+        Some(items.clone())
+    } else {
+        None
+    }
+}
+
+/// Decide every element of one batch, then write the forwarded ones as one
+/// array and each deny as its own JSON-RPC error.
+///
+/// The forwarded array keeps the elements that were allowed or rewritten, in
+/// their original order. A batch whose every element was denied writes
+/// nothing to the server. A response batch is decided the same way; a deny on
+/// the way back cannot un-run the tool, so a denied response element is
+/// dropped rather than answered (there is no second client to answer).
+fn gate_batch<W: Write>(
+    elements: &[Value],
+    to: &mut W,
+    gate: &mut Gate<'_, impl Write>,
+) -> io::Result<()> {
+    let mut forwarded: Vec<Value> = Vec::new();
+    for element in elements {
+        let line = serde_json::to_string(element).unwrap_or_default();
+        let action = decide_and_apply(&line, gate);
+        match action {
+            FrameAction::Forward => forwarded.push(element.clone()),
+            FrameAction::Rewrite { bytes } => {
+                if let Ok(value) = serde_json::from_str(&bytes) {
+                    forwarded.push(value);
+                }
+            }
+            FrameAction::Reject { response } => {
+                if gate.direction == DIR_C2S && !response.is_empty() {
+                    write_frame(gate.client, response.as_bytes(), b"\n")?;
+                }
+            }
+        }
+    }
+    if !forwarded.is_empty() {
+        if let Ok(bytes) = serde_json::to_vec(&Value::Array(forwarded)) {
+            let newline: &[u8] = if gate.eof { b"" } else { b"\n" };
+            write_frame(to, &bytes, newline)?;
+        }
+    }
+    Ok(())
 }
 
 /// What the audit stores as "before".
@@ -501,6 +650,10 @@ fn audit_before(line: &str, decision: &Decision) -> String {
             let key = field.strip_prefix("arg.").unwrap_or(field.as_str());
             let value = if key == "command" {
                 labels.command.clone()
+            } else if key == "mcp_tool" || key == "tool" {
+                labels.tool.clone()
+            } else if key == "mcp_method" || key == "method" {
+                labels.method.clone()
             } else {
                 labels
                     .args
@@ -537,6 +690,47 @@ fn planned_after(decision: &Decision) -> Option<String> {
     Some(parts.join("\n"))
 }
 
+/// A rewrite that [`apply_request`] / [`apply_response`] could not write back
+/// arrives as a drop. The audit row already says rewrite. Append what was
+/// actually done: the bytes were not forwarded, and the client gets a JSON-RPC
+/// error when the frame has an id.
+fn realized_action(
+    action: &FrameAction,
+    decision: &Decision,
+    line: &str,
+    gate: &Gate<'_, impl Write>,
+) -> FrameAction {
+    let FrameAction::Reject { response } = action else {
+        return action.clone();
+    };
+    if decision.effective != Action::Rewrite || !response.is_empty() {
+        return action.clone();
+    }
+    let mut downgraded = decision.clone();
+    downgraded.effective = Action::Deny;
+    downgraded.downgraded = true;
+    downgraded.fields.clear();
+    downgraded.reason = Some("改写写不回这一帧，已改为拒绝".to_owned());
+    let _ = audit_mcp(
+        &downgraded,
+        &audit_before(line, &downgraded),
+        None,
+        gate.endpoint,
+        Some(line),
+        gate.direction,
+    );
+    let frame_decision = FrameDecision {
+        verdict: FrameVerdict::Deny,
+        reason: downgraded.reason.as_deref(),
+        fields: &[],
+    };
+    if gate.direction == DIR_C2S {
+        apply_request(line, &frame_decision)
+    } else {
+        apply_response(line, &frame_decision)
+    }
+}
+
 fn write_action<W: Write>(
     action: &FrameAction,
     original: &[u8],
@@ -546,25 +740,15 @@ fn write_action<W: Write>(
 ) -> io::Result<()> {
     let newline: &[u8] = if eof { b"" } else { b"\n" };
     match action {
-        FrameAction::Forward => {
-            to.write_all(original)?;
-            to.write_all(newline)?;
-            to.flush()?;
-        }
-        FrameAction::Rewrite { bytes } => {
-            to.write_all(bytes.as_bytes())?;
-            to.write_all(newline)?;
-            to.flush()?;
-        }
+        FrameAction::Forward => write_frame(to, original, newline)?,
+        FrameAction::Rewrite { bytes } => write_frame(to, bytes.as_bytes(), newline)?,
         FrameAction::Reject { response } => {
             // Not written to the child. A request deny answers the MCP client.
-            // The production caller passes stdout. A response deny is not
-            // produced (`apply_response` forwards those bytes).
+            // The production caller passes stdout. An empty response is a drop
+            // (a notification, or a line that is not one JSON object).
             if let Some(client) = client {
                 if !response.is_empty() {
-                    client.write_all(response.as_bytes())?;
-                    client.write_all(b"\n")?;
-                    client.flush()?;
+                    write_frame(client, response.as_bytes(), b"\n")?;
                 }
             }
         }
@@ -572,14 +756,30 @@ fn write_action<W: Write>(
     Ok(())
 }
 
+/// One frame plus its delimiter, in a single `write_all`.
+///
+/// The request thread and the response thread both write this process's
+/// stdout (a deny's JSON-RPC error, and a rewritten result). Two `write_all`
+/// calls each take the stdout lock separately, so the two threads can
+/// interleave a frame with the other thread's newline. One buffer, one write,
+/// keeps each line intact.
+fn write_frame<W: Write + ?Sized>(to: &mut W, bytes: &[u8], newline: &[u8]) -> io::Result<()> {
+    let mut line = Vec::with_capacity(bytes.len() + newline.len());
+    line.extend_from_slice(bytes);
+    line.extend_from_slice(newline);
+    to.write_all(&line)?;
+    to.flush()?;
+    Ok(())
+}
+
 fn decide_line(policy: &aw_pipeline::Policy, frame: &str, direction: &str) -> Decision {
     let Some(labels) = subject_from_frame(frame) else {
+        // A line the tap cannot label is not a call it can prove is safe.
+        // Rules are on, so an unreadable `tools/call` (not JSON, or a batch
+        // the caller did not split) follows `on_error`. Default is deny.
         return match policy.on_error() {
             OnError::Allow => allow_decision(),
-            // Non-JSON is not a call a rule named. Forwarding it keeps a
-            // session intact. `on_error` applies when a rewrite cannot be
-            // applied, not when the line has no labels.
-            OnError::Deny => allow_decision(),
+            OnError::Deny => deny_decision("这一行读不了，已按拒绝处理"),
         };
     };
     let subject = Subject {
@@ -655,8 +855,15 @@ fn audit_mcp(
     before: &str,
     after: Option<&str>,
     endpoint: Option<&Endpoint>,
+    frame: Option<&str>,
+    direction: &str,
 ) -> super::intercept_audit::AuditDelivery {
-    let subject = subject_from_frame(before)
+    // `before` is the field summary the audit stores. It is not a JSON-RPC
+    // frame: parsing it again leaves tool, method, and event empty. Labels
+    // come from the original line (`frame`); the direction is the copy that
+    // already knows which way the bytes moved.
+    let subject = frame
+        .and_then(subject_from_frame)
         .map(|labels| Subject {
             layer: Layer::Mcp,
             tool: labels.tool.clone(),
@@ -665,10 +872,12 @@ fn audit_mcp(
             mcp_tool: labels.tool,
             command: labels.command,
             args: labels.args,
+            event: Some(direction.to_owned()),
             ..Subject::default()
         })
         .unwrap_or(Subject {
             layer: Layer::Mcp,
+            event: Some(direction.to_owned()),
             ..Subject::default()
         });
     let backup = super::intercept_audit::backup_path(
@@ -987,7 +1196,9 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
         // A rewrite with nowhere to record it is a deny. This test is about
         // the rewrite itself, so it gets a local audit file.
         let _guard = crate::cmd::policy_file::env_lock();
-        let dir = std::env::temp_dir().join(format!("aw-mcp-unit-{}", std::process::id()));
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("aw-mcp-unit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _audit = crate::cmd::policy_file::EnvVarGuard::set(
@@ -1021,6 +1232,232 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
         let error = String::from_utf8(client).unwrap();
         assert!(error.contains("\"id\":9"));
         assert!(error.contains("规则文件读不了"));
+    }
+
+    /// One JSON-RPC batch. The denied element answers the client with that
+    /// element's id; the allowed element is the only thing the server sees;
+    /// the rewritten element's command is the replacement.
+    #[test]
+    fn batch_decides_each_element() {
+        let _guard = crate::cmd::policy_file::env_lock();
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("aw-mcp-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _audit = crate::cmd::policy_file::EnvVarGuard::set(
+            crate::cmd::intercept_audit::AUDIT_ENV,
+            &dir.join("audit.jsonl"),
+        );
+        let policy = r#"
+version = 1
+enabled = true
+on_error = "deny"
+
+[[rule]]
+id = "no-rm"
+layer = ["mcp"]
+match.command = { prefix = "rm " }
+action = "deny"
+reason = "不允许删除"
+
+[[rule]]
+id = "plan-only"
+layer = ["mcp"]
+match.command = { prefix = "terraform apply" }
+action = "rewrite"
+rewrite.command = { replace = ["terraform apply", "terraform plan"] }
+"#;
+        let frame = concat!(
+            r#"[{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run","arguments":{"command":"rm -rf /"}}},"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run","arguments":{"command":"echo ok"}}},"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run","arguments":{"command":"terraform apply"}}}]"#,
+            "\n"
+        );
+        let copy = copy_gated_for_test(frame.as_bytes(), DIR_C2S, policy, true).unwrap();
+        let child = String::from_utf8(copy.child).unwrap();
+        let client = String::from_utf8(copy.client).unwrap();
+        assert!(
+            !child.contains("rm -rf"),
+            "denied element reached the server: {child}"
+        );
+        assert!(
+            child.contains("echo ok"),
+            "allowed element was not forwarded: {child}"
+        );
+        assert!(
+            child.contains("terraform plan"),
+            "rewritten element kept the original command: {child}"
+        );
+        assert!(
+            !child.contains("terraform apply"),
+            "original command reached the server: {child}"
+        );
+        assert!(
+            client.contains("\"id\":2"),
+            "denied element did not answer with its id: {client}"
+        );
+        assert!(
+            client.contains("不允许删除"),
+            "deny reason missing: {client}"
+        );
+        assert!(!client.contains("rm -rf"), "denied text echoed: {client}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A line that is not JSON, while rules are on, is not a call this tap can
+    /// label. Forwarding it would let an unreadable `tools/call` through.
+    #[test]
+    fn non_json_line_is_not_forwarded_when_rules_are_on() {
+        let policy = r#"
+version = 1
+enabled = true
+on_error = "deny"
+
+[[rule]]
+id = "no-rm"
+layer = ["mcp"]
+match.command = { prefix = "rm " }
+action = "deny"
+reason = "不允许删除"
+"#;
+        let copy = copy_gated_for_test(b"not json at all\n", DIR_C2S, policy, true).unwrap();
+        assert!(
+            copy.child.is_empty(),
+            "non-json line was forwarded: {}",
+            String::from_utf8_lossy(&copy.child)
+        );
+    }
+
+    /// `rewrite.mcp_tool` changes `params.name`. The server must see the new
+    /// name, and the audit must say rewrite, not the original tool.
+    #[test]
+    fn rewrite_mcp_tool_is_what_the_server_receives() {
+        let _guard = crate::cmd::policy_file::env_lock();
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("aw-mcp-tool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_path = dir.join("audit.jsonl");
+        let _audit = crate::cmd::policy_file::EnvVarGuard::set(
+            crate::cmd::intercept_audit::AUDIT_ENV,
+            &audit_path,
+        );
+        let policy = r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "rename-tool"
+layer = ["mcp"]
+match.mcp_tool = { exact = "oldtool" }
+action = "rewrite"
+rewrite.mcp_tool = { replace = ["oldtool", "newtool"] }
+"#;
+        let frame = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"oldtool\",\"arguments\":{\"command\":\"echo\"}}}\n";
+        let copy = copy_gated_for_test(frame, DIR_C2S, policy, true).unwrap();
+        let child = String::from_utf8(copy.child).unwrap();
+        assert!(
+            child.contains("newtool"),
+            "server did not see the rewritten tool: {child}"
+        );
+        assert!(
+            !child.contains("oldtool"),
+            "original tool name reached the server: {child}"
+        );
+        let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
+        assert!(
+            audit.contains("\"effective_action\":\"rewrite\""),
+            "audit did not record the rewrite that was forwarded: {audit}"
+        );
+        assert!(
+            audit.contains("\"tool\":\"oldtool\""),
+            "audit lost the tool the frame named: {audit}"
+        );
+        assert!(
+            audit.contains("mcp_tool=oldtool"),
+            "audit before-summary is not the tool that was rewritten: {audit}"
+        );
+        assert!(
+            audit.contains("\"mcp_method\":\"tools/call\""),
+            "audit lost the method: {audit}"
+        );
+        assert!(
+            audit.contains("\"event\":\"c2s\""),
+            "audit lost the direction: {audit}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A response rewrite of `result.text` is what the client receives.
+    #[test]
+    fn response_rewrite_replaces_result_text() {
+        let _guard = crate::cmd::policy_file::env_lock();
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("aw-mcp-resp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _audit = crate::cmd::policy_file::EnvVarGuard::set(
+            crate::cmd::intercept_audit::AUDIT_ENV,
+            &dir.join("audit.jsonl"),
+        );
+        let policy = r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "redact-result"
+layer = ["mcp"]
+match.direction = { exact = "s2c" }
+match.arg.text = { regex = "SECRET" }
+action = "rewrite"
+rewrite.arg.text = { replace = ["SECRET", "XXX"] }
+"#;
+        let frame = b"{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"text\":\"SECRET\"}}\n";
+        let copy = copy_gated_for_test(frame, DIR_S2C, policy, false).unwrap();
+        let child = String::from_utf8(copy.child).unwrap();
+        assert!(
+            child.contains("XXX"),
+            "client did not see the rewritten result: {child}"
+        );
+        assert!(
+            !child.contains("SECRET"),
+            "original result reached the client: {child}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A broken policy file still has to see a `tools/call` inside a batch.
+    /// Forwarding the array would run the call the single-object path denies.
+    #[test]
+    fn broken_policy_denies_a_tools_call_inside_a_batch() {
+        let (tx, _rx) = mpsc::sync_channel(8);
+        let mut child = Vec::new();
+        let mut client = Vec::new();
+        let input = concat!(
+            r#"[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},"#,
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"run","arguments":{"command":"echo hello"}}}]"#,
+            "\n"
+        );
+        copy_broken_for_test(input.as_bytes(), DIR_C2S, &tx, &mut child, &mut client).unwrap();
+        let forwarded = String::from_utf8(child).unwrap();
+        assert!(
+            forwarded.contains("initialize"),
+            "initialize was not forwarded: {forwarded}"
+        );
+        assert!(
+            !forwarded.contains("tools/call"),
+            "tools/call inside a batch was forwarded: {forwarded}"
+        );
+        assert!(
+            !forwarded.contains("echo hello"),
+            "the call's argument reached the server: {forwarded}"
+        );
+        let error = String::from_utf8(client).unwrap();
+        assert!(error.contains("\"id\":9"), "missing id: {error}");
+        assert!(error.contains("规则文件读不了"), "reason missing: {error}");
     }
 
     #[test]

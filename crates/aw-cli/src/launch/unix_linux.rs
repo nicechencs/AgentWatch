@@ -983,15 +983,21 @@ fn move_and_wait(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod launch_tests {
-    use super::super::terminal::TerminalDecision;
     use super::*;
 
     /// `cgroup.procs` refuses the pid (here: the session directory is gone):
     /// the already-running program is not killed; it finishes and its exit
     /// code comes back, marked as not scoped. Linux only, like `move_and_wait`.
+    ///
+    /// `terminal` exists only when this file is built as part of the bin or the
+    /// Linux/macOS lib (`lib.rs` gates it). The import lives in this function
+    /// so Windows, where the module is absent, does not name it, and macOS
+    /// clippy does not see an import that only a `cfg(linux)` test uses.
     #[cfg(target_os = "linux")]
     #[test]
     fn refused_cgroup_procs_keeps_the_running_program() {
+        use super::super::terminal::TerminalDecision;
+
         let terminal_decision = TerminalDecision::before_fork();
         let child = std::process::Command::new("sh")
             .args(["-c", "exit 5"])

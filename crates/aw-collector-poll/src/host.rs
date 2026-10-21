@@ -366,11 +366,12 @@ pub fn host_process_table() -> Option<Vec<HostProcess>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::keep_subtrees;
     // Only the Windows netstat tests name this. On Linux and macOS the import
     // is unused, and clippy -D warnings fails the lib tests there.
-    #[cfg(all(test, windows))]
+    #[cfg(windows)]
     use crate::source::SourceFailure;
     use crate::source::{ProcessRow, ProcessSource, ProcessStartTime};
 

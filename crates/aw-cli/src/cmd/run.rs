@@ -1258,6 +1258,11 @@ pub(crate) fn run(
         Err(outcome) => return outcome,
     };
     let notice = rewrite_notice(rewrites);
+    let limits = if intercept_dir.is_some() {
+        intercept_limit_notes(&spec)
+    } else {
+        String::new()
+    };
 
     let launched = match launcher.launch(&spec) {
         Ok(launched) => launched,
@@ -1287,6 +1292,7 @@ pub(crate) fn run(
         if let Some(note) = omitted {
             stderr.push_str(&note);
         }
+        stderr.push_str(&limits);
         let mut outcome = Outcome {
             code: launched.code,
             stdout: Vec::new(),
@@ -1329,6 +1335,7 @@ pub(crate) fn run(
     if let Some(note) = omitted {
         outcome.stderr.extend_from_slice(note.as_bytes());
     }
+    outcome.stderr.extend_from_slice(limits.as_bytes());
     append_cleanup_note(&mut outcome, cleanup);
     outcome
 }
@@ -1553,6 +1560,154 @@ fn enabled_omitted_note() -> Option<String> {
     }
 }
 
+/// First `major.minor.patch` in `text`. Claude Code prints `2.1.295 (Claude Code)`.
+/// A line without three numbers is not a version.
+fn parse_claude_version(text: &str) -> Option<(u64, u64, u64)> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let Some((major, after_major)) = take_u64(bytes, index) else {
+            break;
+        };
+        if after_major >= bytes.len() || bytes[after_major] != b'.' {
+            index = start + 1;
+            continue;
+        }
+        let Some((minor, after_minor)) = take_u64(bytes, after_major + 1) else {
+            index = start + 1;
+            continue;
+        };
+        if after_minor >= bytes.len() || bytes[after_minor] != b'.' {
+            index = start + 1;
+            continue;
+        }
+        let Some((patch, _)) = take_u64(bytes, after_minor + 1) else {
+            index = start + 1;
+            continue;
+        };
+        let preceded = start > 0 && bytes[start - 1].is_ascii_digit();
+        if !preceded {
+            return Some((major, minor, patch));
+        }
+        index = start + 1;
+    }
+    None
+}
+
+fn take_u64(bytes: &[u8], start: usize) -> Option<(u64, usize)> {
+    if start >= bytes.len() || !bytes[start].is_ascii_digit() {
+        return None;
+    }
+    let mut number: u64 = 0;
+    let mut index = start;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        number = number.checked_mul(10)?.checked_add(u64::from(bytes[index] - b'0'))?;
+        index += 1;
+    }
+    Some((number, index))
+}
+
+/// stderr when `onFailure: block` may not be honored.
+///
+/// Claude Code 2.1.295 is the first version that reads that field. Older than
+/// that, a hook that fails to start does not block the tool. No parsed version
+/// is the same warning: we do not pretend the field works.
+fn claude_version_note(version: Option<(u64, u64, u64)>) -> Option<&'static str> {
+    const NEED: (u64, u64, u64) = (2, 1, 295);
+    match version {
+        Some(found) if found >= NEED => None,
+        Some(_) => Some(
+            "[aw] 提示：Claude Code 版本低于 2.1.295，不认识 onFailure: block。hook 起不来时工具仍会执行。\n",
+        ),
+        None => Some(
+            "[aw] 提示：没有读到 Claude Code 的版本。onFailure: block 需要 2.1.295 或更新；更旧的版本里，hook 起不来时工具仍会执行。\n",
+        ),
+    }
+}
+
+/// stderr when the operator's argv skips hooks.
+///
+/// `--bare` and `--safe-mode` are exact arguments. `--barely` is not a match.
+/// `allowManagedHooksOnly` lives in managed settings this process does not read.
+fn claude_flag_note(command: &[String]) -> Option<&'static str> {
+    let hit = command
+        .iter()
+        .any(|arg| arg == "--bare" || arg == "--safe-mode");
+    if hit {
+        Some("[aw] 提示：命令行有 --bare 或 --safe-mode。这两种模式下 aw 注入的 hook 不会运行。\n")
+    } else {
+        None
+    }
+}
+
+/// stderr when this process is root or an elevated admin.
+///
+/// The caller decides `is_root`. This crate does not call `geteuid`: `unsafe`
+/// stays in the platform crates. Windows elevation is not detected here.
+fn root_note(is_root: bool) -> Option<&'static str> {
+    if is_root {
+        Some("[aw] 提示：这次以管理员身份运行，拦截不可靠。管理员可以改规则、关掉 hook。\n")
+    } else {
+        None
+    }
+}
+
+/// Ask `program --version` and parse it. A missing program, a hang, or a line
+/// without three numbers is `None`. The wait is capped so a stuck binary
+/// cannot hold the launch.
+fn probe_claude_version(program: &str) -> Option<(u64, u64, u64)> {
+    if program.is_empty() {
+        return None;
+    }
+    let mut child = std::process::Command::new(program)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = sender.send(buf);
+    });
+    let text = match receiver.recv_timeout(std::time::Duration::from_millis(500)) {
+        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let _ = child.wait();
+    parse_claude_version(&text)
+}
+
+/// Notes for a launch that injected hooks. Empty when there is nothing to say.
+///
+/// Root is not included: this crate does not ask the OS whether it is an
+/// admin. `--bare` / `--safe-mode` are visible on the command. The version is
+/// whatever `program --version` printed.
+fn intercept_limit_notes(spec: &crate::launch::RunSpec) -> String {
+    let mut out = String::new();
+    let program = spec.command.first().map(String::as_str).unwrap_or("");
+    if let Some(note) = claude_version_note(probe_claude_version(program)) {
+        out.push_str(note);
+    }
+    if let Some(note) = claude_flag_note(&spec.command) {
+        out.push_str(note);
+    }
+    out
+}
+
 /// `AW_POLICY` when it is set, otherwise the per-user file. Empty when neither
 /// can be named: there is then nothing to warn about.
 fn policy_path_in_env() -> std::path::PathBuf {
@@ -1612,7 +1767,10 @@ fn inject_claude_intercept(
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    if std::fs::create_dir_all(&dir).is_err() {
+    // `create_dir` (not `create_dir_all`) at 0700, and the file opened at 0600.
+    // A 0755 mkdir followed by chmod leaves a window where the settings file,
+    // which names the hook command, is readable by every user on the machine.
+    if !create_owner_dir(&dir) {
         return Err(super::error_outcome(
             exit::GENERAL,
             "intercept",
@@ -1621,7 +1779,7 @@ fn inject_claude_intercept(
         ));
     }
     let path = dir.join("claude-settings.json");
-    if std::fs::write(&path, doc).is_err() {
+    if write_owner_file(&path, doc.as_bytes()).is_err() {
         let _ = std::fs::remove_dir_all(&dir);
         return Err(super::error_outcome(
             exit::GENERAL,
@@ -1630,16 +1788,46 @@ fn inject_claude_intercept(
             args.json,
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
     spec.command.push("--settings".to_owned());
     spec.command.push(path.display().to_string());
     // `AW_SESSION` and `--session` are set above when the caller already has
     // the daemon's public id. `aw run` without a daemon has no id to give.
     Ok(Some((dir, rewrites)))
+}
+
+/// Create `dir` mode `0o700` on Unix. The parent already exists, so this is
+/// `create_dir`, not `create_dir_all`. Mode is set on the mkdir itself.
+fn create_owner_dir(dir: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        return std::fs::DirBuilder::new().mode(0o700).create(dir).is_ok();
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(dir).is_ok()
+    }
+}
+
+/// Create `path` mode `0o600` and write `bytes`. `create_new` will not replace
+/// a file that is already there. Mode is the open mode, not a later chmod.
+fn write_owner_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
 }
 
 /// Remove the temp settings directory. A failure is reported, not hidden:
@@ -1714,6 +1902,11 @@ pub(crate) fn daemon_run(
         }
     };
     let notice = rewrite_notice(rewrites);
+    let limits = if intercept_dir.is_some() {
+        intercept_limit_notes(&spec)
+    } else {
+        String::new()
+    };
     let mut child = match spawner.spawn(&spec) {
         Ok(child) => child,
         Err((code, detail)) => {
@@ -1789,6 +1982,7 @@ pub(crate) fn daemon_run(
         if let Some(note) = &omitted {
             stderr.push_str(note);
         }
+        stderr.push_str(&limits);
         if let Some(warning) = pin_warning.clone() {
             stderr.push_str(&warning);
         }
@@ -1835,6 +2029,7 @@ pub(crate) fn daemon_run(
     if let Some(note) = omitted {
         stderr.extend_from_slice(note.as_bytes());
     }
+    stderr.extend_from_slice(limits.as_bytes());
     if let Some(warning) = pin_warning {
         stderr.extend_from_slice(warning.as_bytes());
     }
@@ -2464,6 +2659,105 @@ mod intercept_inject_tests {
         );
         let _ = cleanup_intercept_dir(&bare_dir);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The temp settings directory is created mode 0700 and the file mode 0600.
+    /// A later chmod is not the point: the create itself is owner-only, so a
+    /// umask of 022 cannot leave the directory readable by everyone else.
+    #[test]
+    fn settings_directory_and_file_are_owner_only() {
+        let dir = scratch_policy("mode");
+        let policy = dir.join("policy.toml");
+        std::fs::write(&policy, "enabled = true\n[[rule]]\naction = \"deny\"\n").unwrap();
+        let _guard = super::super::policy_file::env_lock();
+        let _env = super::super::policy_file::EnvVarGuard::set(
+            super::super::policy_file::POLICY_ENV,
+            &policy,
+        );
+        let _home = isolate_home();
+        let command = vec!["claude".to_owned()];
+        let args = RunArgs {
+            agent: Some("claude-code"),
+            name: None,
+            no_follow_children: false,
+            cwd: None,
+            env: &[],
+            summary: None,
+            pin: false,
+            no_daemon: false,
+            raw: None,
+            command: &command,
+            json: false,
+            quiet: true,
+        };
+        let deferred = DeferredFlags {
+            proxy: false,
+            proxy_on_reject: false,
+            proxy_on_reject_value: None,
+            self_report: false,
+            mcp_tap: false,
+            unsafe_no_redact: false,
+            include_proc: false,
+            group: false,
+            intercept: true,
+        };
+        let mut spec = crate::launch::RunSpec::new(command.clone()).unwrap();
+        let written = match inject_claude_intercept(&args, deferred, &mut spec, None) {
+            Ok(Some((dir, _))) => dir,
+            Ok(None) => panic!("intercept did not write settings"),
+            Err(_) => panic!("intercept settings could not be written"),
+        };
+        let file = written.join("claude-settings.json");
+        assert!(file.is_file(), "settings file missing");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&written).unwrap().permissions().mode() & 0o777;
+            let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700, "settings dir mode is {dir_mode:o}");
+            assert_eq!(file_mode, 0o600, "settings file mode is {file_mode:o}");
+        }
+        let _ = cleanup_intercept_dir(&written);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `onFailure: block` needs Claude Code 2.1.295. `--bare` and `--safe-mode`
+    /// skip the injected hook. Root can edit the policy. Each note is the whole
+    /// stderr line.
+    #[test]
+    fn version_and_flag_notes_name_the_limit() {
+        assert_eq!(
+            parse_claude_version("2.1.295 (Claude Code)"),
+            Some((2, 1, 295))
+        );
+        assert_eq!(parse_claude_version("Claude Code 2.1.294"), Some((2, 1, 294)));
+        assert!(parse_claude_version("not a version").is_none());
+
+        let below = claude_version_note(Some((2, 1, 294))).unwrap();
+        assert!(below.contains("2.1.295"), "{below}");
+        assert!(below.contains("仍会执行"), "{below}");
+        assert!(claude_version_note(Some((2, 1, 295))).is_none());
+        assert!(claude_version_note(Some((2, 2, 0))).is_none());
+        let unknown = claude_version_note(None).unwrap();
+        assert!(unknown.contains("没有读到"), "{unknown}");
+        assert!(unknown.contains("2.1.295"), "{unknown}");
+
+        let bare = claude_flag_note(&["claude".to_owned(), "--bare".to_owned()]).unwrap();
+        assert!(bare.contains("--bare"), "{bare}");
+        assert!(bare.contains("不会运行"), "{bare}");
+        let safe = claude_flag_note(&["claude".to_owned(), "--safe-mode".to_owned()]).unwrap();
+        assert!(safe.contains("--safe-mode"), "{safe}");
+        assert!(claude_flag_note(&[
+            "claude".to_owned(),
+            "--settings".to_owned(),
+            "x".to_owned()
+        ])
+        .is_none());
+        assert!(claude_flag_note(&["claude".to_owned(), "--barely".to_owned()]).is_none());
+
+        let root = root_note(true).unwrap();
+        assert!(root.contains("拦截不可靠"), "{root}");
+        assert!(root_note(false).is_none());
     }
 
     /// Every PreToolUse / PostToolUse hook command in the injected settings.

@@ -499,7 +499,7 @@ flowchart LR
 
 PostToolUse、SessionStart、SessionEnd 不输出判定、不改写、不写拒绝审计（规则文件坏了也一样）。`permissionDecision` 只属于 PreToolUse；PostToolUse 的 `updatedToolOutput` 第一步不做，规则里还没有阶段字段。
 
-实现差（2026-10-22）：`aw run --intercept`，或规则已开、或规则文件损坏且目标像 Claude（`--agent claude-code|claude` 或 argv0 `claude`）时才写临时 settings。损坏也注入，否则 hook 的拒绝不会跑。不改 `~/.claude/`。Codex 不自动改配置，只有手动片段。输出的 `hookSpecificOutput` 带 `hookEventName`。有后台时，`begin_run` 之后把公开会话号注入 `AW_SESSION` 和 hook 的 `--session`；没有后台的 `aw run` 没有号可给。临时 settings 目录创建时就是 `0700`，文件创建时就是 `0600`。Claude Code 版本低于 2.1.295，或 `程序 --version` 没有读到版本时，stderr 提示 `onFailure: block` 靠不住。argv 里有 `--bare` 或 `--safe-mode` 时提示注入的 hook 不会运行。这个检查看的是 `spec.command[0]`：`aw run -- npx claude` 查到的是 npx 的版本。argv 里有 `--bare` 或 `--safe-mode` 时提示注入的 hook 不会运行。未做：第一步不检测本进程是不是 root 或 Windows 管理员。不是做不到（Linux 可读 `/proc/self/status` 的 `Uid`，或跑 `id -u`，不用 FFI），留待后续。不读 `allowManagedHooksOnly`：受管设置路径公开，但这个进程不读那份文件，而且它也可能由 MDM 或服务端下发，读文件覆盖不全。
+实现差（2026-10-22）：`aw run --intercept`，或规则已开、或规则文件损坏且目标像 Claude（`--agent claude-code|claude` 或 argv0 `claude`）时才写临时 settings。损坏也注入，否则 hook 的拒绝不会跑。不改 `~/.claude/`。Codex 不自动改配置，只有手动片段。输出的 `hookSpecificOutput` 带 `hookEventName`。有后台时，`begin_run` 之后把公开会话号注入 `AW_SESSION` 和 hook 的 `--session`；没有后台的 `aw run` 没有号可给。临时 settings 目录创建时就是 `0700`，文件创建时就是 `0600`。Claude Code 版本低于 2.1.295，或 `程序 --version` 没有读到版本时，stderr 提示 `onFailure: block` 靠不住。argv 里有 `--bare` 或 `--safe-mode` 时提示注入的 hook 不会运行。这个检查看的是 `spec.command[0]`：`aw run -- npx claude` 查到的是 npx 的版本。未做：第一步不检测本进程是不是 root 或 Windows 管理员。不是做不到（Linux 可读 `/proc/self/status` 的 `Uid`，或跑 `id -u`，不用 FFI），留待后续。不读 `allowManagedHooksOnly`：受管设置路径公开，但这个进程不读那份文件，而且它也可能由 MDM 或服务端下发，读文件覆盖不全。
 
 ### P5-SEC-03 `aw mcp-tap` 按规则拒绝与改写
 

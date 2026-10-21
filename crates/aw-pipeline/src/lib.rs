@@ -81,9 +81,10 @@ pub use limits::Limiter;
 pub use output::{DnsRec, FileAccessRec, FlowBucketRec, GapRec, NetFlowRec, Output, ProcessRec};
 pub use pipeline::Pipeline;
 pub use policy::{
-    audit_record, decide, downgrade_codex_ask, hash_original, load_str, rules_without_enabled,
-    Action, AuditRecord, DecideError, Decision, Delivered, FieldRewrite, Layer, Matcher, OnError,
-    Phase, Policy, PolicyError, PolicyState, Rule, Subject, AUDIT_SUMMARY_CHARS,
+    audit_record, audit_summary, decide, downgrade_codex_ask, hash_original, load_str,
+    rules_without_enabled, Action, AuditRecord, DecideError, Decision, Delivered, FieldRewrite,
+    Layer, Matcher, OnError, Phase, Policy, PolicyError, PolicyState, Rule, Subject,
+    AUDIT_SUMMARY_CHARS,
 };
 pub use redact::{builtin_rules, BuiltinRule, Redactor, UNSAFE_NO_REDACT_FLAG};
 pub use scope::{ScopeConfig, ScopeFilter, ScopeSet, ScopeUpdate, DEFAULT_PENDING_MS};

@@ -96,13 +96,12 @@ pub fn audit_record(
     original: &str,
     rewritten: Option<&str>,
 ) -> AuditRecord {
-    let redactor = Redactor::new(&RedactionConfig::default());
-    let before_summary = truncate_summary(&redactor.scrub_text(original));
+    let before_summary = audit_summary(original);
     let before_hash = hash_original(salt, original.as_bytes());
     let (after_summary, after_hash) = if decision.effective == Action::Rewrite {
         let text = rewritten.unwrap_or("");
         (
-            Some(truncate_summary(&redactor.scrub_text(text))),
+            Some(audit_summary(text)),
             Some(hash_original(salt, text.as_bytes())),
         )
     } else {
@@ -165,6 +164,17 @@ fn source_for(layer: Layer, agent: Option<&str>) -> String {
         Layer::Mcp => "intercept.mcp-tap".to_owned(),
         Layer::Proxy => "intercept.proxy".to_owned(),
     }
+}
+
+/// What an audit summary stores: redacted, then cut at [`AUDIT_SUMMARY_CHARS`].
+///
+/// A caller that hashes one string and displays another (a response field's
+/// value versus its name) runs the displayed text through this, so it gets the
+/// same redaction and the same length cap as [`audit_record`].
+#[must_use]
+pub fn audit_summary(text: &str) -> String {
+    let redactor = Redactor::new(&RedactionConfig::default());
+    truncate_summary(&redactor.scrub_text(text))
 }
 
 fn truncate_summary(text: &str) -> String {

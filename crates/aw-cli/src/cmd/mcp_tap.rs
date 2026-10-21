@@ -358,7 +358,7 @@ fn gate_broken<W: Write>(
     // summary is the command the call carried, not the whole frame.
     let _ = audit_mcp(
         &decision,
-        &audit_before(line, &decision),
+        &audit_before(line, &decision, direction),
         None,
         endpoint,
         Some(line),
@@ -403,7 +403,7 @@ fn gate_broken_batch<W: Write>(
             }
             let _ = audit_mcp(
                 &decision,
-                &audit_before(&line, &decision),
+                &audit_before(&line, &decision, side.direction),
                 None,
                 side.endpoint,
                 Some(&line),
@@ -543,8 +543,8 @@ fn decide_and_apply(line: &str, gate: &mut Gate<'_, impl Write>) -> FrameAction 
         if labeled && (decision.effective != Action::Allow || decision.action != Action::Allow) {
             Some(audit_mcp(
                 &decision,
-                &audit_before(line, &decision),
-                planned_after(&decision).as_deref(),
+                &audit_before(line, &decision, gate.direction),
+                planned_after(&decision, gate.direction).as_ref(),
                 gate.endpoint,
                 Some(line),
                 gate.direction,
@@ -649,16 +649,34 @@ fn gate_batch<W: Write>(
     Ok(())
 }
 
+/// What the audit stores as "before", split for hashing.
+///
+/// `summary` is what `before_summary` stores. `hashed` is the original bytes
+/// `before_hash` covers. On a request the two are the same text. On a response
+/// they are not: a withheld result (denied, failed closed, or the value a
+/// rewrite replaces) must not land in the summary, so `summary` is the field
+/// name and `hashed` is the field value.
+struct HeldText {
+    summary: String,
+    hashed: String,
+}
+
 /// What the audit stores as "before".
 ///
 /// A rewrite names the fields it replaced, so those original values are the
 /// change. Anything else (a deny, an ask) keeps the command, path, or URL the
 /// rule matched, and falls back to the frame only when the line had none of
 /// those. The policy file's own text is never one of these.
-fn audit_before(line: &str, decision: &Decision) -> String {
+///
+/// `s2c` keeps the field name in the summary and the field value only in the
+/// hash. `c2s` stores the command (or the `name=value` line) in both.
+fn audit_before(line: &str, decision: &Decision, direction: &str) -> HeldText {
     if decision.action == Action::Rewrite && !decision.fields.is_empty() {
         let Some(labels) = subject_from_frame(line) else {
-            return String::new();
+            return HeldText {
+                summary: String::new(),
+                hashed: String::new(),
+            };
         };
         let mut parts = Vec::new();
         for (field, _) in &decision.fields {
@@ -677,48 +695,97 @@ fn audit_before(line: &str, decision: &Decision) -> String {
                     .map(|(_, value)| value.clone())
             };
             if let Some(value) = value {
-                parts.push(format!("{field}={value}"));
+                parts.push((field.clone(), value));
             }
         }
         if !parts.is_empty() {
-            return parts.join("\n");
+            return held_fields(&parts, direction);
         }
     }
     let Some(labels) = subject_from_frame(line) else {
-        return String::new();
+        return HeldText {
+            summary: String::new(),
+            hashed: String::new(),
+        };
     };
     if let Some(command) = labels.command.filter(|text| !text.is_empty()) {
-        return command;
+        // A response result named `command` is still a result field. Naming it
+        // the way a request's command is named would store the withheld text.
+        if direction == DIR_S2C {
+            return held_fields(&[("arg.command".to_owned(), command)], direction);
+        }
+        return HeldText {
+            summary: command.clone(),
+            hashed: command,
+        };
     }
     // A response has no command. The matched text is a result field, and the
     // whole frame would store the result this rule just refused to hand on.
     if !labels.args.is_empty() {
-        return labels
+        let parts: Vec<(String, String)> = labels
             .args
             .iter()
-            .map(|(key, value)| format!("arg.{key}={value}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+            .map(|(key, value)| (format!("arg.{key}"), value.clone()))
+            .collect();
+        return held_fields(&parts, direction);
     }
-    labels
+    let method = labels
         .method
         .filter(|text| !text.is_empty())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    HeldText {
+        summary: method.clone(),
+        hashed: method,
+    }
+}
+
+/// Field names and values, joined the way one audit row stores several fields.
+///
+/// A request summary is `name=value` lines, and that same text is hashed. A
+/// response summary is the names only; the values are hashed and never written
+/// into `before_summary`. An empty value list hashes nothing, so a response
+/// with no named field does not invent a hash of the field names.
+fn held_fields(parts: &[(String, String)], direction: &str) -> HeldText {
+    if direction == DIR_S2C {
+        return HeldText {
+            summary: parts
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            hashed: parts
+                .iter()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+    }
+    let packed = parts
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    HeldText {
+        summary: packed.clone(),
+        hashed: packed,
+    }
 }
 
 /// What a rewrite would store as "after", before the frame is changed.
 ///
 /// Only the fields the rule replaced. The rest of the JSON-RPC line can carry
-/// a sibling the rule did not touch.
-fn planned_after(decision: &Decision) -> Option<String> {
+/// a sibling the rule did not touch. `s2c` keeps the field name in the summary
+/// and the replacement only in the hash, same as [`audit_before`].
+fn planned_after(decision: &Decision, direction: &str) -> Option<HeldText> {
     if decision.effective != Action::Rewrite {
         return None;
     }
-    let mut parts = Vec::new();
-    for (field, value) in &decision.fields {
-        parts.push(format!("{field}={value}"));
-    }
-    Some(parts.join("\n"))
+    let parts: Vec<(String, String)> = decision
+        .fields
+        .iter()
+        .map(|(field, value)| (field.clone(), value.clone()))
+        .collect();
+    Some(held_fields(&parts, direction))
 }
 
 /// A rewrite that [`apply_request`] / [`apply_response`] could not write back
@@ -745,7 +812,7 @@ fn realized_action(
     downgraded.reason = Some("改写写不回这一帧，已改为拒绝".to_owned());
     let _ = audit_mcp(
         &downgraded,
-        &audit_before(line, &downgraded),
+        &audit_before(line, &downgraded, gate.direction),
         None,
         gate.endpoint,
         Some(line),
@@ -943,8 +1010,8 @@ fn audit_backup() -> Option<std::path::PathBuf> {
 /// the post. A dropped rewrite is the caller's signal to deny instead.
 fn audit_mcp(
     decision: &Decision,
-    before: &str,
-    after: Option<&str>,
+    before: &HeldText,
+    after: Option<&HeldText>,
     endpoint: Option<&Endpoint>,
     frame: Option<&str>,
     direction: &str,
@@ -985,14 +1052,24 @@ fn audit_mcp(
         Some(id) => id.as_bytes(),
         None => super::intercept_audit::process_salt(),
     };
+    // The hash covers `hashed`. The summary stores `summary`. On a request the
+    // two are the same text. On a response the summary is the field name and
+    // the hash covers the withheld value, so the value is not what gets stored.
     let mut record = super::intercept_audit::record_for(
         &subject,
         decision,
         salt,
-        before,
-        after,
+        &before.hashed,
+        after.map(|text| text.hashed.as_str()),
         session.as_deref(),
     );
+    // `record_for` summarized `hashed`. A response's summary is the field name,
+    // not that text, so replace it — through the same redaction and length cap.
+    // A request's two strings are equal, so this writes the same summary back.
+    record.before_summary = aw_pipeline::audit_summary(&before.summary);
+    if record.after_summary.is_some() {
+        record.after_summary = after.map(|text| aw_pipeline::audit_summary(&text.summary));
+    }
     let delivery = super::intercept_audit::deliver(
         endpoint,
         backup.as_deref(),
@@ -1653,6 +1730,269 @@ rewrite.arg.text = { replace = ["SECRET", "XXX"] }
             "original result reached the client: {client}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A response that was withheld (denied, failed closed, or replaced) must not
+    /// leave its text in `before_summary` / `after_summary`. The summary is the
+    /// field name. The hash is of the field value, so the value can still be
+    /// checked. A request deny still stores the command (P5-SEC-03).
+    #[test]
+    fn s2c_audit_records_the_field_name_and_hash_not_the_withheld_text() {
+        fn last_row(path: &std::path::Path) -> serde_json::Value {
+            let text = std::fs::read_to_string(path).unwrap_or_default();
+            let line = text
+                .lines()
+                .rfind(|line| !line.is_empty())
+                .unwrap_or_else(|| panic!("no audit row in {}", path.display()));
+            serde_json::from_str(line).unwrap_or_else(|err| panic!("{err}: {line}"))
+        }
+        fn audit_len(path: &std::path::Path) -> usize {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| !line.is_empty())
+                .count()
+        }
+
+        let _guard = crate::cmd::policy_file::env_lock();
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "aw-mcp-s2c-held-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or(0)
+            ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit = dir.join("audit.jsonl");
+        // Drop order is reverse of declaration: the audit file is closed before
+        // this removes the directory, including when an assertion panics.
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _scratch = Scratch(dir.clone());
+        let _cleared = [
+            "AW_SOCKET",
+            "AW_POLICY",
+            "AW_INTERCEPT_AUDIT",
+            "AW_TOKEN",
+            "AW_HTTP",
+            "AW_SYSTEM_SOCKET",
+            "AW_SESSION",
+            "XDG_STATE_HOME",
+            "TMPDIR",
+        ]
+        .map(crate::cmd::policy_file::EnvVarGuard::unset);
+        let _homes = ["XDG_CONFIG_HOME", "HOME", "APPDATA", "LOCALAPPDATA"]
+            .map(|key| crate::cmd::policy_file::EnvVarGuard::set_text(key, &dir));
+        let _audit = crate::cmd::policy_file::EnvVarGuard::set(
+            crate::cmd::intercept_audit::AUDIT_ENV,
+            &audit,
+        );
+        // No session, so the salt is this process's, and the hash is reproducible.
+        let salt: &[u8] = crate::cmd::intercept_audit::process_salt();
+        let secret = b"{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"text\":\"SECRET\"}}\n";
+
+        let deny_policy = r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "r"
+layer = ["mcp"]
+match.direction = { exact = "s2c" }
+match.arg.text = { regex = "SECRET" }
+action = "deny"
+reason = "resp deny"
+"#;
+        let copy = copy_gated_for_test_at(secret, DIR_S2C, deny_policy, false, None).unwrap();
+        let client = String::from_utf8(copy.client).unwrap();
+        assert!(copy.child.is_empty(), "deny wrote to the server side");
+        assert!(client.contains("resp deny"), "{client}");
+        assert!(!client.contains("SECRET"), "{client}");
+        let row = last_row(&audit);
+        assert_eq!(audit_len(&audit), 1, "{row}");
+        assert_eq!(row["event"].as_str(), Some("s2c"), "{row}");
+        assert_eq!(row["layer"].as_str(), Some("mcp"), "{row}");
+        assert_eq!(row["action"].as_str(), Some("deny"), "{row}");
+        assert_eq!(row["effective_action"].as_str(), Some("deny"), "{row}");
+        assert_eq!(row["rule_id"].as_str(), Some("r"), "{row}");
+        assert_eq!(row["reason"].as_str(), Some("resp deny"), "{row}");
+        assert_eq!(row["before_summary"].as_str(), Some("arg.text"), "{row}");
+        let deny_hash = aw_pipeline::hash_original(salt, b"SECRET");
+        assert_eq!(
+            row["before_hash"].as_str(),
+            Some(deny_hash.as_str()),
+            "{row}"
+        );
+        assert!(row["after_summary"].is_null(), "{row}");
+        assert!(row["after_hash"].is_null(), "{row}");
+        assert_eq!(row["delivered"].as_str(), Some("local_backup"), "{row}");
+        let rendered = serde_json::to_string(&row).unwrap();
+        assert!(
+            !rendered.to_ascii_lowercase().contains("secret"),
+            "denied response text landed in the audit: {rendered}"
+        );
+
+        let rewrite_policy = r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "redact-result"
+layer = ["mcp"]
+match.direction = { exact = "s2c" }
+match.arg.text = { regex = "SECRET" }
+action = "rewrite"
+rewrite.arg.text = { replace = ["SECRET", "XXX"] }
+"#;
+        let copy = copy_gated_for_test_at(secret, DIR_S2C, rewrite_policy, false, None).unwrap();
+        let client = String::from_utf8(copy.client).unwrap();
+        assert!(
+            client.contains("XXX"),
+            "client did not see the rewrite: {client}"
+        );
+        assert!(!client.contains("SECRET"), "{client}");
+        let row = last_row(&audit);
+        assert_eq!(audit_len(&audit), 2, "{row}");
+        assert_eq!(row["event"].as_str(), Some("s2c"), "{row}");
+        assert_eq!(row["action"].as_str(), Some("rewrite"), "{row}");
+        assert_eq!(row["effective_action"].as_str(), Some("rewrite"), "{row}");
+        assert_eq!(row["rule_id"].as_str(), Some("redact-result"), "{row}");
+        assert!(row["reason"].is_null(), "{row}");
+        assert_eq!(row["before_summary"].as_str(), Some("arg.text"), "{row}");
+        let before_hash = aw_pipeline::hash_original(salt, b"SECRET");
+        assert_eq!(
+            row["before_hash"].as_str(),
+            Some(before_hash.as_str()),
+            "{row}"
+        );
+        assert_eq!(row["after_summary"].as_str(), Some("arg.text"), "{row}");
+        let after_hash = aw_pipeline::hash_original(salt, b"XXX");
+        assert_eq!(
+            row["after_hash"].as_str(),
+            Some(after_hash.as_str()),
+            "{row}"
+        );
+        let rendered = serde_json::to_string(&row).unwrap();
+        assert!(
+            !rendered.to_ascii_lowercase().contains("secret"),
+            "withheld response text landed in the audit: {rendered}"
+        );
+        assert!(
+            !rendered.contains("XXX"),
+            "rewritten response text landed in the audit summary: {rendered}"
+        );
+
+        let miss_policy = r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "redact-miss"
+layer = ["mcp"]
+match.direction = { exact = "s2c" }
+match.arg.text = { regex = "(?i)secret" }
+action = "rewrite"
+rewrite.arg.text = { replace = ["SECRET", "XXX"] }
+"#;
+        let missed = b"{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"text\":\"my secret\"}}\n";
+        let copy = copy_gated_for_test_at(missed, DIR_S2C, miss_policy, false, None).unwrap();
+        let client = String::from_utf8(copy.client).unwrap();
+        assert!(
+            client.contains("判定出错"),
+            "a missed rewrite was not an error: {client}"
+        );
+        assert!(
+            !client.to_ascii_lowercase().contains("secret"),
+            "original result reached the client: {client}"
+        );
+        let row = last_row(&audit);
+        assert_eq!(audit_len(&audit), 3, "{row}");
+        assert_eq!(row["event"].as_str(), Some("s2c"), "{row}");
+        assert_eq!(row["action"].as_str(), Some("deny"), "{row}");
+        assert_eq!(row["effective_action"].as_str(), Some("deny"), "{row}");
+        assert!(row["rule_id"].is_null(), "{row}");
+        assert_eq!(
+            row["reason"].as_str(),
+            Some("判定出错，已按拒绝处理"),
+            "{row}"
+        );
+        assert_eq!(row["before_summary"].as_str(), Some("arg.text"), "{row}");
+        let miss_hash = aw_pipeline::hash_original(salt, b"my secret");
+        assert_eq!(
+            row["before_hash"].as_str(),
+            Some(miss_hash.as_str()),
+            "{row}"
+        );
+        assert!(row["after_summary"].is_null(), "{row}");
+        assert!(row["after_hash"].is_null(), "{row}");
+        let rendered = serde_json::to_string(&row).unwrap();
+        assert!(
+            !rendered.to_ascii_lowercase().contains("secret"),
+            "withheld response text landed in the audit: {rendered}"
+        );
+
+        // A value that itself contains `=` must be hashed whole. Splitting the
+        // packed `name=value` line on the first `=` would hash only `a`.
+        let equals_policy = r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "r-eq"
+layer = ["mcp"]
+match.direction = { exact = "s2c" }
+match.arg.text = { prefix = "a=" }
+action = "deny"
+reason = "resp deny"
+"#;
+        let equals = b"{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"text\":\"a=b=c\"}}\n";
+        let copy = copy_gated_for_test_at(equals, DIR_S2C, equals_policy, false, None).unwrap();
+        let client = String::from_utf8(copy.client).unwrap();
+        assert!(client.contains("resp deny"), "{client}");
+        assert!(!client.contains("a=b=c"), "{client}");
+        let row = last_row(&audit);
+        assert_eq!(audit_len(&audit), 4, "{row}");
+        assert_eq!(row["event"].as_str(), Some("s2c"), "{row}");
+        assert_eq!(row["before_summary"].as_str(), Some("arg.text"), "{row}");
+        let equals_hash = aw_pipeline::hash_original(salt, b"a=b=c");
+        assert_eq!(
+            row["before_hash"].as_str(),
+            Some(equals_hash.as_str()),
+            "{row}"
+        );
+        let rendered = serde_json::to_string(&row).unwrap();
+        assert!(
+            !rendered.contains("a=b=c"),
+            "withheld response text landed in the audit: {rendered}"
+        );
+
+        // Request direction is unchanged: the summary is still the command.
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"run\",\"arguments\":{\"command\":\"rm -rf /tmp\"}}}\n";
+        let copy = copy_gated_for_test_at(request, DIR_C2S, DENY_RM, true, None).unwrap();
+        assert!(copy.child.is_empty(), "denied request reached the child");
+        let client = String::from_utf8(copy.client).unwrap();
+        assert!(client.contains("不允许删除"), "{client}");
+        assert!(!client.contains("rm -rf"), "{client}");
+        let row = last_row(&audit);
+        assert_eq!(audit_len(&audit), 5, "{row}");
+        assert_eq!(row["event"].as_str(), Some("c2s"), "{row}");
+        assert_eq!(row["effective_action"].as_str(), Some("deny"), "{row}");
+        assert_eq!(row["before_summary"].as_str(), Some("rm -rf /tmp"), "{row}");
+        let command_hash = aw_pipeline::hash_original(salt, b"rm -rf /tmp");
+        assert_eq!(
+            row["before_hash"].as_str(),
+            Some(command_hash.as_str()),
+            "{row}"
+        );
+        assert!(row["after_summary"].is_null(), "{row}");
     }
 
     /// A broken policy file still has to see a `tools/call` inside a batch.

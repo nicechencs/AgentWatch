@@ -187,7 +187,7 @@ action = "deny"
 reason = "不允许连这个网站"
 ```
 
-- 匹配字段：`tool`、`agent`、`match.command`、`match.path`、`match.host`、`match.url`、`match.method`、`match.mcp_method`、`match.mcp_tool`、`match.arg.<字段名>`、`match.direction`；每个字段支持 `exact` / `prefix` / `glob` / `regex`。
+- 匹配字段：`tool`、`agent`、`match.command`、`match.path`、`match.host`、`match.url`、`match.method`、`match.mcp_method`、`match.mcp_tool`、`match.arg.<字段名>`、`match.direction`；每个字段支持 `exact` / `prefix` / `glob` / `regex`，但 `match.direction` 除外，只能用 `exact`。
 - `match.direction` 只能写在 `layer` 只含 `mcp` 的规则上（`hook`、`proxy`，或没写 `layer`，都算规则文件损坏）。合法写法只有两个：`{ exact = "c2s" }`（客户端到服务端的请求）和 `{ exact = "s2c" }`（服务端到客户端的回包）。写成纯字符串、`"S2C"`、`"x2y"`、带空格，或用 `prefix` / `glob` / `regex`，都算规则文件损坏，按 `on_error` 处理。不写这个字段时只匹配请求方向；回包规则必须显式写 `{ exact = "s2c" }`。回包没有 `method` 和 `params`，能匹配的是 `result` 里的字符串字段，写成 `match.arg.<字段名>`（例如 `match.arg.text` 对上 `{"result":{"text":"SECRET"}}`）。`rewrite.arg.<字段名>` 写回 `result` 的同一个字段，改完转发给客户端。`rewrite.direction` 不是帧里的字段，加载时按规则损坏拒绝。
 - 规则按文件顺序检查，**多条命中时取最严**：`deny > ask > rewrite > allow`（和 Claude Code 的优先级一致）。
 - `rewrite` 只允许「字段级替换」（某个字段换值、字符串替换），不允许写脚本。改写后再用全部规则检查一遍，被 `deny` 命中就拒绝（防止改出危险命令）。
@@ -236,6 +236,7 @@ reason = "不允许连这个网站"
 | `delivered` | 后台收到 / 写入本地备份 / 都失败 |
 
 - 不存原文全文，不存 body，不存提示词全文（ADR-0012）。脱敏走管道现有 Redact 规则。
+- 回包方向（`layer` 为 `mcp` 且 `event` 为 `s2c`）被扣下的内容不写入摘要。拒绝、判定出错后改成拒绝、以及改写前的字段值，都不出现在 `before_summary` 或 `after_summary` 里；这两项只写字段名（例如 `arg.text`）。`before_hash` 仍是被扣下的字段值的加盐 SHA-256，`after_hash` 是改写后那个字段值的哈希。请求方向（`c2s`）不变：摘要仍是脱敏、截断后的命令或参数。
 - 投递：先追加本地 `intercept-audit.jsonl`（`AW_INTERCEPT_AUDIT`，否则 `<会话目录>/intercept-audit.jsonl`，Unix 上 `0600`），再尽力 `POST /api/v1/agent/intercept`。会话目录是 `<状态目录>/agentwatch/sessions/<会话号>`：Linux / macOS 的状态目录是 `XDG_STATE_HOME`（未设或为空则 `$HOME/.local/state`），Windows 是 `%LOCALAPPDATA%`，不认 `XDG_STATE_HOME`。没有会话号、会话号不是单个路径分量、或状态目录也没有时，没有本地备份。hook 只有 200 ms，不能让连不上的后台吃掉预算、连本地备份也写不成。后台写成功时记录的 `delivered` 是 `daemon`（本地行可能还在，第一步不把这份文件再收进库）。两边都失败时按 §5.3 第 2 条处理。改写已经按拒绝执行、但先发出去的那条仍写着 `rewrite` 时，再写一条 `effective_action` 为 `deny` 的记录，以后写的那条为准。Gap（`gap_kind = intercept_audit_dropped`）只在客户端仍能把 `dropped: true` 送到这条路由时入库；后台本身不可达时，这条 Gap 也送不出去，只剩降级。
 - 规则文件：`AW_POLICY`（非空路径；文件不存在当作关），否则 `$XDG_CONFIG_HOME/agentwatch/policy.toml`（未设则 `~/.config/agentwatch/policy.toml`），Windows 为 `%APPDATA%\agentwatch\policy.toml`。不读 `/etc/agentwatch/config.toml`，也不读项目目录里的文件。
 - 实现落点（2026-10-21，`feat/intercept`）：规则与判定在 `aw-pipeline`（已有 `regex`、`toml`、脱敏；`sha2` 0.11 已在锁文件，MIT OR Apache-2.0）。`aw-core` 不增加 `GapKind` 变体（那是全仓类型变更，AGENTS.md §8 要求单独先合）；`gaps.kind` 以文本 `intercept_audit_dropped` 写入。Codex 自动注入未做，只提供手动片段（`codex::decision::manual_snippet`），不改 `~/.codex/`，不加 `--dangerously-bypass-hook-trust`。有后台时，`begin_run` 之后注入 `AW_SESSION` 和 hook 的 `--session`；没有后台就没有公开号可给。代理不从 `aw run` 拉起，拒绝回包只在库里测过，没有端到端。真机 `aw run --agent claude-code` 已在 Linux 上跑过（2026-10-21：拒绝和改写都生效，审计写入后台）。macOS 和 Windows 未验证。规则文件损坏时：`aw hook` 按拒绝输出（带 `hookEventName`）；`aw run` 仍注入临时 hooks，否则这个拒绝不会跑；`aw mcp-tap` 只拒绝 `tools/call`，`initialize` / `tools/list` / 通知照常转发。`hookSpecificOutput` 必须带与输入一致的 `hookEventName`，否则 Claude Code 把输出当非阻塞错误、工具照常执行。

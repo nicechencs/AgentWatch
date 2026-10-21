@@ -167,7 +167,7 @@ $ aw run --proxy -- claude
 ```
 
 - 信息输出到 stderr，以 `[aw]` 为前缀。`--quiet` 可以关闭。
-- `--json` 把结束摘要写成 stderr 上的**一个** JSON 文档，后面不再有任何文字。同一份文档带 `notes`：字符串数组，内容是人读摘要里那些 `[aw]` 提示和警告（改写会跳过权限确认、规则文件有规则但没有写 `enabled`、版本或 `--bare` / `--safe-mode` 限制、pin 没保住、还有子进程没记上、daemon 没记上退出码），每条去掉末尾换行。没有这类提示时 `notes` 是空数组 `[]`，不是省略。`--quiet` 或 `--summary none` 不输出这份文档，提示和警告仍以 `[aw]` 文本写到 stderr，不因为加了 `--json` 就丢掉。
+- `--json` 把结束摘要写成 stderr 上的**一个** JSON 文档，后面不再有任何文字。同一份文档带 `notes`：字符串数组，内容是人读摘要里那些 `[aw]` 提示和警告（改写会跳过权限确认、规则文件有规则但没有写 `enabled`、版本或 `--bare` / `--safe-mode` 限制、pin 没保住、还有子进程没记上、daemon 没记上退出码），每条去掉末尾换行，并去掉开头的 `[aw] `。人读摘要、`--quiet` 和 `--summary none` 仍以带 `[aw]` 的文本写到 stderr。没有这类提示时 `notes` 是空数组 `[]`，不是省略。`--quiet` 或 `--summary none` 不输出这份文档，提示和警告仍以 `[aw]` 文本写到 stderr，不因为加了 `--json` 就丢掉。
 - 目标进程的 stdio 完全透传。
 
 ## 3. HTTP API

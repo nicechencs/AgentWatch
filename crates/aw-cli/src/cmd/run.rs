@@ -2278,12 +2278,16 @@ struct SummaryTail<'a> {
     notes: &'a [String],
 }
 
-/// One `notes` entry: the `[aw]` line without its trailing newline. A note is
-/// one sentence, so an embedded newline would only come from a warning that
-/// already folded; JSON keeps it as one string either way by flattening.
+/// One `notes` entry: the `[aw]` line without its trailing newline and without
+/// the `[aw] ` prefix. A note is one sentence, so an embedded newline would
+/// only come from a warning that already folded; JSON keeps it as one string
+/// either way by flattening. Human-readable and `--quiet` output do not call
+/// this, so they still print the prefix.
 fn summary_note_line(note: &str) -> String {
-    note.trim_end_matches(['\n', '\r'])
-        .replace(['\n', '\r'], " ")
+    let line = note
+        .trim_end_matches(['\n', '\r'])
+        .replace(['\n', '\r'], " ");
+    line.strip_prefix("[aw] ").unwrap_or(&line).to_owned()
 }
 
 /// Write the human-summary notes. Not used for `--json`: those go inside the
@@ -3428,10 +3432,14 @@ mod tests {
             .map(|item| item.as_str().expect("note string"))
             .collect::<Vec<_>>();
         assert!(
-            notes.iter().any(|note| {
-                note.contains("改写") && note.contains("权限确认") && !note.contains('\n')
-            }),
-            "the rewrite sentence belongs in notes: {err}"
+            notes.contains(
+                &"提示：规则里有改写。命中的命令会带着改后的参数直接执行，不再弹出权限确认。"
+            ),
+            "the rewrite sentence belongs in notes, without the [aw] prefix: {err}"
+        );
+        assert!(
+            notes.iter().all(|note| !note.starts_with("[aw]")),
+            "json notes keep the [aw] prefix: {notes:?}"
         );
         assert!(!err.contains("上传了"), "{err}");
         assert!(outcome.stdout.is_empty());
@@ -3575,7 +3583,7 @@ mod tests {
         assert_eq!(notes.len(), 1, "{err}");
         assert_eq!(
             notes[0],
-            "[aw] 提示：规则文件里有规则，但没有写 enabled，拦截没有打开。要打开请写 enabled = true。"
+            "提示：规则文件里有规则，但没有写 enabled，拦截没有打开。要打开请写 enabled = true。"
         );
         assert!(!notes[0].as_str().unwrap().contains('\n'));
         assert!(outcome.stdout.is_empty(), "{:?}", outcome.stdout);
@@ -3654,15 +3662,19 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             notes.contains(
-                &"[aw] 警告：后台没有保留这个会话：连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：pin-down"
+                &"警告：后台没有保留这个会话：连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：pin-down"
             ),
             "{notes:?}"
         );
         assert!(
             notes.contains(
-                &"[aw] 警告：daemon 未记录程序退出码：连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：exit-down"
+                &"警告：daemon 未记录程序退出码：连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：exit-down"
             ),
             "{notes:?}"
+        );
+        assert!(
+            notes.iter().all(|note| !note.starts_with("[aw]")),
+            "json notes keep the [aw] prefix: {notes:?}"
         );
         assert!(notes.iter().all(|note| !note.contains('\n')));
         assert!(outcome.stdout.is_empty());

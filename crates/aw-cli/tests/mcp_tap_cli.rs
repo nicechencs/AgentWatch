@@ -380,18 +380,20 @@ rewrite.arg.text = { replace = ["SECRET", "XXX"] }
 "#;
 
 /// The server answers `{"result":{"text":"SECRET"}}`. The client must see
-/// `XXX`, and the audit row must name the tool, the method, and the direction.
+/// `XXX`. The s2c audit names the field and hashes the withheld value and the
+/// replacement; it does not store either string. `AW_SESSION` is the salt.
 #[test]
 fn response_rewrite_reaches_the_client() {
     let dir = scratch("resp");
     let policy = write_policy(&dir, REDACT_RESULT);
     let audit = dir.join("audit.jsonl");
     let server = PathBuf::from(env!("CARGO_BIN_EXE_mcp_result"));
-    let (status, stdout, stderr) = exchange_all(
+    let (status, stdout, stderr) = exchange_all_env(
         Some(&policy),
         Some(&audit),
         &server,
         r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run","arguments":{"command":"echo"}}}"#,
+        &[("AW_SESSION", "s-s2c")],
     );
     assert_eq!(status, 0, "stderr: {stderr}");
     assert!(
@@ -423,9 +425,37 @@ fn response_rewrite_reaches_the_client() {
         response_row.contains("\"effective_action\":\"rewrite\""),
         "the response rewrite was not recorded: {body}"
     );
+    let response: serde_json::Value = serde_json::from_str(response_row).expect("s2c audit row");
+    assert_eq!(response["session"].as_str(), Some("s-s2c"), "{response}");
+    assert_eq!(
+        response["before_summary"].as_str(),
+        Some("arg.text"),
+        "{response}"
+    );
+    assert_eq!(
+        response["after_summary"].as_str(),
+        Some("arg.text"),
+        "{response}"
+    );
+    let before_hash = aw_pipeline::hash_original(b"s-s2c", b"SECRET");
+    let after_hash = aw_pipeline::hash_original(b"s-s2c", b"XXX");
+    assert_eq!(
+        response["before_hash"].as_str(),
+        Some(before_hash.as_str()),
+        "{response}"
+    );
+    assert_eq!(
+        response["after_hash"].as_str(),
+        Some(after_hash.as_str()),
+        "{response}"
+    );
     assert!(
-        response_row.contains("XXX"),
-        "the response audit does not name the replacement: {body}"
+        !response_row.to_ascii_lowercase().contains("secret"),
+        "withheld response text landed in the audit: {response_row}"
+    );
+    assert!(
+        !response_row.contains("XXX"),
+        "replacement text landed in the audit: {response_row}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

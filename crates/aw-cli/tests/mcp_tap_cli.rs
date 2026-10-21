@@ -49,8 +49,28 @@ fn write_policy(dir: &std::path::Path, body: &str) -> PathBuf {
 
 /// One JSON-RPC line in, one line out. `aw` must exit after the child does.
 fn exchange(policy: Option<&std::path::Path>, request: &str) -> (i32, String, String) {
+    exchange_at(policy, None, None, request)
+}
+
+/// `socket` is `--socket`. `http` is `--http` plus a throwaway bearer, which
+/// that flag requires. Either one is the audit address.
+fn exchange_at(
+    policy: Option<&std::path::Path>,
+    socket: Option<&std::path::Path>,
+    http: Option<&str>,
+    request: &str,
+) -> (i32, String, String) {
     let echo = echo_bin();
     let mut cmd = aw();
+    if let Some(path) = socket {
+        cmd.arg("--socket").arg(path);
+    }
+    if let Some(url) = http {
+        cmd.arg("--http")
+            .arg(url)
+            .arg("--token")
+            .arg("mcp-tap-test");
+    }
     cmd.args(["mcp-tap", "--"]).arg(&echo);
     if let Some(path) = policy {
         cmd.env("AW_POLICY", path);
@@ -207,4 +227,245 @@ fn rewrite_is_what_the_server_receives() {
         rewritten.1
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A daemon that stores the audit. The rewrite is what the child sees, and
+/// the posted body names the rule. The same request against a socket nobody
+/// listens on is a deny: a rewrite with no record must not be forwarded.
+#[test]
+fn rewrite_is_posted_and_a_dead_daemon_denies_it() {
+    let dir = scratch("audit");
+    let policy = write_policy(&dir, REWRITE);
+    let request = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run","arguments":{"command":"terraform apply"}}}"#;
+
+    let posted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (address, server) = stand_in(std::sync::Arc::clone(&posted));
+    let live = exchange_at(Some(&policy), address.socket(), address.http(), request);
+    drop(server);
+    assert_eq!(live.0, 0, "stderr: {}", live.2);
+    assert!(
+        live.1.contains("terraform plan"),
+        "a recorded rewrite did not reach the server: {}",
+        live.1
+    );
+    let bodies = posted.lock().expect("posted").clone();
+    assert!(
+        bodies.iter().any(|body| body.contains("plan-only")),
+        "the audit never arrived: {bodies:?}"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("command=terraform apply")),
+        "the audit lost the field that was rewritten: {bodies:?}"
+    );
+    assert!(
+        bodies
+            .iter()
+            .all(|body| !body.contains("jsonrpc") && !body.contains("params")),
+        "the audit stored the whole frame: {bodies:?}"
+    );
+
+    let dead = address.dead();
+    let started = std::time::Instant::now();
+    let denied = exchange_at(Some(&policy), dead.socket(), dead.http(), request);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a daemon that is not listening held the call for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(denied.0, 0, "stderr: {}", denied.2);
+    assert!(
+        denied.2.contains("intercept_audit_dropped"),
+        "the drop was not reported: {}",
+        denied.2
+    );
+    assert!(
+        !denied.1.contains("terraform plan"),
+        "the rewrite was forwarded with no audit: {}",
+        denied.1
+    );
+    assert!(
+        denied.1.contains("\"id\":4"),
+        "the downgraded deny did not answer the client: {}",
+        denied.1
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `AW_SOCKET` is the address `aw` uses when no flag was passed. A broken
+/// policy's deny has to arrive there too, and the body must not carry the
+/// policy file's text.
+#[cfg(unix)]
+#[test]
+fn broken_policy_deny_uses_aw_socket() {
+    let dir = scratch("broken");
+    let policy = dir.join("broken.toml");
+    std::fs::write(&policy, "this is not a policy\n").expect("policy");
+    let socket = dir.join("api.sock");
+    let posted = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let saved = std::sync::Arc::clone(&posted);
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    let worker = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut buf = [0_u8; 16 * 1024];
+        let Ok(n) = std::io::Read::read(&mut stream, &mut buf) else {
+            return;
+        };
+        *saved.lock().expect("posted") = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let _ = std::io::Write::write_all(
+            &mut stream,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+        );
+    });
+    let echo = echo_bin();
+    let mut cmd = aw();
+    cmd.env("AW_POLICY", &policy).env("AW_SOCKET", &socket);
+    cmd.env_remove("AW_INTERCEPT_AUDIT");
+    cmd.args(["mcp-tap", "--"]).arg(&echo);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"run","arguments":{"command":"echo hello"}}}"#,
+        )
+        .expect("write");
+    stdin.write_all(b"\n").expect("newline");
+    drop(stdin);
+    let stdout = child.stdout.take().expect("stdout");
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufRead::read_line(&mut BufReader::new(stdout), &mut line);
+        line
+    });
+    let status = wait_child(&mut child, Duration::from_secs(15));
+    let answer = reader.join().expect("reader");
+    let _ = worker.join();
+    assert_eq!(status, 0, "{answer}");
+    assert!(answer.contains("\"id\":9"), "{answer}");
+    let body = posted.lock().expect("posted").clone();
+    assert!(body.contains("/api/v1/agent/intercept"), "{body}");
+    assert!(body.contains("echo hello"), "{body}");
+    assert!(body.contains("规则文件读不了"), "{body}");
+    assert!(!body.contains("this is not a policy"), "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Where the audit goes, and the same address with nothing listening.
+struct AuditAddress {
+    socket: Option<std::path::PathBuf>,
+    http: Option<String>,
+    dead_socket: Option<std::path::PathBuf>,
+    dead_http: Option<String>,
+}
+
+impl AuditAddress {
+    fn socket(&self) -> Option<&std::path::Path> {
+        self.socket.as_deref()
+    }
+
+    fn http(&self) -> Option<&str> {
+        self.http.as_deref()
+    }
+
+    fn dead(&self) -> Self {
+        Self {
+            socket: self.dead_socket.clone(),
+            http: self.dead_http.clone(),
+            dead_socket: None,
+            dead_http: None,
+        }
+    }
+}
+
+/// One local listener that records `POST /api/v1/agent/intercept` bodies.
+///
+/// Unix uses a socket. Windows uses loopback HTTP: the named-pipe server needs
+/// the daemon's tokio runtime, and `--http` is the channel `aw` already speaks
+/// on every system. The dead address is the same kind with nobody listening.
+fn stand_in(posted: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> (AuditAddress, StandIn) {
+    #[cfg(unix)]
+    {
+        let dir = scratch("sock");
+        let path = dir.join("api.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let worker = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0_u8; 16 * 1024];
+            let Ok(n) = std::io::Read::read(&mut stream, &mut buf) else {
+                return;
+            };
+            let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+            posted.lock().expect("posted").push(text);
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+            );
+        });
+        let dead = dir.join("dead.sock");
+        (
+            AuditAddress {
+                socket: Some(path),
+                http: None,
+                dead_socket: Some(dead),
+                dead_http: None,
+            },
+            StandIn {
+                worker: Some(worker),
+            },
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let worker = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0_u8; 16 * 1024];
+            let Ok(n) = std::io::Read::read(&mut stream, &mut buf) else {
+                return;
+            };
+            let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+            posted.lock().expect("posted").push(text);
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+            );
+        });
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("dead");
+        let dead_port = dead.local_addr().expect("addr").port();
+        drop(dead);
+        (
+            AuditAddress {
+                socket: None,
+                http: Some(format!("http://127.0.0.1:{port}")),
+                dead_socket: None,
+                dead_http: Some(format!("http://127.0.0.1:{dead_port}")),
+            },
+            StandIn {
+                worker: Some(worker),
+            },
+        )
+    }
+}
+
+struct StandIn {
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }

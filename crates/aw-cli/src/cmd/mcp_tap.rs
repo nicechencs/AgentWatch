@@ -28,9 +28,16 @@ use aw_agent_adapters::{
 use aw_pipeline::{decide, Action, Decision, Layer, OnError, Phase, Subject};
 use serde_json::{json, Value};
 
+use crate::endpoint::Endpoint;
 use crate::exit;
 
 use super::Outcome;
+
+/// How long one audit post may wait on a daemon. The copy loop is the MCP
+/// session, so a daemon that is not listening must fail fast: the same bound
+/// `aw hook` uses inside its 200 ms budget. A rewrite that cannot be recorded
+/// is a deny (design §5.3).
+const AUDIT_POST_BUDGET: Duration = Duration::from_millis(50);
 
 /// How long a notice may wait for the stderr printer before the copy loop
 /// drops that notice and keeps forwarding. The copy itself is never blocked
@@ -53,10 +60,14 @@ enum CopyNote {
 /// is a usage error and does not spawn. The child's exit code is this
 /// process's exit code. A signal death with no code is exit 1, not 0.
 ///
+/// `endpoint` is where an intercept audit is posted. `None` is a daemon this
+/// process could not resolve; the post is skipped and a rewrite with no local
+/// backup becomes a deny.
+///
 /// # Panics
 ///
 /// Never. Spawn and copy failures become [`Outcome`] with exit 1.
-pub(crate) fn run(cmd: &[String]) -> Outcome {
+pub(crate) fn run(cmd: &[String], endpoint: Option<&Endpoint>) -> Outcome {
     let Some((program, args)) = cmd.split_first() else {
         return super::error_outcome(
             exit::USAGE,
@@ -65,7 +76,7 @@ pub(crate) fn run(cmd: &[String]) -> Outcome {
             false,
         );
     };
-    match spawn_and_copy(program, args) {
+    match spawn_and_copy(program, args, endpoint) {
         Ok(outcome) => outcome,
         Err(err) => super::error_outcome(
             exit::GENERAL,
@@ -76,7 +87,11 @@ pub(crate) fn run(cmd: &[String]) -> Outcome {
     }
 }
 
-fn spawn_and_copy(program: &str, args: &[String]) -> io::Result<Outcome> {
+fn spawn_and_copy(
+    program: &str,
+    args: &[String],
+    endpoint: Option<&Endpoint>,
+) -> io::Result<Outcome> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::piped())
@@ -86,6 +101,9 @@ fn spawn_and_copy(program: &str, args: &[String]) -> io::Result<Outcome> {
         .map_err(|err| io::Error::other(err.to_string()))?;
 
     let policy = Arc::new(load_mcp_policy());
+    // Resolved once. A connect that fails is still one attempt per audit,
+    // bounded by [`AUDIT_POST_BUDGET`], not a reason to skip the post.
+    let audit_endpoint = endpoint.cloned();
     let child_stdin = child
         .stdin
         .take()
@@ -105,17 +123,25 @@ fn spawn_and_copy(program: &str, args: &[String]) -> io::Result<Outcome> {
 
     let stdin_tx = tx.clone();
     let stdin_policy = Arc::clone(&policy);
+    let stdin_endpoint = audit_endpoint.clone();
     let stdin_thread = thread::Builder::new()
         .name("aw-mcp-tap-stdin".to_owned())
         .spawn(move || {
-            let result =
-                copy_parent_to_child(io::stdin(), child_stdin, DIR_C2S, &stdin_tx, &stdin_policy);
+            let result = copy_parent_to_child(
+                io::stdin(),
+                child_stdin,
+                DIR_C2S,
+                &stdin_tx,
+                &stdin_policy,
+                stdin_endpoint.as_ref(),
+            );
             let _ = stdin_tx.send(CopyNote::Done(result));
         })
         .map_err(|err| io::Error::other(err.to_string()))?;
 
     let stdout_tx = tx.clone();
     let stdout_policy = policy;
+    let stdout_endpoint = audit_endpoint;
     let stdout_thread = thread::Builder::new()
         .name("aw-mcp-tap-stdout".to_owned())
         .spawn(move || {
@@ -125,6 +151,7 @@ fn spawn_and_copy(program: &str, args: &[String]) -> io::Result<Outcome> {
                 DIR_S2C,
                 &stdout_tx,
                 &stdout_policy,
+                stdout_endpoint.as_ref(),
             );
             let _ = stdout_tx.send(CopyNote::Done(result));
         })
@@ -208,8 +235,9 @@ fn copy_parent_to_child<R: Read, W: Write>(
     direction: &'static str,
     tx: &SyncSender<CopyNote>,
     policy: &McpPolicy,
+    endpoint: Option<&Endpoint>,
 ) -> io::Result<()> {
-    copy_with_policy(&mut from, &mut to, direction, tx, policy, true)
+    copy_with_policy(&mut from, &mut to, direction, tx, policy, endpoint, true)
 }
 
 /// Copy child stdout onto the parent, and note each completed line.
@@ -223,8 +251,9 @@ fn copy_child_to_parent<R: Read, W: Write>(
     direction: &'static str,
     tx: &SyncSender<CopyNote>,
     policy: &McpPolicy,
+    endpoint: Option<&Endpoint>,
 ) -> io::Result<()> {
-    copy_with_policy(&mut from, &mut to, direction, tx, policy, false)
+    copy_with_policy(&mut from, &mut to, direction, tx, policy, endpoint, false)
 }
 
 fn copy_with_policy<R: Read, W: Write>(
@@ -233,12 +262,13 @@ fn copy_with_policy<R: Read, W: Write>(
     direction: &'static str,
     tx: &SyncSender<CopyNote>,
     policy: &McpPolicy,
+    endpoint: Option<&Endpoint>,
     to_client: bool,
 ) -> io::Result<()> {
     match policy {
         McpPolicy::Off => copy_parsed(from, to, direction, tx),
-        McpPolicy::On(policy) => copy_gated(from, to, direction, tx, policy, to_client),
-        McpPolicy::Broken => copy_broken(from, to, direction, tx, to_client),
+        McpPolicy::On(policy) => copy_gated(from, to, direction, tx, policy, endpoint, to_client),
+        McpPolicy::Broken => copy_broken(from, to, direction, tx, endpoint, to_client),
     }
 }
 
@@ -249,6 +279,7 @@ fn copy_broken<R: Read, W: Write>(
     to: &mut W,
     direction: &'static str,
     tx: &SyncSender<CopyNote>,
+    endpoint: Option<&Endpoint>,
     to_client: bool,
 ) -> io::Result<()> {
     let mut client: Box<dyn Write> = if to_client {
@@ -262,13 +293,21 @@ fn copy_broken<R: Read, W: Write>(
         let n = from.read(&mut buf)?;
         if n == 0 {
             if let Some(outcome) = splitter.finish() {
-                gate_broken(&outcome, to, client.as_mut(), direction, tx, true)?;
+                gate_broken(&outcome, to, client.as_mut(), direction, tx, endpoint, true)?;
             }
             to.flush()?;
             return Ok(());
         }
         for outcome in splitter.push(&buf[..n]) {
-            gate_broken(&outcome, to, client.as_mut(), direction, tx, false)?;
+            gate_broken(
+                &outcome,
+                to,
+                client.as_mut(),
+                direction,
+                tx,
+                endpoint,
+                false,
+            )?;
         }
     }
 }
@@ -279,6 +318,7 @@ fn gate_broken<W: Write>(
     client: &mut dyn Write,
     direction: &'static str,
     tx: &SyncSender<CopyNote>,
+    endpoint: Option<&Endpoint>,
     eof: bool,
 ) -> io::Result<()> {
     let FrameOutcome::Frame(frame) = outcome else {
@@ -307,7 +347,10 @@ fn gate_broken<W: Write>(
     };
     let action = apply_request(line, &frame_decision);
     write_action(&action, frame, to, Some(client), eof)?;
-    audit_mcp(&decision, line, None);
+    // A deny still happens when the audit cannot be stored. The notice is the
+    // only record of that drop; the policy file's text is not in it. The
+    // summary is the command the call carried, not the whole frame.
+    let _ = audit_mcp(&decision, &audit_before(line, &decision), None, endpoint);
     note_frame(outcome, direction, tx);
     Ok(())
 }
@@ -324,12 +367,13 @@ fn copy_gated<R: Read, W: Write>(
     direction: &'static str,
     tx: &SyncSender<CopyNote>,
     policy: &aw_pipeline::Policy,
+    endpoint: Option<&Endpoint>,
     to_client: bool,
 ) -> io::Result<()> {
     if to_client {
-        copy_gated_client(from, to, &mut io::stdout(), direction, tx, policy)
+        copy_gated_client(from, to, &mut io::stdout(), direction, tx, policy, endpoint)
     } else {
-        copy_gated_client(from, to, io::sink(), direction, tx, policy)
+        copy_gated_client(from, to, io::sink(), direction, tx, policy, endpoint)
     }
 }
 
@@ -340,70 +384,157 @@ fn copy_gated_client<R: Read, W: Write, C: Write>(
     direction: &'static str,
     tx: &SyncSender<CopyNote>,
     policy: &aw_pipeline::Policy,
+    endpoint: Option<&Endpoint>,
 ) -> io::Result<()> {
     let mut splitter = Splitter::new();
     let mut buf = [0_u8; 8 * 1024];
+    let mut gate = Gate {
+        client: &mut client,
+        direction,
+        tx,
+        policy,
+        endpoint,
+        eof: false,
+    };
     loop {
         let n = from.read(&mut buf)?;
         if n == 0 {
             if let Some(outcome) = splitter.finish() {
-                gate_one(&outcome, to, &mut client, direction, tx, policy, true)?;
+                gate.eof = true;
+                gate_one(&outcome, to, &mut gate)?;
             }
             to.flush()?;
             return Ok(());
         }
         for outcome in splitter.push(&buf[..n]) {
-            gate_one(&outcome, to, &mut client, direction, tx, policy, false)?;
+            gate.eof = false;
+            gate_one(&outcome, to, &mut gate)?;
         }
     }
+}
+
+/// What one gated line needs besides the bytes it is deciding.
+struct Gate<'a, C> {
+    /// Where a denied request's JSON-RPC error is written.
+    client: &'a mut C,
+    direction: &'static str,
+    tx: &'a SyncSender<CopyNote>,
+    policy: &'a aw_pipeline::Policy,
+    /// Audit post. `None` skips it.
+    endpoint: Option<&'a Endpoint>,
+    /// The frame had no trailing newline of its own.
+    eof: bool,
 }
 
 fn gate_one<W: Write, C: Write>(
     outcome: &FrameOutcome,
     to: &mut W,
-    client: &mut C,
-    direction: &'static str,
-    tx: &SyncSender<CopyNote>,
-    policy: &aw_pipeline::Policy,
-    eof: bool,
+    gate: &mut Gate<'_, C>,
 ) -> io::Result<()> {
     match outcome {
         FrameOutcome::Gap(_) => {
             // The splitter dropped an oversize line's bytes. There is nothing
             // left to forward. The notice is the only record.
-            note_frame(outcome, direction, tx);
+            note_frame(outcome, gate.direction, gate.tx);
             Ok(())
         }
         FrameOutcome::Frame(frame) => {
             let text = String::from_utf8_lossy(frame);
             let line = text.trim_end_matches('\r');
-            let decision = decide_line(policy, line, direction);
+            let decision = decide_line(gate.policy, line, gate.direction);
+            // Audit before the bytes move. A rewrite the daemon and the local
+            // file both refused is a deny (design §5.3): the replacement must
+            // not reach the server with no record of the change. The "before"
+            // text is the fields the rule looked at, not the whole frame: the
+            // frame can hold a sibling argument the rule did not touch.
+            let audited = if decision.effective != Action::Allow || decision.action != Action::Allow
+            {
+                Some(audit_mcp(
+                    &decision,
+                    &audit_before(line, &decision),
+                    planned_after(&decision).as_deref(),
+                    gate.endpoint,
+                ))
+            } else {
+                None
+            };
+            let decision = match audited {
+                Some(delivery)
+                    if delivery.delivered == aw_pipeline::Delivered::Dropped
+                        && decision.effective == Action::Rewrite =>
+                {
+                    delivery.downgrade_rewrite(&decision)
+                }
+                _ => decision,
+            };
             let changes = field_changes(&decision);
             let frame_decision = FrameDecision {
                 verdict: verdict_of(&decision),
                 reason: decision.reason.as_deref(),
                 fields: &changes,
             };
-            let action = if direction == DIR_C2S {
+            let action = if gate.direction == DIR_C2S {
                 apply_request(line, &frame_decision)
             } else {
                 apply_response(line, &frame_decision)
             };
-            write_action(&action, frame, to, Some(client), eof)?;
-            if decision.effective != Action::Allow || decision.action != Action::Allow {
-                audit_mcp(&decision, line, action_after(&action));
-            }
-            note_frame(outcome, direction, tx);
+            write_action(&action, frame, to, Some(gate.client), gate.eof)?;
+            note_frame(outcome, gate.direction, gate.tx);
             Ok(())
         }
     }
 }
 
-fn action_after(action: &FrameAction) -> Option<&str> {
-    match action {
-        FrameAction::Rewrite { bytes } => Some(bytes.as_str()),
-        FrameAction::Forward | FrameAction::Reject { .. } => None,
+/// What the audit stores as "before".
+///
+/// A rewrite names the fields it replaced, so those original values are the
+/// change. Anything else (a deny, an ask) keeps the command, path, or URL the
+/// rule matched, and falls back to the frame only when the line had none of
+/// those. The policy file's own text is never one of these.
+fn audit_before(line: &str, decision: &Decision) -> String {
+    if decision.action == Action::Rewrite && !decision.fields.is_empty() {
+        let Some(labels) = subject_from_frame(line) else {
+            return String::new();
+        };
+        let mut parts = Vec::new();
+        for (field, _) in &decision.fields {
+            let key = field.strip_prefix("arg.").unwrap_or(field.as_str());
+            let value = if key == "command" {
+                labels.command.clone()
+            } else {
+                labels
+                    .args
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.clone())
+            };
+            if let Some(value) = value {
+                parts.push(format!("{field}={value}"));
+            }
+        }
+        if !parts.is_empty() {
+            return parts.join("\n");
+        }
     }
+    subject_from_frame(line)
+        .and_then(|labels| labels.command)
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| line.to_owned())
+}
+
+/// What a rewrite would store as "after", before the frame is changed.
+///
+/// Only the fields the rule replaced. The rest of the JSON-RPC line can carry
+/// a sibling the rule did not touch.
+fn planned_after(decision: &Decision) -> Option<String> {
+    if decision.effective != Action::Rewrite {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for (field, value) in &decision.fields {
+        parts.push(format!("{field}={value}"));
+    }
+    Some(parts.join("\n"))
 }
 
 fn write_action<W: Write>(
@@ -513,7 +644,18 @@ fn deny_decision(reason: &str) -> Decision {
     }
 }
 
-fn audit_mcp(decision: &Decision, before: &str, after: Option<&str>) {
+/// Record one deny, rewrite, ask, or downgrade, then post it.
+///
+/// The local backup is written first. The daemon post uses `endpoint` (the
+/// address `aw` already resolved: `--socket`, `--http`, `AW_SOCKET`, or the
+/// platform default) and gives up after [`AUDIT_POST_BUDGET`]. `None` skips
+/// the post. A dropped rewrite is the caller's signal to deny instead.
+fn audit_mcp(
+    decision: &Decision,
+    before: &str,
+    after: Option<&str>,
+    endpoint: Option<&Endpoint>,
+) -> super::intercept_audit::AuditDelivery {
     let subject = subject_from_frame(before)
         .map(|labels| Subject {
             layer: Layer::Mcp,
@@ -545,20 +687,21 @@ fn audit_mcp(decision: &Decision, before: &str, after: Option<&str>) {
         None,
     );
     let delivery = super::intercept_audit::deliver(
-        None,
+        endpoint,
         backup.as_deref(),
         &mut record,
-        std::time::Duration::from_millis(20),
+        AUDIT_POST_BUDGET,
     );
-    // Both the local line and the daemon post failed. The deny already
-    // happened; this notice is the Gap the design requires for a dropped audit.
-    // It carries no command text.
+    // Both the local line and the daemon post failed. The notice is the Gap
+    // the design asks for. It carries no command text. A rewrite is not
+    // forwarded: the caller turns it into a deny.
     if delivery.delivered == aw_pipeline::Delivered::Dropped {
         let _ = writeln!(
             io::stderr(),
             "mcp-tap：拦截审计写不进去（intercept_audit_dropped）"
         );
     }
+    delivery
 }
 
 enum McpPolicy {
@@ -701,6 +844,18 @@ fn copy_gated_for_test(
     policy_text: &str,
     to_client: bool,
 ) -> io::Result<GatedCopy> {
+    copy_gated_for_test_at(input, direction, policy_text, to_client, None)
+}
+
+/// Same as [`copy_gated_for_test`], but the audit is posted to `endpoint`.
+#[cfg(test)]
+fn copy_gated_for_test_at(
+    input: &[u8],
+    direction: &'static str,
+    policy_text: &str,
+    to_client: bool,
+    endpoint: Option<&Endpoint>,
+) -> io::Result<GatedCopy> {
     let policy = match aw_pipeline::load_str(policy_text) {
         Ok(aw_pipeline::PolicyState::On(policy)) => policy,
         _ => {
@@ -719,6 +874,7 @@ fn copy_gated_for_test(
             direction,
             &tx,
             &policy,
+            endpoint,
         )?;
     } else {
         copy_gated_client(
@@ -728,6 +884,7 @@ fn copy_gated_for_test(
             direction,
             &tx,
             &policy,
+            endpoint,
         )?;
     }
     Ok(GatedCopy { child, client })
@@ -740,6 +897,18 @@ fn copy_broken_for_test(
     tx: &SyncSender<CopyNote>,
     child: &mut Vec<u8>,
     client: &mut Vec<u8>,
+) -> io::Result<()> {
+    copy_broken_for_test_at(input, direction, tx, child, client, None)
+}
+
+#[cfg(test)]
+fn copy_broken_for_test_at(
+    input: &[u8],
+    direction: &'static str,
+    tx: &SyncSender<CopyNote>,
+    child: &mut Vec<u8>,
+    client: &mut Vec<u8>,
+    endpoint: Option<&Endpoint>,
 ) -> io::Result<()> {
     let mut splitter = Splitter::new();
     let mut frames = splitter.push(input);
@@ -754,6 +923,7 @@ fn copy_broken_for_test(
             client,
             direction,
             tx,
+            endpoint,
             index == eof_at && !input.ends_with(b"\n"),
         )?;
     }
@@ -814,6 +984,16 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
 
     #[test]
     fn rewrite_reaches_the_child_and_a_miss_is_unchanged() {
+        // A rewrite with nowhere to record it is a deny. This test is about
+        // the rewrite itself, so it gets a local audit file.
+        let _guard = crate::cmd::policy_file::env_lock();
+        let dir = std::env::temp_dir().join(format!("aw-mcp-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _audit = crate::cmd::policy_file::EnvVarGuard::set(
+            crate::cmd::intercept_audit::AUDIT_ENV,
+            &dir.join("audit.jsonl"),
+        );
         let apply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"run\",\"arguments\":{\"command\":\"terraform apply\",\"dry\":false}}}\n";
         let copy = copy_gated_for_test(apply, DIR_C2S, REWRITE, true).unwrap();
         let child = String::from_utf8(copy.child).unwrap();
@@ -824,6 +1004,7 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
         let ping = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n";
         let copy = copy_gated_for_test(ping, DIR_C2S, REWRITE, true).unwrap();
         assert_eq!(copy.child, ping);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -853,6 +1034,7 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
             DIR_C2S,
             &tx,
             &McpPolicy::Off,
+            None,
             true,
         )
         .unwrap();

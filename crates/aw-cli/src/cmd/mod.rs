@@ -124,7 +124,7 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
     if let Some(outcome) = hook_command(&cli, env_token.as_deref()) {
         return Ok(outcome);
     }
-    if let Some(outcome) = mcp_tap_command(&cli) {
+    if let Some(outcome) = mcp_tap_command(&cli, env_token.as_deref()) {
         return Ok(outcome);
     }
     if let Some(outcome) = merge_command(&cli) {
@@ -610,7 +610,7 @@ fn dispatch(
     if let Some(outcome) = hook_command(&cli, env_token.as_deref()) {
         return Ok(outcome);
     }
-    if let Some(outcome) = mcp_tap_command(&cli) {
+    if let Some(outcome) = mcp_tap_command(&cli, env_token.as_deref()) {
         return Ok(outcome);
     }
     if let Some(outcome) = merge_command(&cli) {
@@ -697,14 +697,25 @@ fn merge_command(cli: &Cli) -> Option<Outcome> {
 /// A non-empty command spawns the wrapped server. It does not probe `/health`.
 /// There is no `AgentRpc` ingest route, so extracts are not posted. This must
 /// run before any "not in this build" check: the wrapper is connected.
-fn mcp_tap_command(cli: &Cli) -> Option<Outcome> {
+fn mcp_tap_command(cli: &Cli, env_token: Option<&str>) -> Option<Outcome> {
     let Command::McpTap { cmd } = &cli.command else {
         return None;
     };
     if cmd.is_empty() {
         return None;
     }
-    Some(mcp_tap::run(cmd))
+    // Same resolution as every other command: `--socket`, then `--http`, then
+    // `AW_SOCKET`, then the platform default. A failure is not fatal — the
+    // wrapper still runs — but an audit then has nowhere to go, and a rewrite
+    // with no local backup becomes a deny.
+    let input = EndpointInput {
+        socket: cli.socket.clone(),
+        http: cli.http.clone(),
+        token: cli.token.clone(),
+        token_env: env_token.map(str::to_owned),
+    };
+    let endpoint = endpoint::resolve(&input).ok();
+    Some(mcp_tap::run(cmd, endpoint.as_ref()))
 }
 
 /// Commands deliberately compiled into the command tree for compatibility but

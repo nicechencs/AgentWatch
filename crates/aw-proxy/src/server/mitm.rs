@@ -442,11 +442,19 @@ fn request_host(url: &str) -> Option<String> {
     let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let hostport = without_scheme.split('/').next().unwrap_or("");
     let host = hostport.split('@').next_back().unwrap_or(hostport);
-    let host = host.split(':').next().unwrap_or(host);
+    // `[::1]:8080` is one host. Splitting on the first colon would leave `[`.
+    let host = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inside, _)) => format!("[{inside}]"),
+            None => host.to_owned(),
+        }
+    } else {
+        host.split(':').next().unwrap_or(host).to_owned()
+    };
     if host.is_empty() {
         None
     } else {
-        Some(host.to_owned())
+        Some(host.to_ascii_lowercase())
     }
 }
 
@@ -454,21 +462,31 @@ fn request_host(url: &str) -> Option<String> {
 /// The reason is also a header so a client that ignores the body still sees it.
 fn deny_response(reason: &str) -> Response<hudsucker::Body> {
     let safe = header_safe(reason);
-    Response::builder()
+    let built = Response::builder()
         .status(403)
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .header("x-aw-reason", &safe)
-        .body(hudsucker::Body::from(safe.into_bytes()))
-        .unwrap_or_else(|_| Response::new(hudsucker::Body::from(Vec::<u8>::new())))
+        .body(hudsucker::Body::from(reason.as_bytes().to_vec()));
+    built.unwrap_or_else(|_| {
+        // `Response::new` is 200. A deny that failed to build is still a deny.
+        let mut response = Response::new(hudsucker::Body::from(reason.as_bytes().to_vec()));
+        *response.status_mut() = http::StatusCode::FORBIDDEN;
+        response
+    })
 }
 
-/// Header values cannot contain CR or LF. A reason with either is replaced
-/// by a fixed sentence so the response cannot be split.
+/// Header values are visible ASCII. Anything else, including CR, LF, and
+/// Chinese, is percent-encoded so the builder does not drop the header.
 fn header_safe(reason: &str) -> String {
-    if reason.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
-        return "已拒绝".to_owned();
+    let mut out = String::new();
+    for byte in reason.bytes() {
+        if byte.is_ascii_graphic() || byte == b' ' {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
     }
-    reason.to_owned()
+    out
 }
 
 fn c_size(collected: &http_body_util::Collected<hyper::body::Bytes>) -> u64 {
@@ -670,5 +688,86 @@ action = "deny"
             preview_proxy_decision(Some(&policy), "GET", "https://example.com/"),
             ProxyPreview::Forward
         );
+    }
+
+    /// A Chinese reason used to make the header builder fail, and the fallback
+    /// was `Response::new`, which is 200. A deny is 403 even then.
+    #[test]
+    fn deny_response_status_is_403_for_a_chinese_reason() {
+        let response = deny_response("不允许连这个网站");
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+        let reason = response
+            .headers()
+            .get("x-aw-reason")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            reason, "%E4%B8%8D%E5%85%81%E8%AE%B8%E8%BF%9E%E8%BF%99%E4%B8%AA%E7%BD%91%E7%AB%99",
+            "reason header: {reason}"
+        );
+        let broken = deny_response("line\r\nbreak");
+        assert_eq!(broken.status(), http::StatusCode::FORBIDDEN);
+        let broken_reason = broken
+            .headers()
+            .get("x-aw-reason")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(broken_reason, "line%0D%0Abreak", "{broken_reason}");
+    }
+
+    /// Host compare is case-insensitive. An IPv6 literal keeps the brackets and
+    /// does not stop at the first colon.
+    #[test]
+    fn request_host_folds_case_and_keeps_ipv6() {
+        assert_eq!(
+            request_host("https://Example.COM/a"),
+            Some("example.com".to_owned())
+        );
+        assert_eq!(
+            request_host("https://user:pw@Example.COM:443/a"),
+            Some("example.com".to_owned())
+        );
+        assert_eq!(
+            request_host("http://[::1]:8080/a"),
+            Some("[::1]".to_owned())
+        );
+        assert_eq!(request_host("http://[::1]/a"), Some("[::1]".to_owned()));
+        assert_eq!(
+            request_host("http://127.0.0.1:9/a"),
+            Some("127.0.0.1".to_owned())
+        );
+
+        let policy = enabled(
+            r#"
+version = 1
+enabled = true
+[[rule]]
+id = "block"
+layer = ["proxy"]
+match.host = { exact = "example.com" }
+action = "deny"
+reason = "不允许连这个网站"
+"#,
+        );
+        match preview_proxy_decision(Some(&policy), "GET", "https://Example.COM/a") {
+            ProxyPreview::Deny { status, .. } => assert_eq!(status, 403),
+            ProxyPreview::Forward => panic!("mixed-case host was forwarded"),
+        }
+        let v6 = enabled(
+            r#"
+version = 1
+enabled = true
+[[rule]]
+id = "loop"
+layer = ["proxy"]
+match.host = { exact = "[::1]" }
+action = "deny"
+reason = "不允许连这个网站"
+"#,
+        );
+        match preview_proxy_decision(Some(&v6), "GET", "http://[::1]:8080/a") {
+            ProxyPreview::Deny { status, .. } => assert_eq!(status, 403),
+            ProxyPreview::Forward => panic!("ipv6 host was forwarded"),
+        }
     }
 }

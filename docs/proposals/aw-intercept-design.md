@@ -242,8 +242,9 @@ reason = "不允许连这个网站"
 
 ## 6. 安全边界（要写在界面和文档里）
 
-- **agent 以管理员 / root 身份运行时，aw 管不住**：它可以改 aw 的规则、杀掉 aw、关掉 hook。第一步检测到目标以 root / 提权运行时，提示「拦截不可靠」。
-- **agent 能改自己的配置**：Claude Code 的 `--settings` 比项目配置优先，项目里的 `disableAllHooks` 压不过；但管理员策略 `allowManagedHooksOnly`、`--bare`、`--safe-mode` 会让我们的 hook 不跑。`aw run` 发现命令行里的 `--bare` 和 `--safe-mode` 时提示。`allowManagedHooksOnly` 在受管设置里，这一进程不读那份文件，发现不了。
+- **agent 以管理员 / root 身份运行时，aw 管不住**：它可以改 aw 的规则、杀掉 aw、关掉 hook。第一步不检测 root，也不提示。不是做不到：Linux 可以读 `/proc/self/status` 的 `Uid`，或者跑 `id -u`，都不用 FFI，留待后续。
+- **agent 能改自己的配置**：Claude Code 的 `--settings` 比项目配置优先，项目里的 `disableAllHooks` 压不过；但管理员策略 `allowManagedHooksOnly`、`--bare`、`--safe-mode` 会让我们的 hook 不跑。`aw run` 发现命令行里的 `--bare` 和 `--safe-mode` 时提示。`allowManagedHooksOnly` 的受管设置路径是公开的，但这一进程不读那份文件；它也可能由 MDM 或服务端下发，所以只读文件也覆盖不全。
+- **版本检查看的是启动命令的第一个参数**：`aw run -- npx claude` 跑的是 `npx --version`。npx 报出的版本（例如 10.x）高于 2.1.295，这时不会提示「`onFailure: block` 靠不住」，即使真正的 Claude Code 更旧。
 - **临时 settings 和规则文件属于同一个用户**：`aw run` 写的 settings 和 `policy.toml` 都在这个用户名下。被启动的程序能改规则文件；Claude Code 会重新加载 settings。aw 发现不了这种改动，之后的拦截按改过的内容执行。
 - **hook 只管工具调用**：agent 自己访问模型 API、Codex 的托管工具（WebSearch）不走 hook。
 - **代理能被绕过**：程序不读代理环境变量、或自己带证书库，就看不到、拦不住。

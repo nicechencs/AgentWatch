@@ -1652,19 +1652,6 @@ fn claude_flag_note(command: &[String]) -> Option<&'static str> {
     }
 }
 
-/// stderr when the caller says this process is root.
-///
-/// Test-only. The launch path does not ask the OS: `aw-cli` does not call
-/// `geteuid`, and Windows elevation is not detected.
-#[cfg(test)]
-fn root_note(is_root: bool) -> Option<&'static str> {
-    if is_root {
-        Some("[aw] 提示：这次以管理员身份运行，拦截不可靠。管理员可以改规则、关掉 hook。\n")
-    } else {
-        None
-    }
-}
-
 /// Ask `program --version` and parse it. A missing program, a hang, or a line
 /// without three numbers is `None`. The wait is capped so a stuck binary
 /// cannot hold the launch.
@@ -1701,9 +1688,11 @@ fn probe_claude_version(program: &str) -> Option<(u64, u64, u64)> {
 
 /// Notes for a launch that injected hooks. Empty when there is nothing to say.
 ///
-/// Root is not included: this crate does not ask the OS whether it is an
-/// admin. `--bare` / `--safe-mode` are visible on the command. The version is
-/// whatever `program --version` printed.
+/// Root is not checked. Step 1 does not ask the OS; reading `/proc/self/status`
+/// or `id -u` is left for later, and neither needs FFI. `--bare` /
+/// `--safe-mode` are visible on the command. The version is whatever
+/// `program --version` printed, and `program` is `spec.command[0]`:
+/// `aw run -- npx claude` reports npx's version.
 fn intercept_limit_notes(spec: &crate::launch::RunSpec) -> String {
     let mut out = String::new();
     let program = spec.command.first().map(String::as_str).unwrap_or("");
@@ -2769,10 +2758,6 @@ mod intercept_inject_tests {
                 .is_none()
         );
         assert!(claude_flag_note(&["claude".to_owned(), "--barely".to_owned()]).is_none());
-
-        let root = root_note(true).unwrap();
-        assert!(root.contains("拦截不可靠"), "{root}");
-        assert!(root_note(false).is_none());
     }
 
     /// Every PreToolUse / PostToolUse hook command in the injected settings.

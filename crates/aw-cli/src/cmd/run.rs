@@ -1550,6 +1550,11 @@ fn rewrite_notice(rewrites: bool) -> Option<&'static str> {
 fn enabled_omitted_note() -> Option<String> {
     let path = policy_path_in_env();
     let text = std::fs::read_to_string(&path).ok()?;
+    // An unknown key is a broken file. `aw hook` denies that. Saying "you
+    // forgot enabled" would hide the typo (`enable = true`).
+    if aw_pipeline::load_str(&text).is_err() {
+        return None;
+    }
     if aw_pipeline::rules_without_enabled(&text) {
         Some(
             "[aw] 提示：规则文件里有规则，但没有写 enabled，拦截没有打开。要打开请写 enabled = true。\n"
@@ -2562,6 +2567,15 @@ mod intercept_inject_tests {
             spec.command
         );
 
+        std::fs::write(
+            &policy,
+            "version = 1\nenable = true\n[[rule]]\naction = \"deny\"\n",
+        )
+        .unwrap();
+        assert!(
+            enabled_omitted_note().is_none(),
+            "an unknown key is a broken file, not a missing enabled switch"
+        );
         std::fs::write(&policy, "version = 1\nenabled = false\n").unwrap();
         assert!(
             enabled_omitted_note().is_none(),

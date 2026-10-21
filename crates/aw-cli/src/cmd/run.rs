@@ -1288,11 +1288,19 @@ pub(crate) fn run(
         let cleanup = intercept_dir
             .as_deref()
             .and_then(|dir| cleanup_intercept_dir(dir).err());
-        let mut stderr = notice.unwrap_or("").to_owned();
-        if let Some(note) = omitted {
-            stderr.push_str(&note);
+        // `--json` asked for a document. With no summary there is nothing to
+        // print; a note here would be the only line, and not JSON.
+        let mut stderr = if args.json {
+            String::new()
+        } else {
+            notice.unwrap_or("").to_owned()
+        };
+        if !args.json {
+            if let Some(note) = omitted {
+                stderr.push_str(&note);
+            }
+            stderr.push_str(&limits);
         }
-        stderr.push_str(&limits);
         let mut outcome = Outcome {
             code: launched.code,
             stdout: Vec::new(),
@@ -1329,13 +1337,18 @@ pub(crate) fn run(
         stdout: Vec::new(),
         stderr,
     };
-    if let Some(notice) = notice {
-        outcome.stderr.extend_from_slice(notice.as_bytes());
+    // `--json` stderr is one JSON document. A note after it is a second line,
+    // and `serde_json::from_slice` rejects that as trailing characters. The
+    // human summary still gets the notes.
+    if !args.json {
+        if let Some(notice) = notice {
+            outcome.stderr.extend_from_slice(notice.as_bytes());
+        }
+        if let Some(note) = omitted {
+            outcome.stderr.extend_from_slice(note.as_bytes());
+        }
+        outcome.stderr.extend_from_slice(limits.as_bytes());
     }
-    if let Some(note) = omitted {
-        outcome.stderr.extend_from_slice(note.as_bytes());
-    }
-    outcome.stderr.extend_from_slice(limits.as_bytes());
     append_cleanup_note(&mut outcome, cleanup);
     outcome
 }
@@ -1969,19 +1982,27 @@ pub(crate) fn daemon_run(
         .err()
         .map(|error| format!("[aw] 警告：daemon 未记录程序退出码：{error}\n"));
     if level == SummaryLevel::None || args.quiet {
-        let mut stderr = notice.unwrap_or("").to_owned();
-        if let Some(note) = &omitted {
-            stderr.push_str(note);
-        }
-        stderr.push_str(&limits);
-        if let Some(warning) = pin_warning.clone() {
-            stderr.push_str(&warning);
-        }
-        if let Some(warning) = leftovers_warning {
-            stderr.push_str(&warning);
-        }
-        if let Some(warning) = exit_warning {
-            stderr.push_str(&warning);
+        // `--json` with no summary still emits nothing: the flag asked for a
+        // document, and there is none. Notes stay on the human path only.
+        let mut stderr = if args.json {
+            String::new()
+        } else {
+            notice.unwrap_or("").to_owned()
+        };
+        if !args.json {
+            if let Some(note) = &omitted {
+                stderr.push_str(note);
+            }
+            stderr.push_str(&limits);
+            if let Some(warning) = pin_warning.clone() {
+                stderr.push_str(&warning);
+            }
+            if let Some(warning) = leftovers_warning {
+                stderr.push_str(&warning);
+            }
+            if let Some(warning) = exit_warning {
+                stderr.push_str(&warning);
+            }
         }
         return finish_daemon(
             intercept_dir.as_deref(),
@@ -2014,21 +2035,25 @@ pub(crate) fn daemon_run(
             super::error_outcome(exit::GENERAL, "summary", &error.to_string(), args.json),
         );
     }
-    if let Some(notice) = notice {
-        stderr.extend_from_slice(notice.as_bytes());
-    }
-    if let Some(note) = omitted {
-        stderr.extend_from_slice(note.as_bytes());
-    }
-    stderr.extend_from_slice(limits.as_bytes());
-    if let Some(warning) = pin_warning {
-        stderr.extend_from_slice(warning.as_bytes());
-    }
-    if let Some(warning) = leftovers_warning {
-        stderr.extend_from_slice(warning.as_bytes());
-    }
-    if let Some(warning) = exit_warning {
-        stderr.extend_from_slice(warning.as_bytes());
+    // Same rule as `run`: one JSON document, nothing after it. Pin, leftover,
+    // and exit warnings are `[aw]` text; they stay on the human summary.
+    if !args.json {
+        if let Some(notice) = notice {
+            stderr.extend_from_slice(notice.as_bytes());
+        }
+        if let Some(note) = omitted {
+            stderr.extend_from_slice(note.as_bytes());
+        }
+        stderr.extend_from_slice(limits.as_bytes());
+        if let Some(warning) = pin_warning {
+            stderr.extend_from_slice(warning.as_bytes());
+        }
+        if let Some(warning) = leftovers_warning {
+            stderr.extend_from_slice(warning.as_bytes());
+        }
+        if let Some(warning) = exit_warning {
+            stderr.extend_from_slice(warning.as_bytes());
+        }
     }
     finish_daemon(
         intercept_dir.as_deref(),
@@ -3224,6 +3249,70 @@ mod tests {
         String::from_utf8(bytes.to_vec()).expect("utf8")
     }
 
+    /// Point config homes at an empty crate directory and clear the intercept
+    /// variables. `AW_POLICY` unset makes `aw run` read `%APPDATA%` on Windows
+    /// and `$XDG_CONFIG_HOME` / `$HOME/.config` elsewhere; a real policy file
+    /// there appends a note after the JSON summary.
+    fn isolate_config() -> IsolatedConfig {
+        let lock = super::super::policy_file::env_lock();
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("run-tests")
+            .join(format!(
+                "home-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let homes = ["XDG_CONFIG_HOME", "HOME", "APPDATA", "LOCALAPPDATA"]
+            .into_iter()
+            .map(|key| super::super::policy_file::EnvVarGuard::set_text(key, &dir))
+            .collect();
+        let cleared = [
+            "AW_POLICY",
+            "AW_SOCKET",
+            "AW_INTERCEPT_AUDIT",
+            "AW_TOKEN",
+            "AW_HTTP",
+            "AW_SYSTEM_SOCKET",
+            "AW_SESSION",
+        ]
+        .into_iter()
+        .map(super::super::policy_file::EnvVarGuard::unset)
+        .collect();
+        IsolatedConfig {
+            _lock: lock,
+            dir,
+            homes,
+            cleared,
+        }
+    }
+
+    /// Restores the variables `isolate_config` changed and deletes the scratch dir.
+    ///
+    /// The lock is held for the whole guard. `AW_POLICY` and the config homes
+    /// are process-global, and other tests in this binary set them too.
+    struct IsolatedConfig {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        /// Scratch directory the four config homes point at. Visible to the
+        /// tests in this module, which write a policy file under it.
+        dir: std::path::PathBuf,
+        homes: Vec<super::super::policy_file::EnvVarGuard>,
+        cleared: Vec<super::super::policy_file::EnvVarGuard>,
+    }
+
+    impl Drop for IsolatedConfig {
+        fn drop(&mut self) {
+            self.homes.clear();
+            self.cleared.clear();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     /// A rewrite rule prints `allow` plus the new arguments, which Claude Code
     /// treats as approval. The launch says so once, on stderr.
     #[test]
@@ -3269,6 +3358,31 @@ mod tests {
         assert!(err.contains("改写"), "{err}");
         assert!(err.contains("权限确认"), "{err}");
         assert!(!err.contains("上传了"), "{err}");
+
+        // The same rule under `--json` must not follow the summary. Claude Code
+        // treats a rewrite as approval; that sentence stays on the human summary.
+        let mut json_args = args(&command);
+        json_args.json = true;
+        json_args.quiet = true;
+        let mut launcher = FakeLaunch {
+            code: 0,
+            sampling_seen: None,
+            forwarded: Vec::new(),
+            env_len: None,
+            fail: None,
+        };
+        let outcome = run(
+            &json_args,
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut FixedSummary(None),
+        );
+        let err = text(&outcome.stderr);
+        assert!(
+            err.is_empty(),
+            "--json with no summary must not print the rewrite note: {err}"
+        );
+        assert!(outcome.stdout.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3302,6 +3416,7 @@ mod tests {
 
     #[test]
     fn daemon_zero_process_summary_says_it_exited_before_sampling() {
+        let _home = isolate_config();
         let command = vec!["tool".to_owned()];
         let zero = Summary {
             session_id: Some("s-fast".to_owned()),
@@ -3336,6 +3451,65 @@ mod tests {
             serde_json::from_slice(&outcome.stderr).expect("JSON summary");
         assert_eq!(body["processes"], 0);
         assert_eq!(body["processes_note"], "exited_before_sampled");
+    }
+
+    /// `--json` puts one JSON document on stderr. A policy note (rules present,
+    /// `enabled` never set) used to be appended after that document, so
+    /// `from_slice` failed with "trailing characters" on line 2. The note still
+    /// belongs on stderr when the summary is human text.
+    #[test]
+    fn json_summary_stays_one_document_when_enabled_is_omitted() {
+        // Holds the process-wide env lock and points every config home at an
+        // empty directory, so a parallel test or a runner policy cannot add a
+        // second stderr line of its own.
+        let home = isolate_config();
+        let policy_dir = home.dir.join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        let policy = policy_dir.join("policy.toml");
+        std::fs::write(
+            &policy,
+            "[[rule]]\nid = \"no-rm\"\nlayer = [\"hook\"]\naction = \"deny\"\n",
+        )
+        .unwrap();
+        let _policy = super::super::policy_file::EnvVarGuard::set(
+            super::super::policy_file::POLICY_ENV,
+            &policy,
+        );
+        let command = vec!["tool".to_owned()];
+        let mut json_args = args(&command);
+        json_args.json = true;
+        let mut launcher = fake_exit_7();
+        let outcome = run(
+            &json_args,
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut EmptySummary,
+        );
+        let err = text(&outcome.stderr);
+        let body: serde_json::Value = serde_json::from_str(err.trim_end()).expect(&err);
+        assert_eq!(body["available"], false, "{err}");
+        assert_eq!(body["reason"], "摘要不可用", "{err}");
+        assert!(
+            !err.contains("enabled"),
+            "--json stderr must be the summary alone, got {err}"
+        );
+        assert!(outcome.stdout.is_empty(), "{:?}", outcome.stdout);
+
+        let mut human = args(&command);
+        human.json = false;
+        let mut launcher = fake_exit_7();
+        let outcome = run(
+            &human,
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut EmptySummary,
+        );
+        let err = text(&outcome.stderr);
+        assert!(err.contains("摘要不可用"), "{err}");
+        assert!(
+            err.contains("没有写 enabled") && err.contains("没有打开"),
+            "the human summary must still name the missing switch: {err}"
+        );
     }
 
     #[test]
@@ -3463,6 +3637,7 @@ mod tests {
 
     #[test]
     fn requests_do_not_override_fixed_summary_evidence_or_confirm_a_pin() {
+        let _home = isolate_config();
         let command = vec!["tool".to_owned()];
         for json in [false, true] {
             let mut ran = args(&command);
@@ -3502,6 +3677,7 @@ mod tests {
 
     #[test]
     fn empty_summary_keeps_pin_and_sampling_unknown() {
+        let _home = isolate_config();
         let command = vec!["tool".to_owned()];
         for pin in [false, true] {
             for no_daemon in [false, true] {
@@ -3543,6 +3719,7 @@ mod tests {
 
     #[test]
     fn summary_failure_keeps_target_exit_and_unknown_results() {
+        let _home = isolate_config();
         let command = vec!["tool".to_owned()];
         for json in [false, true] {
             let mut ran = args(&command);
@@ -3573,6 +3750,7 @@ mod tests {
 
     #[test]
     fn quiet_or_summary_none_skips_requests_and_summary_source() {
+        let _home = isolate_config();
         let command = vec!["tool".to_owned()];
         for json in [false, true] {
             for (quiet, level) in [(true, Some("full")), (false, Some("none"))] {
@@ -3596,6 +3774,7 @@ mod tests {
 
     #[test]
     fn json_unknown_counts_are_null_and_domain_array_is_preserved() {
+        let _home = isolate_config();
         let command = vec!["tool".to_owned()];
         let mut ran = args(&command);
         ran.json = true;
@@ -4423,6 +4602,7 @@ mod tests {
 
     #[test]
     fn daemon_json_summary_keeps_the_real_session_id() {
+        let _home = isolate_config();
         let command = vec!["tool".to_owned()];
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut sessions = FakeSessions::new(Rc::clone(&log));

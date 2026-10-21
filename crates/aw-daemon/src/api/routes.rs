@@ -850,12 +850,41 @@ pub(crate) fn dispatch_peer(
             "the internal channel serves /health and /api/v1 only",
         );
     }
+    // The hook and intercept writers have no ticket. On the loopback HTTP
+    // listener `dispatch` answers them before authentication, still requiring a
+    // loopback Host. This channel is a filesystem socket or a named pipe: there
+    // is no Host and no port, and the peer was already identified by the
+    // transport. Sending them through `route_authed` answered 404, so a rewrite
+    // whose audit could not be stored was downgraded to a deny. They are
+    // answered here, and the Host check is skipped because a curl-style
+    // `Host: localhost` (no port) would otherwise be 421. The HTTP listener does
+    // not call this function, so its loopback Host check is unchanged.
+    if req.path == "/api/v1/agent/hook" && req.method.eq_ignore_ascii_case("POST") {
+        return ingest_agent_hook(state, &peer_without_host(req));
+    }
+    if req.path == "/api/v1/agent/intercept" && req.method.eq_ignore_ascii_case("POST") {
+        return ingest_intercept(state, &peer_without_host(req));
+    }
     let mut peer_req = req.clone();
     peer_req.headers.remove("authorization");
     route_authed(state, &peer_req, caller)
 }
 
-/// `POST /api/v1/agent/hook`. Loopback only. No bearer: the hook process has no ticket.
+/// A copy of `req` with no `Host`, so [`req_host_bad`] does not refuse it.
+///
+/// Unix sockets and named pipes have no host and no listen port. The ingest
+/// functions still check Host, because the HTTP listener calls them too; that
+/// check stays. Only this channel drops the header first.
+fn peer_without_host(req: &HttpRequest) -> HttpRequest {
+    let mut peer_req = req.clone();
+    peer_req.headers.remove("host");
+    peer_req
+}
+
+/// `POST /api/v1/agent/hook`. No bearer: the hook process has no ticket.
+///
+/// On the HTTP listener a loopback Host is required. The internal channel
+/// ([`dispatch_peer`]) has no Host; it strips the header before calling this.
 ///
 /// `dropped: true` records a `self_report_dropped` gap and does not insert a
 /// tool call. Any other body is parsed by [`super::agent::ingest_hook`] and,
@@ -864,7 +893,11 @@ pub(crate) fn dispatch_peer(
 fn ingest_agent_hook(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     let _busy_deadline = aw_store::BusyDeadline::start(aw_store::BUSY_TIMEOUT);
     let host = req.headers.get("host").cloned();
-    if req_host_bad(&host, req.listen_port) {
+    // A missing Host is loopback. The HTTP parser always inserts one
+    // (`http.rs`), so an HTTP request still has to name 127.0.0.1 or localhost
+    // with the listen port. The socket and the named pipe have nothing to put
+    // there; [`dispatch_peer`] strips a client-supplied Host before calling this.
+    if host.is_some() && req_host_bad(&host, req.listen_port) {
         return misdirected();
     }
     let value: serde_json::Value = match serde_json::from_slice(&req.body) {
@@ -991,7 +1024,10 @@ fn ingest_agent_hook(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     ApiResponse::json(200, &json!({ "accepted": accepted }))
 }
 
-/// `POST /api/v1/agent/intercept`. Loopback only. No bearer.
+/// `POST /api/v1/agent/intercept`. No bearer.
+///
+/// On the HTTP listener a loopback Host is required. The internal channel
+/// ([`dispatch_peer`]) has no Host; it strips the header before calling this.
 ///
 /// The body is an already-redacted audit record. `dropped: true` records an
 /// `intercept_audit_dropped` gap and does not insert a row. A missing required
@@ -999,7 +1035,9 @@ fn ingest_agent_hook(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
 fn ingest_intercept(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     let _busy_deadline = aw_store::BusyDeadline::start(aw_store::BUSY_TIMEOUT);
     let host = req.headers.get("host").cloned();
-    if req_host_bad(&host, req.listen_port) {
+    // See [`ingest_agent_hook`]: a present Host must be loopback. No Host is the
+    // internal channel, which has no host and no port.
+    if host.is_some() && req_host_bad(&host, req.listen_port) {
         return misdirected();
     }
     let value: serde_json::Value = match serde_json::from_slice(&req.body) {
@@ -2890,8 +2928,8 @@ fn forbidden() -> ApiResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        database_busy_json, database_read_only_newer_response, dispatch, not_implemented, ApiState,
-        HttpBind, HttpRequest,
+        database_busy_json, database_read_only_newer_response, dispatch, dispatch_peer,
+        not_implemented, ApiState, HttpBind, HttpRequest,
     };
     use crate::api::auth::{TicketStore, UI_TICKET_TTL};
     use crate::api::pipe_dacl_configured;
@@ -3012,6 +3050,136 @@ mod tests {
             &req("GET", "/api/v1/sessions", Some("127.0.0.1:7456"), None, b""),
         );
         assert_eq!(response.status, 401);
+    }
+
+    /// The socket and the named pipe reach hook and intercept without a ticket
+    /// and without a Host. HTTP still refuses a foreign Host with 421.
+    #[test]
+    fn socket_and_pipe_ingest_hook_and_intercept() {
+        let dir = std::env::temp_dir().join(format!(
+            "aw-routes-peer-ingest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let db = dir.join("agentwatch.db");
+        let opened = (|| -> Result<(), String> {
+            let store = aw_store::Store::open(&db).map_err(|err| err.to_string())?;
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO sessions (public_id, mode, user_id, started_ns, platform, collectors) \
+                     VALUES ('s-peer', 'launch', 'alice', 1, 'linux', '[]')",
+                    [],
+                )
+                .map_err(|err| err.to_string())?;
+            Ok(())
+        })();
+        assert!(opened.is_ok(), "{opened:?}");
+
+        let mut state = ApiState::new(1_000);
+        state.query = crate::api::query::StoreQuery::open_path(db.clone());
+        let caller = crate::api::auth::Caller {
+            user_id: "alice".to_owned(),
+            admin: false,
+            peer: None,
+        };
+        // What curl --unix-socket sends: Host is `localhost` with no port.
+        let mut headers = BTreeMap::new();
+        headers.insert("host".to_owned(), "localhost".to_owned());
+        headers.insert("content-type".to_owned(), "application/json".to_owned());
+        let intercept = HttpRequest {
+            method: "POST".to_owned(),
+            path: "/api/v1/agent/intercept".to_owned(),
+            query: String::new(),
+            headers: headers.clone(),
+            body: br#"{"session":"s-peer","agent":"claude-code","layer":"hook","event":"PreToolUse","rule_id":"x","action":"rewrite","effective_action":"rewrite","tool":"Bash","before_summary":"echo","before_hash":"ab","evidence":"E3","source":"intercept.claude-code/hook"}"#.to_vec(),
+            listen_port: 0,
+            body_too_large: false,
+        };
+        let stored = dispatch_peer(&mut state, &intercept, &caller);
+        assert_eq!(
+            stored.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&stored.body)
+        );
+        assert_eq!(json_body(&stored)["stored"], true);
+
+        let hook = HttpRequest {
+            method: "POST".to_owned(),
+            path: "/api/v1/agent/hook".to_owned(),
+            headers: headers.clone(),
+            body: br#"{"agent":"claude-code","session":"s-peer","payload":{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"echo"}}}"#.to_vec(),
+            ..intercept.clone()
+        };
+        let hooked = dispatch_peer(&mut state, &hook, &caller);
+        assert_eq!(
+            hooked.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&hooked.body)
+        );
+        let accepted = json_body(&hooked)["accepted"].as_u64().unwrap_or(0);
+        assert!(
+            accepted >= 1,
+            "hook did not land: {}",
+            String::from_utf8_lossy(&hooked.body)
+        );
+
+        let counted = (|| -> Result<(i64, i64), String> {
+            let store = aw_store::Store::open(&db).map_err(|err| err.to_string())?;
+            let intercepts: i64 = store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM intercept_events WHERE before_summary = 'echo'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|err| err.to_string())?;
+            let hooks: i64 = store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_events WHERE agent = 'claude-code'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|err| err.to_string())?;
+            Ok((intercepts, hooks))
+        })();
+        assert_eq!(
+            counted.ok(),
+            Some((1, i64::try_from(accepted).unwrap_or(0)))
+        );
+
+        // Same bodies over HTTP. A foreign Host stays 421. A loopback Host stores.
+        let mut foreign = intercept.clone();
+        foreign
+            .headers
+            .insert("host".to_owned(), "evil.com".to_owned());
+        foreign.listen_port = 7456;
+        let refused = dispatch(&mut state, &foreign);
+        assert_eq!(refused.status, 421);
+
+        let mut loopback = intercept;
+        loopback
+            .headers
+            .insert("host".to_owned(), "127.0.0.1:7456".to_owned());
+        loopback.listen_port = 7456;
+        loopback.body = br#"{"session":"s-peer","agent":"claude-code","layer":"hook","event":"PreToolUse","rule_id":"x","action":"deny","effective_action":"deny","tool":"Bash","before_summary":"echo-http","before_hash":"cd","evidence":"E3","source":"intercept.claude-code/hook"}"#.to_vec();
+        let via_http = dispatch(&mut state, &loopback);
+        assert_eq!(
+            via_http.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&via_http.body)
+        );
+        assert_eq!(json_body(&via_http)["stored"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

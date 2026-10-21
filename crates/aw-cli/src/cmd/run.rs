@@ -1247,14 +1247,21 @@ pub(crate) fn run(
     launcher: &mut dyn Launcher,
     summary: &mut dyn SessionSummary,
 ) -> Outcome {
-    let (level, spec) = match prepare(args, deferred) {
+    let (level, mut spec) = match prepare(args, deferred) {
         Ok(prepared) => prepared,
+        Err(outcome) => return outcome,
+    };
+    let intercept_dir = match inject_claude_intercept(args, deferred, &mut spec) {
+        Ok(dir) => dir,
         Err(outcome) => return outcome,
     };
 
     let launched = match launcher.launch(&spec) {
         Ok(launched) => launched,
         Err(err) => {
+            let cleanup = intercept_dir
+                .as_deref()
+                .and_then(|dir| cleanup_intercept_dir(dir).err());
             let error_code = err.code().unwrap_or("launch");
             let code = if args.no_daemon {
                 exit::GENERAL
@@ -1263,16 +1270,23 @@ pub(crate) fn run(
             } else {
                 exit::GENERAL
             };
-            return super::error_outcome(code, error_code, &err.to_string(), args.json);
+            let mut outcome = super::error_outcome(code, error_code, &err.to_string(), args.json);
+            append_cleanup_note(&mut outcome, cleanup);
+            return outcome;
         }
     };
 
     if level == SummaryLevel::None || args.quiet {
-        return Outcome {
+        let cleanup = intercept_dir
+            .as_deref()
+            .and_then(|dir| cleanup_intercept_dir(dir).err());
+        let mut outcome = Outcome {
             code: launched.code,
             stdout: Vec::new(),
             stderr: Vec::new(),
         };
+        append_cleanup_note(&mut outcome, cleanup);
+        return outcome;
     }
 
     let figures = summary.summarize(args.name);
@@ -1286,12 +1300,31 @@ pub(crate) fn run(
         None,
         PinState::Unknown,
     ) {
-        return super::error_outcome(exit::GENERAL, "summary", &err.to_string(), args.json);
+        let cleanup = intercept_dir
+            .as_deref()
+            .and_then(|dir| cleanup_intercept_dir(dir).err());
+        let mut outcome =
+            super::error_outcome(exit::GENERAL, "summary", &err.to_string(), args.json);
+        append_cleanup_note(&mut outcome, cleanup);
+        return outcome;
     }
-    Outcome {
+    let cleanup = intercept_dir
+        .as_deref()
+        .and_then(|dir| cleanup_intercept_dir(dir).err());
+    let mut outcome = Outcome {
         code: launched.code,
         stdout: Vec::new(),
         stderr,
+    };
+    append_cleanup_note(&mut outcome, cleanup);
+    outcome
+}
+
+/// A cleanup failure is a note on the outcome, not a swallowed error and not a
+/// changed exit code: the target already ran.
+fn append_cleanup_note(outcome: &mut Outcome, note: Option<String>) {
+    if let Some(note) = note {
+        outcome.stderr.extend(format!("[aw] {note}\n").into_bytes());
     }
 }
 
@@ -1409,28 +1442,29 @@ fn prepare(
     spec.env = env;
     spec.no_follow_children = args.no_follow_children;
     spec.no_daemon = args.no_daemon;
-    if let Some(outcome) = inject_claude_intercept(args, deferred, &mut spec) {
-        return Err(outcome);
-    }
+    // Validation only. Writing the settings file here would run twice: `preflight`
+    // calls this, then `daemon_run` calls it again, and each call minted a new
+    // `aw-intercept-<pid>-<ns>` directory and appended another `--settings`.
+    claude_intercept_enabled(args, deferred, &spec)?;
     Ok((level, spec))
 }
 
 /// Claude Code intercept injection (P5-SEC-02).
 ///
-/// Off unless `--intercept` was passed or the policy file is enabled. A temp
-/// settings file is written under the system temp directory (not `~/.claude/`)
-/// and `--settings <path>` is appended. The hook command is this binary's
-/// absolute path, `args` are `["hook", "claude-code"]`, and `onFailure` is
-/// `block`. Codex is not injected: that path is unverified, and the manual
-/// fragment lives in the adapter.
+/// Off unless `--intercept` was passed or the policy file is enabled. When it
+/// is on, [`inject_claude_intercept`] writes one temp settings file (not under
+/// `~/.claude/`) and appends `--settings <path>` once. The hook command is this
+/// binary's absolute path, `args` are `["hook", "claude-code"]`, and
+/// `onFailure` is `block`. Codex is not injected: that path is unverified, and
+/// the manual fragment lives in the adapter.
 ///
-/// Returns `Some` only when the settings file could not be written. That is a
-/// failed launch, not a launch without the hook the operator asked for.
-fn inject_claude_intercept(
+/// `Err` means the launch must not start: the policy file could not be read.
+/// `Ok(None)` means intercept is off for this command.
+fn claude_intercept_enabled(
     args: &RunArgs<'_>,
     deferred: DeferredFlags,
-    spec: &mut crate::launch::RunSpec,
-) -> Option<Outcome> {
+    spec: &crate::launch::RunSpec,
+) -> Result<Option<()>, Outcome> {
     let agent = args.agent.unwrap_or("");
     let looks_like_claude = agent == "claude-code"
         || agent == "claude"
@@ -1439,7 +1473,7 @@ fn inject_claude_intercept(
             .first()
             .is_some_and(|program| program.rsplit(['/', '\\']).next() == Some("claude"));
     if !looks_like_claude {
-        return None;
+        return Ok(None);
     }
     let policy = super::policy_file::load_policy(
         std::env::var_os(super::policy_file::POLICY_ENV)
@@ -1455,8 +1489,30 @@ fn inject_claude_intercept(
             policy,
             super::policy_file::PolicyLoad::On(_) | super::policy_file::PolicyLoad::Broken
         );
-    if !enabled {
-        return None;
+    if enabled {
+        Ok(Some(()))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Write one settings file and append `--settings` exactly once.
+///
+/// Called from the launch paths ([`run`], [`daemon_run`]), never from
+/// [`prepare`]: that function also runs as a preflight, and writing there
+/// produced a second `aw-intercept-<pid>-<ns>` directory and a second
+/// `--settings` on the same command. The returned directory is removed when
+/// the launch outcome is built; a failure before that still removes it here.
+///
+/// `Err` is a failed launch, not a launch without the hook the operator asked
+/// for. `Ok(None)` means intercept is off and nothing was written.
+fn inject_claude_intercept(
+    args: &RunArgs<'_>,
+    deferred: DeferredFlags,
+    spec: &mut crate::launch::RunSpec,
+) -> Result<Option<std::path::PathBuf>, Outcome> {
+    if claude_intercept_enabled(args, deferred, spec)?.is_none() {
+        return Ok(None);
     }
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aw"));
     let command = exe.display().to_string();
@@ -1474,7 +1530,7 @@ fn inject_claude_intercept(
             .unwrap_or(0)
     ));
     if std::fs::create_dir_all(&dir).is_err() {
-        return Some(super::error_outcome(
+        return Err(super::error_outcome(
             exit::GENERAL,
             "intercept",
             "拦截的临时设置目录写不了，这次没有启动",
@@ -1483,7 +1539,8 @@ fn inject_claude_intercept(
     }
     let path = dir.join("claude-settings.json");
     if std::fs::write(&path, doc).is_err() {
-        return Some(super::error_outcome(
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(super::error_outcome(
             exit::GENERAL,
             "intercept",
             "拦截的临时设置文件写不了，这次没有启动",
@@ -1500,7 +1557,20 @@ fn inject_claude_intercept(
     // `AW_SESSION` is not set here. The daemon assigns the public id after
     // this function returns, and this process does not know it yet. The hook
     // falls back to `--session` when a later card threads the id through.
-    None
+    Ok(Some(dir))
+}
+
+/// Remove the temp settings directory. A failure is reported, not hidden:
+/// the file holds the hook command path, and leaving it behind is visible.
+fn cleanup_intercept_dir(dir: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "拦截的临时设置目录没有删掉（{}）：{err}",
+            dir.display()
+        )),
+    }
 }
 
 /// Whether the pin result is known after a completed run.
@@ -1526,8 +1596,14 @@ pub(crate) fn daemon_run(
     spawner: &mut dyn Spawner,
     summary: &mut dyn SessionSummary,
 ) -> Outcome {
-    let (level, spec) = match daemon_prepare(args, deferred) {
+    let (level, mut spec) = match daemon_prepare(args, deferred) {
         Ok(prepared) => prepared,
+        Err(outcome) => return outcome,
+    };
+    // One settings file for this launch. `preflight` already validated the
+    // policy and wrote nothing, so this is the only `--settings`.
+    let intercept_dir = match inject_claude_intercept(args, deferred, &mut spec) {
+        Ok(dir) => dir,
         Err(outcome) => return outcome,
     };
     let request = BeginRunRequest {
@@ -1539,7 +1615,12 @@ pub(crate) fn daemon_run(
     };
     let launch = match sessions.begin_run(&request) {
         Ok(launch) => launch,
-        Err(error) => return daemon_error_outcome(error, args.json, false),
+        Err(error) => {
+            return finish_daemon(
+                intercept_dir.as_deref(),
+                daemon_error_outcome(error, args.json, false),
+            );
+        }
     };
     let mut child = match spawner.spawn(&spec) {
         Ok(child) => child,
@@ -1548,7 +1629,10 @@ pub(crate) fn daemon_run(
             // session: discard the reservation so callers never observe an
             // empty launch after a local spawn failure.
             let _ = sessions.discard_run(&launch);
-            return super::error_outcome(exit::GENERAL, code, &detail, args.json);
+            return finish_daemon(
+                intercept_dir.as_deref(),
+                super::error_outcome(exit::GENERAL, code, &detail, args.json),
+            );
         }
     };
     if let Err(error) = sessions.adopt(&launch, child.pid()) {
@@ -1556,17 +1640,26 @@ pub(crate) fn daemon_run(
         // Adoption did not make the held process runnable.  This is still a
         // failed launch, not a recorded session with zero useful events.
         let _ = sessions.discard_run(&launch);
-        return daemon_error_outcome(error, args.json, true);
+        return finish_daemon(
+            intercept_dir.as_deref(),
+            daemon_error_outcome(error, args.json, true),
+        );
     }
     if let Err((code, detail)) = child.release() {
         child.kill_and_reap();
         let _ = sessions.discard_run(&launch);
-        return super::error_outcome(exit::GENERAL, code, &detail, args.json);
+        return finish_daemon(
+            intercept_dir.as_deref(),
+            super::error_outcome(exit::GENERAL, code, &detail, args.json),
+        );
     }
     if let Err(error) = sessions.commit_run(&launch) {
         child.kill_and_reap();
         let _ = sessions.discard_run(&launch);
-        return daemon_error_outcome(error, args.json, true);
+        return finish_daemon(
+            intercept_dir.as_deref(),
+            daemon_error_outcome(error, args.json, true),
+        );
     }
 
     let (pin_state, pin_warning) = if args.pin {
@@ -1583,7 +1676,10 @@ pub(crate) fn daemon_run(
     let code = match child.wait() {
         Ok(code) => code,
         Err(detail) => {
-            return super::error_outcome(exit::GENERAL, "wait_failed", &detail, args.json)
+            return finish_daemon(
+                intercept_dir.as_deref(),
+                super::error_outcome(exit::GENERAL, "wait_failed", &detail, args.json),
+            );
         }
     };
     let leftovers_warning = child.cleanup_leftovers().and_then(|leftovers| {
@@ -1604,11 +1700,14 @@ pub(crate) fn daemon_run(
         if let Some(warning) = exit_warning {
             stderr.push_str(&warning);
         }
-        return Outcome {
-            code,
-            stdout: Vec::new(),
-            stderr: stderr.into_bytes(),
-        };
+        return finish_daemon(
+            intercept_dir.as_deref(),
+            Outcome {
+                code,
+                stdout: Vec::new(),
+                stderr: stderr.into_bytes(),
+            },
+        );
     }
     let launched = Launched {
         code,
@@ -1627,7 +1726,10 @@ pub(crate) fn daemon_run(
         Some(&launch.public_id),
         pin_state,
     ) {
-        return super::error_outcome(exit::GENERAL, "summary", &error.to_string(), args.json);
+        return finish_daemon(
+            intercept_dir.as_deref(),
+            super::error_outcome(exit::GENERAL, "summary", &error.to_string(), args.json),
+        );
     }
     if let Some(warning) = pin_warning {
         stderr.extend_from_slice(warning.as_bytes());
@@ -1638,11 +1740,27 @@ pub(crate) fn daemon_run(
     if let Some(warning) = exit_warning {
         stderr.extend_from_slice(warning.as_bytes());
     }
-    Outcome {
-        code,
-        stdout: Vec::new(),
-        stderr,
+    finish_daemon(
+        intercept_dir.as_deref(),
+        Outcome {
+            code,
+            stdout: Vec::new(),
+            stderr,
+        },
+    )
+}
+
+/// Delete the intercept settings directory, then return `outcome`.
+///
+/// The directory exists only for this launch. Removing it after the child has
+/// exited (or after the launch failed) is the whole cleanup: Claude reads
+/// `--settings` at start, so the file is not needed once the process is gone.
+/// A delete that fails is named on stderr and does not change the exit code.
+fn finish_daemon(intercept_dir: Option<&std::path::Path>, mut outcome: Outcome) -> Outcome {
+    if let Some(dir) = intercept_dir {
+        append_cleanup_note(&mut outcome, cleanup_intercept_dir(dir).err());
     }
+    outcome
 }
 
 fn daemon_error_outcome(error: ControlError, json: bool, child_stopped: bool) -> Outcome {
@@ -1968,13 +2086,133 @@ mod intercept_inject_tests {
             intercept: false,
         };
         let outcome = inject_claude_intercept(&args, deferred, &mut spec);
+        if let Ok(Some(settings_dir)) = &outcome {
+            let _ = std::fs::remove_dir_all(settings_dir);
+        }
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(outcome.is_none(), "broken policy must not skip the launch");
+        assert!(outcome.is_ok(), "broken policy must not skip the launch");
         assert!(
-            spec.command.windows(2).any(|pair| pair[0] == "--settings"),
-            "broken policy did not inject --settings: {:?}",
+            matches!(outcome, Ok(Some(_))),
+            "broken policy did not write settings"
+        );
+        assert_eq!(
+            spec.command
+                .iter()
+                .filter(|arg| *arg == "--settings")
+                .count(),
+            1,
+            "broken policy injected --settings more than once: {:?}",
             spec.command
         );
+    }
+
+    /// `preflight` validates and writes nothing. One launch writes one file and
+    /// one `--settings`; the directory is gone after the session cleanup.
+    #[test]
+    fn intercept_settings_are_written_once_and_removed() {
+        let policy_root = std::env::temp_dir().join(format!(
+            "aw-inject-once-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&policy_root);
+        std::fs::create_dir_all(&policy_root).unwrap();
+        let policy = policy_root.join("policy.toml");
+        std::fs::write(&policy, "enabled = true\n").unwrap();
+        let _guard = super::super::policy_file::env_lock();
+        let _env = super::super::policy_file::EnvVarGuard::set(
+            super::super::policy_file::POLICY_ENV,
+            &policy,
+        );
+
+        let command = vec!["claude".to_owned()];
+        let args = RunArgs {
+            agent: Some("claude-code"),
+            name: None,
+            no_follow_children: false,
+            cwd: None,
+            env: &[],
+            summary: None,
+            pin: false,
+            no_daemon: false,
+            raw: None,
+            command: &command,
+            json: false,
+            quiet: true,
+        };
+        let deferred = DeferredFlags {
+            proxy: false,
+            proxy_on_reject: false,
+            proxy_on_reject_value: None,
+            self_report: false,
+            mcp_tap: false,
+            unsafe_no_redact: false,
+            include_proc: false,
+            group: false,
+            intercept: true,
+        };
+        let before = ours_in_temp();
+        let preflight = preflight(&args, deferred);
+        assert!(preflight.is_ok(), "preflight refused a valid intercept run");
+        assert_eq!(
+            ours_in_temp(),
+            before,
+            "preflight wrote a settings directory"
+        );
+
+        let mut spec = crate::launch::RunSpec::new(command.clone()).unwrap();
+        let written = match inject_claude_intercept(&args, deferred, &mut spec) {
+            Ok(Some(dir)) => dir,
+            Ok(None) => panic!("intercept did not write settings"),
+            Err(_) => panic!("intercept settings could not be written"),
+        };
+        let created: Vec<_> = ours_in_temp()
+            .into_iter()
+            .filter(|path| !before.contains(path))
+            .collect();
+        assert_eq!(
+            created,
+            vec![written.clone()],
+            "expected exactly one new dir"
+        );
+        assert_eq!(
+            spec.command
+                .iter()
+                .filter(|arg| *arg == "--settings")
+                .count(),
+            1,
+            "{:?}",
+            spec.command
+        );
+        assert!(written.join("claude-settings.json").is_file());
+        assert!(cleanup_intercept_dir(&written).is_ok());
+        assert!(
+            !written.exists(),
+            "settings dir survived: {}",
+            written.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&policy_root);
+    }
+
+    /// `aw-intercept-<this pid>-*` left in the temp dir by this process.
+    fn ours_in_temp() -> Vec<std::path::PathBuf> {
+        let prefix = format!("aw-intercept-{}-", std::process::id());
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with(&prefix) {
+                found.push(entry.path());
+            }
+        }
+        found.sort();
+        found
     }
 }
 

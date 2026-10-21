@@ -293,6 +293,36 @@ CREATE TABLE gaps (
 );
 CREATE INDEX idx_gaps_session_ts ON gaps(session_id, from_ns);
 
+-- ============ 拦截审计（P5-SEC-01，迁移 0012） ============
+-- 一次 deny / rewrite / ask / 降级一行。摘要已脱敏、截到 256 字；哈希是
+-- SHA-256(盐 || 0xff || 原字节) 的十六进制。没有原文、body、提示词列。
+-- session_id 无外键：拦截可能先于会话行到达，未知会话为 NULL 而不是 0。
+-- delivered：daemon / local_backup / dropped。downgraded：0 或 1。
+CREATE TABLE intercept_events (
+  id                INTEGER PRIMARY KEY,
+  session_id        INTEGER,
+  ts_ns             INTEGER NOT NULL,
+  agent             TEXT,
+  layer             TEXT NOT NULL,
+  event             TEXT,
+  rule_id           TEXT,
+  action            TEXT NOT NULL,
+  effective_action  TEXT NOT NULL,
+  tool              TEXT,
+  host              TEXT,
+  mcp_method        TEXT,
+  before_summary    TEXT NOT NULL,
+  before_hash       TEXT NOT NULL,
+  after_summary     TEXT,
+  after_hash        TEXT,
+  reason            TEXT,
+  evidence          TEXT NOT NULL,
+  source            TEXT NOT NULL,
+  delivered         TEXT NOT NULL,
+  downgraded        INTEGER NOT NULL
+);
+CREATE INDEX idx_intercept_events_session_ts ON intercept_events(session_id, ts_ns);
+
 -- ============ 调试（仅 debug.keep_raw_events） ============
 CREATE TABLE raw_events (
   session_id      INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

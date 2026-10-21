@@ -368,7 +368,9 @@ pub fn host_process_table() -> Option<Vec<HostProcess>> {
 #[cfg(test)]
 mod tests {
     use super::keep_subtrees;
-    use crate::source::{ProcessRow, ProcessSource, ProcessStartTime, SourceFailure};
+    #[cfg(windows)]
+    use crate::source::SourceFailure;
+    use crate::source::{ProcessRow, ProcessSource, ProcessStartTime};
 
     /// A non-zero `netstat` used to be recorded as `permission` whatever the
     /// exit was. Only access denied (exit 5) is a refusal; the rest failed.

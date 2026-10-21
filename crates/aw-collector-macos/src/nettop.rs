@@ -722,7 +722,14 @@ fn parse_line(line: &str, current: Option<(String, u32)>) -> LineParse {
 fn parse_logging_line(cells: &[String], current: Option<(String, u32)>) -> Option<LineParse> {
     let first = cells.first()?.as_str();
     if let Some((prefix, rest)) = split_flow_prefix(first) {
-        let (name, pid) = current?;
+        // A flow row names no pid of its own. Without the process row above it
+        // there is nothing to attribute it to, and dropping the line would hide
+        // that. The gap says so; the addresses are not copied into it.
+        let Some((name, pid)) = current else {
+            return Some(LineParse::Bad {
+                detail: "flow row has no process row",
+            });
+        };
         let (local, remote) = split_endpoints(rest)?;
         let proto = if prefix.starts_with("tcp") {
             L4Proto::Tcp
@@ -1167,7 +1174,6 @@ tcp4 127.0.0.1:8021<->*:*,,,
     }
 
     #[test]
-    #[test]
     fn logging_layout_process_row_with_extra_cells_is_not_a_gap() {
         // A process row can carry more than the two counters `-J` asked for.
         // That is still the process, not a flow, and not a parse error.
@@ -1184,6 +1190,7 @@ rapportd.656,46530,41102,7,
         );
     }
 
+    #[test]
     fn logging_layout_flow_without_a_process_is_a_gap() {
         let text = "tcp4 192.168.8.53:60034<->198.18.3.149:443,3943,123596,\n";
         let events = parse_nettop(text, &scope(&[51854]), CLOCK).expect("sample");

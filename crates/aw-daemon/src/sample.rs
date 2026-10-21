@@ -2853,9 +2853,12 @@ mod depth_tests {
     }
 
     /// `(kind, count, from_ns, to_ns, collector, detail)` in storage order.
-    fn stored_gaps(
-        db: &std::path::Path,
-    ) -> Vec<(String, Option<i64>, i64, i64, String, Option<String>)> {
+    ///
+    /// Named so the six-element tuple is not spelled at the signature, which
+    /// is past clippy's type_complexity limit.
+    type StoredGap = (String, Option<i64>, i64, i64, String, Option<String>);
+
+    fn stored_gaps(db: &std::path::Path) -> Vec<StoredGap> {
         let store = aw_store::Store::open(db).expect("open");
         let mut stmt = store
             .connection()

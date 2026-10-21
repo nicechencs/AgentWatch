@@ -385,6 +385,7 @@ pub fn bearer_token(authorization: Option<&str>) -> Option<&str> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
         authorize, bearer_token, visible_sessions, AuthDecision, AuthInput, Caller, Secret,

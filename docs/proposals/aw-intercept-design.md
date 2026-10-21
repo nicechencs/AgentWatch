@@ -188,7 +188,7 @@ reason = "不允许连这个网站"
 ```
 
 - 匹配字段：`tool`、`agent`、`match.command`、`match.path`、`match.host`、`match.url`、`match.method`、`match.mcp_method`、`match.mcp_tool`、`match.arg.<字段名>`、`match.direction`；每个字段支持 `exact` / `prefix` / `glob` / `regex`。
-- `match.direction` 只在 MCP 层有值：`c2s` 是客户端到服务端的请求，`s2c` 是服务端到客户端的回包。不写这个字段时两个方向都参与匹配。回包没有 `method` 和 `params`，能匹配的是 `result` 里的字符串字段，写成 `match.arg.<字段名>`（例如 `match.arg.text` 对上 `{"result":{"text":"SECRET"}}`）。`rewrite.arg.<字段名>` 写回 `result` 的同一个字段，改完转发给客户端。`rewrite.direction` 不是帧里的字段，加载时按规则损坏拒绝。
+- `match.direction` 只能写在 `layer` 只含 `mcp` 的规则上（`hook`、`proxy`，或没写 `layer`，都算规则文件损坏）。合法写法只有两个：`{ exact = "c2s" }`（客户端到服务端的请求）和 `{ exact = "s2c" }`（服务端到客户端的回包）。写成纯字符串、`"S2C"`、`"x2y"`、带空格，或用 `prefix` / `glob` / `regex`，都算规则文件损坏，按 `on_error` 处理。不写这个字段时只匹配请求方向；回包规则必须显式写 `{ exact = "s2c" }`。回包没有 `method` 和 `params`，能匹配的是 `result` 里的字符串字段，写成 `match.arg.<字段名>`（例如 `match.arg.text` 对上 `{"result":{"text":"SECRET"}}`）。`rewrite.arg.<字段名>` 写回 `result` 的同一个字段，改完转发给客户端。`rewrite.direction` 不是帧里的字段，加载时按规则损坏拒绝。
 - 规则按文件顺序检查，**多条命中时取最严**：`deny > ask > rewrite > allow`（和 Claude Code 的优先级一致）。
 - `rewrite` 只允许「字段级替换」（某个字段换值、字符串替换），不允许写脚本。改写后再用全部规则检查一遍，被 `deny` 命中就拒绝（防止改出危险命令）。
 
@@ -197,8 +197,8 @@ reason = "不允许连这个网站"
 | 动作 | hook 层（Claude） | hook 层（Codex） | MCP 层 | 代理层 |
 |---|---|---|---|---|
 | 放行 `allow` | 不输出决定（走 agent 自己的权限流程），**不是**自动批准 | 同左 | 原样转发 | 原样转发 |
-| 拒绝 `deny` | `permissionDecision: deny` + 原因 | `permissionDecision: deny` + 原因 | 不转给服务端，直接回一个 JSON-RPC 错误 | 回 403 + 原因 |
-| 改写 `rewrite` | `allow` + `updatedInput`（只在 PreToolUse） | `allow` + `updatedInput`（只在 PreToolUse） | 改写请求参数或返回结果后转发。回包用 `match.direction = "s2c"` 加 `match.arg.<字段>` / `rewrite.arg.<字段>`（见 §5.1）。写不回帧的字段按拒绝，审计记实际执行的动作 | 第一步不支持，按 `deny` 处理并在审计里写明 |
+| 拒绝 `deny` | `permissionDecision: deny` + 原因 | `permissionDecision: deny` + 原因 | 不转发。请求方向不转给服务端，直接回一个 JSON-RPC 错误；回包方向工具已经执行，把结果换成同一个 `id` 的 JSON-RPC 错误（`-32000`，消息不含原文），不把结果交给模型。审计记实际执行的拒绝 | 回 403 + 原因 |
+| 改写 `rewrite` | `allow` + `updatedInput`（只在 PreToolUse） | `allow` + `updatedInput`（只在 PreToolUse） | 改写请求参数或返回结果后转发。回包用 `match.direction = { exact = "s2c" }` 加 `match.arg.<字段>` / `rewrite.arg.<字段>`（见 §5.1）。写不回帧的字段、替换对不上、判定出错，都按拒绝：回包方向不转发原文，给同一个 `id` 回 JSON-RPC 错误（`-32000`，消息不含原文）。工具已经执行了，但结果不交给模型。审计记实际执行的动作 | 第一步不支持，按 `deny` 处理并在审计里写明 |
 | 问用户 `ask` | `permissionDecision: ask` | 降级为 `deny`（见 §4.2） | 第一步降级为 `deny` | 第一步降级为 `deny` |
 
 注意「放行」不等于「自动批准」：aw 不替用户点同意，只是不插手。不命中规则时 stdout 为空，Claude Code 走它自己的权限流程。

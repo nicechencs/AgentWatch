@@ -504,7 +504,7 @@ flowchart LR
 
 **要点**：deny 回 JSON-RPC 错误（同一 `id`），不转给服务端；rewrite 改请求参数或结果；规则关闭时逐字节透传。
 
-实现差（2026-10-21）：规则文件损坏时，`tools/call` 回 JSON-RPC 错误（同一 `id`）并记审计；`initialize`、`tools/list`、通知和其他方法照常转发。`ask` 在判定里已降为 deny。响应方向只改写 `result` 字段，不拒绝。
+实现差（2026-10-21）：规则文件损坏时，`tools/call` 回 JSON-RPC 错误（同一 `id`）并记审计；`initialize`、`tools/list`、通知和其他方法照常转发。`ask` 在判定里已降为 deny。响应方向只改写 `result` 字段，不拒绝。`aw mcp-tap -- <cmd>` 原先在分发处被「本版本未接入」截住，包装器没有启动；现已接到 `mcp_tap::run`。`aw run --mcp-tap` 仍未接入（没有按 Agent 改临时 MCP 配置）。
 
 ### P5-SEC-04 网络代理按规则拒绝
 

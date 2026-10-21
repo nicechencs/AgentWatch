@@ -29,6 +29,7 @@ AgentWatch 命令行客户端
   db        数据库
   merge     跨主机离线合并
   hook      由智能体自动调用，一般不用手动运行
+  mcp-tap   stdio 透明包装器：按规则转发、拒绝或改写 MCP 帧
   version   版本
 
 选项：

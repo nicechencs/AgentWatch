@@ -323,8 +323,7 @@ pub(crate) enum Command {
         #[arg(long)]
         session: Option<String>,
     },
-    /// stdio 透明包装器（本版本未接入）
-    #[command(hide = true)]
+    /// stdio 透明包装器：按规则转发、拒绝或改写 MCP 帧
     McpTap {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,

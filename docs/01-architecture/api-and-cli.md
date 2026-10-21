@@ -149,7 +149,7 @@ aw
 ├── chain <SESSION> <TABLE>:<ID>           （本版本未接入）
 ├── merge <A.jsonl> <B.jsonl> -o <db>      跨主机离线合并（可选，P6-STORE-02）
 ├── hook <AGENT> [--session <SESSION>]      由 Agent hooks 调用：从 stdin 读事件 JSON，转发为 AgentToolCall（E3，SPIKE-07）
-├── mcp-tap -- <CMD> [ARGS...]             （本版本未接入，帮助中隐藏）
+├── mcp-tap -- <CMD> [ARGS...]             包装 MCP stdio：规则关闭时原样转发；命中规则则拒绝或改写。`aw run --mcp-tap` 仍未接入
 ├── dev [--] <subcommand>                  （本版本未接入，帮助中隐藏）
 └── version [--check]                      `--check` 本版本未接入
 ```

@@ -691,10 +691,12 @@ fn merge_command(cli: &Cli) -> Option<Outcome> {
     }))
 }
 
-/// `aw mcp-tap` (P6-AGENT-01). An empty command stays on the usage path.
+/// `aw mcp-tap` (P6-AGENT-01, deny/rewrite P5-SEC-03). An empty command stays
+/// on the usage path.
 ///
 /// A non-empty command spawns the wrapped server. It does not probe `/health`.
-/// There is no `AgentRpc` ingest route, so extracts are not posted.
+/// There is no `AgentRpc` ingest route, so extracts are not posted. This must
+/// run before any "not in this build" check: the wrapper is connected.
 fn mcp_tap_command(cli: &Cli) -> Option<Outcome> {
     let Command::McpTap { cmd } = &cli.command else {
         return None;
@@ -716,8 +718,7 @@ fn not_in_build_command(command: &Command, json: bool) -> Option<Outcome> {
         | Command::Chain { .. }
         | Command::Fixtures(_)
         | Command::Group(_)
-        | Command::Dev { .. }
-        | Command::McpTap { .. } => command_label(command),
+        | Command::Dev { .. } => command_label(command),
         _ => return None,
     };
     Some(not_in_build(label, json))
@@ -1555,7 +1556,7 @@ mod tests {
         for name in [
             "run", "attach", "stop", "ps", "sessions", "timeline", "procs", "files", "flows",
             "http", "findings", "gaps", "around", "search", "export", "ui", "doctor", "daemon",
-            "config", "db", "merge", "hook", "version",
+            "config", "db", "merge", "hook", "mcp-tap", "version",
         ] {
             assert!(
                 help.lines()
@@ -1564,7 +1565,7 @@ mod tests {
             );
         }
         for name in [
-            "proxy", "fixtures", "group", "agents", "links", "rpc", "chain", "mcp-tap", "dev",
+            "proxy", "fixtures", "group", "agents", "links", "rpc", "chain", "dev",
         ] {
             assert!(
                 !help
@@ -1583,7 +1584,9 @@ mod tests {
         let root_help = text(&root.stdout);
         assert!(root_help.contains("用法:"), "{root_help}");
         assert!(!root_help.contains("agents"), "{root_help}");
-        assert!(!root_help.contains("mcp-tap"), "{root_help}");
+        // `mcp-tap` is wired (P5-SEC-03) and listed. `hide = true` stays on
+        // commands that still return `not_in_build`.
+        assert!(root_help.contains("mcp-tap"), "{root_help}");
         assert!(!root_help.contains("proxy"), "{root_help}");
 
         let stop = run(&["stop", "--help"], None, &mut http);

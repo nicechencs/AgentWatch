@@ -1251,6 +1251,7 @@ pub(crate) fn run(
         Ok(prepared) => prepared,
         Err(outcome) => return outcome,
     };
+    let omitted = enabled_omitted_note();
     let (intercept_dir, rewrites) = match inject_claude_intercept(args, deferred, &mut spec) {
         Ok(Some((dir, rewrites))) => (Some(dir), rewrites),
         Ok(None) => (None, false),
@@ -1282,10 +1283,14 @@ pub(crate) fn run(
         let cleanup = intercept_dir
             .as_deref()
             .and_then(|dir| cleanup_intercept_dir(dir).err());
+        let mut stderr = notice.unwrap_or("").to_owned();
+        if let Some(note) = omitted {
+            stderr.push_str(&note);
+        }
         let mut outcome = Outcome {
             code: launched.code,
             stdout: Vec::new(),
-            stderr: notice.unwrap_or("").as_bytes().to_vec(),
+            stderr: stderr.into_bytes(),
         };
         append_cleanup_note(&mut outcome, cleanup);
         return outcome;
@@ -1320,6 +1325,9 @@ pub(crate) fn run(
     };
     if let Some(notice) = notice {
         outcome.stderr.extend_from_slice(notice.as_bytes());
+    }
+    if let Some(note) = omitted {
+        outcome.stderr.extend_from_slice(note.as_bytes());
     }
     append_cleanup_note(&mut outcome, cleanup);
     outcome
@@ -1524,6 +1532,39 @@ fn rewrite_notice(rewrites: bool) -> Option<&'static str> {
     }
 }
 
+/// stderr when the policy file has `[[rule]]` and never sets `enabled`.
+///
+/// The file loads as off (the default is closed), so nothing is injected. An
+/// operator who wrote the rules and forgot the switch, or who typed `enable`
+/// and had the unknown key refused, needs to see which of the two it was.
+/// `enable` is a load error and takes the broken-file path instead; this note
+/// is only the quiet omission. `None` when the file sets `enabled`, has no
+/// rules, or cannot be read as TOML.
+fn enabled_omitted_note() -> Option<String> {
+    let path = policy_path_in_env();
+    let text = std::fs::read_to_string(&path).ok()?;
+    if aw_pipeline::rules_without_enabled(&text) {
+        Some(
+            "[aw] 提示：规则文件里有规则，但没有写 enabled，拦截没有打开。要打开请写 enabled = true。\n"
+                .to_owned(),
+        )
+    } else {
+        None
+    }
+}
+
+/// `AW_POLICY` when it is set, otherwise the per-user file. Empty when neither
+/// can be named: there is then nothing to warn about.
+fn policy_path_in_env() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os(super::policy_file::POLICY_ENV) {
+        if !path.is_empty() {
+            return std::path::PathBuf::from(path);
+        }
+    }
+    super::policy_file::default_policy_path(super::policy_file::user_config_home().as_deref())
+        .unwrap_or_default()
+}
+
 /// Write one settings file and append `--settings` exactly once.
 ///
 /// Called from the launch paths ([`run`], [`daemon_run`]), never from
@@ -1630,6 +1671,7 @@ pub(crate) fn daemon_run(
         Ok(prepared) => prepared,
         Err(outcome) => return outcome,
     };
+    let omitted = enabled_omitted_note();
     // One settings file for this launch. `preflight` already validated the
     // policy and wrote nothing, so this is the only `--settings`.
     let (intercept_dir, rewrites) = match inject_claude_intercept(args, deferred, &mut spec) {
@@ -1726,6 +1768,9 @@ pub(crate) fn daemon_run(
         .map(|error| format!("[aw] 警告：daemon 未记录程序退出码：{error}\n"));
     if level == SummaryLevel::None || args.quiet {
         let mut stderr = notice.unwrap_or("").to_owned();
+        if let Some(note) = &omitted {
+            stderr.push_str(note);
+        }
         if let Some(warning) = pin_warning.clone() {
             stderr.push_str(&warning);
         }
@@ -1768,6 +1813,9 @@ pub(crate) fn daemon_run(
     }
     if let Some(notice) = notice {
         stderr.extend_from_slice(notice.as_bytes());
+    }
+    if let Some(note) = omitted {
+        stderr.extend_from_slice(note.as_bytes());
     }
     if let Some(warning) = pin_warning {
         stderr.extend_from_slice(warning.as_bytes());
@@ -2234,6 +2282,106 @@ mod intercept_inject_tests {
         );
 
         let _ = std::fs::remove_dir_all(&policy_root);
+    }
+
+    /// `[[rule]]` with no `enabled` used to load as off and say nothing, so an
+    /// operator who mistyped the switch (or forgot it) thought intercept was on.
+    /// `aw run` names that on stderr and does not inject. A file that sets
+    /// `enabled = false` stays quiet: that one is deliberate.
+    #[test]
+    fn rules_without_enabled_are_named_on_stderr() {
+        let dir = scratch_policy("no-enabled");
+        let policy = dir.join("policy.toml");
+        std::fs::write(
+            &policy,
+            "version = 1\n[[rule]]\nid = \"r\"\naction = \"deny\"\n",
+        )
+        .unwrap();
+        let _guard = super::super::policy_file::env_lock();
+        let _env = super::super::policy_file::EnvVarGuard::set(
+            super::super::policy_file::POLICY_ENV,
+            &policy,
+        );
+        let _home = isolate_home();
+        let command = vec!["claude".to_owned()];
+        let args = RunArgs {
+            agent: Some("claude-code"),
+            name: None,
+            no_follow_children: false,
+            cwd: None,
+            env: &[],
+            summary: None,
+            pin: false,
+            no_daemon: true,
+            raw: None,
+            command: &command,
+            json: false,
+            quiet: true,
+        };
+        let deferred = DeferredFlags {
+            proxy: false,
+            proxy_on_reject: false,
+            proxy_on_reject_value: None,
+            self_report: false,
+            mcp_tap: false,
+            unsafe_no_redact: false,
+            include_proc: false,
+            group: false,
+            intercept: false,
+        };
+        let note = enabled_omitted_note();
+        assert!(
+            note.is_some(),
+            "a rule file with no enabled key produced no stderr note"
+        );
+        let text = note.unwrap();
+        assert!(
+            text.contains("enabled") && text.contains("没有打开"),
+            "stderr did not say the switch is missing: {text}"
+        );
+        let mut spec = crate::launch::RunSpec::new(command.clone()).unwrap();
+        let injected = inject_claude_intercept(&args, deferred, &mut spec)
+            .unwrap_or_else(|_| panic!("inject failed"));
+        assert!(
+            injected.is_none(),
+            "a file that never sets enabled must not inject hooks"
+        );
+        assert!(
+            !spec.command.iter().any(|arg| arg == "--settings"),
+            "settings were appended: {:?}",
+            spec.command
+        );
+
+        std::fs::write(&policy, "version = 1\nenabled = false\n").unwrap();
+        assert!(
+            enabled_omitted_note().is_none(),
+            "enabled = false is deliberate and must stay quiet"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scratch policy directory inside this crate, never `/tmp`.
+    fn scratch_policy(name: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("run-tests")
+            .join(format!(
+                "{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Point the per-user config lookup at an empty directory so a developer's
+    /// real `policy.toml` cannot decide this test. Restored on drop.
+    fn isolate_home() -> super::super::policy_file::HomeEnvGuard {
+        super::super::policy_file::HomeEnvGuard::isolate()
     }
 
     /// `aw-intercept-<this pid>-*` left in the temp dir by this process.

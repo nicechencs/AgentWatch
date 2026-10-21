@@ -19,7 +19,7 @@ mod tests;
 
 pub use audit::{audit_record, hash_original, AuditRecord, Delivered, AUDIT_SUMMARY_CHARS};
 pub use decide::{decide, downgrade_codex_ask, DecideError, Decision};
-pub use load::{load_str, PolicyError, PolicyFile, PolicyState};
+pub use load::{load_str, rules_without_enabled, PolicyError, PolicyFile, PolicyState};
 pub use match_field::Matcher;
 
 use std::fmt;

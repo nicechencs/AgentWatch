@@ -31,6 +31,9 @@ pub enum PolicyError {
     OnError,
     /// `[[rule]]` was not an array of tables.
     Rules,
+    /// A top-level key this loader does not read. Named, so a typo such as
+    /// `enable` is not stored as "off". The value is not included.
+    UnknownKey,
     /// One rule failed. `index` is its position in the file, from 0.
     Rule { index: usize, detail: RuleError },
 }
@@ -43,6 +46,7 @@ impl std::fmt::Display for PolicyError {
             Self::Enabled => f.write_str("policy enabled must be a bool"),
             Self::OnError => f.write_str("policy on_error must be deny or allow"),
             Self::Rules => f.write_str("policy rule must be an array of tables"),
+            Self::UnknownKey => f.write_str("policy has an unknown key"),
             Self::Rule { index, detail } => write!(f, "policy rule {index}: {detail}"),
         }
     }
@@ -69,6 +73,9 @@ pub enum RuleError {
     Rewrite(String),
     /// `action = "rewrite"` with no `rewrite` fields.
     RewriteRequired,
+    /// A key this loader does not read (`tols` for `tool`, and the same inside
+    /// `match`). The key's value is not included: it can quote a command.
+    UnknownKey,
 }
 
 impl std::fmt::Display for RuleError {
@@ -82,6 +89,7 @@ impl std::fmt::Display for RuleError {
             Self::Reason => f.write_str("reason must be a string"),
             Self::Match(detail) | Self::Rewrite(detail) => f.write_str(detail),
             Self::RewriteRequired => f.write_str("rewrite action needs at least one rewrite field"),
+            Self::UnknownKey => f.write_str("unknown key"),
         }
     }
 }
@@ -92,13 +100,21 @@ impl std::fmt::Display for RuleError {
 ///
 /// [`PolicyError`] when the document is TOML but not a policy, or when a rule
 /// cannot be compiled. An absent `enabled` (or `enabled = false`) is
-/// [`PolicyState::Off`], not an error, even if later keys are junk: those
-/// keys are not consulted.
+/// [`PolicyState::Off`], not an error. Unknown keys are still an error when the
+/// file claims to be on: a typo must not silently drop a rule. A file that is
+/// off is not consulted past `enabled`, except that a key this loader does not
+/// know is refused either way — `enable = true` with no `enabled` used to read
+/// as off.
 pub fn load_str(text: &str) -> Result<PolicyState, PolicyError> {
     let value: toml::Value = toml::from_str(text).map_err(|_| PolicyError::NotToml)?;
     let Some(root) = value.as_table() else {
         return Err(PolicyError::NotToml);
     };
+    // Checked before `enabled`, so `enable = true` is a broken file and not
+    // "off". The value is not part of the error.
+    if root.keys().any(|key| !known_root_key(key)) {
+        return Err(PolicyError::UnknownKey);
+    }
     if let Some(version) = root.get("version") {
         if version.as_integer() != Some(1) {
             return Err(PolicyError::Version);
@@ -133,8 +149,42 @@ pub fn load_str(text: &str) -> Result<PolicyState, PolicyError> {
     Ok(PolicyState::On(Policy { on_error, rules }))
 }
 
+/// `true` when `text` is a policy document that contains at least one `[[rule]]`
+/// and never sets `enabled`.
+///
+/// That file loads as [`PolicyState::Off`]: the default is closed. The caller
+/// (`aw run`) says so on stderr, because an operator who wrote rules and forgot
+/// the switch otherwise sees nothing happen. A document that is not TOML, or
+/// that sets `enabled` either way, is `false`.
+#[must_use]
+pub fn rules_without_enabled(text: &str) -> bool {
+    let Ok(value) = toml::from_str::<toml::Value>(text) else {
+        return false;
+    };
+    let Some(root) = value.as_table() else {
+        return false;
+    };
+    if root.contains_key("enabled") {
+        return false;
+    }
+    match root.get("rule") {
+        Some(toml::Value::Array(items)) => !items.is_empty(),
+        _ => false,
+    }
+}
+
+/// Top-level keys [`load_str`] reads. Anything else is a broken file.
+fn known_root_key(key: &str) -> bool {
+    matches!(key, "version" | "enabled" | "on_error" | "rule")
+}
+
 fn parse_rule(value: &toml::Value) -> Result<Rule, RuleError> {
     let table = value.as_table().ok_or(RuleError::NotTable)?;
+    // `match` and `rewrite` check their own keys. A sibling the loader skips
+    // (`tols` for `tool`) would otherwise widen the rule to every tool.
+    if table.keys().any(|key| !known_rule_key(key)) {
+        return Err(RuleError::UnknownKey);
+    }
     let id = table
         .get("id")
         .and_then(toml::Value::as_str)
@@ -180,6 +230,14 @@ fn parse_rule(value: &toml::Value) -> Result<Rule, RuleError> {
         reason,
         rewrites,
     })
+}
+
+/// Keys [`parse_rule`] reads. `match` and `rewrite` have their own lists.
+fn known_rule_key(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "layer" | "agent" | "tool" | "action" | "reason" | "match" | "rewrite"
+    )
 }
 
 fn optional_layers(value: Option<&toml::Value>) -> Result<Vec<Layer>, RuleError> {

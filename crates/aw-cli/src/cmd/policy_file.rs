@@ -74,6 +74,60 @@ impl EnvVarGuard {
     }
 }
 
+/// Point `XDG_CONFIG_HOME`, `HOME`, and `APPDATA` at an empty directory for the
+/// guard's lifetime, then put them back.
+///
+/// `AW_POLICY` unset makes [`load_policy`] read the per-user file. A developer
+/// machine that already has one would decide the test. The directory is created
+/// under the crate, not in `/tmp`.
+#[cfg(test)]
+pub(crate) struct HomeEnvGuard {
+    dir: PathBuf,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(test)]
+impl HomeEnvGuard {
+    /// Isolate the three homes. Drop restores each one, including after a panic.
+    pub(crate) fn isolate() -> Self {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("policy-home")
+            .join(format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("policy home");
+        let saved = ["XDG_CONFIG_HOME", "HOME", "APPDATA"]
+            .into_iter()
+            .map(|key| {
+                let previous = std::env::var_os(key);
+                std::env::set_var(key, &dir);
+                (key, previous)
+            })
+            .collect();
+        Self { dir, saved }
+    }
+}
+
+#[cfg(test)]
+impl Drop for HomeEnvGuard {
+    fn drop(&mut self) {
+        for (key, previous) in self.saved.drain(..) {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 #[cfg(test)]
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {

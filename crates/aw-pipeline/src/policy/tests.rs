@@ -83,6 +83,71 @@ fn disabled_or_absent_enabled_is_off() {
     assert!(matches!(load_str("").unwrap(), PolicyState::Off));
 }
 
+/// A misspelled top-level key used to be ignored. `enable = true` then looked
+/// like "no `enabled`", which is off, so the intercept the operator wrote never
+/// ran. A misspelled rule key (`tols` for `tool`) used to match every tool.
+/// Both are a broken file, and a broken file denies (design §5.3).
+#[test]
+fn unknown_keys_are_a_broken_file() {
+    let top = load_str("version = 1\nenable = true\n[[rule]]\nid = \"r\"\naction = \"deny\"\n")
+        .unwrap_err();
+    let top_text = top.to_string();
+    assert!(
+        top_text.contains("unknown key"),
+        "top-level typo was not refused: {top_text}"
+    );
+    assert!(
+        !top_text.contains("deny"),
+        "the error quoted a rule value: {top_text}"
+    );
+
+    let rule = load_str(
+        "version = 1\nenabled = true\n[[rule]]\nid = \"typo\"\ntols = [\"Bash\"]\n\
+         layer = [\"hook\"]\naction = \"deny\"\n",
+    )
+    .unwrap_err();
+    let rule_text = rule.to_string();
+    assert!(
+        rule_text.contains("unknown key") && rule_text.contains("rule 0"),
+        "rule typo was not refused: {rule_text}"
+    );
+    assert!(
+        !rule_text.contains("Bash"),
+        "the error quoted the tool list: {rule_text}"
+    );
+
+    // `match.colour` is not a field the decider reads. Ignoring it would let
+    // the rule match everything the rest of `match` names.
+    let nested = load_str(
+        "version = 1\nenabled = true\n[[rule]]\nid = \"m\"\naction = \"deny\"\n\
+         match.colour = { exact = \"red\" }\n",
+    )
+    .unwrap_err();
+    let nested_text = nested.to_string();
+    assert!(
+        nested_text.contains("unknown match field"),
+        "unknown match field was not refused: {nested_text}"
+    );
+}
+
+/// A file that contains `[[rule]]` but never says `enabled` is off (the default
+/// is closed), and the caller can see that the omission was there. `aw run`
+/// prints that; a file with no rules and no `enabled` stays quietly off.
+#[test]
+fn rules_without_enabled_are_off_but_named() {
+    let text = "version = 1\n[[rule]]\nid = \"r\"\naction = \"deny\"\n";
+    assert!(matches!(load_str(text).unwrap(), PolicyState::Off));
+    assert!(
+        super::rules_without_enabled(text),
+        "rules with no enabled key were not reported"
+    );
+    assert!(!super::rules_without_enabled(
+        "version = 1\nenabled = false\n[[rule]]\nid = \"r\"\naction = \"deny\"\n"
+    ));
+    assert!(!super::rules_without_enabled("version = 1\n"));
+    assert!(!super::rules_without_enabled("this is not toml [[["));
+}
+
 #[test]
 fn broken_file_is_an_error_not_off() {
     let err = load_str("enabled = true\n[[rule]]\naction = \"nope\"\n").unwrap_err();

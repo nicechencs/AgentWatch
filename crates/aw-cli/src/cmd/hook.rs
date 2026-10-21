@@ -1304,6 +1304,25 @@ action = "ask"
         }
     }
 
+    /// The variable [`intercept_audit::state_home`] reads on this platform.
+    fn session_state_var() -> &'static str {
+        if cfg!(windows) {
+            "LOCALAPPDATA"
+        } else {
+            "XDG_STATE_HOME"
+        }
+    }
+
+    /// The variable this platform ignores, so a sibling's value cannot redirect
+    /// the backup.
+    fn session_state_other() -> &'static str {
+        if cfg!(windows) {
+            "XDG_STATE_HOME"
+        } else {
+            "LOCALAPPDATA"
+        }
+    }
+
     /// Scratch directory inside the crate, never `/tmp`. Windows path limits
     /// do not apply: nothing here is a socket name.
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -1634,7 +1653,13 @@ action = "ask"
         )
         .unwrap();
         let _policy = policy_file::EnvVarGuard::set(policy_file::POLICY_ENV, &path);
+        // A session id plus a state home is also a backup path. Leaving either
+        // set (a sibling test, or the runner) would store the line and the
+        // rewrite would go ahead.
         let _audit = policy_file::EnvVarGuard::unset(intercept_audit::AUDIT_ENV);
+        let _session = policy_file::EnvVarGuard::unset(SESSION_ENV);
+        let _state = policy_file::EnvVarGuard::unset("XDG_STATE_HOME");
+        let _local = policy_file::EnvVarGuard::unset("LOCALAPPDATA");
         let endpoint = endpoint();
         let payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"terraform apply -auto-approve","extra":true}}"#;
         let mut transport = Scripted {
@@ -1676,7 +1701,10 @@ action = "ask"
     }
 
     /// No `AW_INTERCEPT_AUDIT`. The deny line is
-    /// `<XDG_STATE_HOME>/agentwatch/sessions/<id>/intercept-audit.jsonl`.
+    /// `<state home>/agentwatch/sessions/<id>/intercept-audit.jsonl`.
+    ///
+    /// Linux and macOS take `XDG_STATE_HOME`. Windows takes `LOCALAPPDATA` and
+    /// ignores `XDG_STATE_HOME`, matching [`intercept_audit::state_home`].
     #[test]
     fn hook_without_audit_env_writes_the_session_directory() {
         let _guard = policy_file::env_lock();
@@ -1693,7 +1721,8 @@ action = "ask"
         .unwrap();
         let _policy = policy_file::EnvVarGuard::set(policy_file::POLICY_ENV, &policy);
         let _audit = policy_file::EnvVarGuard::unset(intercept_audit::AUDIT_ENV);
-        let _state = policy_file::EnvVarGuard::set_text("XDG_STATE_HOME", &state);
+        let _state = policy_file::EnvVarGuard::set_text(session_state_var(), &state);
+        let _other = policy_file::EnvVarGuard::unset(session_state_other());
         let endpoint = endpoint();
         let payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/x"}}"#;
         let mut transport = Scripted {
@@ -1756,7 +1785,8 @@ action = "ask"
         .unwrap();
         let _policy = policy_file::EnvVarGuard::set(policy_file::POLICY_ENV, &policy);
         let _audit = policy_file::EnvVarGuard::unset(intercept_audit::AUDIT_ENV);
-        let _state = policy_file::EnvVarGuard::set_text("XDG_STATE_HOME", &state);
+        let _state = policy_file::EnvVarGuard::set_text(session_state_var(), &state);
+        let _other = policy_file::EnvVarGuard::unset(session_state_other());
         let endpoint = endpoint();
         let payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"terraform apply -auto-approve","extra":true}}"#;
         let mut transport = Scripted {
@@ -1821,6 +1851,9 @@ action = "ask"
         .unwrap();
         let _policy = policy_file::EnvVarGuard::set(policy_file::POLICY_ENV, &path);
         let _audit = policy_file::EnvVarGuard::unset(intercept_audit::AUDIT_ENV);
+        let _session = policy_file::EnvVarGuard::unset(SESSION_ENV);
+        let _state = policy_file::EnvVarGuard::unset("XDG_STATE_HOME");
+        let _local = policy_file::EnvVarGuard::unset("LOCALAPPDATA");
         let (endpoint, _bodies) = stored_false_stand_in();
         let payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"terraform apply"}}"#;
         let mut transport = Scripted {
@@ -1903,8 +1936,12 @@ action = "ask"
         .unwrap();
         let _policy = policy_file::EnvVarGuard::set(policy_file::POLICY_ENV, &path);
         // No local backup. The daemon's row is the only copy, and it says
-        // rewrite until the correction arrives.
+        // rewrite until the correction arrives. A session directory left by the
+        // runner would be a second copy and the rewrite would go ahead.
         let _audit = policy_file::EnvVarGuard::unset(intercept_audit::AUDIT_ENV);
+        let _session = policy_file::EnvVarGuard::unset(SESSION_ENV);
+        let _state = policy_file::EnvVarGuard::unset("XDG_STATE_HOME");
+        let _local = policy_file::EnvVarGuard::unset("LOCALAPPDATA");
         let (endpoint, bodies) = slow_intercept_stand_in();
         let payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"terraform apply"}}"#;
         let mut started = input("claude-code", payload, &endpoint);

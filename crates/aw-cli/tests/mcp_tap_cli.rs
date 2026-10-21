@@ -31,6 +31,8 @@ fn isolate(cmd: &mut Command) {
     cmd.env_remove("AW_INTERCEPT_AUDIT");
     cmd.env_remove("AW_HTTP");
     cmd.env_remove("AW_SESSION");
+    cmd.env_remove("XDG_STATE_HOME");
+    cmd.env_remove("LOCALAPPDATA");
     // A cleared `AW_POLICY` falls through to the user config. Point that at an
     // empty directory this process owns, so a developer machine's real policy
     // file is not what the child reads. One directory per process: the tests
@@ -597,10 +599,12 @@ fn broken_policy_deny_uses_aw_socket() {
             return;
         };
         *saved.lock().expect("posted") = String::from_utf8_lossy(&buf[..n]).into_owned();
-        let _ = std::io::Write::write_all(
-            &mut stream,
-            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+        let reply_body = "{\"stored\":true}";
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{reply_body}",
+            reply_body.len()
         );
+        let _ = std::io::Write::write_all(&mut stream, reply.as_bytes());
     });
     let echo = echo_bin();
     let mut cmd = aw();
@@ -688,10 +692,15 @@ fn stand_in(posted: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> (AuditAddr
             };
             let text = String::from_utf8_lossy(&buf[..n]).into_owned();
             posted.lock().expect("posted").push(text);
-            let _ = std::io::Write::write_all(
-                &mut stream,
-                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+            // `{}` is a 200 the client used to treat as stored. The route's
+            // success body is `{"stored": true}`; anything else downgrades a
+            // rewrite to a deny.
+            let reply_body = "{\"stored\":true}";
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{reply_body}",
+                reply_body.len()
             );
+            let _ = std::io::Write::write_all(&mut stream, reply.as_bytes());
         });
         let dead = dir.join("d");
         (
@@ -720,10 +729,12 @@ fn stand_in(posted: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> (AuditAddr
             };
             let text = String::from_utf8_lossy(&buf[..n]).into_owned();
             posted.lock().expect("posted").push(text);
-            let _ = std::io::Write::write_all(
-                &mut stream,
-                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+            let reply_body = "{\"stored\":true}";
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{reply_body}",
+                reply_body.len()
             );
+            let _ = std::io::Write::write_all(&mut stream, reply.as_bytes());
         });
         let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("dead");
         let dead_port = dead.local_addr().expect("addr").port();

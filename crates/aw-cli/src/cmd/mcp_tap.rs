@@ -1090,6 +1090,11 @@ fn copy_gated_for_test(
     policy_text: &str,
     to_client: bool,
 ) -> io::Result<GatedCopy> {
+    // These four decide the backup path and are process-global. A sibling sets
+    // them, finishes, and drops the guard; this call would otherwise append a
+    // deny into that sibling's file. Callers that want one of them set it after
+    // this clear, and hold `env_lock` for the whole call.
+    let _cleared = clear_inherited_audit_env();
     copy_gated_for_test_at(input, direction, policy_text, to_client, None)
 }
 
@@ -1144,7 +1149,23 @@ fn copy_broken_for_test(
     child: &mut Vec<u8>,
     client: &mut Vec<u8>,
 ) -> io::Result<()> {
+    let _cleared = clear_inherited_audit_env();
     copy_broken_for_test_at(input, direction, tx, child, client, None)
+}
+
+/// Drop the process-global audit variables a sibling test may have left set.
+///
+/// The returned guards restore them. Hold `env_lock` across the call: without
+/// it, a sibling can set the variable again between the clear and the write.
+#[cfg(test)]
+fn clear_inherited_audit_env() -> [super::policy_file::EnvVarGuard; 4] {
+    [
+        super::intercept_audit::AUDIT_ENV,
+        super::hook::SESSION_ENV,
+        "XDG_STATE_HOME",
+        "LOCALAPPDATA",
+    ]
+    .map(super::policy_file::EnvVarGuard::unset)
 }
 
 #[cfg(test)]
@@ -1242,7 +1263,8 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
         let _session =
             crate::cmd::policy_file::EnvVarGuard::set_text(crate::cmd::hook::SESSION_ENV, "s-mcp");
         let frame = b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"run\",\"arguments\":{\"command\":\"rm -rf /tmp\"}}}\n";
-        let copy = copy_gated_for_test(frame, DIR_C2S, DENY_RM, true).unwrap();
+        // `copy_gated_for_test` clears the audit variables this test just set.
+        let copy = copy_gated_for_test_at(frame, DIR_C2S, DENY_RM, true, None).unwrap();
         assert!(copy.child.is_empty(), "denied frame reached the child");
         let text = std::fs::read_to_string(&audit).unwrap();
         let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
@@ -1263,7 +1285,8 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
     }
 
     /// No `AW_INTERCEPT_AUDIT`: the line goes to the session directory derived
-    /// from `AW_SESSION` and `XDG_STATE_HOME`.
+    /// from `AW_SESSION` and the platform state home (`XDG_STATE_HOME` on Unix,
+    /// `LOCALAPPDATA` on Windows).
     #[test]
     fn missing_audit_env_writes_the_session_directory() {
         let _guard = crate::cmd::policy_file::env_lock();
@@ -1282,12 +1305,24 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
         let state = root.join("state");
         let _audit =
             crate::cmd::policy_file::EnvVarGuard::unset(crate::cmd::intercept_audit::AUDIT_ENV);
-        let _state = crate::cmd::policy_file::EnvVarGuard::set_text("XDG_STATE_HOME", &state);
+        let state_var = if cfg!(windows) {
+            "LOCALAPPDATA"
+        } else {
+            "XDG_STATE_HOME"
+        };
+        let other_var = if cfg!(windows) {
+            "XDG_STATE_HOME"
+        } else {
+            "LOCALAPPDATA"
+        };
+        let _state = crate::cmd::policy_file::EnvVarGuard::set_text(state_var, &state);
+        let _other = crate::cmd::policy_file::EnvVarGuard::unset(other_var);
         let _home = crate::cmd::policy_file::EnvVarGuard::set_text("HOME", &root);
         let _session =
             crate::cmd::policy_file::EnvVarGuard::set_text(crate::cmd::hook::SESSION_ENV, "s-mcp");
         let frame = b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"run\",\"arguments\":{\"command\":\"rm -rf /tmp\"}}}\n";
-        let copy = copy_gated_for_test(frame, DIR_C2S, DENY_RM, true).unwrap();
+        // `copy_gated_for_test` would clear `XDG_STATE_HOME` and `AW_SESSION`.
+        let copy = copy_gated_for_test_at(frame, DIR_C2S, DENY_RM, true, None).unwrap();
         assert!(copy.child.is_empty(), "denied frame reached the child");
         let audit = state
             .join("agentwatch")
@@ -1306,6 +1341,7 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
 
     #[test]
     fn deny_is_not_forwarded_and_the_error_keeps_the_id() {
+        let _guard = crate::cmd::policy_file::env_lock();
         let frame = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"run\",\"arguments\":{\"command\":\"rm -rf /tmp\"}}}\n";
         let copy = copy_gated_for_test(frame, DIR_C2S, DENY_RM, true).unwrap();
         assert!(copy.child.is_empty(), "denied frame reached the child");
@@ -1330,20 +1366,21 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
             &dir.join("audit.jsonl"),
         );
         let apply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"run\",\"arguments\":{\"command\":\"terraform apply\",\"dry\":false}}}\n";
-        let copy = copy_gated_for_test(apply, DIR_C2S, REWRITE, true).unwrap();
+        let copy = copy_gated_for_test_at(apply, DIR_C2S, REWRITE, true, None).unwrap();
         let child = String::from_utf8(copy.child).unwrap();
         assert!(child.contains("terraform plan"));
         assert!(child.contains("\"dry\":false"));
         assert!(copy.client.is_empty());
 
         let ping = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n";
-        let copy = copy_gated_for_test(ping, DIR_C2S, REWRITE, true).unwrap();
+        let copy = copy_gated_for_test_at(ping, DIR_C2S, REWRITE, true, None).unwrap();
         assert_eq!(copy.child, ping);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn broken_policy_denies_tools_call_and_forwards_initialize() {
+        let _guard = crate::cmd::policy_file::env_lock();
         let (tx, _rx) = mpsc::sync_channel(8);
         let mut child = Vec::new();
         let mut client = Vec::new();
@@ -1398,7 +1435,7 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
             r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run","arguments":{"command":"terraform apply"}}}]"#,
             "\n"
         );
-        let copy = copy_gated_for_test(frame.as_bytes(), DIR_C2S, policy, true).unwrap();
+        let copy = copy_gated_for_test_at(frame.as_bytes(), DIR_C2S, policy, true, None).unwrap();
         let child = String::from_utf8(copy.child).unwrap();
         let client = String::from_utf8(copy.client).unwrap();
         assert!(
@@ -1433,6 +1470,7 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
     /// label. Forwarding it would let an unreadable `tools/call` through.
     #[test]
     fn non_json_line_is_not_forwarded_when_rules_are_on() {
+        let _guard = crate::cmd::policy_file::env_lock();
         let policy = r#"
 version = 1
 enabled = true
@@ -1480,7 +1518,7 @@ action = "rewrite"
 rewrite.mcp_tool = { replace = ["oldtool", "newtool"] }
 "#;
         let frame = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"oldtool\",\"arguments\":{\"command\":\"echo\"}}}\n";
-        let copy = copy_gated_for_test(frame, DIR_C2S, policy, true).unwrap();
+        let copy = copy_gated_for_test_at(frame, DIR_C2S, policy, true, None).unwrap();
         let child = String::from_utf8(copy.child).unwrap();
         assert!(
             child.contains("newtool"),
@@ -1540,7 +1578,7 @@ action = "rewrite"
 rewrite.arg.text = { replace = ["SECRET", "XXX"] }
 "#;
         let frame = b"{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"text\":\"SECRET\"}}\n";
-        let copy = copy_gated_for_test(frame, DIR_S2C, policy, false).unwrap();
+        let copy = copy_gated_for_test_at(frame, DIR_S2C, policy, false, None).unwrap();
         let child = String::from_utf8(copy.child).unwrap();
         assert!(
             child.contains("XXX"),
@@ -1557,6 +1595,7 @@ rewrite.arg.text = { replace = ["SECRET", "XXX"] }
     /// Forwarding the array would run the call the single-object path denies.
     #[test]
     fn broken_policy_denies_a_tools_call_inside_a_batch() {
+        let _guard = crate::cmd::policy_file::env_lock();
         let (tx, _rx) = mpsc::sync_channel(8);
         let mut child = Vec::new();
         let mut client = Vec::new();

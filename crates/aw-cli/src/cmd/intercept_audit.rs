@@ -42,23 +42,36 @@ pub(crate) fn process_salt() -> &'static [u8] {
 }
 
 fn fill_random(bytes: &mut [u8]) {
-    if let Ok(mut file) = fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        if file.read_exact(bytes).is_ok() {
-            return;
-        }
+    if read_urandom(bytes) {
+        return;
     }
-    // No urandom (or a short read). Mix the clock and the pid. Weaker than
-    // urandom, still not a compile-time constant.
+    // Windows has no `/dev/urandom`. `RandomState` takes its seed from the OS
+    // random source on every platform the standard library supports. The clock
+    // and pid are mixed in so two seeds that happened to match still differ.
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
     let ticks = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let mixed = ticks ^ (u128::from(std::process::id()) << 64);
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        let shift = (index % 16) * 8;
-        *byte = (mixed >> shift) as u8 ^ (index as u8).wrapping_mul(31);
+    for (index, chunk) in bytes.chunks_mut(8).enumerate() {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u128(mixed);
+        hasher.write_usize(index);
+        let word = hasher.finish().to_le_bytes();
+        let n = chunk.len().min(word.len());
+        chunk[..n].copy_from_slice(&word[..n]);
     }
+}
+
+/// `true` when `/dev/urandom` filled `bytes`. A short read is a failure.
+fn read_urandom(bytes: &mut [u8]) -> bool {
+    let Ok(mut file) = fs::File::open("/dev/urandom") else {
+        return false;
+    };
+    use std::io::Read;
+    file.read_exact(bytes).is_ok()
 }
 
 /// Where a record went, and whether a rewrite must be downgraded.
@@ -225,6 +238,35 @@ mod tests {
             reason: Some("原因".to_owned()),
             fields: vec![("command".to_owned(), "terraform plan".to_owned())],
         }
+    }
+
+    #[test]
+    fn process_salt_is_not_zero_and_differs_from_an_empty_salt() {
+        let salt = process_salt();
+        assert_eq!(salt.len(), 32);
+        assert!(salt.iter().any(|byte| *byte != 0), "salt is all zeros");
+        let subject = Subject {
+            layer: Layer::Hook,
+            agent: Some("claude-code".to_owned()),
+            tool: Some("Bash".to_owned()),
+            phase: Phase::Pre,
+            ..Subject::default()
+        };
+        let original = "rm -rf /tmp/x";
+        let with_salt = record_for(
+            &subject,
+            &decision(Action::Deny),
+            salt,
+            original,
+            None,
+            None,
+        );
+        let empty = record_for(&subject, &decision(Action::Deny), b"", original, None, None);
+        assert_ne!(with_salt.before_hash, empty.before_hash);
+        assert_eq!(
+            empty.before_hash,
+            aw_pipeline::hash_original(b"", original.as_bytes())
+        );
     }
 
     #[test]

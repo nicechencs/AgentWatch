@@ -460,9 +460,6 @@ fn render_decision(
     (rendered, text)
 }
 
-/// What the audit stores as "after". Only the fields the rule replaced, not
-/// the whole tool_input: that object can hold a sibling the rule did not
-/// touch, and hashing it would keep more than the change.
 /// Name written into `hookSpecificOutput.hookEventName`. The input's
 /// `hook_event_name` when it had one. A payload that omitted it still has to
 /// name an event, or Claude Code treats the object as a non-blocking error
@@ -472,6 +469,9 @@ fn hook_event_name(subject: &Subject) -> &str {
     subject.event.as_deref().unwrap_or("PreToolUse")
 }
 
+/// What the audit stores as "after". Only the fields the rule replaced, not
+/// the whole tool_input: that object can hold a sibling the rule did not
+/// touch, and hashing it would keep more than the change.
 fn rewrite_audit_text(decision: &Decision) -> Option<String> {
     if decision.effective != Action::Rewrite {
         return None;
@@ -703,17 +703,9 @@ fn read_stdin_bounded(deadline: Instant) -> io::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
 
-    /// `AW_POLICY` is process-global. Tests that set it take this lock.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        match LOCK.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
-    }
-
+    // `AW_POLICY` is process-global. The lock lives in `policy_file` so `aw run`
+    // tests that set the same variable cannot run beside these.
     struct Scripted {
         sent: Vec<Vec<u8>>,
         ok: bool,
@@ -745,8 +737,8 @@ mod tests {
 
     #[test]
     fn policy_off_stdout_is_empty_and_exit_is_zero() {
-        let _guard = env_lock();
-        std::env::remove_var(policy_file::POLICY_ENV);
+        let _guard = policy_file::env_lock();
+        let _policy_env = policy_file::EnvVarGuard::unset(policy_file::POLICY_ENV);
         let endpoint = endpoint();
         let payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/x"}}"#;
         let mut transport = Scripted {
@@ -761,7 +753,7 @@ mod tests {
 
     #[test]
     fn claude_deny_rewrite_and_ask_match_the_documented_json() {
-        let _guard = env_lock();
+        let _guard = policy_file::env_lock();
         let dir = std::env::temp_dir().join(format!("aw-hook-policy-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -797,10 +789,10 @@ action = "ask"
 "#,
         )
         .unwrap();
-        std::env::set_var(policy_file::POLICY_ENV, &path);
+        let policy_env = policy_file::EnvVarGuard::set(policy_file::POLICY_ENV, &path);
         let endpoint = endpoint();
         let audit = dir.join("audit.jsonl");
-        std::env::set_var(intercept_audit::AUDIT_ENV, &audit);
+        let _audit_env = policy_file::EnvVarGuard::set(intercept_audit::AUDIT_ENV, &audit);
 
         let deny_payload = br#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/x","extra":1}}"#;
         let mut transport = Scripted {
@@ -907,7 +899,7 @@ action = "ask"
 
         let broken = dir.join("broken.toml");
         fs::write(&broken, "enabled = true\n[[rule]]\naction = \"nope\"\n").unwrap();
-        std::env::set_var(policy_file::POLICY_ENV, &broken);
+        policy_env.replace(&broken);
         let broken_out = run(
             input("claude-code", deny_payload, &endpoint),
             &mut transport,
@@ -925,8 +917,6 @@ action = "ask"
         let audit_text = fs::read_to_string(&audit).unwrap_or_default();
         assert!(audit_text.contains("\"downgraded\":true") || audit_text.contains("downgraded"));
         assert!(!audit_text.contains("sk-abcdefghijklmnopqrstuvwxyz"));
-        std::env::remove_var(policy_file::POLICY_ENV);
-        std::env::remove_var(intercept_audit::AUDIT_ENV);
         let _ = fs::remove_dir_all(&dir);
     }
 }

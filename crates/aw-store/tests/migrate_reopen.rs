@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aw_store::{
     apply_agent_schema, apply_file_schema, apply_http_schema, apply_inter_agent_schema,
-    apply_proxy_schema, OpenStatus, Store, StoreError, INTERCEPT_SCHEMA_VERSION,
+    apply_proxy_schema, OpenStatus, Store, StoreError, SUPPORTED_SCHEMA_VERSION,
 };
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
@@ -351,9 +351,10 @@ fn helpers_preserve_higher_versions() {
 
 #[test]
 fn future_schema_is_read_only_and_unchanged_even_with_extra_scripts() {
-    // One past the version this binary understands. Migration 0012 made 12
-    // the current intercept schema, so a literal 12 is no longer "future".
-    let future = INTERCEPT_SCHEMA_VERSION + 1;
+    // One past the version this binary understands. The ceiling is
+    // `SUPPORTED_SCHEMA_VERSION`, not the intercept migration number: the next
+    // migration raises both together, and a literal would go stale again.
+    let future = SUPPORTED_SCHEMA_VERSION + 1;
     let db = TestDb::new();
     {
         let store = Store::open(&db.path).expect("base");
@@ -378,7 +379,7 @@ fn future_schema_is_read_only_and_unchanged_even_with_extra_scripts() {
             store.status(),
             &OpenStatus::ReadOnlyNewer {
                 found: future,
-                supported: INTERCEPT_SCHEMA_VERSION
+                supported: SUPPORTED_SCHEMA_VERSION
             }
         );
         assert!(store.is_read_only());

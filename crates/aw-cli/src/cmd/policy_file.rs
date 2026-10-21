@@ -25,6 +25,58 @@ use aw_pipeline::{load_str, Policy, PolicyState};
 /// `AW_POLICY`. A path, not the document.
 pub const POLICY_ENV: &str = "AW_POLICY";
 
+/// Process-wide lock for tests that set or clear [`POLICY_ENV`].
+///
+/// The variable is process-global. `aw hook` and `aw run` tests run in the same
+/// binary, so each module's own mutex still lets them overwrite each other.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    match LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Restores one environment variable when dropped, including on panic.
+#[cfg(test)]
+pub(crate) struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl EnvVarGuard {
+    /// Remember the current value, then set `key` to `value`.
+    pub(crate) fn set(key: &'static str, value: &std::path::Path) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+
+    /// Replace the live value. Drop still restores what [`Self::set`] saved.
+    pub(crate) fn replace(&self, value: &std::path::Path) {
+        std::env::set_var(self.key, value);
+    }
+
+    /// Remember the current value, then remove `key`.
+    pub(crate) fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 /// What the hook, mcp-tap, and the proxy should do with the file.
 #[derive(Debug)]
 pub(crate) enum PolicyLoad {

@@ -222,7 +222,7 @@ reason = "不允许连这个网站"
 | `session`、`agent`、`layer`、`event` | 哪个会话、哪个 agent、哪一层、哪个事件（如 PreToolUse） |
 | `rule_id`、`action`、`effective_action` | 命中规则、规则写的动作、实际执行的动作（降级时两者不同） |
 | `tool` / `host` / `mcp_method` | 对象 |
-| `before_summary`、`before_hash` | 原文**脱敏后**截断到 256 字的摘要 + 原文 SHA-256。有会话号时盐是会话号；没有会话号时盐是本进程启动时生成的 32 字节随机数（不落盘，进程一变就变，所以无法拿固定盐做字典反查） |
+| `before_summary`、`before_hash` | 原文**脱敏后**截断到 256 字的摘要 + 原文 SHA-256。有会话号时盐是会话号；没有会话号时盐是本进程启动时生成的 32 字节随机数（优先 `/dev/urandom`，读不到时用标准库 `RandomState` 的系统随机种子再混时钟和 pid；不落盘，进程一变就变，所以无法拿固定盐做字典反查） |
 | `after_summary`、`after_hash` | 改写后的同样两项（只有改写才有） |
 | `reason` | 给 agent / 用户看的原因 |
 | `evidence`、`source` | `E3`（agent 自报告链路）或 `S`（aw 自己的代理 / 转接层做的决定）；`source` 如 `intercept.claude-code/hook` |

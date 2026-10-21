@@ -43,7 +43,11 @@ use crate::error::StoreError;
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Highest schema version understood by this binary, independently of bootstrap.
-const SUPPORTED_SCHEMA_VERSION: u32 = INTERCEPT_SCHEMA_VERSION;
+///
+/// Future-version tests use this plus one. A new migration that raises
+/// [`INTERCEPT_SCHEMA_VERSION`] must raise this too, or those tests keep
+/// calling the old ceiling "future" and fail for the wrong reason.
+pub const SUPPORTED_SCHEMA_VERSION: u32 = INTERCEPT_SCHEMA_VERSION;
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 

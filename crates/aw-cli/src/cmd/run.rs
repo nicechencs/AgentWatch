@@ -1934,7 +1934,12 @@ mod intercept_inject_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let policy = dir.join("policy.toml");
         std::fs::write(&policy, "enabled = true\n[[rule]]\naction = \"nope\"\n").unwrap();
-        std::env::set_var(super::super::policy_file::POLICY_ENV, &policy);
+        // Same lock as the hook tests. A panic still clears the variable.
+        let _guard = super::super::policy_file::env_lock();
+        let _env = super::super::policy_file::EnvVarGuard::set(
+            super::super::policy_file::POLICY_ENV,
+            &policy,
+        );
         let command = Vec::<String>::new();
         let args = RunArgs {
             agent: Some("claude-code"),
@@ -1963,7 +1968,6 @@ mod intercept_inject_tests {
             intercept: false,
         };
         let outcome = inject_claude_intercept(&args, deferred, &mut spec);
-        std::env::remove_var(super::super::policy_file::POLICY_ENV);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(outcome.is_none(), "broken policy must not skip the launch");
         assert!(

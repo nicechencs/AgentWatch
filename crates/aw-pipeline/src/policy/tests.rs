@@ -215,6 +215,102 @@ rewrite.arg.text = { replace = ["SECRET", "XXX"] }
     assert!(request.rule_id.is_none());
 }
 
+/// A direction that is not exactly `c2s` or `s2c` is a broken file. A wrong
+/// value used to load and then never match, which silently drops the rule.
+#[test]
+fn direction_must_be_c2s_or_s2c() {
+    let base = r#"
+enabled = true
+[[rule]]
+id = "r"
+layer = ["mcp"]
+action = "deny"
+"#;
+    let ok_c2s = format!("{base}match.direction = {{ exact = \"c2s\" }}\n");
+    assert!(load_str(&ok_c2s).is_ok(), "c2s was refused");
+    let ok_s2c = format!("{base}match.direction = {{ exact = \"s2c\" }}\n");
+    assert!(load_str(&ok_s2c).is_ok(), "s2c was refused");
+
+    for bad in [
+        "match.direction = \"s2c\"\n",
+        "match.direction = { exact = \"S2C\" }\n",
+        "match.direction = { exact = \"x2y\" }\n",
+        "match.direction = { exact = \"s2c \" }\n",
+        "match.direction = { exact = \" c2s\" }\n",
+        "match.direction = { prefix = \"s2c\" }\n",
+        "match.direction = { regex = \"s2c\" }\n",
+        "match.direction = { glob = \"s2c\" }\n",
+    ] {
+        let text = format!("{base}{bad}");
+        let err = load_str(&text).expect_err(&text);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("direction"),
+            "{bad:?} loaded or did not name the field: {rendered}"
+        );
+    }
+}
+
+/// `match.direction` names an MCP frame. A hook or proxy rule that sets it is
+/// naming a field that layer does not have, so the file is broken.
+#[test]
+fn direction_only_on_an_mcp_rule() {
+    for layer in ["hook", "proxy"] {
+        let text = format!(
+            "enabled = true\n[[rule]]\nid = \"r\"\nlayer = [\"{layer}\"]\n\
+             match.direction = {{ exact = \"c2s\" }}\naction = \"deny\"\n"
+        );
+        let err = load_str(&text).expect_err(layer);
+        assert!(
+            err.to_string().contains("direction"),
+            "{layer} accepted direction: {err}"
+        );
+    }
+    // No layer list means every layer, which includes hook and proxy.
+    let text = "enabled = true\n[[rule]]\nid = \"r\"\n\
+                match.direction = { exact = \"s2c\" }\naction = \"deny\"\n";
+    let err = load_str(text).expect_err("no layer");
+    assert!(err.to_string().contains("direction"), "{err}");
+}
+
+/// A rule that does not name a direction matches a request only. The same text
+/// on a response used to hit, and a deny there was recorded for a result that
+/// was forwarded.
+#[test]
+fn direction_defaults_to_the_request() {
+    let text = r#"
+enabled = true
+[[rule]]
+id = "no-rm"
+layer = ["mcp"]
+match.command = { regex = "rm" }
+action = "deny"
+reason = "不允许"
+"#;
+    let PolicyState::On(policy) = load_str(text).unwrap() else {
+        panic!("on");
+    };
+    let request = Subject {
+        layer: Layer::Mcp,
+        event: Some("c2s".to_owned()),
+        command: Some("rm -rf /".to_owned()),
+        ..Subject::default()
+    };
+    let denied = decide(&policy, &request).unwrap();
+    assert_eq!(denied.effective, Action::Deny);
+    assert_eq!(denied.rule_id.as_deref(), Some("no-rm"));
+
+    let response = Subject {
+        layer: Layer::Mcp,
+        event: Some("s2c".to_owned()),
+        command: Some("rm -rf /".to_owned()),
+        ..Subject::default()
+    };
+    let forwarded = decide(&policy, &response).unwrap();
+    assert_eq!(forwarded.effective, Action::Allow);
+    assert!(forwarded.rule_id.is_none(), "{forwarded:?}");
+}
+
 #[test]
 fn two_hits_keep_the_stricter_one() {
     let policy = policy();

@@ -697,6 +697,52 @@ rewrite.arg.text = { replace = ["SECRET", "XXX"] }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A deny that does not name a direction matches a request only. The same
+/// command text inside a response is forwarded, and no audit row is written
+/// for a refusal that did not happen.
+#[test]
+fn response_is_not_denied_by_a_rule_without_a_direction() {
+    let dir = scratch("resp-default");
+    let policy = write_policy(
+        &dir,
+        r#"
+version = 1
+enabled = true
+
+[[rule]]
+id = "no-rm"
+layer = ["mcp"]
+match.command = { regex = "rm" }
+action = "deny"
+reason = "不允许删除"
+"#,
+    );
+    let audit = dir.join("audit.jsonl");
+    let server = PathBuf::from(env!("CARGO_BIN_EXE_mcp_result"));
+    let (status, stdout, stderr) = exchange_all_env(
+        Some(&policy),
+        Some(&audit),
+        &server,
+        RESPONSE_REQUEST,
+        &[("AW_MCP_RESULT_TEXT", "rm -rf /")],
+    );
+    assert_eq!(status, 0, "stderr: {stderr}");
+    assert!(
+        stdout.contains("rm -rf /"),
+        "the response was not forwarded: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"error\""),
+        "a direction-less rule denied the response: {stdout}"
+    );
+    let body = std::fs::read_to_string(&audit).unwrap_or_default();
+    assert!(
+        !body.contains("\"event\":\"s2c\""),
+        "the response was audited: {body}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// One batch: the `rm` element is answered with its own id, the `echo`
 /// element is what the server receives, the `terraform` element is rewritten.
 #[test]

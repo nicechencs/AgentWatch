@@ -104,6 +104,9 @@ fn matching<'a>(policy: &'a Policy, subject: &Subject) -> Vec<&'a Rule> {
 }
 
 fn rule_matches(rule: &Rule, subject: &Subject) -> bool {
+    if !rule_direction(rule, subject) {
+        return false;
+    }
     if !rule.layers.is_empty() && !rule.layers.contains(&subject.layer) {
         return false;
     }
@@ -128,6 +131,18 @@ fn rule_matches(rule: &Rule, subject: &Subject) -> bool {
             .field(&field.field)
             .is_some_and(|text| field.matcher.is_match(text))
     })
+}
+
+/// A rule that does not name `match.direction` matches a request only.
+///
+/// A response rule has to say `s2c`. Matching both ways made a request rule
+/// hit a result that carried the same text, and a deny there was recorded for
+/// a result the tap still forwarded.
+fn rule_direction(rule: &Rule, subject: &Subject) -> bool {
+    if rule.matches.iter().any(|field| field.field == "direction") {
+        return true;
+    }
+    subject.event.as_deref() != Some("s2c")
 }
 
 fn strictest<'a>(hits: &[&'a Rule]) -> Option<&'a Rule> {

@@ -213,6 +213,14 @@ fn parse_rule(value: &toml::Value) -> Result<Rule, RuleError> {
         None => Vec::new(),
         Some(value) => parse_matches(value)?,
     };
+    // `direction` is an MCP frame's way. A hook or proxy rule, or a rule that
+    // names no layer (every layer), has no such field, so the file is broken
+    // rather than a rule that never matches.
+    if matches.iter().any(|field| field.field == "direction") && layers != [Layer::Mcp] {
+        return Err(RuleError::Match(
+            "match.direction is only valid on a rule whose layer is mcp".to_owned(),
+        ));
+    }
     let rewrites = match table.get("rewrite") {
         None => Vec::new(),
         Some(value) => parse_rewrites(value)?,
@@ -280,6 +288,12 @@ fn parse_matches(value: &toml::Value) -> Result<Vec<FieldMatch>, RuleError> {
         }
         let matcher =
             Matcher::compile(&raw).map_err(|err| RuleError::Match(field_error(&key, err)))?;
+        // Two values, written as `exact`. `prefix` / `glob` / `regex`, a bare
+        // string, or `S2C` used to load and then match nothing, which turns a
+        // redact rule off without saying so.
+        if key == "direction" {
+            check_direction(&matcher).map_err(RuleError::Match)?;
+        }
         out.push(FieldMatch {
             field: key,
             matcher,
@@ -342,6 +356,20 @@ fn known_match_field(name: &str) -> bool {
             | "tool"
             | "direction"
     ) || name.starts_with("arg.") && name.len() > "arg.".len() && !name[4..].contains('.')
+}
+
+/// `c2s` or `s2c`, and only as `exact`. Anything else is a broken file.
+fn check_direction(matcher: &Matcher) -> Result<(), String> {
+    match matcher {
+        Matcher::Exact(value) if value == "c2s" || value == "s2c" => Ok(()),
+        Matcher::Exact(_) => {
+            Err("match.direction must be exact \"c2s\" or exact \"s2c\"".to_owned())
+        }
+        _ => Err(
+            "match.direction only accepts exact, and the value must be \"c2s\" or \"s2c\""
+                .to_owned(),
+        ),
+    }
 }
 
 fn field_error(field: &str, err: MatchError) -> String {

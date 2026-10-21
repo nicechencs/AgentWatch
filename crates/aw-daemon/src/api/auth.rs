@@ -389,7 +389,7 @@ pub fn bearer_token(authorization: Option<&str>) -> Option<&str> {
 mod tests {
     use super::{
         authorize, bearer_token, visible_sessions, AuthDecision, AuthInput, Caller, Secret,
-        SessionView, TicketError, TicketStore, FAIL_RANDOM, UI_TICKET_TTL,
+        SessionView, TicketError, TicketStore, UiTicket, FAIL_RANDOM, UI_TICKET_TTL,
     };
 
     fn http_input(host: Option<&str>, caller: Option<Caller>, operation: &str) -> AuthInput {
@@ -585,6 +585,60 @@ mod tests {
         assert_eq!(store.ticket_count(), 0, "nothing stored under an empty key");
     }
 
+    /// Fixed text that `Debug` of a stored ticket always prints, independent of
+    /// the secret. A sliding window shorter than these runs collides with them
+    /// by chance: `issued_at: 1000` contains `100` and `000`, and `<redacted>`
+    /// contains `dac`. A 64-hex secret has ~62 windows of 3, each with 4096
+    /// possible values, so a random secret fails this check about 4% of the time
+    /// (observed on Ubuntu CI at commit bbe3d90, `auth.rs` window loop).
+    ///
+    /// Eight hex chars is 32 bits: none of the fixed runs below is 8 hex chars,
+    /// and a collision with a 64-hex secret is negligible. The helper returns
+    /// the windows so a test can show the short window false-fails on a secret
+    /// built to contain `000`.
+    fn secret_windows(secret: &str, len: usize) -> Vec<String> {
+        let chars: Vec<char> = secret.chars().collect();
+        chars
+            .windows(len)
+            .map(|window| window.iter().collect())
+            .collect()
+    }
+
+    #[test]
+    fn three_char_window_false_fails_on_fixed_debug_text() {
+        // Constructed, not drawn from the CSPRNG: the body contains `000`, which
+        // `issued_at: 1000` also prints. A 3-char scan of this secret reports a
+        // leak that is not there.
+        let secret = format!("t-{hex}", hex = "000".repeat(21) + "0");
+        assert_eq!(secret.len(), 2 + 64);
+        let mut store = TicketStore::new();
+        store.tickets.insert(
+            Secret::new(secret.clone()),
+            UiTicket {
+                user_id: "alice".to_owned(),
+                admin: false,
+                issued_at: 1_000,
+            },
+        );
+        let rendered = format!("{store:?}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(
+            !rendered.contains(&secret),
+            "the whole secret must stay out: {rendered}"
+        );
+        let short = secret_windows(&secret, 3);
+        assert!(
+            short.iter().any(|piece| rendered.contains(piece.as_str())),
+            "a 3-char window of a secret containing `000` collides with \
+             `issued_at: 1000` (and `dac` inside `<redacted>`): {rendered}"
+        );
+        let long = secret_windows(&secret, 8);
+        assert!(
+            long.iter().all(|piece| !rendered.contains(piece.as_str())),
+            "an 8-hex window is not a substring of the fixed Debug text: {rendered}"
+        );
+    }
+
     #[test]
     fn debug_and_display_of_a_stored_ticket_redact_the_secret() {
         let mut store = TicketStore::new();
@@ -599,10 +653,12 @@ mod tests {
         assert_eq!(format!("{wrapped:?}"), "<redacted>");
         assert_eq!(wrapped.to_string(), "<redacted>");
         assert_eq!(wrapped.expose(), secret);
-        for window in secret.chars().collect::<Vec<_>>().windows(3) {
-            let piece: String = window.iter().collect();
+        // 8 hex chars, not 3. See `three_char_window_false_fails_on_fixed_debug_text`:
+        // `100`/`000` (from `issued_at: 1000`) and `dac` (from `<redacted>`) make
+        // a 3-char scan fail on a secret that was never printed.
+        for piece in secret_windows(&secret, 8) {
             assert!(
-                !rendered.contains(&piece),
+                !rendered.contains(piece.as_str()),
                 "store debug contains `{piece}`: {rendered}"
             );
         }

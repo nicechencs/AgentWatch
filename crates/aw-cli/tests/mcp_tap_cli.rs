@@ -14,28 +14,47 @@ use std::time::Duration;
 
 fn aw() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aw"));
+    isolate(&mut cmd);
+    cmd
+}
+
+/// Drop every address and policy the parent shell might have exported.
+///
+/// A previous run inherited `AW_SOCKET` from the outer shell and a rewrite
+/// looked recorded when this test had given it nowhere to go. The child must
+/// see only what this test sets.
+fn isolate(cmd: &mut Command) {
     cmd.env_remove("AW_TOKEN");
     cmd.env_remove("AW_POLICY");
-    cmd
+    cmd.env_remove("AW_SOCKET");
+    cmd.env_remove("AW_SYSTEM_SOCKET");
+    cmd.env_remove("AW_INTERCEPT_AUDIT");
+    cmd.env_remove("AW_HTTP");
 }
 
 fn echo_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mcp_echo"))
 }
 
-/// Policy files live under the crate's `target/` directory, not `/tmp`.
-/// Cargo already gitignores that tree, and the test deletes the directory.
+/// Policy files and sockets live under the crate's `target/` directory, not
+/// `/tmp` (test assets stay in the gitignored build tree). Cargo deletes
+/// nothing here; each test removes its own directory.
+///
+/// The directory name is a counter, not a timestamp. A Unix socket path has
+/// to stay under `SUN_LEN` (108 bytes on Linux, 104 on macOS). The absolute
+/// `target/` path on a GitHub runner
+/// (`/home/runner/work/AgentWatch/AgentWatch/...`) is already past that, so a
+/// socket is never named by this absolute path. [`exchange_at`] runs `aw` with
+/// this directory as its cwd and passes a short relative socket name; the
+/// kernel resolves that against cwd, and the sockaddr stays short on every
+/// runner. Windows has no `sockaddr_un` limit; it uses loopback HTTP instead.
 fn scratch(name: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
-        .join(format!(
-            "aw-mcp-tap-cli-{}-{}-{name}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        .join(format!("aw-mcp-{}-{}-{name}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch");
     dir
@@ -49,7 +68,7 @@ fn write_policy(dir: &std::path::Path, body: &str) -> PathBuf {
 
 /// One JSON-RPC line in, one line out. `aw` must exit after the child does.
 fn exchange(policy: Option<&std::path::Path>, request: &str) -> (i32, String, String) {
-    exchange_at(policy, None, None, request)
+    exchange_with(policy, None, None, None, request)
 }
 
 /// `socket` is `--socket`. `http` is `--http` plus a throwaway bearer, which
@@ -60,10 +79,31 @@ fn exchange_at(
     http: Option<&str>,
     request: &str,
 ) -> (i32, String, String) {
+    exchange_with(policy, socket, http, None, request)
+}
+
+/// `audit` is `AW_INTERCEPT_AUDIT`: a local jsonl line, so a rewrite has a
+/// record even when no daemon is listening. `None` leaves the variable unset.
+fn exchange_with(
+    policy: Option<&std::path::Path>,
+    socket: Option<&std::path::Path>,
+    http: Option<&str>,
+    audit: Option<&std::path::Path>,
+    request: &str,
+) -> (i32, String, String) {
     let echo = echo_bin();
     let mut cmd = aw();
     if let Some(path) = socket {
-        cmd.arg("--socket").arg(path);
+        // Bind used the absolute path. `--socket` gets only the file name, and
+        // cwd is that file's directory: `aw` dials the name as given, and
+        // `SUN_LEN` counts those bytes, not the runner's absolute prefix.
+        cmd.current_dir(path.parent().expect("socket parent"));
+        cmd.arg("--socket").arg(
+            path.file_name()
+                .expect("socket file name")
+                .to_str()
+                .expect("socket name is utf-8"),
+        );
     }
     if let Some(url) = http {
         cmd.arg("--http")
@@ -74,6 +114,9 @@ fn exchange_at(
     cmd.args(["mcp-tap", "--"]).arg(&echo);
     if let Some(path) = policy {
         cmd.env("AW_POLICY", path);
+    }
+    if let Some(path) = audit {
+        cmd.env("AW_INTERCEPT_AUDIT", path);
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -211,8 +254,14 @@ fn deny_answers_the_client_and_does_not_reach_the_server() {
 fn rewrite_is_what_the_server_receives() {
     let dir = scratch("rewrite");
     let policy = write_policy(&dir, REWRITE);
-    let rewritten = exchange(
+    // A rewrite with nowhere to record it is a deny (design §5.3). This test
+    // checks the bytes the server sees, so the audit goes to a file in `dir`,
+    // not to whatever `AW_SOCKET` the parent happened to export.
+    let rewritten = exchange_with(
         Some(&policy),
+        None,
+        None,
+        Some(&dir.join("audit.jsonl")),
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"run","arguments":{"command":"terraform apply"}}}"#,
     );
     assert_eq!(rewritten.0, 0, "stderr: {}", rewritten.2);
@@ -302,7 +351,9 @@ fn broken_policy_deny_uses_aw_socket() {
     let dir = scratch("broken");
     let policy = dir.join("broken.toml");
     std::fs::write(&policy, "this is not a policy\n").expect("policy");
-    let socket = dir.join("api.sock");
+    // Relative name, resolved by `aw` against `dir`. Binding uses the absolute
+    // path (this process's cwd is not `dir`); connecting uses the short name.
+    let socket = dir.join("s");
     let posted = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let saved = std::sync::Arc::clone(&posted);
     let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
@@ -322,7 +373,8 @@ fn broken_policy_deny_uses_aw_socket() {
     });
     let echo = echo_bin();
     let mut cmd = aw();
-    cmd.env("AW_POLICY", &policy).env("AW_SOCKET", &socket);
+    cmd.current_dir(&dir);
+    cmd.env("AW_POLICY", &policy).env("AW_SOCKET", "s");
     cmd.env_remove("AW_INTERCEPT_AUDIT");
     cmd.args(["mcp-tap", "--"]).arg(&echo);
     cmd.stdin(Stdio::piped())
@@ -392,7 +444,8 @@ fn stand_in(posted: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> (AuditAddr
     #[cfg(unix)]
     {
         let dir = scratch("sock");
-        let path = dir.join("api.sock");
+        // `s` / `d` stay under SUN_LEN once `aw` resolves them from `dir`.
+        let path = dir.join("s");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
         let worker = std::thread::spawn(move || {
             let Ok((mut stream, _)) = listener.accept() else {
@@ -409,7 +462,7 @@ fn stand_in(posted: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> (AuditAddr
                 b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
             );
         });
-        let dead = dir.join("dead.sock");
+        let dead = dir.join("d");
         (
             AuditAddress {
                 socket: Some(path),

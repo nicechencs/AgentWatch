@@ -59,8 +59,11 @@ impl EnvVarGuard {
         std::env::set_var(self.key, value);
     }
 
-    /// Remember the current value, then set `key` to a string.
-    pub(crate) fn set_text(key: &'static str, value: &std::path::Path) -> Self {
+    /// Remember the current value, then set `key` to `value`.
+    ///
+    /// A path and a plain string both implement this, so a session id and a
+    /// config directory share one setter.
+    pub(crate) fn set_text(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let previous = std::env::var_os(key);
         std::env::set_var(key, value);
         Self { key, previous }

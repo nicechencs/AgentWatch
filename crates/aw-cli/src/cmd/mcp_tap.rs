@@ -930,13 +930,23 @@ fn audit_mcp(
             .as_deref(),
         None,
     );
+    // Same salt rule as the hook: a session id is the salt, so two processes
+    // auditing one session hash one command the same way. No session means the
+    // process-local salt, which is not comparable across restarts.
+    let session = std::env::var(super::hook::SESSION_ENV)
+        .ok()
+        .filter(|id| !id.is_empty());
+    let salt: &[u8] = match session.as_deref() {
+        Some(id) => id.as_bytes(),
+        None => super::intercept_audit::process_salt(),
+    };
     let mut record = super::intercept_audit::record_for(
         &subject,
         decision,
-        super::intercept_audit::process_salt(),
+        salt,
         before,
         after,
-        None,
+        session.as_deref(),
     );
     let delivery = super::intercept_audit::deliver(
         endpoint,
@@ -1222,6 +1232,47 @@ match.command = { prefix = "terraform apply" }
 action = "rewrite"
 rewrite.command = { replace = ["terraform apply", "terraform plan"] }
 "#;
+
+    /// `AW_SESSION` is how `aw run` names the daemon session. The audit line
+    /// stores that id, not an empty session.
+    #[test]
+    fn audit_line_carries_aw_session() {
+        let _guard = crate::cmd::policy_file::env_lock();
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "aw-mcp-session-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit = dir.join("audit.jsonl");
+        let _audit = crate::cmd::policy_file::EnvVarGuard::set(
+            crate::cmd::intercept_audit::AUDIT_ENV,
+            &audit,
+        );
+        let _session =
+            crate::cmd::policy_file::EnvVarGuard::set_text(crate::cmd::hook::SESSION_ENV, "s-mcp");
+        let frame = b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"run\",\"arguments\":{\"command\":\"rm -rf /tmp\"}}}\n";
+        let copy = copy_gated_for_test(frame, DIR_C2S, DENY_RM, true).unwrap();
+        assert!(copy.child.is_empty(), "denied frame reached the child");
+        let text = std::fs::read_to_string(&audit).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        let row: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(row["session"], serde_json::json!("s-mcp"), "{row}");
+        assert_eq!(row["effective_action"], serde_json::json!("deny"), "{row}");
+        assert_eq!(row["layer"], serde_json::json!("mcp"), "{row}");
+        assert_eq!(row["tool"], serde_json::json!("run"), "{row}");
+        assert_eq!(row["mcp_method"], serde_json::json!("tools/call"), "{row}");
+        assert_eq!(row["before_summary"], serde_json::json!("rm -rf /tmp"), "{row}");
+        assert_eq!(row["delivered"], serde_json::json!("local_backup"), "{row}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn deny_is_not_forwarded_and_the_error_keeps_the_id() {

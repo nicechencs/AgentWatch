@@ -1252,7 +1252,7 @@ pub(crate) fn run(
         Err(outcome) => return outcome,
     };
     let omitted = enabled_omitted_note();
-    let (intercept_dir, rewrites) = match inject_claude_intercept(args, deferred, &mut spec) {
+    let (intercept_dir, rewrites) = match inject_claude_intercept(args, deferred, &mut spec, None) {
         Ok(Some((dir, rewrites))) => (Some(dir), rewrites),
         Ok(None) => (None, false),
         Err(outcome) => return outcome,
@@ -1581,15 +1581,27 @@ fn inject_claude_intercept(
     args: &RunArgs<'_>,
     deferred: DeferredFlags,
     spec: &mut crate::launch::RunSpec,
+    session: Option<&str>,
 ) -> Result<Option<(std::path::PathBuf, bool)>, Outcome> {
     let Some(rewrites) = claude_intercept_enabled(args, deferred, spec)? else {
         return Ok(None);
     };
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aw"));
     let command = exe.display().to_string();
+    // The daemon's public id, once it has assigned one. The hook reads
+    // `AW_SESSION` and `--session`. mcp-tap, started later in the same process
+    // tree, reads the variable. Both are how an intercept row gets a session.
+    let mut hook_args = vec!["hook".to_owned(), "claude-code".to_owned()];
+    if let Some(id) = session.map(str::trim).filter(|id| !id.is_empty()) {
+        hook_args.push("--session".to_owned());
+        hook_args.push(id.to_owned());
+        spec.env
+            .push((super::hook::SESSION_ENV.to_owned(), id.to_owned()));
+    }
+    let hook_refs: Vec<&str> = hook_args.iter().map(String::as_str).collect();
     let doc = aw_agent_adapters::agents::claude_code::decision::intercept_settings_json(
         &command,
-        &["hook", "claude-code"],
+        &hook_refs,
         true,
     );
     let dir = std::env::temp_dir().join(format!(
@@ -1625,9 +1637,8 @@ fn inject_claude_intercept(
     }
     spec.command.push("--settings".to_owned());
     spec.command.push(path.display().to_string());
-    // `AW_SESSION` is not set here. The daemon assigns the public id after
-    // this function returns, and this process does not know it yet. The hook
-    // falls back to `--session` when a later card threads the id through.
+    // `AW_SESSION` and `--session` are set above when the caller already has
+    // the daemon's public id. `aw run` without a daemon has no id to give.
     Ok(Some((dir, rewrites)))
 }
 
@@ -1672,14 +1683,9 @@ pub(crate) fn daemon_run(
         Err(outcome) => return outcome,
     };
     let omitted = enabled_omitted_note();
-    // One settings file for this launch. `preflight` already validated the
-    // policy and wrote nothing, so this is the only `--settings`.
-    let (intercept_dir, rewrites) = match inject_claude_intercept(args, deferred, &mut spec) {
-        Ok(Some((dir, rewrites))) => (Some(dir), rewrites),
-        Ok(None) => (None, false),
-        Err(outcome) => return outcome,
-    };
-    let notice = rewrite_notice(rewrites);
+    // The public id exists only after the daemon accepts the run. Inject after
+    // that, so the hook command and `AW_SESSION` name this session. The argv
+    // sent to `begin_run` is the operator's command, without `--settings`.
     let request = BeginRunRequest {
         argv: spec.command.clone(),
         cwd: spec.cwd.clone(),
@@ -1689,13 +1695,25 @@ pub(crate) fn daemon_run(
     };
     let launch = match sessions.begin_run(&request) {
         Ok(launch) => launch,
-        Err(error) => {
-            return finish_daemon(
-                intercept_dir.as_deref(),
-                daemon_error_outcome(error, args.json, false),
-            );
+        Err(error) => return daemon_error_outcome(error, args.json, false),
+    };
+    // One settings file for this launch. `preflight` already validated the
+    // policy and wrote nothing, so this is the only `--settings`.
+    let (intercept_dir, rewrites) = match inject_claude_intercept(
+        args,
+        deferred,
+        &mut spec,
+        Some(launch.public_id.as_str()),
+    ) {
+        Ok(Some((dir, rewrites))) => (Some(dir), rewrites),
+        Ok(None) => (None, false),
+        Err(outcome) => {
+            // The reservation has no child. Drop it; do not leave a pending run.
+            let _ = sessions.discard_run(&launch);
+            return outcome;
         }
     };
+    let notice = rewrite_notice(rewrites);
     let mut child = match spawner.spawn(&spec) {
         Ok(child) => child,
         Err((code, detail)) => {
@@ -2171,7 +2189,7 @@ mod intercept_inject_tests {
             group: false,
             intercept: false,
         };
-        let outcome = inject_claude_intercept(&args, deferred, &mut spec);
+        let outcome = inject_claude_intercept(&args, deferred, &mut spec, None);
         if let Ok(Some((settings_dir, _))) = &outcome {
             let _ = std::fs::remove_dir_all(settings_dir);
         }
@@ -2250,7 +2268,7 @@ mod intercept_inject_tests {
         );
 
         let mut spec = crate::launch::RunSpec::new(command.clone()).unwrap();
-        let written = match inject_claude_intercept(&args, deferred, &mut spec) {
+        let written = match inject_claude_intercept(&args, deferred, &mut spec, None) {
             Ok(Some((dir, _))) => dir,
             Ok(None) => panic!("intercept did not write settings"),
             Err(_) => panic!("intercept settings could not be written"),
@@ -2340,7 +2358,7 @@ mod intercept_inject_tests {
             "stderr did not say the switch is missing: {text}"
         );
         let mut spec = crate::launch::RunSpec::new(command.clone()).unwrap();
-        let injected = inject_claude_intercept(&args, deferred, &mut spec)
+        let injected = inject_claude_intercept(&args, deferred, &mut spec, None)
             .unwrap_or_else(|_| panic!("inject failed"));
         assert!(
             injected.is_none(),
@@ -2358,6 +2376,133 @@ mod intercept_inject_tests {
             "enabled = false is deliberate and must stay quiet"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A daemon launch already has a public id. The hook command and the child
+    /// environment both carry it, so the audit row is not stored with an empty
+    /// session. Without an id, neither is invented.
+    #[test]
+    fn injected_hook_carries_the_daemon_session() {
+        let dir = scratch_policy("session");
+        let policy = dir.join("policy.toml");
+        std::fs::write(&policy, "enabled = true\n[[rule]]\naction = \"deny\"\n").unwrap();
+        let _guard = super::super::policy_file::env_lock();
+        let _env = super::super::policy_file::EnvVarGuard::set(
+            super::super::policy_file::POLICY_ENV,
+            &policy,
+        );
+        let _home = isolate_home();
+        let command = vec!["claude".to_owned()];
+        let args = RunArgs {
+            agent: Some("claude-code"),
+            name: None,
+            no_follow_children: false,
+            cwd: None,
+            env: &[],
+            summary: None,
+            pin: false,
+            no_daemon: false,
+            raw: None,
+            command: &command,
+            json: false,
+            quiet: true,
+        };
+        let deferred = DeferredFlags {
+            proxy: false,
+            proxy_on_reject: false,
+            proxy_on_reject_value: None,
+            self_report: false,
+            mcp_tap: false,
+            unsafe_no_redact: false,
+            include_proc: false,
+            group: false,
+            intercept: true,
+        };
+        let mut spec = crate::launch::RunSpec::new(command.clone()).unwrap();
+        let written = match inject_claude_intercept(&args, deferred, &mut spec, Some("s-public")) {
+            Ok(Some((dir, _))) => dir,
+            Ok(None) => panic!("intercept did not write settings"),
+            Err(_) => panic!("intercept settings could not be written"),
+        };
+        let doc = std::fs::read_to_string(written.join("claude-settings.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        let args_json = hook_command_args(&value);
+        assert_eq!(
+            args_json,
+            vec![
+                "hook".to_owned(),
+                "claude-code".to_owned(),
+                "--session".to_owned(),
+                "s-public".to_owned(),
+            ],
+            "settings hook args: {doc}"
+        );
+        assert_eq!(
+            spec.env,
+            vec![(super::super::hook::SESSION_ENV.to_owned(), "s-public".to_owned())],
+            "child env did not receive AW_SESSION"
+        );
+        let _ = cleanup_intercept_dir(&written);
+
+        let mut bare = crate::launch::RunSpec::new(command.clone()).unwrap();
+        let bare_dir = match inject_claude_intercept(&args, deferred, &mut bare, None) {
+            Ok(Some((dir, _))) => dir,
+            Ok(None) => panic!("intercept did not write settings"),
+            Err(_) => panic!("intercept settings could not be written"),
+        };
+        let bare_doc = std::fs::read_to_string(bare_dir.join("claude-settings.json")).unwrap();
+        let bare_value: serde_json::Value = serde_json::from_str(&bare_doc).unwrap();
+        assert_eq!(
+            hook_command_args(&bare_value),
+            vec!["hook".to_owned(), "claude-code".to_owned()],
+            "a launch with no session invented one: {bare_doc}"
+        );
+        assert!(
+            bare.env.is_empty(),
+            "AW_SESSION was set with no session: {:?}",
+            bare.env
+        );
+        let _ = cleanup_intercept_dir(&bare_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every PreToolUse / PostToolUse hook command in the injected settings.
+    fn hook_command_args(value: &serde_json::Value) -> Vec<String> {
+        let hooks = value
+            .get("hooks")
+            .and_then(|hooks| hooks.as_object())
+            .expect("settings have no hooks object");
+        let mut found = Vec::new();
+        for event in ["PreToolUse", "PostToolUse"] {
+            let Some(groups) = hooks.get(event).and_then(|entry| entry.as_array()) else {
+                continue;
+            };
+            for group in groups {
+                let Some(entries) = group.get("hooks").and_then(|entry| entry.as_array()) else {
+                    continue;
+                };
+                for entry in entries {
+                    if entry.get("type").and_then(|kind| kind.as_str()) != Some("command") {
+                        continue;
+                    }
+                    let Some(args) = entry.get("args").and_then(|args| args.as_array()) else {
+                        continue;
+                    };
+                    found.push(
+                        args.iter()
+                            .filter_map(|arg| arg.as_str().map(str::to_owned))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+        }
+        assert!(!found.is_empty(), "no hook command args in {value}");
+        let first = found[0].clone();
+        assert!(
+            found.iter().all(|args| args == &first),
+            "hook commands disagree: {found:?}"
+        );
+        first
     }
 
     /// Scratch policy directory inside this crate, never `/tmp`.

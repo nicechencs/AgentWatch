@@ -19,6 +19,9 @@ toml = { version = "0.8.23", default-features = false, features = ["parse"] }
 # the pipeline. MIT OR Apache-2.0. serde_json renders AgentToolCall summaries.
 regex = "1.11.1"
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+# Salted audit hashes (P5-SEC-01). sha2 0.11.0 is already in Cargo.lock via
+# aw-core (MIT OR Apache-2.0). Not a new third-party crate.
+sha2 = { version = "0.11.0", default-features = false }
 
 [[bench]]
 name = "passthrough"

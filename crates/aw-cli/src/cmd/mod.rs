@@ -15,9 +15,11 @@ mod gaps;
 mod hook;
 mod http;
 mod http_source;
+mod intercept_audit;
 mod lifecycle;
 mod mcp_tap;
 mod merge;
+mod policy_file;
 mod procs;
 mod proxy;
 mod ps;
@@ -357,6 +359,7 @@ fn run_parts<'a>(
         no_daemon,
         raw,
         unsafe_no_redact,
+        intercept,
         cmd,
     } = command
     else {
@@ -385,6 +388,7 @@ fn run_parts<'a>(
         unsafe_no_redact: *unsafe_no_redact,
         include_proc: !include_proc.is_empty(),
         group: group.is_some(),
+        intercept: *intercept,
     };
     Some((args, deferred))
 }
@@ -780,6 +784,7 @@ fn launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
             no_daemon,
             raw,
             unsafe_no_redact,
+            intercept,
             cmd,
         } => {
             let args = run::RunArgs {
@@ -805,6 +810,7 @@ fn launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
                 unsafe_no_redact: *unsafe_no_redact,
                 include_proc: !include_proc.is_empty(),
                 group: group.is_some(),
+                intercept: *intercept,
             };
             Some(run::run(
                 &args,

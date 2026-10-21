@@ -748,6 +748,11 @@ pub fn dispatch(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     if req.path == "/api/v1/agent/hook" && req.method.eq_ignore_ascii_case("POST") {
         return ingest_agent_hook(state, req);
     }
+    // Same trust model as the hook route: the intercept writer is a local
+    // process with no ticket. Loopback Host is still required.
+    if req.path == "/api/v1/agent/intercept" && req.method.eq_ignore_ascii_case("POST") {
+        return ingest_intercept(state, req);
+    }
 
     // Socket/pipe ticket issuance is not an HTTP-bearer flow. Over HTTP,
     // a presented bearer (or an explicit test caller header is not invented):
@@ -984,6 +989,77 @@ fn ingest_agent_hook(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
         );
     }
     ApiResponse::json(200, &json!({ "accepted": accepted }))
+}
+
+/// `POST /api/v1/agent/intercept`. Loopback only. No bearer.
+///
+/// The body is an already-redacted audit record. `dropped: true` records an
+/// `intercept_audit_dropped` gap and does not insert a row. A missing required
+/// field is 400; this route does not invent an empty summary.
+fn ingest_intercept(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
+    let _busy_deadline = aw_store::BusyDeadline::start(aw_store::BUSY_TIMEOUT);
+    let host = req.headers.get("host").cloned();
+    if req_host_bad(&host, req.listen_port) {
+        return misdirected();
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&req.body) {
+        Ok(value) => value,
+        Err(_) => return error_response(400, "not_json", "intercept body is not JSON"),
+    };
+    let dropped = value.get("dropped").and_then(serde_json::Value::as_bool) == Some(true);
+    let report = super::query::InterceptReport {
+        session: json_string(&value, "session"),
+        agent: json_string(&value, "agent"),
+        layer: json_string(&value, "layer").unwrap_or_default(),
+        event: json_string(&value, "event"),
+        rule_id: json_string(&value, "rule_id"),
+        action: json_string(&value, "action").unwrap_or_default(),
+        effective_action: json_string(&value, "effective_action").unwrap_or_default(),
+        tool: json_string(&value, "tool"),
+        host: json_string(&value, "host"),
+        mcp_method: json_string(&value, "mcp_method"),
+        before_summary: json_string(&value, "before_summary").unwrap_or_default(),
+        before_hash: json_string(&value, "before_hash").unwrap_or_default(),
+        after_summary: json_string(&value, "after_summary"),
+        after_hash: json_string(&value, "after_hash"),
+        reason: json_string(&value, "reason"),
+        evidence: json_string(&value, "evidence").unwrap_or_default(),
+        source: json_string(&value, "source").unwrap_or_default(),
+        delivered: json_string(&value, "delivered").unwrap_or_else(|| "daemon".to_owned()),
+        downgraded: value.get("downgraded").and_then(serde_json::Value::as_bool) == Some(true),
+        dropped,
+    };
+    if !dropped
+        && (report.layer.is_empty()
+            || report.action.is_empty()
+            || report.effective_action.is_empty()
+            || report.before_summary.is_empty()
+            || report.before_hash.is_empty()
+            || report.evidence.is_empty()
+            || report.source.is_empty())
+    {
+        return error_response(400, "bad_argument", "intercept record is missing a field");
+    }
+    match state.query.ingest_intercept(&report) {
+        Ok(super::query::InterceptIngest::Stored) => {
+            ApiResponse::json(200, &json!({ "stored": true }))
+        }
+        Ok(super::query::InterceptIngest::Gap) => {
+            ApiResponse::json(200, &json!({ "gap": "intercept_audit_dropped" }))
+        }
+        Ok(super::query::InterceptIngest::NoDatabase) => {
+            ApiResponse::json(200, &json!({ "stored": false, "storage": "not_ready" }))
+        }
+        Err(_) => error_response(500, "store", "intercept record was not written"),
+    }
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
 }
 
 fn hook_result(state: &mut ApiState, report: &super::query::HookReport) -> ApiResponse {

@@ -185,6 +185,7 @@ dependencies = [
  "aw-store",
  "regex",
  "serde_json",
+ "sha2",
  "toml",
 ]
 
@@ -205,6 +206,7 @@ name = "aw-proxy"
 version = "0.1.0"
 dependencies = [
  "aw-core",
+ "aw-pipeline",
  "flate2",
  "http",
  "http-body-util",

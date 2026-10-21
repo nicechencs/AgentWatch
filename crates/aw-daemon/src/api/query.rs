@@ -351,6 +351,14 @@ pub trait SessionQuery {
     /// `POST /api/v1/agent/hook`. Writes one bounded self-report, or one gap when
     /// the hook says the report was dropped. Does not store a prompt or a body.
     fn ingest_self_report(&self, report: &HookReport) -> Result<HookIngest, QueryBackendError>;
+
+    /// `POST /api/v1/agent/intercept`. Writes one deny / rewrite / ask row, or
+    /// one `intercept_audit_dropped` gap when the caller says delivery failed.
+    /// Summaries are already redacted. This does not store an original.
+    fn ingest_intercept(
+        &self,
+        report: &InterceptReport,
+    ) -> Result<InterceptIngest, QueryBackendError>;
 }
 
 /// One hook post, already split by the route. Fields are the whitelist only.
@@ -391,6 +399,63 @@ pub struct HookReport {
     pub dropped: bool,
     /// Why it was dropped: `timeout`, `send_failed`. Not a payload.
     pub drop_reason: Option<String>,
+}
+
+/// One intercept post. Fields are the audit whitelist. Not `Debug`: summaries
+/// are still derived from commands and URLs.
+#[derive(Clone)]
+pub struct InterceptReport {
+    /// Public session id, or unknown.
+    pub session: Option<String>,
+    /// Agent id, or unknown.
+    pub agent: Option<String>,
+    /// `hook` / `mcp` / `proxy`.
+    pub layer: String,
+    /// Hook event name, or unknown.
+    pub event: Option<String>,
+    /// Winning rule, or unknown.
+    pub rule_id: Option<String>,
+    /// Rule action.
+    pub action: String,
+    /// Action actually taken.
+    pub effective_action: String,
+    /// Tool name, or unknown.
+    pub tool: Option<String>,
+    /// Host, or unknown.
+    pub host: Option<String>,
+    /// MCP method, or unknown.
+    pub mcp_method: Option<String>,
+    /// Redacted summary of the original. Not the original.
+    pub before_summary: String,
+    /// Salted SHA-256 of the original, hex.
+    pub before_hash: String,
+    /// Redacted replacement, only for a rewrite.
+    pub after_summary: Option<String>,
+    /// Hash of the replacement, only for a rewrite.
+    pub after_hash: Option<String>,
+    /// Sentence shown to the agent.
+    pub reason: Option<String>,
+    /// `E3` or `S`.
+    pub evidence: String,
+    /// `intercept.<agent>/hook`, `intercept.mcp-tap`, or `intercept.proxy`.
+    pub source: String,
+    /// `daemon` when the caller is asking this process to store it.
+    pub delivered: String,
+    /// `true` when the effective action is not the rule's action.
+    pub downgraded: bool,
+    /// `true` when the caller could not keep the audit anywhere. One gap, no row.
+    pub dropped: bool,
+}
+
+/// What the store did with one intercept post.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterceptIngest {
+    /// The row is in `intercept_events`.
+    Stored,
+    /// The database is not configured. The row was not written.
+    NoDatabase,
+    /// `dropped: true` became an `intercept_audit_dropped` gap.
+    Gap,
 }
 
 /// What the store did with one hook post.
@@ -1265,6 +1330,52 @@ impl SessionQuery for StoreQuery {
         };
         aw_store::store_agent_event(&mut store, &row).map_err(map_store)?;
         Ok(HookIngest::Stored)
+    }
+
+    fn ingest_intercept(
+        &self,
+        report: &InterceptReport,
+    ) -> Result<InterceptIngest, QueryBackendError> {
+        if self.db_path.is_none() {
+            return Ok(InterceptIngest::NoDatabase);
+        }
+        let mut store = self.open_mut()?;
+        let now = unix_now_ns();
+        let session_id = match report.session.as_deref().filter(|sid| !sid.is_empty()) {
+            Some(sid) => {
+                aw_store::session_id_by_public(store.connection(), sid).map_err(map_store)?
+            }
+            None => None,
+        };
+        if report.dropped {
+            aw_store::insert_intercept_gap(store.connection(), session_id, now, "dropped")
+                .map_err(map_store)?;
+            return Ok(InterceptIngest::Gap);
+        }
+        let row = aw_store::InterceptEventInsert {
+            session_id,
+            ts_ns: now,
+            agent: report.agent.clone(),
+            layer: report.layer.clone(),
+            event: report.event.clone(),
+            rule_id: report.rule_id.clone(),
+            action: report.action.clone(),
+            effective_action: report.effective_action.clone(),
+            tool: report.tool.clone(),
+            host: report.host.clone(),
+            mcp_method: report.mcp_method.clone(),
+            before_summary: report.before_summary.clone(),
+            before_hash: report.before_hash.clone(),
+            after_summary: report.after_summary.clone(),
+            after_hash: report.after_hash.clone(),
+            reason: report.reason.clone(),
+            evidence: report.evidence.clone(),
+            source: report.source.clone(),
+            delivered: report.delivered.clone(),
+            downgraded: report.downgraded,
+        };
+        aw_store::store_intercept_event(&mut store, &row).map_err(map_store)?;
+        Ok(InterceptIngest::Stored)
     }
 }
 

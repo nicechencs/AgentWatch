@@ -557,7 +557,7 @@ fn decide_and_apply(line: &str, gate: &mut Gate<'_, impl Write>) -> FrameAction 
         Some((delivery, posted))
             if delivery.client_unconfirmed && decision.effective == Action::Rewrite =>
         {
-            let downgraded = unconfirmed_rewrite(&decision);
+            let downgraded = delivery.downgrade_rewrite(&decision);
             let _ = super::intercept_audit::correct_delivered(
                 audit_backup().as_deref(),
                 gate.endpoint,
@@ -857,21 +857,6 @@ fn deny_decision(reason: &str) -> Decision {
 ///
 /// The rule's action stays `rewrite`. The sentence keeps the rule's reason and
 /// says why the bytes did not change.
-fn unconfirmed_rewrite(decision: &Decision) -> Decision {
-    let extra = "审计写不进去，改写已改为拒绝";
-    Decision {
-        rule_id: decision.rule_id.clone(),
-        action: decision.action,
-        effective: Action::Deny,
-        downgraded: true,
-        reason: Some(match decision.reason.as_deref() {
-            Some(text) if !text.is_empty() => format!("{text}（{extra}）"),
-            _ => extra.to_owned(),
-        }),
-        fields: Vec::new(),
-    }
-}
-
 /// `AW_INTERCEPT_AUDIT`, else `<session dir>/intercept-audit.jsonl`.
 ///
 /// The session directory comes from `AW_SESSION` and the platform state home.
@@ -1268,7 +1253,11 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
         assert_eq!(row["layer"], serde_json::json!("mcp"), "{row}");
         assert_eq!(row["tool"], serde_json::json!("run"), "{row}");
         assert_eq!(row["mcp_method"], serde_json::json!("tools/call"), "{row}");
-        assert_eq!(row["before_summary"], serde_json::json!("rm -rf /tmp"), "{row}");
+        assert_eq!(
+            row["before_summary"],
+            serde_json::json!("rm -rf /tmp"),
+            "{row}"
+        );
         assert_eq!(row["delivered"], serde_json::json!("local_backup"), "{row}");
         let _ = std::fs::remove_dir_all(&dir);
     }

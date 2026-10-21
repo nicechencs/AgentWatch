@@ -484,6 +484,8 @@ flowchart LR
 
 **验收标准**：见 [拦截方案 §8](../../proposals/aw-intercept-design.md) 中规则与审计相关条目。
 
+实现差（2026-10-22）：规则文件里不认识的键（含 `[[rule]]` 内和 `match` 内）按损坏拒绝，不会因为写错 `enable` 就静默关掉。有 `[[rule]]` 但没有 `enabled` 时，`aw run` 在 stderr 说明拦截没打开。后台回 `stored: false` 不算送达；改写因此改成拒绝时再补一条记录。没有 `AW_INTERCEPT_AUDIT` 时，备份写到状态目录下的 `agentwatch/sessions/<会话号>/intercept-audit.jsonl`（Linux / macOS 用 `XDG_STATE_HOME` 或 `~/.local/state`，Windows 用 `LOCALAPPDATA`），Unix 上文件是 `0600`。
+
 ### P5-SEC-02 `aw hook` 按规则拒绝 / 改写 / 问用户
 
 - **AREA**: AGENT
@@ -523,4 +525,4 @@ PostToolUse、SessionStart、SessionEnd 不输出判定、不改写、不写拒�
 
 **要点**：命中 deny 回 403 和中文原因，不连上游；第一步不改写；代理接入 `aw run` 启动链路是后续任务。
 
-实现差（2026-10-21）：`MitmProxy::bind` 仍不接收规则（现有调用不变）。拒绝与「改写降为拒绝」由 `preview_proxy_decision` 测到；handler 在 `policy: None` 时原样转发。`aw run` 不拉起代理。
+实现差（2026-10-22）：`MitmProxy::bind` 仍不接收规则（现有调用不变）。拒绝与「改写降为拒绝」由 `preview_proxy_decision` 测到；handler 在 `policy: None` 时原样转发。拒绝回包在库里是 403（中文原因做百分号编码，构造失败也不掉成 200）。主机名比较忽略大小写，`[::1]` 不会被冒号截断。这一层仍是库级：未接入 `aw run` 启动链路，没有端到端测试。

@@ -322,7 +322,7 @@ fn apply_decision(
     // last line matches what ran.
     let rewrite_unconfirmed = decided.effective == Action::Rewrite && audited.client_unconfirmed;
     if rewrite_unconfirmed {
-        let downgraded = downgrade_unconfirmed(&decided);
+        let downgraded = audited.downgrade_rewrite(&decided);
         let _ = intercept_audit::correct_delivered(
             intercept_audit::backup_path(
                 audit_env_path().as_deref(),
@@ -451,25 +451,6 @@ fn on_error_decision(on_error: OnError, reason: &str) -> Decision {
         effective: action,
         downgraded: false,
         reason: Some(reason.to_owned()),
-        fields: Vec::new(),
-    }
-}
-
-/// A rewrite whose audit the client could not confirm, printed as a deny.
-///
-/// The rule's action stays `rewrite`, so the row shows what was asked and
-/// what ran. The reason keeps the rule's sentence and says why it changed.
-fn downgrade_unconfirmed(decision: &Decision) -> Decision {
-    let extra = "审计写不进去，改写已改为拒绝";
-    Decision {
-        rule_id: decision.rule_id.clone(),
-        action: decision.action,
-        effective: Action::Deny,
-        downgraded: true,
-        reason: Some(match decision.reason.as_deref() {
-            Some(text) if !text.is_empty() => format!("{text}（{extra}）"),
-            _ => extra.to_owned(),
-        }),
         fields: Vec::new(),
     }
 }

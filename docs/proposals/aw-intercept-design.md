@@ -236,9 +236,9 @@ reason = "不允许连这个网站"
 | `delivered` | 后台收到 / 写入本地备份 / 都失败 |
 
 - 不存原文全文，不存 body，不存提示词全文（ADR-0012）。脱敏走管道现有 Redact 规则。
-- 投递：先追加本地 `intercept-audit.jsonl`（`AW_INTERCEPT_AUDIT`，否则 `<会话目录>/intercept-audit.jsonl`，Unix 上 `0600`），再尽力 `POST /api/v1/agent/intercept`。hook 只有 200 ms，不能让连不上的后台吃掉预算、连本地备份也写不成。后台写成功时记录的 `delivered` 是 `daemon`（本地行可能还在，第一步不把这份文件再收进库）。两边都失败时按 §5.3 第 2 条处理。Gap（`gap_kind = intercept_audit_dropped`）只在客户端仍能把 `dropped: true` 送到这条路由时入库；后台本身不可达时，这条 Gap 也送不出去，只剩降级。
+- 投递：先追加本地 `intercept-audit.jsonl`（`AW_INTERCEPT_AUDIT`，否则 `<会话目录>/intercept-audit.jsonl`，Unix 上 `0600`），再尽力 `POST /api/v1/agent/intercept`。hook 只有 200 ms，不能让连不上的后台吃掉预算、连本地备份也写不成。后台写成功时记录的 `delivered` 是 `daemon`（本地行可能还在，第一步不把这份文件再收进库）。两边都失败时按 §5.3 第 2 条处理。改写已经按拒绝执行、但先发出去的那条仍写着 `rewrite` 时，再写一条 `effective_action` 为 `deny` 的记录，以后写的那条为准。Gap（`gap_kind = intercept_audit_dropped`）只在客户端仍能把 `dropped: true` 送到这条路由时入库；后台本身不可达时，这条 Gap 也送不出去，只剩降级。
 - 规则文件：`AW_POLICY`（非空路径；文件不存在当作关），否则 `$XDG_CONFIG_HOME/agentwatch/policy.toml`（未设则 `~/.config/agentwatch/policy.toml`），Windows 为 `%APPDATA%\agentwatch\policy.toml`。不读 `/etc/agentwatch/config.toml`，也不读项目目录里的文件。
-- 实现落点（2026-10-21，`feat/intercept`）：规则与判定在 `aw-pipeline`（已有 `regex`、`toml`、脱敏；`sha2` 0.11 已在锁文件，MIT OR Apache-2.0）。`aw-core` 不增加 `GapKind` 变体（那是全仓类型变更，AGENTS.md §8 要求单独先合）；`gaps.kind` 以文本 `intercept_audit_dropped` 写入。Codex 自动注入未做，只提供手动片段（`codex::decision::manual_snippet`），不改 `~/.codex/`，不加 `--dangerously-bypass-hook-trust`。`aw run` 不注入 `AW_SESSION`（公开 id 在 `prepare` 返回之后才有）。代理不从 `aw run` 拉起。真机 `aw run --agent claude-code` 未验证。规则文件损坏时：`aw hook` 按拒绝输出（带 `hookEventName`）；`aw run` 仍注入临时 hooks，否则这个拒绝不会跑；`aw mcp-tap` 只拒绝 `tools/call`，`initialize` / `tools/list` / 通知照常转发。`hookSpecificOutput` 必须带与输入一致的 `hookEventName`，否则 Claude Code 把输出当非阻塞错误、工具照常执行。
+- 实现落点（2026-10-21，`feat/intercept`）：规则与判定在 `aw-pipeline`（已有 `regex`、`toml`、脱敏；`sha2` 0.11 已在锁文件，MIT OR Apache-2.0）。`aw-core` 不增加 `GapKind` 变体（那是全仓类型变更，AGENTS.md §8 要求单独先合）；`gaps.kind` 以文本 `intercept_audit_dropped` 写入。Codex 自动注入未做，只提供手动片段（`codex::decision::manual_snippet`），不改 `~/.codex/`，不加 `--dangerously-bypass-hook-trust`。有后台时，`begin_run` 之后注入 `AW_SESSION` 和 hook 的 `--session`；没有后台就没有公开号可给。代理不从 `aw run` 拉起，拒绝回包只在库里测过，没有端到端。真机 `aw run --agent claude-code` 已在 Linux 上跑过（2026-10-21：拒绝和改写都生效，审计写入后台）。macOS 和 Windows 未验证。规则文件损坏时：`aw hook` 按拒绝输出（带 `hookEventName`）；`aw run` 仍注入临时 hooks，否则这个拒绝不会跑；`aw mcp-tap` 只拒绝 `tools/call`，`initialize` / `tools/list` / 通知照常转发。`hookSpecificOutput` 必须带与输入一致的 `hookEventName`，否则 Claude Code 把输出当非阻塞错误、工具照常执行。
 
 ## 6. 安全边界（要写在界面和文档里）
 
@@ -277,7 +277,7 @@ reason = "不允许连这个网站"
 - [ ] `on_error=deny` 时规则文件损坏 → 拒绝；`on_error=allow` → 放行；两种都有审计或 Gap。
 - [ ] mcp-tap：命中 deny 的 `tools/call` 不到达服务端，客户端收到 JSON-RPC 错误（同一个 `id`）；改写后的参数到达服务端；未命中逐字节透传。
 - [ ] 代理：命中 deny 的请求得到 403，不连上游；未命中照旧。
-- [ ] 审计：每次 deny / rewrite / ask 恰好一条记录；记录里没有 `sk-`、`Bearer` 等明文（复用 `redact_corpus/`）；后台不在时写入本地备份文件。
+- [ ] 审计：每次 deny / rewrite / ask 写一条记录。客户端没确认审计、因而把改写改成拒绝时，再补一条实际执行的拒绝（以后写的那条为准）。本地备份和后台各有一份时，是同一决定的两个副本，不是两条决定。记录里没有 `sk-`、`Bearer` 等明文（复用 `redact_corpus/`）；后台不在时写入本地备份文件。
 - [ ] `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -D warnings`、相关 crate 测试通过；`cargo xtask wording-lint` 通过。
 - [ ] 真机（第一步结束前，至少 Linux 一台）：`aw run --agent claude-code` 下让 Claude 跑 `rm -rf /tmp/x`，被拒绝、界面有中文原因、审计可查。Mac、Windows 各跑一次，没跑的如实标「未验证」。
 

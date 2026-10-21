@@ -1606,7 +1606,9 @@ fn take_u64(bytes: &[u8], start: usize) -> Option<(u64, usize)> {
     let mut number: u64 = 0;
     let mut index = start;
     while index < bytes.len() && bytes[index].is_ascii_digit() {
-        number = number.checked_mul(10)?.checked_add(u64::from(bytes[index] - b'0'))?;
+        number = number
+            .checked_mul(10)?
+            .checked_add(u64::from(bytes[index] - b'0'))?;
         index += 1;
     }
     Some((number, index))
@@ -1645,10 +1647,11 @@ fn claude_flag_note(command: &[String]) -> Option<&'static str> {
     }
 }
 
-/// stderr when this process is root or an elevated admin.
+/// stderr when the caller says this process is root.
 ///
-/// The caller decides `is_root`. This crate does not call `geteuid`: `unsafe`
-/// stays in the platform crates. Windows elevation is not detected here.
+/// Test-only. The launch path does not ask the OS: `aw-cli` does not call
+/// `geteuid`, and Windows elevation is not detected.
+#[cfg(test)]
 fn root_note(is_root: bool) -> Option<&'static str> {
     if is_root {
         Some("[aw] 提示：这次以管理员身份运行，拦截不可靠。管理员可以改规则、关掉 hook。\n")
@@ -1755,9 +1758,7 @@ fn inject_claude_intercept(
     }
     let hook_refs: Vec<&str> = hook_args.iter().map(String::as_str).collect();
     let doc = aw_agent_adapters::agents::claude_code::decision::intercept_settings_json(
-        &command,
-        &hook_refs,
-        true,
+        &command, &hook_refs, true,
     );
     let dir = std::env::temp_dir().join(format!(
         "aw-intercept-{}-{}",
@@ -1801,7 +1802,7 @@ fn create_owner_dir(dir: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        return std::fs::DirBuilder::new().mode(0o700).create(dir).is_ok();
+        std::fs::DirBuilder::new().mode(0o700).create(dir).is_ok()
     }
     #[cfg(not(unix))]
     {
@@ -1822,7 +1823,7 @@ fn write_owner_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
             .mode(0o600)
             .open(path)?;
         file.write_all(bytes)?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(unix))]
     {
@@ -1887,20 +1888,16 @@ pub(crate) fn daemon_run(
     };
     // One settings file for this launch. `preflight` already validated the
     // policy and wrote nothing, so this is the only `--settings`.
-    let (intercept_dir, rewrites) = match inject_claude_intercept(
-        args,
-        deferred,
-        &mut spec,
-        Some(launch.public_id.as_str()),
-    ) {
-        Ok(Some((dir, rewrites))) => (Some(dir), rewrites),
-        Ok(None) => (None, false),
-        Err(outcome) => {
-            // The reservation has no child. Drop it; do not leave a pending run.
-            let _ = sessions.discard_run(&launch);
-            return outcome;
-        }
-    };
+    let (intercept_dir, rewrites) =
+        match inject_claude_intercept(args, deferred, &mut spec, Some(launch.public_id.as_str())) {
+            Ok(Some((dir, rewrites))) => (Some(dir), rewrites),
+            Ok(None) => (None, false),
+            Err(outcome) => {
+                // The reservation has no child. Drop it; do not leave a pending run.
+                let _ = sessions.discard_run(&launch);
+                return outcome;
+            }
+        };
     let notice = rewrite_notice(rewrites);
     let limits = if intercept_dir.is_some() {
         intercept_limit_notes(&spec)
@@ -2634,7 +2631,10 @@ mod intercept_inject_tests {
         );
         assert_eq!(
             spec.env,
-            vec![(super::super::hook::SESSION_ENV.to_owned(), "s-public".to_owned())],
+            vec![(
+                super::super::hook::SESSION_ENV.to_owned(),
+                "s-public".to_owned()
+            )],
             "child env did not receive AW_SESSION"
         );
         let _ = cleanup_intercept_dir(&written);
@@ -2730,7 +2730,10 @@ mod intercept_inject_tests {
             parse_claude_version("2.1.295 (Claude Code)"),
             Some((2, 1, 295))
         );
-        assert_eq!(parse_claude_version("Claude Code 2.1.294"), Some((2, 1, 294)));
+        assert_eq!(
+            parse_claude_version("Claude Code 2.1.294"),
+            Some((2, 1, 294))
+        );
         assert!(parse_claude_version("not a version").is_none());
 
         let below = claude_version_note(Some((2, 1, 294))).unwrap();
@@ -2747,12 +2750,10 @@ mod intercept_inject_tests {
         assert!(bare.contains("不会运行"), "{bare}");
         let safe = claude_flag_note(&["claude".to_owned(), "--safe-mode".to_owned()]).unwrap();
         assert!(safe.contains("--safe-mode"), "{safe}");
-        assert!(claude_flag_note(&[
-            "claude".to_owned(),
-            "--settings".to_owned(),
-            "x".to_owned()
-        ])
-        .is_none());
+        assert!(
+            claude_flag_note(&["claude".to_owned(), "--settings".to_owned(), "x".to_owned()])
+                .is_none()
+        );
         assert!(claude_flag_note(&["claude".to_owned(), "--barely".to_owned()]).is_none());
 
         let root = root_note(true).unwrap();

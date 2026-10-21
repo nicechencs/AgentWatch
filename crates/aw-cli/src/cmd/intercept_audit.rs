@@ -240,7 +240,11 @@ pub(crate) fn session_audit_dir(
 ) -> Option<PathBuf> {
     let state = state_home.filter(|path| !path.as_os_str().is_empty())?;
     let id = session.map(str::trim).filter(|id| !id.is_empty())?;
-    if id == "." || id == ".." || id.bytes().any(|byte| byte == b'/' || byte == b'\\' || byte == 0)
+    if id == "."
+        || id == ".."
+        || id
+            .bytes()
+            .any(|byte| byte == b'/' || byte == b'\\' || byte == 0)
     {
         return None;
     }

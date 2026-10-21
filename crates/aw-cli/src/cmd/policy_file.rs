@@ -90,6 +90,7 @@ pub(crate) struct HomeEnvGuard {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 impl HomeEnvGuard {
     /// Isolate the three homes. Drop restores each one, including after a panic.
     pub(crate) fn isolate() -> Self {

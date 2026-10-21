@@ -222,7 +222,7 @@ reason = "不允许连这个网站"
 | `session`、`agent`、`layer`、`event` | 哪个会话、哪个 agent、哪一层、哪个事件（如 PreToolUse） |
 | `rule_id`、`action`、`effective_action` | 命中规则、规则写的动作、实际执行的动作（降级时两者不同） |
 | `tool` / `host` / `mcp_method` | 对象 |
-| `before_summary`、`before_hash` | 原文**脱敏后**截断到 256 字的摘要 + 原文 SHA-256（加会话盐） |
+| `before_summary`、`before_hash` | 原文**脱敏后**截断到 256 字的摘要 + 原文 SHA-256。有会话号时盐是会话号；没有会话号时盐是本进程启动时生成的 32 字节随机数（不落盘，进程一变就变，所以无法拿固定盐做字典反查） |
 | `after_summary`、`after_hash` | 改写后的同样两项（只有改写才有） |
 | `reason` | 给 agent / 用户看的原因 |
 | `evidence`、`source` | `E3`（agent 自报告链路）或 `S`（aw 自己的代理 / 转接层做的决定）；`source` 如 `intercept.claude-code/hook` |
@@ -231,7 +231,7 @@ reason = "不允许连这个网站"
 - 不存原文全文，不存 body，不存提示词全文（ADR-0012）。脱敏走管道现有 Redact 规则。
 - 投递：先追加本地 `intercept-audit.jsonl`（`AW_INTERCEPT_AUDIT`，否则 `<会话目录>/intercept-audit.jsonl`，Unix 上 `0600`），再尽力 `POST /api/v1/agent/intercept`。hook 只有 200 ms，不能让连不上的后台吃掉预算、连本地备份也写不成。后台写成功时记录的 `delivered` 是 `daemon`（本地行可能还在，第一步不把这份文件再收进库）。两边都失败时按 §5.3 第 2 条处理。Gap（`gap_kind = intercept_audit_dropped`）只在客户端仍能把 `dropped: true` 送到这条路由时入库；后台本身不可达时，这条 Gap 也送不出去，只剩降级。
 - 规则文件：`AW_POLICY`（非空路径；文件不存在当作关），否则 `$XDG_CONFIG_HOME/agentwatch/policy.toml`（未设则 `~/.config/agentwatch/policy.toml`），Windows 为 `%APPDATA%\agentwatch\policy.toml`。不读 `/etc/agentwatch/config.toml`，也不读项目目录里的文件。
-- 实现落点（2026-10-21，`feat/intercept`）：规则与判定在 `aw-pipeline`（已有 `regex`、`toml`、脱敏；`sha2` 0.11 已在锁文件，MIT OR Apache-2.0）。`aw-core` 不增加 `GapKind` 变体（那是全仓类型变更，AGENTS.md §8 要求单独先合）；`gaps.kind` 以文本 `intercept_audit_dropped` 写入。Codex 自动注入未做，只提供手动片段（`codex::decision::manual_snippet`），不改 `~/.codex/`，不加 `--dangerously-bypass-hook-trust`。`aw run` 不注入 `AW_SESSION`（公开 id 在 `prepare` 返回之后才有）。代理不从 `aw run` 拉起。真机 `aw run --agent claude-code` 未验证。
+- 实现落点（2026-10-21，`feat/intercept`）：规则与判定在 `aw-pipeline`（已有 `regex`、`toml`、脱敏；`sha2` 0.11 已在锁文件，MIT OR Apache-2.0）。`aw-core` 不增加 `GapKind` 变体（那是全仓类型变更，AGENTS.md §8 要求单独先合）；`gaps.kind` 以文本 `intercept_audit_dropped` 写入。Codex 自动注入未做，只提供手动片段（`codex::decision::manual_snippet`），不改 `~/.codex/`，不加 `--dangerously-bypass-hook-trust`。`aw run` 不注入 `AW_SESSION`（公开 id 在 `prepare` 返回之后才有）。代理不从 `aw run` 拉起。真机 `aw run --agent claude-code` 未验证。规则文件损坏时：`aw hook` 按拒绝输出（带 `hookEventName`）；`aw run` 仍注入临时 hooks，否则这个拒绝不会跑；`aw mcp-tap` 只拒绝 `tools/call`，`initialize` / `tools/list` / 通知照常转发。`hookSpecificOutput` 必须带与输入一致的 `hookEventName`，否则 Claude Code 把输出当非阻塞错误、工具照常执行。
 
 ## 6. 安全边界（要写在界面和文档里）
 

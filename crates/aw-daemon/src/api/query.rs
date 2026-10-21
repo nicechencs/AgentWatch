@@ -1883,8 +1883,10 @@ mod label_tests {
         store
             .connection()
             .execute(
-                "UPDATE schema_meta SET value = '12' WHERE key = 'schema_version'",
-                [],
+                "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+                [aw_store::INTERCEPT_SCHEMA_VERSION
+                    .saturating_add(1)
+                    .to_string()],
             )
             .expect("future version");
         drop(store);

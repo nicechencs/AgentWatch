@@ -12,6 +12,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use aw_pipeline::{Action, AuditRecord, Decision, Delivered, Layer, Subject};
@@ -22,6 +23,43 @@ use crate::endpoint::Endpoint;
 
 /// `AW_INTERCEPT_AUDIT`. A file path, not a directory.
 pub(crate) const AUDIT_ENV: &str = "AW_INTERCEPT_AUDIT";
+
+/// Process-local salt used when the caller has no session id.
+///
+/// A session id is the salt when one exists, so two processes auditing the
+/// same session hash the same command the same way. With no session, a fixed
+/// salt would let anyone with the binary dictionary-match `before_hash`.
+/// This value is 32 random bytes, generated once per process. It is not
+/// written next to the hash. Restarting the process changes it, so hashes
+/// from two runs without a session are not comparable. That is the point.
+pub(crate) fn process_salt() -> &'static [u8] {
+    static SALT: OnceLock<[u8; 32]> = OnceLock::new();
+    SALT.get_or_init(|| {
+        let mut bytes = [0_u8; 32];
+        fill_random(&mut bytes);
+        bytes
+    })
+}
+
+fn fill_random(bytes: &mut [u8]) {
+    if let Ok(mut file) = fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        if file.read_exact(bytes).is_ok() {
+            return;
+        }
+    }
+    // No urandom (or a short read). Mix the clock and the pid. Weaker than
+    // urandom, still not a compile-time constant.
+    let ticks = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mixed = ticks ^ (u128::from(std::process::id()) << 64);
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let shift = (index % 16) * 8;
+        *byte = (mixed >> shift) as u8 ^ (index as u8).wrapping_mul(31);
+    }
+}
 
 /// Where a record went, and whether a rewrite must be downgraded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

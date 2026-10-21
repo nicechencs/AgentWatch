@@ -367,9 +367,27 @@ fn audit_decision(
     endpoint: &Endpoint,
     deadline: Instant,
 ) -> AuditDelivery {
-    let salt = session.unwrap_or("").as_bytes();
-    let mut record =
-        intercept_audit::record_for(subject, decision, salt, original, rewritten, session);
+    // A session id is the salt when one exists. Without one, the salt is
+    // process-local and `'static`, so the two paths cannot share one binding.
+    let mut record = if let Some(id) = session.filter(|text| !text.is_empty()) {
+        intercept_audit::record_for(
+            subject,
+            decision,
+            id.as_bytes(),
+            original,
+            rewritten,
+            session,
+        )
+    } else {
+        intercept_audit::record_for(
+            subject,
+            decision,
+            intercept_audit::process_salt(),
+            original,
+            rewritten,
+            session,
+        )
+    };
     let remaining = deadline.saturating_duration_since(Instant::now());
     let backup = intercept_audit::backup_path(audit_env_path().as_deref(), None);
     intercept_audit::deliver(
@@ -416,6 +434,7 @@ fn render_decision(
             reason,
             subject.tool.as_deref(),
             updated.as_ref(),
+            hook_event_name(subject),
         )
         .map(|decision: CodexDecision| decision.to_json());
         return (rendered, text);
@@ -430,14 +449,29 @@ fn render_decision(
         let updated = updated_object(payload, subject, decision);
         (updated, None, rewrite_audit_text(decision))
     };
-    let rendered = claude_decision(permission, reason, input.as_ref(), output.as_ref())
-        .and_then(|decision: HookDecision| decision.to_json());
+    let rendered = claude_decision(
+        permission,
+        reason,
+        input.as_ref(),
+        output.as_ref(),
+        hook_event_name(subject),
+    )
+    .and_then(|decision: HookDecision| decision.to_json());
     (rendered, text)
 }
 
 /// What the audit stores as "after". Only the fields the rule replaced, not
 /// the whole tool_input: that object can hold a sibling the rule did not
 /// touch, and hashing it would keep more than the change.
+/// Name written into `hookSpecificOutput.hookEventName`. The input's
+/// `hook_event_name` when it had one. A payload that omitted it still has to
+/// name an event, or Claude Code treats the object as a non-blocking error
+/// and runs the tool. `PreToolUse` is that fallback: it is the event that
+/// can still deny.
+fn hook_event_name(subject: &Subject) -> &str {
+    subject.event.as_deref().unwrap_or("PreToolUse")
+}
+
 fn rewrite_audit_text(decision: &Decision) -> Option<String> {
     if decision.effective != Action::Rewrite {
         return None;
@@ -779,6 +813,10 @@ action = "ask"
         );
         let deny: Value = serde_json::from_slice(&outcome.stdout).unwrap();
         assert_eq!(
+            deny["hookSpecificOutput"]["hookEventName"],
+            json!("PreToolUse")
+        );
+        assert_eq!(
             deny["hookSpecificOutput"]["permissionDecision"],
             json!("deny")
         );
@@ -800,6 +838,10 @@ action = "ask"
             )
         });
         assert_eq!(
+            rewrite["hookSpecificOutput"]["hookEventName"],
+            json!("PreToolUse")
+        );
+        assert_eq!(
             rewrite["hookSpecificOutput"]["permissionDecision"],
             json!("allow"),
             "{rewrite} audit {}",
@@ -818,12 +860,20 @@ action = "ask"
         let outcome = run(input("claude-code", ask_payload, &endpoint), &mut transport);
         let ask: Value = serde_json::from_slice(&outcome.stdout).unwrap();
         assert_eq!(
+            ask["hookSpecificOutput"]["hookEventName"],
+            json!("PreToolUse")
+        );
+        assert_eq!(
             ask["hookSpecificOutput"]["permissionDecision"],
             json!("ask")
         );
 
         let codex_ask = run(input("codex", ask_payload, &endpoint), &mut transport);
         let codex: Value = serde_json::from_slice(&codex_ask.stdout).unwrap();
+        assert_eq!(
+            codex["hookSpecificOutput"]["hookEventName"],
+            json!("PreToolUse")
+        );
         assert_eq!(
             codex["hookSpecificOutput"]["permissionDecision"],
             json!("deny")
@@ -832,6 +882,10 @@ action = "ask"
         let codex_rewrite = run(input("codex", rewrite_payload, &endpoint), &mut transport);
         let codex: Value = serde_json::from_slice(&codex_rewrite.stdout).unwrap();
         assert_eq!(
+            codex["hookSpecificOutput"]["hookEventName"],
+            json!("PreToolUse")
+        );
+        assert_eq!(
             codex["hookSpecificOutput"]["permissionDecision"],
             json!("allow")
         );
@@ -839,6 +893,34 @@ action = "ask"
             .as_str()
             .unwrap()
             .starts_with("terraform plan"));
+
+        let post_payload = br#"{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"terraform apply"},"tool_response":{"ok":true}}"#;
+        let post = run(
+            input("claude-code", post_payload, &endpoint),
+            &mut transport,
+        );
+        let post_value: Value = serde_json::from_slice(&post.stdout).unwrap();
+        assert_eq!(
+            post_value["hookSpecificOutput"]["hookEventName"],
+            json!("PostToolUse")
+        );
+
+        let broken = dir.join("broken.toml");
+        fs::write(&broken, "enabled = true\n[[rule]]\naction = \"nope\"\n").unwrap();
+        std::env::set_var(policy_file::POLICY_ENV, &broken);
+        let broken_out = run(
+            input("claude-code", deny_payload, &endpoint),
+            &mut transport,
+        );
+        let broken_json: Value = serde_json::from_slice(&broken_out.stdout).unwrap();
+        assert_eq!(
+            broken_json["hookSpecificOutput"]["hookEventName"],
+            json!("PreToolUse")
+        );
+        assert_eq!(
+            broken_json["hookSpecificOutput"]["permissionDecision"],
+            json!("deny")
+        );
 
         let audit_text = fs::read_to_string(&audit).unwrap_or_default();
         assert!(audit_text.contains("\"downgraded\":true") || audit_text.contains("downgraded"));

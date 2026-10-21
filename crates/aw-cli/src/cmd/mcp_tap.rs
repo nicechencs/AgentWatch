@@ -238,7 +238,78 @@ fn copy_with_policy<R: Read, W: Write>(
     match policy {
         McpPolicy::Off => copy_parsed(from, to, direction, tx),
         McpPolicy::On(policy) => copy_gated(from, to, direction, tx, policy, to_client),
+        McpPolicy::Broken => copy_broken(from, to, direction, tx, to_client),
     }
+}
+
+/// A broken policy file. `tools/call` requests are denied. Everything else,
+/// including responses and notifications, is forwarded unchanged.
+fn copy_broken<R: Read, W: Write>(
+    from: &mut R,
+    to: &mut W,
+    direction: &'static str,
+    tx: &SyncSender<CopyNote>,
+    to_client: bool,
+) -> io::Result<()> {
+    let mut client: Box<dyn Write> = if to_client {
+        Box::new(io::stdout())
+    } else {
+        Box::new(io::sink())
+    };
+    let mut splitter = Splitter::new();
+    let mut buf = [0_u8; 8 * 1024];
+    loop {
+        let n = from.read(&mut buf)?;
+        if n == 0 {
+            if let Some(outcome) = splitter.finish() {
+                gate_broken(&outcome, to, client.as_mut(), direction, tx, true)?;
+            }
+            to.flush()?;
+            return Ok(());
+        }
+        for outcome in splitter.push(&buf[..n]) {
+            gate_broken(&outcome, to, client.as_mut(), direction, tx, false)?;
+        }
+    }
+}
+
+fn gate_broken<W: Write>(
+    outcome: &FrameOutcome,
+    to: &mut W,
+    client: &mut dyn Write,
+    direction: &'static str,
+    tx: &SyncSender<CopyNote>,
+    eof: bool,
+) -> io::Result<()> {
+    let FrameOutcome::Frame(frame) = outcome else {
+        note_frame(outcome, direction, tx);
+        return Ok(());
+    };
+    let text = String::from_utf8_lossy(frame);
+    let line = text.trim_end_matches('\r');
+    let tool_call = direction == DIR_C2S
+        && subject_from_frame(line)
+            .is_some_and(|labels| labels.method.as_deref() == Some("tools/call"));
+    if !tool_call {
+        let newline: &[u8] = if eof { b"" } else { b"\n" };
+        to.write_all(frame)?;
+        to.write_all(newline)?;
+        to.flush()?;
+        note_frame(outcome, direction, tx);
+        return Ok(());
+    }
+    let decision = deny_decision("规则文件读不了，已按拒绝处理");
+    let changes = field_changes(&decision);
+    let frame_decision = FrameDecision {
+        verdict: FrameVerdict::Deny,
+        reason: decision.reason.as_deref(),
+        fields: &changes,
+    };
+    let action = apply_request(line, &frame_decision);
+    write_action(&action, frame, to, Some(client), eof)?;
+    audit_mcp(&decision, line, None);
+    note_frame(outcome, direction, tx);
+    Ok(())
 }
 
 /// Policy on. Complete lines are decided before they are written.
@@ -465,19 +536,37 @@ fn audit_mcp(decision: &Decision, before: &str, after: Option<&str>) {
             .as_deref(),
         None,
     );
-    let mut record =
-        super::intercept_audit::record_for(&subject, decision, b"", before, after, None);
-    let _ = super::intercept_audit::deliver(
+    let mut record = super::intercept_audit::record_for(
+        &subject,
+        decision,
+        super::intercept_audit::process_salt(),
+        before,
+        after,
+        None,
+    );
+    let delivery = super::intercept_audit::deliver(
         None,
         backup.as_deref(),
         &mut record,
         std::time::Duration::from_millis(20),
     );
+    // Both the local line and the daemon post failed. The deny already
+    // happened; this notice is the Gap the design requires for a dropped audit.
+    // It carries no command text.
+    if delivery.delivered == aw_pipeline::Delivered::Dropped {
+        let _ = writeln!(
+            io::stderr(),
+            "mcp-tap：拦截审计写不进去（intercept_audit_dropped）"
+        );
+    }
 }
 
 enum McpPolicy {
     Off,
     On(aw_pipeline::Policy),
+    /// The file exists and is not a policy. `tools/call` is denied. Other
+    /// methods stay forwarded so `initialize` and `tools/list` still work.
+    Broken,
 }
 
 fn load_mcp_policy() -> McpPolicy {
@@ -489,12 +578,10 @@ fn load_mcp_policy() -> McpPolicy {
         super::policy_file::user_config_home().as_deref(),
     ) {
         super::policy_file::PolicyLoad::On(policy) => McpPolicy::On(policy),
-        super::policy_file::PolicyLoad::Off | super::policy_file::PolicyLoad::Broken => {
-            // Broken: the file did not name which calls to stop. Non-JSON and
-            // unnamed frames stay forwarded, same as off. A later card can
-            // deny the whole tap; step 1 does not invent that.
-            McpPolicy::Off
-        }
+        super::policy_file::PolicyLoad::Off => McpPolicy::Off,
+        // Default `on_error` is deny (design §5.3). Only `tools/call` is
+        // refused: denying `initialize` would end the session.
+        super::policy_file::PolicyLoad::Broken => McpPolicy::Broken,
     }
 }
 
@@ -646,6 +733,33 @@ fn copy_gated_for_test(
     Ok(GatedCopy { child, client })
 }
 
+#[cfg(test)]
+fn copy_broken_for_test(
+    input: &[u8],
+    direction: &'static str,
+    tx: &SyncSender<CopyNote>,
+    child: &mut Vec<u8>,
+    client: &mut Vec<u8>,
+) -> io::Result<()> {
+    let mut splitter = Splitter::new();
+    let mut frames = splitter.push(input);
+    if let Some(tail) = splitter.finish() {
+        frames.push(tail);
+    }
+    let eof_at = frames.len().saturating_sub(1);
+    for (index, outcome) in frames.iter().enumerate() {
+        gate_broken(
+            outcome,
+            child,
+            client,
+            direction,
+            tx,
+            index == eof_at && !input.ends_with(b"\n"),
+        )?;
+    }
+    Ok(())
+}
+
 /// Bytes a gated copy would write. `child` is what the server sees. `client`
 /// is a JSON-RPC error for a denied request, empty otherwise.
 #[cfg(test)]
@@ -710,6 +824,22 @@ rewrite.command = { replace = ["terraform apply", "terraform plan"] }
         let ping = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n";
         let copy = copy_gated_for_test(ping, DIR_C2S, REWRITE, true).unwrap();
         assert_eq!(copy.child, ping);
+    }
+
+    #[test]
+    fn broken_policy_denies_tools_call_and_forwards_initialize() {
+        let (tx, _rx) = mpsc::sync_channel(8);
+        let mut child = Vec::new();
+        let mut client = Vec::new();
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"run\",\"arguments\":{\"command\":\"rm -rf /tmp\"}}}\n";
+        copy_broken_for_test(input, DIR_C2S, &tx, &mut child, &mut client).unwrap();
+        let forwarded = String::from_utf8(child).unwrap();
+        assert!(forwarded.contains("initialize"));
+        assert!(!forwarded.contains("tools/call"));
+        assert!(!forwarded.contains("rm -rf"));
+        let error = String::from_utf8(client).unwrap();
+        assert!(error.contains("\"id\":9"));
+        assert!(error.contains("规则文件读不了"));
     }
 
     #[test]

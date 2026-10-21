@@ -1448,13 +1448,15 @@ fn inject_claude_intercept(
             .as_deref(),
         super::policy_file::user_config_home().as_deref(),
     );
-    let enabled = deferred.intercept || matches!(policy, super::policy_file::PolicyLoad::On(_));
+    // A broken file is not "off". `aw hook` denies it (design §5.3). Injecting
+    // is what makes that deny run; skipping it would let the tool run.
+    let enabled = deferred.intercept
+        || matches!(
+            policy,
+            super::policy_file::PolicyLoad::On(_) | super::policy_file::PolicyLoad::Broken
+        );
     if !enabled {
         return None;
-    }
-    if matches!(policy, super::policy_file::PolicyLoad::Broken) && !deferred.intercept {
-        // A broken file with no explicit switch still denies inside `aw hook`.
-        // Injecting is what makes that deny run. Inject.
     }
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aw"));
     let command = exe.display().to_string();
@@ -1918,6 +1920,58 @@ fn write_summary(
     }
     let _ = args.agent;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod intercept_inject_tests {
+    use super::*;
+
+    #[test]
+    fn broken_policy_still_injects_settings_without_the_flag() {
+        let dir = std::env::temp_dir().join(format!("aw-inject-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy = dir.join("policy.toml");
+        std::fs::write(&policy, "enabled = true\n[[rule]]\naction = \"nope\"\n").unwrap();
+        std::env::set_var(super::super::policy_file::POLICY_ENV, &policy);
+        let command = Vec::<String>::new();
+        let args = RunArgs {
+            agent: Some("claude-code"),
+            name: None,
+            no_follow_children: false,
+            cwd: None,
+            env: &[],
+            summary: None,
+            pin: false,
+            no_daemon: true,
+            raw: None,
+            command: &command,
+            json: false,
+            quiet: true,
+        };
+        let mut spec = crate::launch::RunSpec::new(vec!["claude".to_owned()]).unwrap();
+        let deferred = DeferredFlags {
+            proxy: false,
+            proxy_on_reject: false,
+            proxy_on_reject_value: None,
+            self_report: false,
+            mcp_tap: false,
+            unsafe_no_redact: false,
+            include_proc: false,
+            group: false,
+            intercept: false,
+        };
+        let outcome = inject_claude_intercept(&args, deferred, &mut spec);
+        std::env::remove_var(super::super::policy_file::POLICY_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(outcome.is_none(), "broken policy must not skip the launch");
+        assert!(
+            spec.command.windows(2).any(|pair| pair[0] == "--settings"),
+            "broken policy did not inject --settings: {:?}",
+            spec.command
+        );
+    }
 }
 
 fn summary_json(

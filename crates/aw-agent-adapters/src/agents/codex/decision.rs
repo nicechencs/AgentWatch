@@ -19,6 +19,9 @@ pub struct CodexDecision {
     pub reason: Option<String>,
     /// Replacement tool input. Required for an allow that rewrites.
     pub updated_input: Option<Value>,
+    /// The input's `hook_event_name`. Codex examples include it; omitting it
+    /// makes the hook output fail open.
+    pub hook_event_name: String,
 }
 
 impl CodexDecision {
@@ -26,6 +29,10 @@ impl CodexDecision {
     #[must_use]
     pub fn to_json(&self) -> Value {
         let mut specific = Map::new();
+        specific.insert(
+            "hookEventName".to_owned(),
+            Value::String(self.hook_event_name.clone()),
+        );
         specific.insert(
             "permissionDecision".to_owned(),
             Value::String(self.permission.to_owned()),
@@ -55,12 +62,17 @@ pub fn codex_decision(
     reason: Option<&str>,
     tool: Option<&str>,
     updated_input: Option<&Value>,
+    hook_event_name: &str,
 ) -> Option<CodexDecision> {
+    if hook_event_name.is_empty() {
+        return None;
+    }
     match permission {
         "deny" => Some(CodexDecision {
             permission: "deny".to_owned(),
             reason: reason.map(str::to_owned),
             updated_input: None,
+            hook_event_name: hook_event_name.to_owned(),
         }),
         "allow" => {
             let input = updated_input?;
@@ -71,6 +83,7 @@ pub fn codex_decision(
                 permission: "allow".to_owned(),
                 reason: reason.map(str::to_owned),
                 updated_input: Some(input.clone()),
+                hook_event_name: hook_event_name.to_owned(),
             })
         }
         _ => None,
@@ -107,16 +120,33 @@ mod tests {
 
     #[test]
     fn deny_and_bash_rewrite() {
-        let deny = codex_decision("deny", Some("不允许递归删除"), Some("Bash"), None).unwrap();
+        let deny = codex_decision(
+            "deny",
+            Some("不允许递归删除"),
+            Some("Bash"),
+            None,
+            "PreToolUse",
+        )
+        .unwrap();
         let body = deny.to_json();
+        assert_eq!(
+            body["hookSpecificOutput"]["hookEventName"],
+            json!("PreToolUse")
+        );
         assert_eq!(
             body["hookSpecificOutput"]["permissionDecision"],
             json!("deny")
         );
 
         let input = json!({"command": "terraform plan", "cwd": "/work"});
-        let rewrite =
-            codex_decision("allow", Some("只允许 plan"), Some("Bash"), Some(&input)).unwrap();
+        let rewrite = codex_decision(
+            "allow",
+            Some("只允许 plan"),
+            Some("Bash"),
+            Some(&input),
+            "PreToolUse",
+        )
+        .unwrap();
         let body = rewrite.to_json();
         assert_eq!(
             body["hookSpecificOutput"]["permissionDecision"],
@@ -130,15 +160,22 @@ mod tests {
 
     #[test]
     fn ask_is_rejected_and_bash_without_command_is_rejected() {
-        assert!(codex_decision("ask", None, Some("Bash"), None).is_none());
+        assert!(codex_decision("ask", None, Some("Bash"), None, "PreToolUse").is_none());
         let input = json!({"cmd": "terraform plan"});
-        assert!(codex_decision("allow", None, Some("Bash"), Some(&input)).is_none());
-        assert!(codex_decision("allow", None, Some("apply_patch"), Some(&input)).is_none());
+        assert!(codex_decision("allow", None, Some("Bash"), Some(&input), "PreToolUse").is_none());
+        assert!(codex_decision(
+            "allow",
+            None,
+            Some("apply_patch"),
+            Some(&input),
+            "PreToolUse"
+        )
+        .is_none());
     }
 
     #[test]
     fn bare_allow_prints_nothing() {
-        assert!(codex_decision("allow", None, Some("Bash"), None).is_none());
+        assert!(codex_decision("allow", None, Some("Bash"), None, "PreToolUse").is_none());
     }
 
     #[test]

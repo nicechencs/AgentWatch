@@ -19,6 +19,9 @@ pub struct HookDecision {
     pub updated_input: Option<Value>,
     /// Replacement model-facing output, for PostToolUse.
     pub updated_output: Option<Value>,
+    /// The input's `hook_event_name`. Claude Code rejects
+    /// `hookSpecificOutput` that omits this, and then runs the tool.
+    pub hook_event_name: String,
 }
 
 impl HookDecision {
@@ -32,6 +35,10 @@ impl HookDecision {
             return None;
         }
         let mut specific = Map::new();
+        specific.insert(
+            "hookEventName".to_owned(),
+            Value::String(self.hook_event_name.clone()),
+        );
         specific.insert(
             "permissionDecision".to_owned(),
             Value::String(self.permission.to_owned()),
@@ -64,11 +71,17 @@ pub fn claude_decision(
     reason: Option<&str>,
     updated_input: Option<&Value>,
     updated_output: Option<&Value>,
+    hook_event_name: &str,
 ) -> Option<HookDecision> {
     let permission = match permission {
         "allow" | "deny" | "ask" => permission.to_owned(),
         _ => return None,
     };
+    // An empty name would still be rejected by Claude Code. Callers pass the
+    // input's `hook_event_name`, or `PreToolUse` when the payload had none.
+    if hook_event_name.is_empty() {
+        return None;
+    }
     if permission == "allow" && updated_input.is_none() && updated_output.is_none() {
         return None;
     }
@@ -82,6 +95,7 @@ pub fn claude_decision(
         reason: reason.map(str::to_owned),
         updated_input,
         updated_output,
+        hook_event_name: hook_event_name.to_owned(),
     })
 }
 
@@ -139,10 +153,14 @@ mod tests {
 
     #[test]
     fn deny_and_ask_and_rewrite_have_the_documented_shape() {
-        let deny = claude_decision("deny", Some("不允许递归删除"), None, None)
+        let deny = claude_decision("deny", Some("不允许递归删除"), None, None, "PreToolUse")
             .unwrap()
             .to_json()
             .unwrap();
+        assert_eq!(
+            deny["hookSpecificOutput"]["hookEventName"],
+            json!("PreToolUse")
+        );
         assert_eq!(
             deny["hookSpecificOutput"]["permissionDecision"],
             json!("deny")
@@ -152,20 +170,30 @@ mod tests {
             json!("不允许递归删除")
         );
 
-        let ask = claude_decision("ask", None, None, None)
+        let ask = claude_decision("ask", None, None, None, "PreToolUse")
             .unwrap()
             .to_json()
             .unwrap();
+        assert_eq!(
+            ask["hookSpecificOutput"]["hookEventName"],
+            json!("PreToolUse")
+        );
         assert_eq!(
             ask["hookSpecificOutput"]["permissionDecision"],
             json!("ask")
         );
 
         let input = json!({"command": "terraform plan", "extra": true});
-        let rewrite = claude_decision("allow", Some("只允许 plan"), Some(&input), None)
-            .unwrap()
-            .to_json()
-            .unwrap();
+        let rewrite = claude_decision(
+            "allow",
+            Some("只允许 plan"),
+            Some(&input),
+            None,
+            "PreToolUse",
+        )
+        .unwrap()
+        .to_json()
+        .unwrap();
         assert_eq!(
             rewrite["hookSpecificOutput"]["permissionDecision"],
             json!("allow")
@@ -178,16 +206,20 @@ mod tests {
 
     #[test]
     fn bare_allow_prints_nothing() {
-        assert!(claude_decision("allow", None, None, None).is_none());
+        assert!(claude_decision("allow", None, None, None, "PreToolUse").is_none());
     }
 
     #[test]
     fn post_tool_output_is_separate_from_input() {
         let output = json!({"ok": false});
-        let decision = claude_decision("allow", None, None, Some(&output))
+        let decision = claude_decision("allow", None, None, Some(&output), "PostToolUse")
             .unwrap()
             .to_json()
             .unwrap();
+        assert_eq!(
+            decision["hookSpecificOutput"]["hookEventName"],
+            json!("PostToolUse")
+        );
         assert_eq!(decision["hookSpecificOutput"]["updatedToolOutput"], output);
     }
 

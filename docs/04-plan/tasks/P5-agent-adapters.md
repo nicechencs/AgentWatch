@@ -493,7 +493,7 @@ flowchart LR
 
 **要点**：Claude Code 输出 `permissionDecision` / `updatedInput` / `updatedToolOutput`；Codex 输出 deny 与 `allow + updatedInput`，`ask` 降级为 deny；Claude 启动注入用 exec 形式 + `onFailure: block`；修正默认 socket / 管道发送格式。规则关闭时输出与现在逐字节一致。
 
-实现差（2026-10-21）：`aw run --intercept`，或规则已开且目标像 Claude（`--agent claude-code|claude` 或 argv0 `claude`）时才写临时 settings。不改 `~/.claude/`。不注入 `AW_SESSION`。Codex 不自动改配置，只有手动片段。
+实现差（2026-10-21）：`aw run --intercept`，或规则已开、或规则文件损坏且目标像 Claude（`--agent claude-code|claude` 或 argv0 `claude`）时才写临时 settings。损坏也注入，否则 hook 的拒绝不会跑。不改 `~/.claude/`。不注入 `AW_SESSION`。Codex 不自动改配置，只有手动片段。输出的 `hookSpecificOutput` 带 `hookEventName`。
 
 ### P5-SEC-03 `aw mcp-tap` 按规则拒绝与改写
 
@@ -504,7 +504,7 @@ flowchart LR
 
 **要点**：deny 回 JSON-RPC 错误（同一 `id`），不转给服务端；rewrite 改请求参数或结果；规则关闭时逐字节透传。
 
-实现差（2026-10-21）：规则坏了的文件按「关」处理（不改无法命名的字节）。`ask` 在判定里已降为 deny。响应方向只改写 `result` 字段，不拒绝。
+实现差（2026-10-21）：规则文件损坏时，`tools/call` 回 JSON-RPC 错误（同一 `id`）并记审计；`initialize`、`tools/list`、通知和其他方法照常转发。`ask` 在判定里已降为 deny。响应方向只改写 `result` 字段，不拒绝。
 
 ### P5-SEC-04 网络代理按规则拒绝
 

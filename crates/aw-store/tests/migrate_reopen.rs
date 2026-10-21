@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aw_store::{
     apply_agent_schema, apply_file_schema, apply_http_schema, apply_inter_agent_schema,
-    apply_proxy_schema, OpenStatus, Store, StoreError,
+    apply_proxy_schema, OpenStatus, Store, StoreError, INTERCEPT_SCHEMA_VERSION,
 };
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
@@ -350,7 +350,10 @@ fn helpers_preserve_higher_versions() {
 }
 
 #[test]
-fn future_v12_is_read_only_and_unchanged_even_with_extra_scripts() {
+fn future_schema_is_read_only_and_unchanged_even_with_extra_scripts() {
+    // One past the version this binary understands. Migration 0012 made 12
+    // the current intercept schema, so a literal 12 is no longer "future".
+    let future = INTERCEPT_SCHEMA_VERSION + 1;
     let db = TestDb::new();
     {
         let store = Store::open(&db.path).expect("base");
@@ -358,27 +361,28 @@ fn future_v12_is_read_only_and_unchanged_even_with_extra_scripts() {
         store
             .connection()
             .execute(
-                "UPDATE schema_meta SET value = '12' WHERE key = 'schema_version'",
-                [],
+                "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",
+                [future.to_string()],
             )
             .expect("future version");
     }
     let before = fs::read(&db.path).expect("database bytes");
+    let past_future = future + 1;
     for extra in [
         &[][..],
         &[(2, "CREATE TABLE must_not_run (id INTEGER)")][..],
-        &[(13, "CREATE TABLE must_not_run (id INTEGER)")][..],
+        &[(past_future, "CREATE TABLE must_not_run (id INTEGER)")][..],
     ] {
         let mut store = Store::open_with_scripts(&db.path, extra).expect("future open");
         assert_eq!(
             store.status(),
             &OpenStatus::ReadOnlyNewer {
-                found: 12,
-                supported: 11
+                found: future,
+                supported: INTERCEPT_SCHEMA_VERSION
             }
         );
         assert!(store.is_read_only());
-        assert_eq!(store.schema_version().expect("future version"), 12);
+        assert_eq!(store.schema_version().expect("future version"), future);
         assert!(store.connection().execute("DELETE FROM dns", []).is_err());
         assert!(matches!(
             apply_agent_schema(&mut store),

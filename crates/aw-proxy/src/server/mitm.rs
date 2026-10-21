@@ -23,6 +23,7 @@ use crate::ca::KeyProtector;
 use std::time::Instant;
 
 use aw_core::{RawEvent, SessionId};
+use aw_pipeline::{decide, Action, Decision, Layer, Phase, Policy, Subject};
 use http::{Request, Response, Uri, Version};
 use http_body_util::BodyExt;
 use hudsucker::certificate_authority::CertificateAuthority;
@@ -125,6 +126,7 @@ impl MitmProxy {
             events: event_tx,
             pending: HashMap::new(),
             next_req: 0,
+            policy: None,
         };
 
         let proxy = Proxy::builder()
@@ -266,6 +268,9 @@ struct RecordingHandler {
     /// guarantees by handing the pair to the same handler instance.
     pending: HashMap<SocketAddr, PendingRequest>,
     next_req: u64,
+    /// `None` is policy off: the request is forwarded unchanged. Step 1 does
+    /// not start this proxy from `aw run`; a later card passes the file.
+    policy: Option<Policy>,
 }
 
 /// Request metadata held between `handle_request` and `handle_response`.
@@ -296,6 +301,17 @@ impl HttpHandler for RecordingHandler {
             body_bytes,
             client: aw_core::SocketAddr::socket(ctx.client_addr),
         };
+        if let Some(decision) = self.proxy_decision(&request) {
+            if decision.effective == Action::Deny {
+                // No upstream. The body was counted and is dropped here.
+                let reason = decision
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "网络代理按规则拒绝了这一次请求".to_owned());
+                let _ = decision;
+                return deny_response(&reason).into();
+            }
+        }
         self.pending.insert(
             ctx.client_addr,
             PendingRequest {
@@ -388,6 +404,73 @@ impl MessageLen for hudsucker::tokio_tungstenite::tungstenite::Message {
     }
 }
 
+impl RecordingHandler {
+    /// Decide this request. `None` means policy off, or nothing matched: forward.
+    /// A rewrite or an ask is already a deny inside `decide` (design §5.2).
+    fn proxy_decision(&self, request: &RequestMeta) -> Option<Decision> {
+        let policy = self.policy.as_ref()?;
+        let subject = proxy_subject(request);
+        match decide(policy, &subject) {
+            Ok(decision) if decision.effective == Action::Allow => None,
+            Ok(decision) => Some(decision),
+            // A decision failure denies. The sentence does not quote the URL.
+            Err(_) => Some(Decision {
+                rule_id: None,
+                action: Action::Deny,
+                effective: Action::Deny,
+                downgraded: false,
+                reason: Some("判定出错，已按拒绝处理".to_owned()),
+                fields: Vec::new(),
+            }),
+        }
+    }
+}
+
+fn proxy_subject(request: &RequestMeta) -> Subject {
+    let host = request_host(&request.url);
+    Subject {
+        layer: Layer::Proxy,
+        method: Some(request.method.clone()),
+        url: Some(request.url.clone()),
+        host,
+        phase: Phase::Pre,
+        ..Subject::default()
+    }
+}
+
+fn request_host(url: &str) -> Option<String> {
+    let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let hostport = without_scheme.split('/').next().unwrap_or("");
+    let host = hostport.split('@').next_back().unwrap_or(hostport);
+    let host = host.split(':').next().unwrap_or(host);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_owned())
+    }
+}
+
+/// 403 and a short Chinese reason. The body is that sentence, not the request.
+/// The reason is also a header so a client that ignores the body still sees it.
+fn deny_response(reason: &str) -> Response<hudsucker::Body> {
+    let safe = header_safe(reason);
+    Response::builder()
+        .status(403)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header("x-aw-reason", &safe)
+        .body(hudsucker::Body::from(safe.into_bytes()))
+        .unwrap_or_else(|_| Response::new(hudsucker::Body::from(Vec::<u8>::new())))
+}
+
+/// Header values cannot contain CR or LF. A reason with either is replaced
+/// by a fixed sentence so the response cannot be split.
+fn header_safe(reason: &str) -> String {
+    if reason.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+        return "已拒绝".to_owned();
+    }
+    reason.to_owned()
+}
+
 fn c_size(collected: &http_body_util::Collected<hyper::body::Bytes>) -> u64 {
     use hyper::body::Body;
     collected.size_hint().lower()
@@ -440,4 +523,152 @@ fn absolute_url(parts: &http::request::Parts) -> String {
 #[allow(dead_code)]
 fn _uses(uri: Uri, gap: UrlGap, ws: WsCounts, err: CaError) {
     let _ = (uri, gap, ws, err);
+}
+
+/// What a request would do under `policy`, without binding a listener.
+///
+/// `Forward` means the handler would connect upstream. `Deny` means it would
+/// return 403 and not connect. Step 1 does not rewrite; a rewrite rule is a deny.
+#[must_use]
+pub fn preview_proxy_decision(policy: Option<&Policy>, method: &str, url: &str) -> ProxyPreview {
+    let Some(policy) = policy else {
+        return ProxyPreview::Forward;
+    };
+    let request = RequestMeta {
+        method: method.to_owned(),
+        url: url.to_owned(),
+        http_version: "HTTP/1.1".to_owned(),
+        headers: Vec::new(),
+        body_bytes: None,
+        client: aw_core::SocketAddr::socket(SocketAddr::from(([127, 0, 0, 1], 1))),
+    };
+    let subject = proxy_subject(&request);
+    match decide(policy, &subject) {
+        Ok(decision) if decision.effective == Action::Allow => ProxyPreview::Forward,
+        Ok(decision) => ProxyPreview::Deny {
+            status: 403,
+            reason: decision
+                .reason
+                .unwrap_or_else(|| "网络代理按规则拒绝了这一次请求".to_owned()),
+            downgraded: decision.downgraded,
+        },
+        Err(_) => ProxyPreview::Deny {
+            status: 403,
+            reason: "判定出错，已按拒绝处理".to_owned(),
+            downgraded: false,
+        },
+    }
+}
+
+/// The handler's choice for one request. Not a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxyPreview {
+    /// Policy off, or no rule matched. The bytes go upstream.
+    Forward,
+    /// Do not connect. `status` is 403. `reason` is the sentence in the body.
+    Deny {
+        /// HTTP status. Always 403 in step 1.
+        status: u16,
+        /// Chinese sentence. Not the URL.
+        reason: String,
+        /// True when a rewrite or an ask was turned into this deny.
+        downgraded: bool,
+    },
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod intercept_tests {
+    use super::*;
+    use aw_pipeline::{load_str, PolicyState};
+
+    fn enabled(text: &str) -> Policy {
+        match load_str(text).expect("policy") {
+            PolicyState::On(policy) => policy,
+            PolicyState::Off => panic!("expected enabled"),
+        }
+    }
+
+    #[test]
+    fn no_policy_forwards() {
+        assert_eq!(
+            preview_proxy_decision(None, "GET", "https://example.com/"),
+            ProxyPreview::Forward
+        );
+    }
+
+    #[test]
+    fn deny_is_403_and_does_not_forward() {
+        let policy = enabled(
+            r#"
+version = 1
+enabled = true
+[[rule]]
+id = "block-paste"
+layer = ["proxy"]
+match.host = { glob = "*.pastebin.com" }
+action = "deny"
+reason = "不允许连这个网站"
+"#,
+        );
+        match preview_proxy_decision(Some(&policy), "GET", "https://x.pastebin.com/raw/abc") {
+            ProxyPreview::Deny {
+                status,
+                reason,
+                downgraded,
+            } => {
+                assert_eq!(status, 403);
+                assert_eq!(reason, "不允许连这个网站");
+                assert!(!downgraded);
+            }
+            ProxyPreview::Forward => panic!("deny was forwarded"),
+        }
+    }
+
+    #[test]
+    fn rewrite_is_denied_instead() {
+        let policy = enabled(
+            r#"
+version = 1
+enabled = true
+[[rule]]
+id = "rw"
+layer = ["proxy"]
+match.host = { exact = "example.com" }
+action = "rewrite"
+rewrite.host = { replace = ["example.com", "localhost"] }
+"#,
+        );
+        match preview_proxy_decision(Some(&policy), "GET", "http://example.com/a") {
+            ProxyPreview::Deny {
+                status,
+                reason,
+                downgraded,
+            } => {
+                assert_eq!(status, 403);
+                assert!(downgraded);
+                assert!(reason.contains("不改写"));
+            }
+            ProxyPreview::Forward => panic!("rewrite was forwarded"),
+        }
+    }
+
+    #[test]
+    fn a_miss_still_forwards() {
+        let policy = enabled(
+            r#"
+version = 1
+enabled = true
+[[rule]]
+id = "block-paste"
+layer = ["proxy"]
+match.host = { exact = "pastebin.com" }
+action = "deny"
+"#,
+        );
+        assert_eq!(
+            preview_proxy_decision(Some(&policy), "GET", "https://example.com/"),
+            ProxyPreview::Forward
+        );
+    }
 }

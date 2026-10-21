@@ -32,7 +32,8 @@ pub use record::{
     ResponseMeta, UrlGap, WsCounts, REDACTED_HEADER, REDACTED_QUERY, SOURCE_MITM,
 };
 pub use server::{
-    AcceptError, BackendError, BackendOutput, MetadataBackend, ProxyBackend, ProxyServer,
+    preview_proxy_decision, AcceptError, BackendError, BackendOutput, MetadataBackend, MitmError,
+    MitmOutput, MitmProxy, ProxyBackend, ProxyPreview, ProxyServer,
 };
 
 /// Empty marker so the daemon can name this crate before real types exist.

@@ -33,6 +33,10 @@
 | P5-PIPE-02 | 用户自定义规则与告警（REQ-10） | PIPE | M | P3：关联引擎 | A |
 | P5-UI-02 | 多会话对比 | UI | M | P5-AGENT-01 | B |
 | P5-DOC-01 | 适配器贡献指南与模板 | DOC | S | P5-AGENT-03 | D |
+| P5-SEC-01 | 拦截规则：格式、判定、审计记录 | SEC | M | ADR-0014 | A |
+| P5-SEC-02 | `aw hook` 按规则拒绝 / 改写 / 问用户（Claude Code、Codex）与 Claude 启动注入 | AGENT | M | P5-SEC-01 | B |
+| P5-SEC-03 | `aw mcp-tap` 按规则拒绝与改写 | AGENT | S | P5-SEC-01 | B |
+| P5-SEC-04 | 网络代理按规则拒绝 | PROXY | S | P5-SEC-01 | B |
 
 并行组：同组任务之间文件不重叠。C 组的各个适配器分别位于 `crates/aw-agent-adapters/src/agents/<id>/`，可以完全并行。
 
@@ -119,7 +123,7 @@ flowchart LR
 - 入库写 `agent_events` 表：`evidence = 'E3'`，`source` 为 `agent.<id>/hook` 或 `agent.<id>/otel`。
 
 **限制**：
-- hook 子命令不返回任何会改变 Agent 行为的输出（例如 deny 决策）。
+- 拦截规则关闭（缺省）时，hook 子命令不返回任何会改变 Agent 行为的输出（例如 deny 决策）。规则开启后的行为见 P5-SEC-02、ADR-0014。
 - OTLP 接收器不转发数据到任何外部端点。
 
 **验收标准**：
@@ -460,3 +464,65 @@ flowchart LR
 - [ ] docs/README.md 的索引已更新。
 
 **参考文档**：[process-tracking](../../01-architecture/process-tracking.md)、[SPIKE-07](../../06-research/SPIKE-07-agent-hooks.md)、[github-workflow](../../05-dev/github-workflow.md)
+
+### P5-SEC-01 拦截规则：格式、判定、审计记录
+
+- **AREA**: SEC
+- **平台**: all
+- **类型**: feature
+- **优先级**: S
+- **规模**: M
+- **依赖**: ADR-0014
+- **关联**: REQ-12、ADR-0012、ADR-0014
+- **文件范围**: 规则与判定模块（平台无关 crate，由实现者选定并在 PR 写明）、`crates/aw-store/migrations/0012_intercept_events.sql`、`crates/aw-daemon/src/api/`（新路由）、相关测试
+
+**背景**：见 [拦截方案 §5](../../proposals/aw-intercept-design.md)。
+
+**实现要点**：TOML 规则；动作 allow / deny / rewrite / ask；多条命中取最严 `deny > ask > rewrite > allow`；改写后复检；`on_error`；审计记录脱敏摘要 + 加盐哈希；后台不在时写会话目录本地备份。
+
+**限制**：规则缺省关闭；不存原文；不引入平台代码。
+
+**验收标准**：见 [拦截方案 §8](../../proposals/aw-intercept-design.md) 中规则与审计相关条目。
+
+实现差（2026-10-22）：规则文件里不认识的键（含 `[[rule]]` 内和 `match` 内）按损坏拒绝，不会因为写错 `enable` 就静默关掉。有 `[[rule]]` 但没有 `enabled` 时，`aw run` 在 stderr 说明拦截没打开。后台回 `stored: false` 不算送达；改写因此改成拒绝时再补一条记录。没有 `AW_INTERCEPT_AUDIT` 时，备份写到状态目录下的 `agentwatch/sessions/<会话号>/intercept-audit.jsonl`（Linux / macOS 用 `XDG_STATE_HOME` 或 `~/.local/state`，Windows 用 `LOCALAPPDATA`），Unix 上文件是 `0600`。
+
+### P5-SEC-02 `aw hook` 按规则拒绝 / 改写 / 问用户
+
+- **AREA**: AGENT
+- **平台**: all
+- **依赖**: P5-SEC-01
+- **文件范围**: `crates/aw-cli/src/cmd/hook.rs`、`crates/aw-cli/src/cmd/run.rs`、`crates/aw-agent-adapters/src/agents/claude_code/`、`crates/aw-agent-adapters/src/agents/codex/`
+
+**要点**：Claude Code 在 PreToolUse 输出 `permissionDecision` / `updatedInput`；Codex 输出 deny 与 `allow + updatedInput`，`ask` 降级为 deny；Claude 启动注入用 exec 形式 + `onFailure: block`；修正默认 socket / 管道发送格式。规则关闭时输出与现在逐字节一致。
+
+改写输出的是 `allow + updatedInput`。Claude Code 把这个 `allow` 当作批准，命中的命令不再弹权限提示，比用户自己设的权限宽。`aw run` 在拦截开启且规则含 `rewrite` 时于 stderr 提示一行。不用 `ask`：`claude -p` 没有人应答。以后可以加 `auto_approve` 开关（默认关时改走 `ask`），第一步没有。
+
+PostToolUse、SessionStart、SessionEnd 不输出判定、不改写、不写拒绝审计（规则文件坏了也一样）。`permissionDecision` 只属于 PreToolUse；PostToolUse 的 `updatedToolOutput` 第一步不做，规则里还没有阶段字段。
+
+实现差（2026-10-22）：`aw run --intercept`，或规则已开、或规则文件损坏且目标像 Claude（`--agent claude-code|claude` 或 argv0 `claude`）时才写临时 settings。损坏也注入，否则 hook 的拒绝不会跑。不改 `~/.claude/`。Codex 不自动改配置，只有手动片段。输出的 `hookSpecificOutput` 带 `hookEventName`。有后台时，`begin_run` 之后把公开会话号注入 `AW_SESSION` 和 hook 的 `--session`；没有后台的 `aw run` 没有号可给。临时 settings 目录创建时就是 `0700`，文件创建时就是 `0600`。Claude Code 版本低于 2.1.295，或 `程序 --version` 没有读到版本时，stderr 提示 `onFailure: block` 靠不住。argv 里有 `--bare` 或 `--safe-mode` 时提示注入的 hook 不会运行。这个检查看的是 `spec.command[0]`：`aw run -- npx claude` 查到的是 npx 的版本。未做：第一步不检测本进程是不是 root 或 Windows 管理员。不是做不到（Linux 可读 `/proc/self/status` 的 `Uid`，或跑 `id -u`，不用 FFI），留待后续。不读 `allowManagedHooksOnly`：受管设置路径公开，但这个进程不读那份文件，而且它也可能由 MDM 或服务端下发，读文件覆盖不全。
+
+### P5-SEC-03 `aw mcp-tap` 按规则拒绝与改写
+
+- **AREA**: AGENT
+- **平台**: all
+- **依赖**: P5-SEC-01
+- **文件范围**: `crates/aw-cli/src/cmd/mcp_tap.rs`、`crates/aw-agent-adapters/src/mcp_tap/`
+
+**要点**：deny 回 JSON-RPC 错误（同一 `id`），不转给服务端；rewrite 改请求参数或结果；规则关闭时逐字节透传。
+
+实现差（2026-10-21）：规则文件损坏时，`tools/call` 回 JSON-RPC 错误（同一 `id`）并记审计；`initialize`、`tools/list`、通知和其他方法照常转发。批量（顶层 JSON 数组）里的 `tools/call` 同样拒绝，其余元素仍转发。`ask` 在判定里已降为 deny。
+
+响应方向：`match.direction` 只能写在 `layer` 只含 `mcp` 的规则上，合法值只有 `{ exact = "c2s" }` 和 `{ exact = "s2c" }`，其他写法和值算规则文件损坏。不写方向时只匹配请求；回包规则必须显式写 `{ exact = "s2c" }`。回包的 `result.<字段>` 用 `match.arg.<字段>` 匹配、用 `rewrite.arg.<字段>` 改写，改完转发给客户端。`rewrite.mcp_tool` 和 `rewrite.tool` 写回请求的 `params.name`。回包方向的拒绝、判定出错、替换不上、审计写不进去，都不转发原文：给同一个 `id` 回 JSON-RPC 错误（`-32000`，消息不含原文），审计记实际执行的拒绝。工具已经执行，结果不交给模型。批量回包里的元素同样处理。规则开着时，读不了的一行（不是 JSON）按 `on_error` 处理，默认丢弃，不转发。JSON-RPC 批量在规则开着时逐个元素判定：拒绝的回该元素自己的 `id`，改写的改写，放行的连同其他放行元素组成一个数组转发。
+
+`aw mcp-tap -- <cmd>` 原先在分发处被「本版本未接入」截住，包装器没有启动；现已接到 `mcp_tap::run`。`aw run --mcp-tap` 仍未接入（没有按 Agent 改临时 MCP 配置）。
+
+### P5-SEC-04 网络代理按规则拒绝
+
+- **AREA**: PROXY
+- **平台**: all
+- **依赖**: P5-SEC-01
+- **文件范围**: `crates/aw-proxy/src/server/`
+
+**要点**：命中 deny 回 403 和中文原因，不连上游；第一步不改写；代理接入 `aw run` 启动链路是后续任务。
+
+实现差（2026-10-22）：`MitmProxy::bind` 仍不接收规则（现有调用不变）。拒绝与「改写降为拒绝」由 `preview_proxy_decision` 测到；handler 在 `policy: None` 时原样转发。拒绝回包在库里是 403（中文原因做百分号编码，构造失败也不掉成 200）。主机名比较忽略大小写，`[::1]` 不会被冒号截断。这一层仍是库级：未接入 `aw run` 启动链路，没有端到端测试。

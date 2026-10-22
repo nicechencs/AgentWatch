@@ -15,9 +15,11 @@ mod gaps;
 mod hook;
 mod http;
 mod http_source;
+mod intercept_audit;
 mod lifecycle;
 mod mcp_tap;
 mod merge;
+mod policy_file;
 mod procs;
 mod proxy;
 mod ps;
@@ -122,7 +124,7 @@ fn dispatch_live(cli: Cli, env_token: Option<String>) -> io::Result<Outcome> {
     if let Some(outcome) = hook_command(&cli, env_token.as_deref()) {
         return Ok(outcome);
     }
-    if let Some(outcome) = mcp_tap_command(&cli) {
+    if let Some(outcome) = mcp_tap_command(&cli, env_token.as_deref()) {
         return Ok(outcome);
     }
     if let Some(outcome) = merge_command(&cli) {
@@ -357,6 +359,7 @@ fn run_parts<'a>(
         no_daemon,
         raw,
         unsafe_no_redact,
+        intercept,
         cmd,
     } = command
     else {
@@ -385,6 +388,7 @@ fn run_parts<'a>(
         unsafe_no_redact: *unsafe_no_redact,
         include_proc: !include_proc.is_empty(),
         group: group.is_some(),
+        intercept: *intercept,
     };
     Some((args, deferred))
 }
@@ -606,7 +610,7 @@ fn dispatch(
     if let Some(outcome) = hook_command(&cli, env_token.as_deref()) {
         return Ok(outcome);
     }
-    if let Some(outcome) = mcp_tap_command(&cli) {
+    if let Some(outcome) = mcp_tap_command(&cli, env_token.as_deref()) {
         return Ok(outcome);
     }
     if let Some(outcome) = merge_command(&cli) {
@@ -687,18 +691,31 @@ fn merge_command(cli: &Cli) -> Option<Outcome> {
     }))
 }
 
-/// `aw mcp-tap` (P6-AGENT-01). An empty command stays on the usage path.
+/// `aw mcp-tap` (P6-AGENT-01, deny/rewrite P5-SEC-03). An empty command stays
+/// on the usage path.
 ///
 /// A non-empty command spawns the wrapped server. It does not probe `/health`.
-/// There is no `AgentRpc` ingest route, so extracts are not posted.
-fn mcp_tap_command(cli: &Cli) -> Option<Outcome> {
+/// There is no `AgentRpc` ingest route, so extracts are not posted. This must
+/// run before any "not in this build" check: the wrapper is connected.
+fn mcp_tap_command(cli: &Cli, env_token: Option<&str>) -> Option<Outcome> {
     let Command::McpTap { cmd } = &cli.command else {
         return None;
     };
     if cmd.is_empty() {
         return None;
     }
-    Some(mcp_tap::run(cmd))
+    // Same resolution as every other command: `--socket`, then `--http`, then
+    // `AW_SOCKET`, then the platform default. A failure is not fatal — the
+    // wrapper still runs — but an audit then has nowhere to go, and a rewrite
+    // with no local backup becomes a deny.
+    let input = EndpointInput {
+        socket: cli.socket.clone(),
+        http: cli.http.clone(),
+        token: cli.token.clone(),
+        token_env: env_token.map(str::to_owned),
+    };
+    let endpoint = endpoint::resolve(&input).ok();
+    Some(mcp_tap::run(cmd, endpoint.as_ref()))
 }
 
 /// Commands deliberately compiled into the command tree for compatibility but
@@ -712,8 +729,7 @@ fn not_in_build_command(command: &Command, json: bool) -> Option<Outcome> {
         | Command::Chain { .. }
         | Command::Fixtures(_)
         | Command::Group(_)
-        | Command::Dev { .. }
-        | Command::McpTap { .. } => command_label(command),
+        | Command::Dev { .. } => command_label(command),
         _ => return None,
     };
     Some(not_in_build(label, json))
@@ -780,6 +796,7 @@ fn launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
             no_daemon,
             raw,
             unsafe_no_redact,
+            intercept,
             cmd,
         } => {
             let args = run::RunArgs {
@@ -805,6 +822,7 @@ fn launch_command(cli: &Cli, json: bool) -> Option<Outcome> {
                 unsafe_no_redact: *unsafe_no_redact,
                 include_proc: !include_proc.is_empty(),
                 group: group.is_some(),
+                intercept: *intercept,
             };
             Some(run::run(
                 &args,
@@ -1549,7 +1567,7 @@ mod tests {
         for name in [
             "run", "attach", "stop", "ps", "sessions", "timeline", "procs", "files", "flows",
             "http", "findings", "gaps", "around", "search", "export", "ui", "doctor", "daemon",
-            "config", "db", "merge", "hook", "version",
+            "config", "db", "merge", "hook", "mcp-tap", "version",
         ] {
             assert!(
                 help.lines()
@@ -1558,7 +1576,7 @@ mod tests {
             );
         }
         for name in [
-            "proxy", "fixtures", "group", "agents", "links", "rpc", "chain", "mcp-tap", "dev",
+            "proxy", "fixtures", "group", "agents", "links", "rpc", "chain", "dev",
         ] {
             assert!(
                 !help
@@ -1577,7 +1595,9 @@ mod tests {
         let root_help = text(&root.stdout);
         assert!(root_help.contains("用法:"), "{root_help}");
         assert!(!root_help.contains("agents"), "{root_help}");
-        assert!(!root_help.contains("mcp-tap"), "{root_help}");
+        // `mcp-tap` is wired (P5-SEC-03) and listed. `hide = true` stays on
+        // commands that still return `not_in_build`.
+        assert!(root_help.contains("mcp-tap"), "{root_help}");
         assert!(!root_help.contains("proxy"), "{root_help}");
 
         let stop = run(&["stop", "--help"], None, &mut http);

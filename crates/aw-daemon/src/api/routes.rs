@@ -746,7 +746,12 @@ pub fn dispatch(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
     // only signal that a self-report was dropped. The listener is loopback-only;
     // this route still refuses a non-loopback Host.
     if req.path == "/api/v1/agent/hook" && req.method.eq_ignore_ascii_case("POST") {
-        return ingest_agent_hook(state, req);
+        return ingest_agent_hook(state, req, false);
+    }
+    // Same trust model as the hook route: the intercept writer is a local
+    // process with no ticket. Loopback Host is still required.
+    if req.path == "/api/v1/agent/intercept" && req.method.eq_ignore_ascii_case("POST") {
+        return ingest_intercept(state, req, false);
     }
 
     // Socket/pipe ticket issuance is not an HTTP-bearer flow. Over HTTP,
@@ -845,21 +850,43 @@ pub(crate) fn dispatch_peer(
             "the internal channel serves /health and /api/v1 only",
         );
     }
+    // The hook and intercept writers have no ticket. On the loopback HTTP
+    // listener `dispatch` answers them before authentication, still requiring a
+    // loopback Host. This channel is a filesystem socket or a named pipe: there
+    // is no Host and no port, and the peer was already identified by the
+    // transport. Sending them through `route_authed` answered 404, so a rewrite
+    // whose audit could not be stored was downgraded to a deny. They are
+    // answered here with `internal` set, so a missing Host is not 421. The
+    // HTTP listener does not call this function; there, no Host is 421.
+    if req.path == "/api/v1/agent/hook" && req.method.eq_ignore_ascii_case("POST") {
+        return ingest_agent_hook(state, req, true);
+    }
+    if req.path == "/api/v1/agent/intercept" && req.method.eq_ignore_ascii_case("POST") {
+        return ingest_intercept(state, req, true);
+    }
     let mut peer_req = req.clone();
     peer_req.headers.remove("authorization");
     route_authed(state, &peer_req, caller)
 }
 
-/// `POST /api/v1/agent/hook`. Loopback only. No bearer: the hook process has no ticket.
+/// `POST /api/v1/agent/hook`. No bearer: the hook process has no ticket.
+///
+/// On the HTTP listener a loopback Host is required, and a missing Host is 421.
+/// [`dispatch_peer`] passes `internal`: the socket and the named pipe have no
+/// Host, and the peer was already identified by the transport.
 ///
 /// `dropped: true` records a `self_report_dropped` gap and does not insert a
 /// tool call. Any other body is parsed by [`super::agent::ingest_hook`] and,
 /// when the database is configured, written to `agent_events`. No database is
 /// `StorageNotReady`, not a forged success.
-fn ingest_agent_hook(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
+fn ingest_agent_hook(state: &mut ApiState, req: &HttpRequest, internal: bool) -> ApiResponse {
     let _busy_deadline = aw_store::BusyDeadline::start(aw_store::BUSY_TIMEOUT);
     let host = req.headers.get("host").cloned();
-    if req_host_bad(&host, req.listen_port) {
+    // HTTP with no Host is 421, the same as a foreign Host. The parser does not
+    // invent one (`http.rs` copies the header it was given). The socket and the
+    // named pipe call this with `internal`: that channel has no Host, and the
+    // peer was already identified by the transport.
+    if !internal && req_host_bad(&host, req.listen_port) {
         return misdirected();
     }
     let value: serde_json::Value = match serde_json::from_slice(&req.body) {
@@ -984,6 +1011,83 @@ fn ingest_agent_hook(state: &mut ApiState, req: &HttpRequest) -> ApiResponse {
         );
     }
     ApiResponse::json(200, &json!({ "accepted": accepted }))
+}
+
+/// `POST /api/v1/agent/intercept`. No bearer.
+///
+/// On the HTTP listener a loopback Host is required, and a missing Host is 421.
+/// [`dispatch_peer`] passes `internal`: the socket and the named pipe have no
+/// Host, and the peer was already identified by the transport.
+///
+/// The body is an already-redacted audit record. `dropped: true` records an
+/// `intercept_audit_dropped` gap and does not insert a row. A missing required
+/// field is 400; this route does not invent an empty summary.
+fn ingest_intercept(state: &mut ApiState, req: &HttpRequest, internal: bool) -> ApiResponse {
+    let _busy_deadline = aw_store::BusyDeadline::start(aw_store::BUSY_TIMEOUT);
+    let host = req.headers.get("host").cloned();
+    // See [`ingest_agent_hook`]. HTTP with no Host is 421. `internal` is the
+    // socket or the named pipe, which has no Host to send.
+    if !internal && req_host_bad(&host, req.listen_port) {
+        return misdirected();
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&req.body) {
+        Ok(value) => value,
+        Err(_) => return error_response(400, "not_json", "intercept body is not JSON"),
+    };
+    let dropped = value.get("dropped").and_then(serde_json::Value::as_bool) == Some(true);
+    let report = super::query::InterceptReport {
+        session: json_string(&value, "session"),
+        agent: json_string(&value, "agent"),
+        layer: json_string(&value, "layer").unwrap_or_default(),
+        event: json_string(&value, "event"),
+        rule_id: json_string(&value, "rule_id"),
+        action: json_string(&value, "action").unwrap_or_default(),
+        effective_action: json_string(&value, "effective_action").unwrap_or_default(),
+        tool: json_string(&value, "tool"),
+        host: json_string(&value, "host"),
+        mcp_method: json_string(&value, "mcp_method"),
+        before_summary: json_string(&value, "before_summary").unwrap_or_default(),
+        before_hash: json_string(&value, "before_hash").unwrap_or_default(),
+        after_summary: json_string(&value, "after_summary"),
+        after_hash: json_string(&value, "after_hash"),
+        reason: json_string(&value, "reason"),
+        evidence: json_string(&value, "evidence").unwrap_or_default(),
+        source: json_string(&value, "source").unwrap_or_default(),
+        delivered: json_string(&value, "delivered").unwrap_or_else(|| "daemon".to_owned()),
+        downgraded: value.get("downgraded").and_then(serde_json::Value::as_bool) == Some(true),
+        dropped,
+    };
+    if !dropped
+        && (report.layer.is_empty()
+            || report.action.is_empty()
+            || report.effective_action.is_empty()
+            || report.before_summary.is_empty()
+            || report.before_hash.is_empty()
+            || report.evidence.is_empty()
+            || report.source.is_empty())
+    {
+        return error_response(400, "bad_argument", "intercept record is missing a field");
+    }
+    match state.query.ingest_intercept(&report) {
+        Ok(super::query::InterceptIngest::Stored) => {
+            ApiResponse::json(200, &json!({ "stored": true }))
+        }
+        Ok(super::query::InterceptIngest::Gap) => {
+            ApiResponse::json(200, &json!({ "gap": "intercept_audit_dropped" }))
+        }
+        Ok(super::query::InterceptIngest::NoDatabase) => {
+            ApiResponse::json(200, &json!({ "stored": false, "storage": "not_ready" }))
+        }
+        Err(_) => error_response(500, "store", "intercept record was not written"),
+    }
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
 }
 
 fn hook_result(state: &mut ApiState, report: &super::query::HookReport) -> ApiResponse {
@@ -2814,8 +2918,8 @@ fn forbidden() -> ApiResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        database_busy_json, database_read_only_newer_response, dispatch, not_implemented, ApiState,
-        HttpBind, HttpRequest,
+        database_busy_json, database_read_only_newer_response, dispatch, dispatch_peer,
+        not_implemented, ApiState, HttpBind, HttpRequest,
     };
     use crate::api::auth::{TicketStore, UI_TICKET_TTL};
     use crate::api::pipe_dacl_configured;
@@ -2936,6 +3040,230 @@ mod tests {
             &req("GET", "/api/v1/sessions", Some("127.0.0.1:7456"), None, b""),
         );
         assert_eq!(response.status, 401);
+    }
+
+    /// The socket and the named pipe reach hook and intercept without a ticket
+    /// and without a Host. HTTP still refuses a foreign Host with 421.
+    #[test]
+    fn socket_and_pipe_ingest_hook_and_intercept() {
+        let dir = std::env::temp_dir().join(format!(
+            "aw-routes-peer-ingest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        let db = dir.join("agentwatch.db");
+        let opened = (|| -> Result<(), String> {
+            let store = aw_store::Store::open(&db).map_err(|err| err.to_string())?;
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO sessions (public_id, mode, user_id, started_ns, platform, collectors) \
+                     VALUES ('s-peer', 'launch', 'alice', 1, 'linux', '[]')",
+                    [],
+                )
+                .map_err(|err| err.to_string())?;
+            Ok(())
+        })();
+        assert!(opened.is_ok(), "{opened:?}");
+
+        let mut state = ApiState::new(1_000);
+        state.query = crate::api::query::StoreQuery::open_path(db.clone());
+        let caller = crate::api::auth::Caller {
+            user_id: "alice".to_owned(),
+            admin: false,
+            peer: None,
+        };
+        // What curl --unix-socket sends: Host is `localhost` with no port.
+        let mut headers = BTreeMap::new();
+        headers.insert("host".to_owned(), "localhost".to_owned());
+        headers.insert("content-type".to_owned(), "application/json".to_owned());
+        let intercept = HttpRequest {
+            method: "POST".to_owned(),
+            path: "/api/v1/agent/intercept".to_owned(),
+            query: String::new(),
+            headers: headers.clone(),
+            body: br#"{"session":"s-peer","agent":"claude-code","layer":"hook","event":"PreToolUse","rule_id":"x","action":"rewrite","effective_action":"rewrite","tool":"Bash","before_summary":"echo","before_hash":"ab","evidence":"E3","source":"intercept.claude-code/hook"}"#.to_vec(),
+            listen_port: 0,
+            body_too_large: false,
+        };
+        let stored = dispatch_peer(&mut state, &intercept, &caller);
+        assert_eq!(
+            stored.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&stored.body)
+        );
+        assert_eq!(json_body(&stored)["stored"], true);
+
+        let hook = HttpRequest {
+            method: "POST".to_owned(),
+            path: "/api/v1/agent/hook".to_owned(),
+            headers: headers.clone(),
+            body: br#"{"agent":"claude-code","session":"s-peer","payload":{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"echo"}}}"#.to_vec(),
+            ..intercept.clone()
+        };
+        let hooked = dispatch_peer(&mut state, &hook, &caller);
+        assert_eq!(
+            hooked.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&hooked.body)
+        );
+        let accepted = json_body(&hooked)["accepted"].as_u64().unwrap_or(0);
+        assert!(
+            accepted >= 1,
+            "hook did not land: {}",
+            String::from_utf8_lossy(&hooked.body)
+        );
+
+        let counted = (|| -> Result<(i64, i64), String> {
+            let store = aw_store::Store::open(&db).map_err(|err| err.to_string())?;
+            let intercepts: i64 = store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM intercept_events WHERE before_summary = 'echo'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|err| err.to_string())?;
+            let hooks: i64 = store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_events WHERE agent = 'claude-code'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|err| err.to_string())?;
+            Ok((intercepts, hooks))
+        })();
+        assert_eq!(
+            counted.ok(),
+            Some((1, i64::try_from(accepted).unwrap_or(0)))
+        );
+
+        // Same bodies over HTTP. A foreign Host stays 421. A loopback Host stores.
+        let mut foreign = intercept.clone();
+        foreign
+            .headers
+            .insert("host".to_owned(), "evil.com".to_owned());
+        foreign.listen_port = 7456;
+        let refused = dispatch(&mut state, &foreign);
+        assert_eq!(refused.status, 421);
+
+        let mut loopback = intercept;
+        loopback
+            .headers
+            .insert("host".to_owned(), "127.0.0.1:7456".to_owned());
+        loopback.listen_port = 7456;
+        loopback.body = br#"{"session":"s-peer","agent":"claude-code","layer":"hook","event":"PreToolUse","rule_id":"x","action":"deny","effective_action":"deny","tool":"Bash","before_summary":"echo-http","before_hash":"cd","evidence":"E3","source":"intercept.claude-code/hook"}"#.to_vec();
+        let via_http = dispatch(&mut state, &loopback);
+        assert_eq!(
+            via_http.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&via_http.body)
+        );
+        assert_eq!(json_body(&via_http)["stored"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// HTTP with no Host used to be accepted: the check only ran when a Host
+    /// was present. The socket and the named pipe have no Host, and they are
+    /// the only path that may omit it.
+    #[test]
+    fn http_without_host_is_421_and_the_socket_stores() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("route-tests")
+            .join(format!(
+                "no-host-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+        assert!(std::fs::create_dir_all(&dir).is_ok());
+        // A failed assertion used to return before the cleanup at the bottom,
+        // leaving this database under the crate's target tree. Drop removes it
+        // on the way out, pass or fail.
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = DirGuard(dir.clone());
+        let db = dir.join("agentwatch.db");
+        let opened = (|| -> Result<(), String> {
+            let store = aw_store::Store::open(&db).map_err(|err| err.to_string())?;
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO sessions (public_id, mode, user_id, started_ns, platform, collectors) \
+                     VALUES ('s-nohost', 'launch', 'alice', 1, 'linux', '[]')",
+                    [],
+                )
+                .map_err(|err| err.to_string())?;
+            Ok(())
+        })();
+        assert!(opened.is_ok(), "{opened:?}");
+
+        let mut state = ApiState::new(1_000);
+        state.query = crate::api::query::StoreQuery::open_path(db.clone());
+        let body = br#"{"session":"s-nohost","agent":"claude-code","layer":"hook","event":"PreToolUse","rule_id":"x","action":"deny","effective_action":"deny","tool":"Bash","before_summary":"echo","before_hash":"ab","evidence":"E3","source":"intercept.claude-code/hook"}"#;
+
+        let http = dispatch(
+            &mut state,
+            &req("POST", "/api/v1/agent/intercept", None, None, body),
+        );
+        assert_eq!(http.status, 421, "{}", String::from_utf8_lossy(&http.body));
+        let hook = dispatch(
+            &mut state,
+            &req(
+                "POST",
+                "/api/v1/agent/hook",
+                None,
+                None,
+                br#"{"agent":"claude-code"}"#,
+            ),
+        );
+        assert_eq!(hook.status, 421, "{}", String::from_utf8_lossy(&hook.body));
+
+        let caller = crate::api::auth::Caller {
+            user_id: "alice".to_owned(),
+            admin: false,
+            peer: None,
+        };
+        let via_socket = dispatch_peer(
+            &mut state,
+            &req("POST", "/api/v1/agent/intercept", None, None, body),
+            &caller,
+        );
+        assert_eq!(
+            via_socket.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&via_socket.body)
+        );
+        assert_eq!(json_body(&via_socket)["stored"], true, "{via_socket:?}");
+        let counted = (|| -> Result<i64, String> {
+            let store = aw_store::Store::open(&db).map_err(|err| err.to_string())?;
+            store
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM intercept_events WHERE before_summary = 'echo'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|err| err.to_string())
+        })();
+        assert_eq!(counted.ok(), Some(1));
     }
 
     #[test]

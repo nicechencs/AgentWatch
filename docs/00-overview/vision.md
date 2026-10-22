@@ -1,7 +1,7 @@
 # 愿景与范围
 
 > 状态：草案
-> 最后更新：2026-10-06
+> 最后更新：2026-10-21
 > 关联：[requirements](requirements.md)、[architecture](../01-architecture/architecture.md)、[evidence-model](../01-architecture/evidence-model.md)
 
 ## 1. 一句话定位
@@ -34,7 +34,7 @@ AgentWatch 把这些能力收敛到“**一次会话 + 一棵进程树**”的�
 以 [requirements §3](requirements.md#3-非目标) 为准，摘要如下：
 - 不对抗刻意规避监控、拥有同等或更高权限的恶意程序；
 - 不做集中式 / 多机监控；
-- 不做拦截或阻断（1.0 之前只审计）；
+- 默认只审计；拦截与改写是可选功能，只在 `aw run` 启动的会话里、用户写了规则后生效，不承诺拦住刻意绕过的程序（REQ-12、ADR-0014）；
 - 不保存文件内容和流量内容。
 
 ## 5. 目标用户

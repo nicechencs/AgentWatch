@@ -36,6 +36,7 @@ pub mod limit;
 pub mod limits;
 pub mod output;
 pub mod pipeline;
+pub mod policy;
 pub mod redact;
 pub mod rules;
 pub mod scope;
@@ -79,6 +80,12 @@ pub use ipc::{
 pub use limits::Limiter;
 pub use output::{DnsRec, FileAccessRec, FlowBucketRec, GapRec, NetFlowRec, Output, ProcessRec};
 pub use pipeline::Pipeline;
+pub use policy::{
+    audit_record, audit_summary, decide, downgrade_codex_ask, hash_original, load_str,
+    rules_without_enabled, Action, AuditRecord, DecideError, Decision, Delivered, FieldRewrite,
+    Layer, Matcher, OnError, Phase, Policy, PolicyError, PolicyState, Rule, Subject,
+    AUDIT_SUMMARY_CHARS,
+};
 pub use redact::{builtin_rules, BuiltinRule, Redactor, UNSAFE_NO_REDACT_FLAG};
 pub use scope::{ScopeConfig, ScopeFilter, ScopeSet, ScopeUpdate, DEFAULT_PENDING_MS};
 pub use sensitive::{PathGlob, Rules as SensitiveRules};

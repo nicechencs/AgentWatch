@@ -15,6 +15,7 @@
 //! it also fills `path` / `url` / `query`, renames MCP tools, and pairs Pre
 //! with Post on `tool_use_id`.
 
+pub mod decision;
 mod map;
 pub mod otel;
 

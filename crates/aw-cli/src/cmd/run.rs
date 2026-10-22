@@ -100,6 +100,8 @@ pub(crate) struct DeferredFlags<'a> {
     pub include_proc: bool,
     /// `--group` was set. Groups are a later card.
     pub group: bool,
+    /// `--intercept`. Writes a temp Claude Code settings file for this launch.
+    pub intercept: bool,
 }
 
 /// How much of the summary to print.
@@ -1245,14 +1247,29 @@ pub(crate) fn run(
     launcher: &mut dyn Launcher,
     summary: &mut dyn SessionSummary,
 ) -> Outcome {
-    let (level, spec) = match prepare(args, deferred) {
+    let (level, mut spec) = match prepare(args, deferred) {
         Ok(prepared) => prepared,
         Err(outcome) => return outcome,
+    };
+    let omitted = enabled_omitted_note();
+    let (intercept_dir, rewrites) = match inject_claude_intercept(args, deferred, &mut spec, None) {
+        Ok(Some((dir, rewrites))) => (Some(dir), rewrites),
+        Ok(None) => (None, false),
+        Err(outcome) => return outcome,
+    };
+    let notice = rewrite_notice(rewrites);
+    let limits = if intercept_dir.is_some() {
+        intercept_limit_notes(&spec)
+    } else {
+        String::new()
     };
 
     let launched = match launcher.launch(&spec) {
         Ok(launched) => launched,
         Err(err) => {
+            let cleanup = intercept_dir
+                .as_deref()
+                .and_then(|dir| cleanup_intercept_dir(dir).err());
             let error_code = err.code().unwrap_or("launch");
             let code = if args.no_daemon {
                 exit::GENERAL
@@ -1261,20 +1278,39 @@ pub(crate) fn run(
             } else {
                 exit::GENERAL
             };
-            return super::error_outcome(code, error_code, &err.to_string(), args.json);
+            let mut outcome = super::error_outcome(code, error_code, &err.to_string(), args.json);
+            append_cleanup_note(&mut outcome, cleanup);
+            return outcome;
         }
     };
 
     if level == SummaryLevel::None || args.quiet {
-        return Outcome {
+        let cleanup = intercept_dir
+            .as_deref()
+            .and_then(|dir| cleanup_intercept_dir(dir).err());
+        // No summary document on this path, so the notes stay `[aw]` text.
+        // `--json` does not change that: there is nothing to put them inside.
+        let mut stderr = notice.unwrap_or("").to_owned();
+        if let Some(note) = omitted {
+            stderr.push_str(&note);
+        }
+        stderr.push_str(&limits);
+        let mut outcome = Outcome {
             code: launched.code,
             stdout: Vec::new(),
-            stderr: Vec::new(),
+            stderr: stderr.into_bytes(),
         };
+        append_cleanup_note(&mut outcome, cleanup);
+        return outcome;
     }
 
     let figures = summary.summarize(args.name);
     let mut stderr = Vec::new();
+    let notes = summary_notes(&[
+        notice,
+        omitted.as_deref(),
+        Some(limits.as_str()).filter(|text| !text.is_empty()),
+    ]);
     if let Err(err) = write_summary(
         &mut stderr,
         args,
@@ -1282,14 +1318,42 @@ pub(crate) fn run(
         &launched,
         &figures,
         None,
-        PinState::Unknown,
+        SummaryTail {
+            pin: PinState::Unknown,
+            notes: &notes,
+        },
     ) {
-        return super::error_outcome(exit::GENERAL, "summary", &err.to_string(), args.json);
+        let cleanup = intercept_dir
+            .as_deref()
+            .and_then(|dir| cleanup_intercept_dir(dir).err());
+        let mut outcome =
+            super::error_outcome(exit::GENERAL, "summary", &err.to_string(), args.json);
+        append_cleanup_note(&mut outcome, cleanup);
+        return outcome;
     }
-    Outcome {
+    let cleanup = intercept_dir
+        .as_deref()
+        .and_then(|dir| cleanup_intercept_dir(dir).err());
+    let mut outcome = Outcome {
         code: launched.code,
         stdout: Vec::new(),
         stderr,
+    };
+    // `--json` already carried these inside the document's `notes`. Appending
+    // them here would be a second line, and `serde_json::from_slice` rejects
+    // that as trailing characters. The human summary still gets the text.
+    if !args.json {
+        append_note_text(&mut outcome.stderr, &notes);
+    }
+    append_cleanup_note(&mut outcome, cleanup);
+    outcome
+}
+
+/// A cleanup failure is a note on the outcome, not a swallowed error and not a
+/// changed exit code: the target already ran.
+fn append_cleanup_note(outcome: &mut Outcome, note: Option<String>) {
+    if let Some(note) = note {
+        outcome.stderr.extend(format!("[aw] {note}\n").into_bytes());
     }
 }
 
@@ -1407,7 +1471,380 @@ fn prepare(
     spec.env = env;
     spec.no_follow_children = args.no_follow_children;
     spec.no_daemon = args.no_daemon;
+    // Validation only. Writing the settings file here would run twice: `preflight`
+    // calls this, then `daemon_run` calls it again, and each call minted a new
+    // `aw-intercept-<pid>-<ns>` directory and appended another `--settings`.
+    claude_intercept_enabled(args, deferred, &spec)?;
     Ok((level, spec))
+}
+
+/// Claude Code intercept injection (P5-SEC-02).
+///
+/// Off unless `--intercept` was passed or the policy file is enabled. When it
+/// is on, [`inject_claude_intercept`] writes one temp settings file (not under
+/// `~/.claude/`) and appends `--settings <path>` once. The hook command is this
+/// binary's absolute path, `args` are `["hook", "claude-code"]`, and
+/// `onFailure` is `block`. Codex is not injected: that path is unverified, and
+/// the manual fragment lives in the adapter.
+///
+/// `Err` means the launch must not start: the policy file could not be read.
+/// `Ok(None)` means intercept is off for this command. `Ok(Some(true))` means
+/// the policy that is on contains a rewrite rule.
+fn claude_intercept_enabled(
+    args: &RunArgs<'_>,
+    deferred: DeferredFlags,
+    spec: &crate::launch::RunSpec,
+) -> Result<Option<bool>, Outcome> {
+    let agent = args.agent.unwrap_or("");
+    let looks_like_claude = agent == "claude-code"
+        || agent == "claude"
+        || spec
+            .command
+            .first()
+            .is_some_and(|program| program.rsplit(['/', '\\']).next() == Some("claude"));
+    if !looks_like_claude {
+        return Ok(None);
+    }
+    let policy = super::policy_file::load_policy(
+        std::env::var_os(super::policy_file::POLICY_ENV)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+        super::policy_file::user_config_home().as_deref(),
+    );
+    // A broken file is not "off". `aw hook` denies it (design §5.3). Injecting
+    // is what makes that deny run; skipping it would let the tool run.
+    let enabled = deferred.intercept
+        || matches!(
+            policy,
+            super::policy_file::PolicyLoad::On(_) | super::policy_file::PolicyLoad::Broken
+        );
+    if enabled {
+        let rewrites = match &policy {
+            super::policy_file::PolicyLoad::On(policy) => policy
+                .rules()
+                .iter()
+                .any(|rule| rule.action == aw_pipeline::Action::Rewrite),
+            _ => false,
+        };
+        Ok(Some(rewrites))
+    } else {
+        Ok(None)
+    }
+}
+
+/// One stderr line when a rewrite rule is in force.
+///
+/// A hook rewrite is printed as `permissionDecision: "allow"` plus
+/// `updatedInput`, and Claude Code treats that `allow` as approval: the
+/// rewritten command runs without the permission prompt. The operator asked
+/// for the rewrite, but should see that it also approves. `ask` is not the
+/// alternative: under `claude -p` nobody answers it (design §5.2).
+fn rewrite_notice(rewrites: bool) -> Option<&'static str> {
+    if rewrites {
+        Some("[aw] 提示：规则里有改写。命中的命令会带着改后的参数直接执行，不再弹出权限确认。\n")
+    } else {
+        None
+    }
+}
+
+/// stderr when the policy file has `[[rule]]` and never sets `enabled`.
+///
+/// The file loads as off (the default is closed), so nothing is injected. An
+/// operator who wrote the rules and forgot the switch, or who typed `enable`
+/// and had the unknown key refused, needs to see which of the two it was.
+/// `enable` is a load error and takes the broken-file path instead; this note
+/// is only the quiet omission. `None` when the file sets `enabled`, has no
+/// rules, or cannot be read as TOML.
+fn enabled_omitted_note() -> Option<String> {
+    let path = policy_path_in_env();
+    let text = std::fs::read_to_string(&path).ok()?;
+    // An unknown key is a broken file. `aw hook` denies that. Saying "you
+    // forgot enabled" would hide the typo (`enable = true`).
+    if aw_pipeline::load_str(&text).is_err() {
+        return None;
+    }
+    if aw_pipeline::rules_without_enabled(&text) {
+        Some(
+            "[aw] 提示：规则文件里有规则，但没有写 enabled，拦截没有打开。要打开请写 enabled = true。\n"
+                .to_owned(),
+        )
+    } else {
+        None
+    }
+}
+
+/// First `major.minor.patch` in `text`. Claude Code prints `2.1.295 (Claude Code)`.
+/// A line without three numbers is not a version.
+fn parse_claude_version(text: &str) -> Option<(u64, u64, u64)> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let Some((major, after_major)) = take_u64(bytes, index) else {
+            break;
+        };
+        if after_major >= bytes.len() || bytes[after_major] != b'.' {
+            index = start + 1;
+            continue;
+        }
+        let Some((minor, after_minor)) = take_u64(bytes, after_major + 1) else {
+            index = start + 1;
+            continue;
+        };
+        if after_minor >= bytes.len() || bytes[after_minor] != b'.' {
+            index = start + 1;
+            continue;
+        }
+        let Some((patch, _)) = take_u64(bytes, after_minor + 1) else {
+            index = start + 1;
+            continue;
+        };
+        let preceded = start > 0 && bytes[start - 1].is_ascii_digit();
+        if !preceded {
+            return Some((major, minor, patch));
+        }
+        index = start + 1;
+    }
+    None
+}
+
+fn take_u64(bytes: &[u8], start: usize) -> Option<(u64, usize)> {
+    if start >= bytes.len() || !bytes[start].is_ascii_digit() {
+        return None;
+    }
+    let mut number: u64 = 0;
+    let mut index = start;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        number = number
+            .checked_mul(10)?
+            .checked_add(u64::from(bytes[index] - b'0'))?;
+        index += 1;
+    }
+    Some((number, index))
+}
+
+/// stderr when `onFailure: block` may not be honored.
+///
+/// Claude Code 2.1.295 is the first version that reads that field. Older than
+/// that, a hook that fails to start does not block the tool. No parsed version
+/// is the same warning: we do not pretend the field works.
+fn claude_version_note(version: Option<(u64, u64, u64)>) -> Option<&'static str> {
+    const NEED: (u64, u64, u64) = (2, 1, 295);
+    match version {
+        Some(found) if found >= NEED => None,
+        Some(_) => Some(
+            "[aw] 提示：Claude Code 版本低于 2.1.295，不认识 onFailure: block。hook 起不来时工具仍会执行。\n",
+        ),
+        None => Some(
+            "[aw] 提示：没有读到 Claude Code 的版本。onFailure: block 需要 2.1.295 或更新；更旧的版本里，hook 起不来时工具仍会执行。\n",
+        ),
+    }
+}
+
+/// stderr when the operator's argv skips hooks.
+///
+/// `--bare` and `--safe-mode` are exact arguments. `--barely` is not a match.
+/// `allowManagedHooksOnly` lives in managed settings this process does not read.
+fn claude_flag_note(command: &[String]) -> Option<&'static str> {
+    let hit = command
+        .iter()
+        .any(|arg| arg == "--bare" || arg == "--safe-mode");
+    if hit {
+        Some("[aw] 提示：命令行有 --bare 或 --safe-mode。这两种模式下 aw 注入的 hook 不会运行。\n")
+    } else {
+        None
+    }
+}
+
+/// Ask `program --version` and parse it. A missing program, a hang, or a line
+/// without three numbers is `None`. The wait is capped so a stuck binary
+/// cannot hold the launch.
+fn probe_claude_version(program: &str) -> Option<(u64, u64, u64)> {
+    if program.is_empty() {
+        return None;
+    }
+    let mut child = std::process::Command::new(program)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = sender.send(buf);
+    });
+    let text = match receiver.recv_timeout(std::time::Duration::from_millis(500)) {
+        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+    let _ = child.wait();
+    parse_claude_version(&text)
+}
+
+/// Notes for a launch that injected hooks. Empty when there is nothing to say.
+///
+/// Root is not checked. Step 1 does not ask the OS; reading `/proc/self/status`
+/// or `id -u` is left for later, and neither needs FFI. `--bare` /
+/// `--safe-mode` are visible on the command. The version is whatever
+/// `program --version` printed, and `program` is `spec.command[0]`:
+/// `aw run -- npx claude` reports npx's version.
+fn intercept_limit_notes(spec: &crate::launch::RunSpec) -> String {
+    let mut out = String::new();
+    let program = spec.command.first().map(String::as_str).unwrap_or("");
+    if let Some(note) = claude_version_note(probe_claude_version(program)) {
+        out.push_str(note);
+    }
+    if let Some(note) = claude_flag_note(&spec.command) {
+        out.push_str(note);
+    }
+    out
+}
+
+/// `AW_POLICY` when it is set, otherwise the per-user file. Empty when neither
+/// can be named: there is then nothing to warn about.
+fn policy_path_in_env() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os(super::policy_file::POLICY_ENV) {
+        if !path.is_empty() {
+            return std::path::PathBuf::from(path);
+        }
+    }
+    super::policy_file::default_policy_path(super::policy_file::user_config_home().as_deref())
+        .unwrap_or_default()
+}
+
+/// Write one settings file and append `--settings` exactly once.
+///
+/// Called from the launch paths ([`run`], [`daemon_run`]), never from
+/// [`prepare`]: that function also runs as a preflight, and writing there
+/// produced a second `aw-intercept-<pid>-<ns>` directory and a second
+/// `--settings` on the same command. The returned directory is removed when
+/// the launch outcome is built; a failure before that still removes it here.
+///
+/// `Err` is a failed launch, not a launch without the hook the operator asked
+/// for. `Ok(None)` means intercept is off and nothing was written.
+/// `Ok(Some((dir, rewrites)))` wrote the settings file; `rewrites` is whether
+/// the policy contains a rewrite rule, which the caller prints once.
+fn inject_claude_intercept(
+    args: &RunArgs<'_>,
+    deferred: DeferredFlags,
+    spec: &mut crate::launch::RunSpec,
+    session: Option<&str>,
+) -> Result<Option<(std::path::PathBuf, bool)>, Outcome> {
+    let Some(rewrites) = claude_intercept_enabled(args, deferred, spec)? else {
+        return Ok(None);
+    };
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aw"));
+    let command = exe.display().to_string();
+    // The daemon's public id, once it has assigned one. The hook reads
+    // `AW_SESSION` and `--session`. mcp-tap, started later in the same process
+    // tree, reads the variable. Both are how an intercept row gets a session.
+    let mut hook_args = vec!["hook".to_owned(), "claude-code".to_owned()];
+    if let Some(id) = session.map(str::trim).filter(|id| !id.is_empty()) {
+        hook_args.push("--session".to_owned());
+        hook_args.push(id.to_owned());
+        spec.env
+            .push((super::hook::SESSION_ENV.to_owned(), id.to_owned()));
+    }
+    let hook_refs: Vec<&str> = hook_args.iter().map(String::as_str).collect();
+    let doc = aw_agent_adapters::agents::claude_code::decision::intercept_settings_json(
+        &command, &hook_refs, true,
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "aw-intercept-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    // `create_dir` (not `create_dir_all`) at 0700, and the file opened at 0600.
+    // A 0755 mkdir followed by chmod leaves a window where the settings file,
+    // which names the hook command, is readable by every user on the machine.
+    if !create_owner_dir(&dir) {
+        return Err(super::error_outcome(
+            exit::GENERAL,
+            "intercept",
+            "拦截的临时设置目录写不了，这次没有启动",
+            args.json,
+        ));
+    }
+    let path = dir.join("claude-settings.json");
+    if write_owner_file(&path, doc.as_bytes()).is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(super::error_outcome(
+            exit::GENERAL,
+            "intercept",
+            "拦截的临时设置文件写不了，这次没有启动",
+            args.json,
+        ));
+    }
+    spec.command.push("--settings".to_owned());
+    spec.command.push(path.display().to_string());
+    // `AW_SESSION` and `--session` are set above when the caller already has
+    // the daemon's public id. `aw run` without a daemon has no id to give.
+    Ok(Some((dir, rewrites)))
+}
+
+/// Create `dir` mode `0o700` on Unix. The parent already exists, so this is
+/// `create_dir`, not `create_dir_all`. Mode is set on the mkdir itself.
+fn create_owner_dir(dir: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(dir).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(dir).is_ok()
+    }
+}
+
+/// Create `path` mode `0o600` and write `bytes`. `create_new` will not replace
+/// a file that is already there. Mode is the open mode, not a later chmod.
+fn write_owner_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
+/// Remove the temp settings directory. A failure is reported, not hidden:
+/// the file holds the hook command path, and leaving it behind is visible.
+fn cleanup_intercept_dir(dir: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "拦截的临时设置目录没有删掉（{}）：{err}",
+            dir.display()
+        )),
+    }
 }
 
 /// Whether the pin result is known after a completed run.
@@ -1433,10 +1870,14 @@ pub(crate) fn daemon_run(
     spawner: &mut dyn Spawner,
     summary: &mut dyn SessionSummary,
 ) -> Outcome {
-    let (level, spec) = match daemon_prepare(args, deferred) {
+    let (level, mut spec) = match daemon_prepare(args, deferred) {
         Ok(prepared) => prepared,
         Err(outcome) => return outcome,
     };
+    let omitted = enabled_omitted_note();
+    // The public id exists only after the daemon accepts the run. Inject after
+    // that, so the hook command and `AW_SESSION` name this session. The argv
+    // sent to `begin_run` is the operator's command, without `--settings`.
     let request = BeginRunRequest {
         argv: spec.command.clone(),
         cwd: spec.cwd.clone(),
@@ -1448,6 +1889,24 @@ pub(crate) fn daemon_run(
         Ok(launch) => launch,
         Err(error) => return daemon_error_outcome(error, args.json, false),
     };
+    // One settings file for this launch. `preflight` already validated the
+    // policy and wrote nothing, so this is the only `--settings`.
+    let (intercept_dir, rewrites) =
+        match inject_claude_intercept(args, deferred, &mut spec, Some(launch.public_id.as_str())) {
+            Ok(Some((dir, rewrites))) => (Some(dir), rewrites),
+            Ok(None) => (None, false),
+            Err(outcome) => {
+                // The reservation has no child. Drop it; do not leave a pending run.
+                let _ = sessions.discard_run(&launch);
+                return outcome;
+            }
+        };
+    let notice = rewrite_notice(rewrites);
+    let limits = if intercept_dir.is_some() {
+        intercept_limit_notes(&spec)
+    } else {
+        String::new()
+    };
     let mut child = match spawner.spawn(&spec) {
         Ok(child) => child,
         Err((code, detail)) => {
@@ -1455,7 +1914,10 @@ pub(crate) fn daemon_run(
             // session: discard the reservation so callers never observe an
             // empty launch after a local spawn failure.
             let _ = sessions.discard_run(&launch);
-            return super::error_outcome(exit::GENERAL, code, &detail, args.json);
+            return finish_daemon(
+                intercept_dir.as_deref(),
+                super::error_outcome(exit::GENERAL, code, &detail, args.json),
+            );
         }
     };
     if let Err(error) = sessions.adopt(&launch, child.pid()) {
@@ -1463,17 +1925,26 @@ pub(crate) fn daemon_run(
         // Adoption did not make the held process runnable.  This is still a
         // failed launch, not a recorded session with zero useful events.
         let _ = sessions.discard_run(&launch);
-        return daemon_error_outcome(error, args.json, true);
+        return finish_daemon(
+            intercept_dir.as_deref(),
+            daemon_error_outcome(error, args.json, true),
+        );
     }
     if let Err((code, detail)) = child.release() {
         child.kill_and_reap();
         let _ = sessions.discard_run(&launch);
-        return super::error_outcome(exit::GENERAL, code, &detail, args.json);
+        return finish_daemon(
+            intercept_dir.as_deref(),
+            super::error_outcome(exit::GENERAL, code, &detail, args.json),
+        );
     }
     if let Err(error) = sessions.commit_run(&launch) {
         child.kill_and_reap();
         let _ = sessions.discard_run(&launch);
-        return daemon_error_outcome(error, args.json, true);
+        return finish_daemon(
+            intercept_dir.as_deref(),
+            daemon_error_outcome(error, args.json, true),
+        );
     }
 
     let (pin_state, pin_warning) = if args.pin {
@@ -1490,7 +1961,10 @@ pub(crate) fn daemon_run(
     let code = match child.wait() {
         Ok(code) => code,
         Err(detail) => {
-            return super::error_outcome(exit::GENERAL, "wait_failed", &detail, args.json)
+            return finish_daemon(
+                intercept_dir.as_deref(),
+                super::error_outcome(exit::GENERAL, "wait_failed", &detail, args.json),
+            );
         }
     };
     let leftovers_warning = child.cleanup_leftovers().and_then(|leftovers| {
@@ -1504,18 +1978,31 @@ pub(crate) fn daemon_run(
         .err()
         .map(|error| format!("[aw] 警告：daemon 未记录程序退出码：{error}\n"));
     if level == SummaryLevel::None || args.quiet {
-        let mut stderr = pin_warning.unwrap_or_default();
+        // No summary document on this path. The warnings stay `[aw]` text even
+        // when `--json` was set: there is no document to put them inside, and
+        // dropping them would hide a failed pin or a lost exit code.
+        let mut stderr = notice.unwrap_or("").to_owned();
+        if let Some(note) = &omitted {
+            stderr.push_str(note);
+        }
+        stderr.push_str(&limits);
+        if let Some(warning) = pin_warning.clone() {
+            stderr.push_str(&warning);
+        }
         if let Some(warning) = leftovers_warning {
             stderr.push_str(&warning);
         }
         if let Some(warning) = exit_warning {
             stderr.push_str(&warning);
         }
-        return Outcome {
-            code,
-            stdout: Vec::new(),
-            stderr: stderr.into_bytes(),
-        };
+        return finish_daemon(
+            intercept_dir.as_deref(),
+            Outcome {
+                code,
+                stdout: Vec::new(),
+                stderr: stderr.into_bytes(),
+            },
+        );
     }
     let launched = Launched {
         code,
@@ -1524,6 +2011,14 @@ pub(crate) fn daemon_run(
         sampling: false,
     };
     let figures = summary.summarize(Some(&launch.public_id));
+    let notes = summary_notes(&[
+        notice,
+        omitted.as_deref(),
+        Some(limits.as_str()).filter(|text| !text.is_empty()),
+        pin_warning.as_deref(),
+        leftovers_warning.as_deref(),
+        exit_warning.as_deref(),
+    ]);
     let mut stderr = Vec::new();
     if let Err(error) = write_summary(
         &mut stderr,
@@ -1532,24 +2027,42 @@ pub(crate) fn daemon_run(
         &launched,
         &figures,
         Some(&launch.public_id),
-        pin_state,
+        SummaryTail {
+            pin: pin_state,
+            notes: &notes,
+        },
     ) {
-        return super::error_outcome(exit::GENERAL, "summary", &error.to_string(), args.json);
+        return finish_daemon(
+            intercept_dir.as_deref(),
+            super::error_outcome(exit::GENERAL, "summary", &error.to_string(), args.json),
+        );
     }
-    if let Some(warning) = pin_warning {
-        stderr.extend_from_slice(warning.as_bytes());
+    // Same rule as `run`: one JSON document, nothing after it. The human
+    // summary still prints the `[aw]` lines.
+    if !args.json {
+        append_note_text(&mut stderr, &notes);
     }
-    if let Some(warning) = leftovers_warning {
-        stderr.extend_from_slice(warning.as_bytes());
+    finish_daemon(
+        intercept_dir.as_deref(),
+        Outcome {
+            code,
+            stdout: Vec::new(),
+            stderr,
+        },
+    )
+}
+
+/// Delete the intercept settings directory, then return `outcome`.
+///
+/// The directory exists only for this launch. Removing it after the child has
+/// exited (or after the launch failed) is the whole cleanup: Claude reads
+/// `--settings` at start, so the file is not needed once the process is gone.
+/// A delete that fails is named on stderr and does not change the exit code.
+fn finish_daemon(intercept_dir: Option<&std::path::Path>, mut outcome: Outcome) -> Outcome {
+    if let Some(dir) = intercept_dir {
+        append_cleanup_note(&mut outcome, cleanup_intercept_dir(dir).err());
     }
-    if let Some(warning) = exit_warning {
-        stderr.extend_from_slice(warning.as_bytes());
-    }
-    Outcome {
-        code,
-        stdout: Vec::new(),
-        stderr,
-    }
+    outcome
 }
 
 fn daemon_error_outcome(error: ControlError, json: bool, child_stopped: bool) -> Outcome {
@@ -1740,6 +2253,51 @@ fn mentions_daemon(_: &LaunchDispatchError) -> bool {
     false
 }
 
+/// The `[aw]` lines that follow a human summary, in print order.
+///
+/// Each item still ends with `\n`, and a multi-line item (the version and flag
+/// notes) is split into one line each. [`summary_note_line`] strips the newline
+/// when the same text goes into the JSON `notes` array, so one source feeds both.
+/// `None` and `""` add nothing.
+fn summary_notes(parts: &[Option<&str>]) -> Vec<String> {
+    let mut notes = Vec::new();
+    for part in parts.iter().copied().flatten() {
+        notes.extend(
+            part.split_inclusive('\n')
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned),
+        );
+    }
+    notes
+}
+
+/// What the summary prints after its figures: the pin result, and the `[aw]`
+/// lines. Grouped so [`write_summary`] stays within the argument limit.
+struct SummaryTail<'a> {
+    pin: PinState,
+    notes: &'a [String],
+}
+
+/// One `notes` entry: the `[aw]` line without its trailing newline and without
+/// the `[aw] ` prefix. A note is one sentence, so an embedded newline would
+/// only come from a warning that already folded; JSON keeps it as one string
+/// either way by flattening. Human-readable and `--quiet` output do not call
+/// this, so they still print the prefix.
+fn summary_note_line(note: &str) -> String {
+    let line = note
+        .trim_end_matches(['\n', '\r'])
+        .replace(['\n', '\r'], " ");
+    line.strip_prefix("[aw] ").unwrap_or(&line).to_owned()
+}
+
+/// Write the human-summary notes. Not used for `--json`: those go inside the
+/// document, and a second line after it is trailing characters.
+fn append_note_text(stderr: &mut Vec<u8>, notes: &[String]) {
+    for note in notes {
+        stderr.extend_from_slice(note.as_bytes());
+    }
+}
+
 fn write_summary(
     out: &mut dyn Write,
     args: &RunArgs<'_>,
@@ -1747,15 +2305,24 @@ fn write_summary(
     launched: &Launched,
     figures: &Result<Option<Summary>, String>,
     session_id: Option<&str>,
-    pin_state: PinState,
+    tail: SummaryTail<'_>,
 ) -> io::Result<()> {
     if args.json {
-        let body = summary_json(args, launched, figures, session_id, pin_state);
+        let mut body = summary_json(args, launched, figures, session_id, tail.pin);
+        // Always present, including `[]`. A reader can tell "nothing to say"
+        // from "this aw is old and dropped the field".
+        body["notes"] = Value::Array(
+            tail.notes
+                .iter()
+                .map(|note| Value::String(summary_note_line(note)))
+                .collect(),
+        );
         let mut bytes = serde_json::to_vec(&body)
             .map_err(|err| io::Error::other(format!("编码摘要失败：{err}")))?;
         bytes.push(b'\n');
         // The summary is an `[aw]` side channel. JSON still goes to stderr so the
-        // target's own stdout stays untouched.
+        // target's own stdout stays untouched. Nothing is written after this
+        // document: notes are a field, not a second line.
         return out.write_all(&bytes);
     }
     match figures {
@@ -1809,7 +2376,7 @@ fn write_summary(
             "[aw] 已请求采样模式（--no-daemon）；实际采集状态不可得，未经采集器确认"
         )?;
     }
-    match (args.pin, pin_state) {
+    match (args.pin, tail.pin) {
         (true, PinState::Unknown) => {
             writeln!(
                 out,
@@ -1827,6 +2394,517 @@ fn write_summary(
     }
     let _ = args.agent;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod intercept_inject_tests {
+    use super::*;
+
+    #[test]
+    fn broken_policy_still_injects_settings_without_the_flag() {
+        let dir = std::env::temp_dir().join(format!("aw-inject-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy = dir.join("policy.toml");
+        std::fs::write(&policy, "enabled = true\n[[rule]]\naction = \"nope\"\n").unwrap();
+        // Same lock as the hook tests. A panic still clears the variable.
+        let _guard = super::super::policy_file::env_lock();
+        let _env = super::super::policy_file::EnvVarGuard::set(
+            super::super::policy_file::POLICY_ENV,
+            &policy,
+        );
+        let command = Vec::<String>::new();
+        let args = RunArgs {
+            agent: Some("claude-code"),
+            name: None,
+            no_follow_children: false,
+            cwd: None,
+            env: &[],
+            summary: None,
+            pin: false,
+            no_daemon: true,
+            raw: None,
+            command: &command,
+            json: false,
+            quiet: true,
+        };
+        let mut spec = crate::launch::RunSpec::new(vec!["claude".to_owned()]).unwrap();
+        let deferred = DeferredFlags {
+            proxy: false,
+            proxy_on_reject: false,
+            proxy_on_reject_value: None,
+            self_report: false,
+            mcp_tap: false,
+            unsafe_no_redact: false,
+            include_proc: false,
+            group: false,
+            intercept: false,
+        };
+        let outcome = inject_claude_intercept(&args, deferred, &mut spec, None);
+        if let Ok(Some((settings_dir, _))) = &outcome {
+            let _ = std::fs::remove_dir_all(settings_dir);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(outcome.is_ok(), "broken policy must not skip the launch");
+        assert!(
+            matches!(outcome, Ok(Some(_))),
+            "broken policy did not write settings"
+        );
+        assert_eq!(
+            spec.command
+                .iter()
+                .filter(|arg| *arg == "--settings")
+                .count(),
+            1,
+            "broken policy injected --settings more than once: {:?}",
+            spec.command
+        );
+    }
+
+    /// `preflight` validates and writes nothing. One launch writes one file and
+    /// one `--settings`; the directory is gone after the session cleanup.
+    #[test]
+    fn intercept_settings_are_written_once_and_removed() {
+        let policy_root = std::env::temp_dir().join(format!(
+            "aw-inject-once-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&policy_root);
+        std::fs::create_dir_all(&policy_root).unwrap();
+        let policy = policy_root.join("policy.toml");
+        std::fs::write(&policy, "enabled = true\n").unwrap();
+        let _guard = super::super::policy_file::env_lock();
+        let _env = super::super::policy_file::EnvVarGuard::set(
+            super::super::policy_file::POLICY_ENV,
+            &policy,
+        );
+
+        let command = vec!["claude".to_owned()];
+        let args = RunArgs {
+            agent: Some("claude-code"),
+            name: None,
+            no_follow_children: false,
+            cwd: None,
+            env: &[],
+            summary: None,
+            pin: false,
+            no_daemon: false,
+            raw: None,
+            command: &command,
+            json: false,
+            quiet: true,
+        };
+        let deferred = DeferredFlags {
+            proxy: false,
+            proxy_on_reject: false,
+            proxy_on_reject_value: None,
+            self_report: false,
+            mcp_tap: false,
+            unsafe_no_redact: false,
+            include_proc: false,
+            group: false,
+            intercept: true,
+        };
+        let before = ours_in_temp();
+        let preflight = preflight(&args, deferred);
+        assert!(preflight.is_ok(), "preflight refused a valid intercept run");
+        assert_eq!(
+            ours_in_temp(),
+            before,
+            "preflight wrote a settings directory"
+        );
+
+        let mut spec = crate::launch::RunSpec::new(command.clone()).unwrap();
+        let written = match inject_claude_intercept(&args, deferred, &mut spec, None) {
+            Ok(Some((dir, _))) => dir,
+            Ok(None) => panic!("intercept did not write settings"),
+            Err(_) => panic!("intercept settings could not be written"),
+        };
+        let created: Vec<_> = ours_in_temp()
+            .into_iter()
+            .filter(|path| !before.contains(path))
+            .collect();
+        assert_eq!(
+            created,
+            vec![written.clone()],
+            "expected exactly one new dir"
+        );
+        assert_eq!(
+            spec.command
+                .iter()
+                .filter(|arg| *arg == "--settings")
+                .count(),
+            1,
+            "{:?}",
+            spec.command
+        );
+        assert!(written.join("claude-settings.json").is_file());
+        assert!(cleanup_intercept_dir(&written).is_ok());
+        assert!(
+            !written.exists(),
+            "settings dir survived: {}",
+            written.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&policy_root);
+    }
+
+    /// `[[rule]]` with no `enabled` used to load as off and say nothing, so an
+    /// operator who mistyped the switch (or forgot it) thought intercept was on.
+    /// `aw run` names that on stderr and does not inject. A file that sets
+    /// `enabled = false` stays quiet: that one is deliberate.
+    #[test]
+    fn rules_without_enabled_are_named_on_stderr() {
+        let dir = scratch_policy("no-enabled");
+        let policy = dir.join("policy.toml");
+        std::fs::write(
+            &policy,
+            "version = 1\n[[rule]]\nid = \"r\"\naction = \"deny\"\n",
+        )
+        .unwrap();
+        let _guard = super::super::policy_file::env_lock();
+        let _env = super::super::policy_file::EnvVarGuard::set(
+            super::super::policy_file::POLICY_ENV,
+            &policy,
+        );
+        let _home = isolate_home();
+        let command = vec!["claude".to_owned()];
+        let args = RunArgs {
+            agent: Some("claude-code"),
+            name: None,
+            no_follow_children: false,
+            cwd: None,
+            env: &[],
+            summary: None,
+            pin: false,
+            no_daemon: true,
+            raw: None,
+            command: &command,
+            json: false,
+            quiet: true,
+        };
+        let deferred = DeferredFlags {
+            proxy: false,
+            proxy_on_reject: false,
+            proxy_on_reject_value: None,
+            self_report: false,
+            mcp_tap: false,
+            unsafe_no_redact: false,
+            include_proc: false,
+            group: false,
+            intercept: false,
+        };
+        let note = enabled_omitted_note();
+        assert!(
+            note.is_some(),
+            "a rule file with no enabled key produced no stderr note"
+        );
+        let text = note.unwrap();
+        assert!(
+            text.contains("enabled") && text.contains("没有打开"),
+            "stderr did not say the switch is missing: {text}"
+        );
+        let mut spec = crate::launch::RunSpec::new(command.clone()).unwrap();
+        let injected = inject_claude_intercept(&args, deferred, &mut spec, None)
+            .unwrap_or_else(|_| panic!("inject failed"));
+        assert!(
+            injected.is_none(),
+            "a file that never sets enabled must not inject hooks"
+        );
+        assert!(
+            !spec.command.iter().any(|arg| arg == "--settings"),
+            "settings were appended: {:?}",
+            spec.command
+        );
+
+        std::fs::write(
+            &policy,
+            "version = 1\nenable = true\n[[rule]]\naction = \"deny\"\n",
+        )
+        .unwrap();
+        assert!(
+            enabled_omitted_note().is_none(),
+            "an unknown key is a broken file, not a missing enabled switch"
+        );
+        std::fs::write(&policy, "version = 1\nenabled = false\n").unwrap();
+        assert!(
+            enabled_omitted_note().is_none(),
+            "enabled = false is deliberate and must stay quiet"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A daemon launch already has a public id. The hook command and the child
+    /// environment both carry it, so the audit row is not stored with an empty
+    /// session. Without an id, neither is invented.
+    #[test]
+    fn injected_hook_carries_the_daemon_session() {
+        let dir = scratch_policy("session");
+        let policy = dir.join("policy.toml");
+        std::fs::write(&policy, "enabled = true\n[[rule]]\naction = \"deny\"\n").unwrap();
+        let _guard = super::super::policy_file::env_lock();
+        let _env = super::super::policy_file::EnvVarGuard::set(
+            super::super::policy_file::POLICY_ENV,
+            &policy,
+        );
+        let _home = isolate_home();
+        let command = vec!["claude".to_owned()];
+        let args = RunArgs {
+            agent: Some("claude-code"),
+            name: None,
+            no_follow_children: false,
+            cwd: None,
+            env: &[],
+            summary: None,
+            pin: false,
+            no_daemon: false,
+            raw: None,
+            command: &command,
+            json: false,
+            quiet: true,
+        };
+        let deferred = DeferredFlags {
+            proxy: false,
+            proxy_on_reject: false,
+            proxy_on_reject_value: None,
+            self_report: false,
+            mcp_tap: false,
+            unsafe_no_redact: false,
+            include_proc: false,
+            group: false,
+            intercept: true,
+        };
+        let mut spec = crate::launch::RunSpec::new(command.clone()).unwrap();
+        let written = match inject_claude_intercept(&args, deferred, &mut spec, Some("s-public")) {
+            Ok(Some((dir, _))) => dir,
+            Ok(None) => panic!("intercept did not write settings"),
+            Err(_) => panic!("intercept settings could not be written"),
+        };
+        let doc = std::fs::read_to_string(written.join("claude-settings.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        let args_json = hook_command_args(&value);
+        assert_eq!(
+            args_json,
+            vec![
+                "hook".to_owned(),
+                "claude-code".to_owned(),
+                "--session".to_owned(),
+                "s-public".to_owned(),
+            ],
+            "settings hook args: {doc}"
+        );
+        assert_eq!(
+            spec.env,
+            vec![(
+                super::super::hook::SESSION_ENV.to_owned(),
+                "s-public".to_owned()
+            )],
+            "child env did not receive AW_SESSION"
+        );
+        let _ = cleanup_intercept_dir(&written);
+
+        let mut bare = crate::launch::RunSpec::new(command.clone()).unwrap();
+        let bare_dir = match inject_claude_intercept(&args, deferred, &mut bare, None) {
+            Ok(Some((dir, _))) => dir,
+            Ok(None) => panic!("intercept did not write settings"),
+            Err(_) => panic!("intercept settings could not be written"),
+        };
+        let bare_doc = std::fs::read_to_string(bare_dir.join("claude-settings.json")).unwrap();
+        let bare_value: serde_json::Value = serde_json::from_str(&bare_doc).unwrap();
+        assert_eq!(
+            hook_command_args(&bare_value),
+            vec!["hook".to_owned(), "claude-code".to_owned()],
+            "a launch with no session invented one: {bare_doc}"
+        );
+        assert!(
+            bare.env.is_empty(),
+            "AW_SESSION was set with no session: {:?}",
+            bare.env
+        );
+        let _ = cleanup_intercept_dir(&bare_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The temp settings directory is created mode 0700 and the file mode 0600.
+    /// A later chmod is not the point: the create itself is owner-only, so a
+    /// umask of 022 cannot leave the directory readable by everyone else.
+    #[test]
+    fn settings_directory_and_file_are_owner_only() {
+        let dir = scratch_policy("mode");
+        let policy = dir.join("policy.toml");
+        std::fs::write(&policy, "enabled = true\n[[rule]]\naction = \"deny\"\n").unwrap();
+        let _guard = super::super::policy_file::env_lock();
+        let _env = super::super::policy_file::EnvVarGuard::set(
+            super::super::policy_file::POLICY_ENV,
+            &policy,
+        );
+        let _home = isolate_home();
+        let command = vec!["claude".to_owned()];
+        let args = RunArgs {
+            agent: Some("claude-code"),
+            name: None,
+            no_follow_children: false,
+            cwd: None,
+            env: &[],
+            summary: None,
+            pin: false,
+            no_daemon: false,
+            raw: None,
+            command: &command,
+            json: false,
+            quiet: true,
+        };
+        let deferred = DeferredFlags {
+            proxy: false,
+            proxy_on_reject: false,
+            proxy_on_reject_value: None,
+            self_report: false,
+            mcp_tap: false,
+            unsafe_no_redact: false,
+            include_proc: false,
+            group: false,
+            intercept: true,
+        };
+        let mut spec = crate::launch::RunSpec::new(command.clone()).unwrap();
+        let written = match inject_claude_intercept(&args, deferred, &mut spec, None) {
+            Ok(Some((dir, _))) => dir,
+            Ok(None) => panic!("intercept did not write settings"),
+            Err(_) => panic!("intercept settings could not be written"),
+        };
+        let file = written.join("claude-settings.json");
+        assert!(file.is_file(), "settings file missing");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&written).unwrap().permissions().mode() & 0o777;
+            let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700, "settings dir mode is {dir_mode:o}");
+            assert_eq!(file_mode, 0o600, "settings file mode is {file_mode:o}");
+        }
+        let _ = cleanup_intercept_dir(&written);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `onFailure: block` needs Claude Code 2.1.295. `--bare` and `--safe-mode`
+    /// skip the injected hook. Root can edit the policy. Each note is the whole
+    /// stderr line.
+    #[test]
+    fn version_and_flag_notes_name_the_limit() {
+        assert_eq!(
+            parse_claude_version("2.1.295 (Claude Code)"),
+            Some((2, 1, 295))
+        );
+        assert_eq!(
+            parse_claude_version("Claude Code 2.1.294"),
+            Some((2, 1, 294))
+        );
+        assert!(parse_claude_version("not a version").is_none());
+
+        let below = claude_version_note(Some((2, 1, 294))).unwrap();
+        assert!(below.contains("2.1.295"), "{below}");
+        assert!(below.contains("仍会执行"), "{below}");
+        assert!(claude_version_note(Some((2, 1, 295))).is_none());
+        assert!(claude_version_note(Some((2, 2, 0))).is_none());
+        let unknown = claude_version_note(None).unwrap();
+        assert!(unknown.contains("没有读到"), "{unknown}");
+        assert!(unknown.contains("2.1.295"), "{unknown}");
+
+        let bare = claude_flag_note(&["claude".to_owned(), "--bare".to_owned()]).unwrap();
+        assert!(bare.contains("--bare"), "{bare}");
+        assert!(bare.contains("不会运行"), "{bare}");
+        let safe = claude_flag_note(&["claude".to_owned(), "--safe-mode".to_owned()]).unwrap();
+        assert!(safe.contains("--safe-mode"), "{safe}");
+        assert!(
+            claude_flag_note(&["claude".to_owned(), "--settings".to_owned(), "x".to_owned()])
+                .is_none()
+        );
+        assert!(claude_flag_note(&["claude".to_owned(), "--barely".to_owned()]).is_none());
+    }
+
+    /// Every PreToolUse / PostToolUse hook command in the injected settings.
+    fn hook_command_args(value: &serde_json::Value) -> Vec<String> {
+        let hooks = value
+            .get("hooks")
+            .and_then(|hooks| hooks.as_object())
+            .expect("settings have no hooks object");
+        let mut found = Vec::new();
+        for event in ["PreToolUse", "PostToolUse"] {
+            let Some(groups) = hooks.get(event).and_then(|entry| entry.as_array()) else {
+                continue;
+            };
+            for group in groups {
+                let Some(entries) = group.get("hooks").and_then(|entry| entry.as_array()) else {
+                    continue;
+                };
+                for entry in entries {
+                    if entry.get("type").and_then(|kind| kind.as_str()) != Some("command") {
+                        continue;
+                    }
+                    let Some(args) = entry.get("args").and_then(|args| args.as_array()) else {
+                        continue;
+                    };
+                    found.push(
+                        args.iter()
+                            .filter_map(|arg| arg.as_str().map(str::to_owned))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+        }
+        assert!(!found.is_empty(), "no hook command args in {value}");
+        let first = found[0].clone();
+        assert!(
+            found.iter().all(|args| args == &first),
+            "hook commands disagree: {found:?}"
+        );
+        first
+    }
+
+    /// Scratch policy directory inside this crate, never `/tmp`.
+    fn scratch_policy(name: &str) -> std::path::PathBuf {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("run-tests")
+            .join(format!(
+                "{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Point the per-user config lookup at an empty directory so a developer's
+    /// real `policy.toml` cannot decide this test. Restored on drop.
+    fn isolate_home() -> super::super::policy_file::HomeEnvGuard {
+        super::super::policy_file::HomeEnvGuard::isolate()
+    }
+
+    /// `aw-intercept-<this pid>-*` left in the temp dir by this process.
+    fn ours_in_temp() -> Vec<std::path::PathBuf> {
+        let prefix = format!("aw-intercept-{}-", std::process::id());
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with(&prefix) {
+                found.push(entry.path());
+            }
+        }
+        found.sort();
+        found
+    }
 }
 
 fn summary_json(
@@ -2051,6 +3129,7 @@ mod tests {
         begin: Option<ControlError>,
         adopt: Option<ControlError>,
         exit: Option<ControlError>,
+        pin: Option<ControlError>,
         seen_begin: Option<BeginRunRequest>,
         stops: Vec<String>,
         discards: Vec<String>,
@@ -2063,6 +3142,7 @@ mod tests {
                 begin: None,
                 adopt: None,
                 exit: None,
+                pin: None,
                 seen_begin: None,
                 stops: Vec::new(),
                 discards: Vec::new(),
@@ -2127,7 +3207,10 @@ mod tests {
 
         fn pin(&mut self, _: &str) -> Result<(), ControlError> {
             self.log.borrow_mut().push("pin");
-            Ok(())
+            match self.pin.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
     }
 
@@ -2204,11 +3287,192 @@ mod tests {
             unsafe_no_redact: false,
             include_proc: false,
             group: false,
+            intercept: false,
         }
     }
 
     fn text(bytes: &[u8]) -> String {
         String::from_utf8(bytes.to_vec()).expect("utf8")
+    }
+
+    /// Point config homes at an empty crate directory and clear the intercept
+    /// variables. `AW_POLICY` unset makes `aw run` read `%APPDATA%` on Windows
+    /// and `$XDG_CONFIG_HOME` / `$HOME/.config` elsewhere; a real policy file
+    /// there appends a note after the JSON summary.
+    fn isolate_config() -> IsolatedConfig {
+        let lock = super::super::policy_file::env_lock();
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("run-tests")
+            .join(format!(
+                "home-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let homes = ["XDG_CONFIG_HOME", "HOME", "APPDATA", "LOCALAPPDATA"]
+            .into_iter()
+            .map(|key| super::super::policy_file::EnvVarGuard::set_text(key, &dir))
+            .collect();
+        let cleared = [
+            "AW_POLICY",
+            "AW_SOCKET",
+            "AW_INTERCEPT_AUDIT",
+            "AW_TOKEN",
+            "AW_HTTP",
+            "AW_SYSTEM_SOCKET",
+            "AW_SESSION",
+        ]
+        .into_iter()
+        .map(super::super::policy_file::EnvVarGuard::unset)
+        .collect();
+        IsolatedConfig {
+            _lock: lock,
+            dir,
+            homes,
+            cleared,
+        }
+    }
+
+    /// Restores the variables `isolate_config` changed and deletes the scratch dir.
+    ///
+    /// The lock is held for the whole guard. `AW_POLICY` and the config homes
+    /// are process-global, and other tests in this binary set them too.
+    struct IsolatedConfig {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        /// Scratch directory the four config homes point at. Visible to the
+        /// tests in this module, which write a policy file under it.
+        dir: std::path::PathBuf,
+        homes: Vec<super::super::policy_file::EnvVarGuard>,
+        cleared: Vec<super::super::policy_file::EnvVarGuard>,
+    }
+
+    impl Drop for IsolatedConfig {
+        fn drop(&mut self) {
+            self.homes.clear();
+            self.cleared.clear();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A rewrite rule prints `allow` plus the new arguments, which Claude Code
+    /// treats as approval. The launch says so once, on stderr.
+    #[test]
+    fn rewrite_rule_is_named_on_stderr() {
+        let _guard = super::super::policy_file::env_lock();
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("run-tests")
+            .join(format!("rewrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let policy = dir.join("policy.toml");
+        std::fs::write(
+            &policy,
+            "enabled = true\n[[rule]]\nid = \"force-dry-run\"\nlayer = [\"hook\"]\n\
+             action = \"rewrite\"\nrewrite.command = { replace = [\"a\", \"b\"] }\n",
+        )
+        .unwrap();
+        let _policy = super::super::policy_file::EnvVarGuard::set(
+            super::super::policy_file::POLICY_ENV,
+            &policy,
+        );
+        let _home = ["XDG_CONFIG_HOME", "HOME", "APPDATA"]
+            .into_iter()
+            .map(|key| super::super::policy_file::EnvVarGuard::set_text(key, &dir))
+            .collect::<Vec<_>>();
+        let command = vec!["claude".to_owned()];
+        let mut launcher = FakeLaunch {
+            code: 0,
+            sampling_seen: None,
+            forwarded: Vec::new(),
+            env_len: None,
+            fail: None,
+        };
+        let mut summary = FixedSummary(None);
+        let outcome = run(
+            &args(&command),
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut summary,
+        );
+        let err = text(&outcome.stderr);
+        assert!(err.contains("改写"), "{err}");
+        assert!(err.contains("权限确认"), "{err}");
+        assert!(!err.contains("上传了"), "{err}");
+
+        // `--json` with a summary keeps the rewrite sentence inside `notes`.
+        // Claude Code treats that rewrite as approval; dropping the sentence
+        // would hide it. Nothing may follow the document.
+        let mut json_args = args(&command);
+        json_args.json = true;
+        let mut launcher = FakeLaunch {
+            code: 0,
+            sampling_seen: None,
+            forwarded: Vec::new(),
+            env_len: None,
+            fail: None,
+        };
+        let outcome = run(
+            &json_args,
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut EmptySummary,
+        );
+        let err = text(&outcome.stderr);
+        let body: serde_json::Value = serde_json::from_str(err.trim_end()).expect(&err);
+        let notes = body["notes"]
+            .as_array()
+            .expect("notes is an array")
+            .iter()
+            .map(|item| item.as_str().expect("note string"))
+            .collect::<Vec<_>>();
+        assert!(
+            notes.contains(
+                &"提示：规则里有改写。命中的命令会带着改后的参数直接执行，不再弹出权限确认。"
+            ),
+            "the rewrite sentence belongs in notes, without the [aw] prefix: {err}"
+        );
+        assert!(
+            notes.iter().all(|note| !note.starts_with("[aw]")),
+            "json notes keep the [aw] prefix: {notes:?}"
+        );
+        assert!(!err.contains("上传了"), "{err}");
+        assert!(outcome.stdout.is_empty());
+
+        // Quiet prints no summary document, so the same sentence stays `[aw]` text.
+        let mut quiet_args = args(&command);
+        quiet_args.json = true;
+        quiet_args.quiet = true;
+        let mut launcher = FakeLaunch {
+            code: 0,
+            sampling_seen: None,
+            forwarded: Vec::new(),
+            env_len: None,
+            fail: None,
+        };
+        let outcome = run(
+            &quiet_args,
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut FixedSummary(None),
+        );
+        let err = text(&outcome.stderr);
+        assert!(
+            err.contains(
+                "[aw] 提示：规则里有改写。命中的命令会带着改后的参数直接执行，不再弹出权限确认。"
+            ),
+            "quiet still prints the rewrite sentence: {err}"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(err.trim_end()).is_err(),
+            "quiet has no JSON document: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2241,6 +3505,7 @@ mod tests {
 
     #[test]
     fn daemon_zero_process_summary_says_it_exited_before_sampling() {
+        let _home = isolate_config();
         let command = vec!["tool".to_owned()];
         let zero = Summary {
             session_id: Some("s-fast".to_owned()),
@@ -2275,6 +3540,183 @@ mod tests {
             serde_json::from_slice(&outcome.stderr).expect("JSON summary");
         assert_eq!(body["processes"], 0);
         assert_eq!(body["processes_note"], "exited_before_sampled");
+    }
+
+    /// `--json` puts one JSON document on stderr. A policy note (rules present,
+    /// `enabled` never set) used to be appended after that document, so
+    /// `from_slice` failed with "trailing characters" on line 2. The sentence
+    /// now lives in `notes`. With no summary (`--quiet` / `--summary none`)
+    /// there is no document, and the same sentence is `[aw]` text again.
+    #[test]
+    fn json_summary_stays_one_document_when_enabled_is_omitted() {
+        // Holds the process-wide env lock and points every config home at an
+        // empty directory, so a parallel test or a runner policy cannot add a
+        // second stderr line of its own.
+        let home = isolate_config();
+        let policy_dir = home.dir.join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        let policy = policy_dir.join("policy.toml");
+        std::fs::write(
+            &policy,
+            "[[rule]]\nid = \"no-rm\"\nlayer = [\"hook\"]\naction = \"deny\"\n",
+        )
+        .unwrap();
+        let _policy = super::super::policy_file::EnvVarGuard::set(
+            super::super::policy_file::POLICY_ENV,
+            &policy,
+        );
+        let command = vec!["tool".to_owned()];
+        let mut json_args = args(&command);
+        json_args.json = true;
+        let mut launcher = fake_exit_7();
+        let outcome = run(
+            &json_args,
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut EmptySummary,
+        );
+        let err = text(&outcome.stderr);
+        let body: serde_json::Value = serde_json::from_str(err.trim_end()).expect(&err);
+        assert_eq!(body["available"], false, "{err}");
+        assert_eq!(body["reason"], "摘要不可用", "{err}");
+        let notes = body["notes"].as_array().expect("notes");
+        assert_eq!(notes.len(), 1, "{err}");
+        assert_eq!(
+            notes[0],
+            "提示：规则文件里有规则，但没有写 enabled，拦截没有打开。要打开请写 enabled = true。"
+        );
+        assert!(!notes[0].as_str().unwrap().contains('\n'));
+        assert!(outcome.stdout.is_empty(), "{:?}", outcome.stdout);
+
+        let mut human = args(&command);
+        human.json = false;
+        let mut launcher = fake_exit_7();
+        let outcome = run(
+            &human,
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut EmptySummary,
+        );
+        let err = text(&outcome.stderr);
+        assert!(err.contains("摘要不可用"), "{err}");
+        assert!(
+            err.contains("[aw] 提示：规则文件里有规则，但没有写 enabled，拦截没有打开。要打开请写 enabled = true。"),
+            "the human summary must still name the missing switch: {err}"
+        );
+
+        let mut quiet = args(&command);
+        quiet.quiet = true;
+        let mut launcher = fake_exit_7();
+        let outcome = run(
+            &quiet,
+            none(),
+            &mut UnixAdapter(&mut launcher),
+            &mut EmptySummary,
+        );
+        let err = text(&outcome.stderr);
+        assert_eq!(
+            err,
+            "[aw] 提示：规则文件里有规则，但没有写 enabled，拦截没有打开。要打开请写 enabled = true。\n",
+            "quiet keeps the note as text: {err}"
+        );
+    }
+
+    /// Pin and exit warnings are `[aw]` text on the human summary. Under `--json`
+    /// they move into `notes` of the same document; they are not dropped.
+    #[test]
+    fn json_summary_keeps_pin_and_exit_warnings_in_notes() {
+        let _home = isolate_config();
+        let command = vec!["tool".to_owned()];
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sessions = FakeSessions::new(Rc::clone(&log));
+        sessions.pin = Some(ControlError::Unreachable {
+            detail: "pin-down".to_owned(),
+        });
+        sessions.exit = Some(ControlError::Unreachable {
+            detail: "exit-down".to_owned(),
+        });
+        let mut spawner = FakeSpawner {
+            log: Rc::clone(&log),
+            spawned: 0,
+            code: 7,
+            fail: None,
+        };
+        let mut parsed = args(&command);
+        parsed.json = true;
+        parsed.pin = true;
+        let outcome = daemon_run(
+            &parsed,
+            none(),
+            &mut sessions,
+            &mut spawner,
+            &mut EmptySummary,
+        );
+        assert_eq!(outcome.code, 7);
+        let err = text(&outcome.stderr);
+        let body: serde_json::Value = serde_json::from_str(err.trim_end()).expect(&err);
+        let notes = body["notes"]
+            .as_array()
+            .expect("notes")
+            .iter()
+            .map(|item| item.as_str().expect("note"))
+            .collect::<Vec<_>>();
+        assert!(
+            notes.contains(
+                &"警告：后台没有保留这个会话：连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：pin-down"
+            ),
+            "{notes:?}"
+        );
+        assert!(
+            notes.contains(
+                &"警告：daemon 未记录程序退出码：连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：exit-down"
+            ),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().all(|note| !note.starts_with("[aw]")),
+            "json notes keep the [aw] prefix: {notes:?}"
+        );
+        assert!(notes.iter().all(|note| !note.contains('\n')));
+        assert!(outcome.stdout.is_empty());
+
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut sessions = FakeSessions::new(Rc::clone(&log));
+        sessions.pin = Some(ControlError::Unreachable {
+            detail: "pin-down".to_owned(),
+        });
+        sessions.exit = Some(ControlError::Unreachable {
+            detail: "exit-down".to_owned(),
+        });
+        let mut spawner = FakeSpawner {
+            log: Rc::clone(&log),
+            spawned: 0,
+            code: 7,
+            fail: None,
+        };
+        let mut quiet = args(&command);
+        quiet.json = true;
+        quiet.quiet = true;
+        quiet.pin = true;
+        let outcome = daemon_run(
+            &quiet,
+            none(),
+            &mut sessions,
+            &mut spawner,
+            &mut EmptySummary,
+        );
+        let err = text(&outcome.stderr);
+        assert!(
+            err.contains("[aw] 警告：后台没有保留这个会话：连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：pin-down\n"),
+            "quiet still prints the pin warning: {err}"
+        );
+        assert!(
+            err.contains("[aw] 警告：daemon 未记录程序退出码：连不上后台，请先运行 `aw daemon start`，或加 --no-daemon（本地轮询采集，证据 S）。详情：exit-down\n"),
+            "quiet still prints the exit warning: {err}"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(err.trim_end()).is_err(),
+            "quiet has no JSON document: {err}"
+        );
     }
 
     #[test]
@@ -2402,6 +3844,7 @@ mod tests {
 
     #[test]
     fn requests_do_not_override_fixed_summary_evidence_or_confirm_a_pin() {
+        let _home = isolate_config();
         let command = vec!["tool".to_owned()];
         for json in [false, true] {
             let mut ran = args(&command);
@@ -2441,6 +3884,7 @@ mod tests {
 
     #[test]
     fn empty_summary_keeps_pin_and_sampling_unknown() {
+        let _home = isolate_config();
         let command = vec!["tool".to_owned()];
         for pin in [false, true] {
             for no_daemon in [false, true] {
@@ -2482,6 +3926,7 @@ mod tests {
 
     #[test]
     fn summary_failure_keeps_target_exit_and_unknown_results() {
+        let _home = isolate_config();
         let command = vec!["tool".to_owned()];
         for json in [false, true] {
             let mut ran = args(&command);
@@ -2512,6 +3957,7 @@ mod tests {
 
     #[test]
     fn quiet_or_summary_none_skips_requests_and_summary_source() {
+        let _home = isolate_config();
         let command = vec!["tool".to_owned()];
         for json in [false, true] {
             for (quiet, level) in [(true, Some("full")), (false, Some("none"))] {
@@ -2535,6 +3981,7 @@ mod tests {
 
     #[test]
     fn json_unknown_counts_are_null_and_domain_array_is_preserved() {
+        let _home = isolate_config();
         let command = vec!["tool".to_owned()];
         let mut ran = args(&command);
         ran.json = true;
@@ -3362,6 +4809,7 @@ mod tests {
 
     #[test]
     fn daemon_json_summary_keeps_the_real_session_id() {
+        let _home = isolate_config();
         let command = vec!["tool".to_owned()];
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut sessions = FakeSessions::new(Rc::clone(&log));

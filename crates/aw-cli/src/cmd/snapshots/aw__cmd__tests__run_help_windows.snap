@@ -58,3 +58,5 @@ Options:
           原始事件文件（本版本未接入）
       --unsafe-no-redact
           关闭脱敏（本版本未接入）
+      --intercept
+          本次启动按规则拦截（Claude Code 注入临时 hooks）

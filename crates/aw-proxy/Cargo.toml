@@ -36,6 +36,9 @@ flate2 = { version = "1.1.2", default-features = false, features = ["rust_backen
 zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 # P3-PROXY-02. Licenses and the reason for each pin are in the workspace table.
+# Policy decisions for a deny (P5-SEC-04). aw-pipeline is already a path crate
+# in the workspace (MIT OR Apache-2.0). No new third-party dependency.
+aw-pipeline = { workspace = true }
 hudsucker = { workspace = true }
 tokio = { workspace = true }
 http = { workspace = true }

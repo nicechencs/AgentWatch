@@ -95,6 +95,8 @@ pub(crate) enum Command {
         raw: Option<String>,
         #[arg(long, help = "关闭脱敏（本版本未接入）")]
         unsafe_no_redact: bool,
+        #[arg(long, help = "本次启动按规则拦截（Claude Code 注入临时 hooks）")]
+        intercept: bool,
         /// 要启动的程序及其参数
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
@@ -321,8 +323,7 @@ pub(crate) enum Command {
         #[arg(long)]
         session: Option<String>,
     },
-    /// stdio 透明包装器（本版本未接入）
-    #[command(hide = true)]
+    /// stdio 透明包装器：按规则转发、拒绝或改写 MCP 帧
     McpTap {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,

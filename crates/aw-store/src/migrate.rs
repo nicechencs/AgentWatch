@@ -43,7 +43,11 @@ use crate::error::StoreError;
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Highest schema version understood by this binary, independently of bootstrap.
-const SUPPORTED_SCHEMA_VERSION: u32 = REPLAY_SCHEMA_VERSION;
+///
+/// Future-version tests use this plus one. A new migration that raises
+/// [`INTERCEPT_SCHEMA_VERSION`] must raise this too, or those tests keep
+/// calling the old ceiling "future" and fail for the wrong reason.
+pub const SUPPORTED_SCHEMA_VERSION: u32 = INTERCEPT_SCHEMA_VERSION;
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_init.sql");
 
@@ -141,6 +145,16 @@ pub const MIGRATION_0011: &str = include_str!("../migrations/0011_replay_writes.
 
 /// Version after [`MIGRATION_0011`].
 pub const REPLAY_SCHEMA_VERSION: u32 = 11;
+
+/// `intercept_events`: one deny / rewrite / ask / downgrade (P5-SEC-01).
+///
+/// [`apply_intercept_schema`] runs it only when the table is missing. A
+/// database that never stores an intercept stays at whatever version it
+/// already had. [`Store::open`] does not apply this script.
+pub const MIGRATION_0012: &str = include_str!("../migrations/0012_intercept_events.sql");
+
+/// Version after [`MIGRATION_0012`].
+pub const INTERCEPT_SCHEMA_VERSION: u32 = 12;
 
 /// Apply [`http_schema_scripts`] when `http` is not there yet.
 ///
@@ -407,6 +421,54 @@ pub fn apply_replay_schema(store: &mut Store) -> Result<(), StoreError> {
     }
 }
 
+/// Create `intercept_events` when it is not there yet.
+///
+/// The table does not depend on `agent_events`. A database that already has
+/// it is left alone, including its `schema_version`. `schema_version` advances
+/// to at least [`INTERCEPT_SCHEMA_VERSION`] only when this call creates the
+/// table; a higher stored version is preserved.
+///
+/// # Errors
+///
+/// [`StoreError::ReadOnly`] when the store was opened read-only.
+/// [`StoreError::Sqlite`] when the script or the version row fails. The
+/// transaction is rolled back.
+pub fn apply_intercept_schema(store: &mut Store) -> Result<(), StoreError> {
+    if store.is_read_only() {
+        return Err(StoreError::ReadOnly);
+    }
+    let conn = store.connection();
+    if table_present(conn, "intercept_events", "probe_intercept_events")? {
+        return Ok(());
+    }
+    let tx = immediate_transaction(conn)
+        .map_err(|err| StoreError::sqlite("begin_intercept_schema", err))?;
+    let applied = (|| {
+        if table_present(&tx, "intercept_events", "probe_intercept_events_locked")? {
+            return Ok(());
+        }
+        tx.execute_batch(MIGRATION_0012)
+            .map_err(|err| StoreError::sqlite("migrate_intercept_events", err))?;
+        tx.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value =
+                 MAX(CAST(schema_meta.value AS INTEGER), CAST(excluded.value AS INTEGER))",
+            rusqlite::params![INTERCEPT_SCHEMA_VERSION.to_string()],
+        )
+        .map_err(|err| StoreError::sqlite("migrate_intercept_schema_version", err))?;
+        Ok::<(), StoreError>(())
+    })();
+    match applied {
+        Ok(()) => tx
+            .commit()
+            .map_err(|err| StoreError::sqlite("commit_intercept_schema", err)),
+        Err(err) => {
+            drop(tx);
+            Err(err)
+        }
+    }
+}
+
 /// The single `ALTER TABLE http ADD COLUMN <name> ...;` line inside `script`.
 ///
 /// `name` is a fixed column from this migration, not user input. `None` means
@@ -586,6 +648,7 @@ impl Store {
         apply_agent_schema(&mut store).map_err(|err| err.with_busy_elapsed(started))?;
         apply_inter_agent_schema(&mut store).map_err(|err| err.with_busy_elapsed(started))?;
         apply_replay_schema(&mut store).map_err(|err| err.with_busy_elapsed(started))?;
+        apply_intercept_schema(&mut store).map_err(|err| err.with_busy_elapsed(started))?;
         crate::query::ensure_timeline(store.connection())
             .map_err(|err| match err {
                 crate::QueryError::Sqlite { source, .. } => {

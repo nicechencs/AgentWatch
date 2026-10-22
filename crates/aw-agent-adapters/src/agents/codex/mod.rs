@@ -21,6 +21,7 @@
 //! - Codex `main` README `codex-rs/linux-sandbox` names the bundled helper
 //!   `codex-linux-sandbox`. That name is not in the public sandbox page.
 
+pub mod decision;
 mod identify;
 mod otel;
 

@@ -1,0 +1,446 @@
+//! Policy decisions from the design's acceptance list (P5-SEC-01).
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use super::{decide, downgrade_codex_ask, load_str, Action, Layer, Phase, PolicyState, Subject};
+
+const SAMPLE: &str = r#"
+version = 1
+enabled = true
+on_error = "deny"
+
+[[rule]]
+id = "no-rm-rf"
+layer = ["hook"]
+agent = ["claude-code", "codex"]
+tool = ["Bash"]
+match.command = { regex = '\brm\s+-rf\b' }
+action = "deny"
+reason = "不允许递归删除"
+
+[[rule]]
+id = "force-dry-run"
+layer = ["hook"]
+tool = ["Bash"]
+match.command = { prefix = "terraform apply" }
+action = "rewrite"
+rewrite.command = { replace = ["terraform apply", "terraform plan"] }
+reason = "只允许 plan"
+
+[[rule]]
+id = "ask-before-push"
+layer = ["hook"]
+tool = ["Bash"]
+match.command = { regex = '^git push' }
+action = "ask"
+
+[[rule]]
+id = "block-paste-sites"
+layer = ["proxy"]
+match.host = { glob = "*.pastebin.com" }
+action = "deny"
+reason = "不允许连这个网站"
+
+[[rule]]
+id = "also-allow-push"
+layer = ["hook"]
+tool = ["Bash"]
+match.command = { prefix = "git push" }
+action = "allow"
+"#;
+
+fn policy() -> super::Policy {
+    match load_str(SAMPLE).expect("sample") {
+        PolicyState::On(policy) => policy,
+        PolicyState::Off => panic!("sample is enabled"),
+    }
+}
+
+fn bash(command: &str) -> Subject {
+    Subject {
+        layer: Layer::Hook,
+        agent: Some("claude-code".to_owned()),
+        tool: Some("Bash".to_owned()),
+        event: Some("PreToolUse".to_owned()),
+        command: Some(command.to_owned()),
+        phase: Phase::Pre,
+        ..Subject::default()
+    }
+}
+
+#[test]
+fn disabled_or_absent_enabled_is_off() {
+    assert!(matches!(
+        load_str("version = 1\nenabled = false\n").unwrap(),
+        PolicyState::Off
+    ));
+    assert!(matches!(
+        load_str("version = 1\n").unwrap(),
+        PolicyState::Off
+    ));
+    // An empty document is not a policy. toml accepts it as an empty table,
+    // which has no `enabled`, so it is off rather than a parse error.
+    assert!(matches!(load_str("").unwrap(), PolicyState::Off));
+}
+
+/// A misspelled top-level key used to be ignored. `enable = true` then looked
+/// like "no `enabled`", which is off, so the intercept the operator wrote never
+/// ran. A misspelled rule key (`tols` for `tool`) used to match every tool.
+/// Both are a broken file, and a broken file denies (design §5.3).
+#[test]
+fn unknown_keys_are_a_broken_file() {
+    let top = load_str("version = 1\nenable = true\n[[rule]]\nid = \"r\"\naction = \"deny\"\n")
+        .unwrap_err();
+    let top_text = top.to_string();
+    assert!(
+        top_text.contains("unknown key"),
+        "top-level typo was not refused: {top_text}"
+    );
+    assert!(
+        !top_text.contains("deny"),
+        "the error quoted a rule value: {top_text}"
+    );
+
+    let rule = load_str(
+        "version = 1\nenabled = true\n[[rule]]\nid = \"typo\"\ntols = [\"Bash\"]\n\
+         layer = [\"hook\"]\naction = \"deny\"\n",
+    )
+    .unwrap_err();
+    let rule_text = rule.to_string();
+    assert!(
+        rule_text.contains("unknown key") && rule_text.contains("rule 0"),
+        "rule typo was not refused: {rule_text}"
+    );
+    assert!(
+        !rule_text.contains("Bash"),
+        "the error quoted the tool list: {rule_text}"
+    );
+
+    // `match.colour` is not a field the decider reads. Ignoring it would let
+    // the rule match everything the rest of `match` names.
+    let nested = load_str(
+        "version = 1\nenabled = true\n[[rule]]\nid = \"m\"\naction = \"deny\"\n\
+         match.colour = { exact = \"red\" }\n",
+    )
+    .unwrap_err();
+    let nested_text = nested.to_string();
+    assert!(
+        nested_text.contains("unknown match field"),
+        "unknown match field was not refused: {nested_text}"
+    );
+}
+
+/// A file that contains `[[rule]]` but never says `enabled` is off (the default
+/// is closed), and the caller can see that the omission was there. `aw run`
+/// prints that; a file with no rules and no `enabled` stays quietly off.
+#[test]
+fn rules_without_enabled_are_off_but_named() {
+    let text = "version = 1\n[[rule]]\nid = \"r\"\naction = \"deny\"\n";
+    assert!(matches!(load_str(text).unwrap(), PolicyState::Off));
+    assert!(
+        super::rules_without_enabled(text),
+        "rules with no enabled key were not reported"
+    );
+    assert!(!super::rules_without_enabled(
+        "version = 1\nenabled = false\n[[rule]]\nid = \"r\"\naction = \"deny\"\n"
+    ));
+    assert!(!super::rules_without_enabled("version = 1\n"));
+    assert!(!super::rules_without_enabled("this is not toml [[["));
+}
+
+#[test]
+fn broken_file_is_an_error_not_off() {
+    let err = load_str("enabled = true\n[[rule]]\naction = \"nope\"\n").unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("rule"));
+    assert!(!text.contains("nope") || text.contains("action"));
+}
+
+#[test]
+fn rm_is_deny_and_terraform_rewrites_and_push_asks() {
+    let policy = policy();
+    let rm = decide(&policy, &bash("rm -rf /tmp/x")).unwrap();
+    assert_eq!(rm.effective, Action::Deny);
+    assert_eq!(rm.rule_id.as_deref(), Some("no-rm-rf"));
+    assert_eq!(rm.reason.as_deref(), Some("不允许递归删除"));
+
+    let plan = decide(&policy, &bash("terraform apply -auto-approve")).unwrap();
+    assert_eq!(plan.effective, Action::Rewrite);
+    assert_eq!(
+        plan.fields,
+        vec![(
+            "command".to_owned(),
+            "terraform plan -auto-approve".to_owned()
+        )]
+    );
+
+    let push = decide(&policy, &bash("git push origin main")).unwrap();
+    assert_eq!(push.action, Action::Ask);
+    assert_eq!(push.effective, Action::Ask);
+    assert_eq!(push.rule_id.as_deref(), Some("ask-before-push"));
+}
+
+/// `match.direction = "s2c"` names a response. The same result text on a
+/// request does not match, so a request rule and a response rule stay apart.
+#[test]
+fn direction_limits_a_rewrite_to_the_response() {
+    let text = r#"
+enabled = true
+[[rule]]
+id = "redact-result"
+layer = ["mcp"]
+match.direction = { exact = "s2c" }
+match.arg.text = { regex = "SECRET" }
+action = "rewrite"
+rewrite.arg.text = { replace = ["SECRET", "XXX"] }
+"#;
+    let PolicyState::On(policy) = load_str(text).unwrap() else {
+        panic!("on");
+    };
+    let mut response = Subject {
+        layer: Layer::Mcp,
+        event: Some("s2c".to_owned()),
+        args: vec![("text".to_owned(), "SECRET".to_owned())],
+        ..Subject::default()
+    };
+    let rewritten = decide(&policy, &response).unwrap();
+    assert_eq!(rewritten.effective, Action::Rewrite);
+    assert_eq!(
+        rewritten.fields,
+        vec![("arg.text".to_owned(), "XXX".to_owned())]
+    );
+    response.event = Some("c2s".to_owned());
+    let request = decide(&policy, &response).unwrap();
+    assert_eq!(request.effective, Action::Allow);
+    assert!(request.rule_id.is_none());
+}
+
+/// A direction that is not exactly `c2s` or `s2c` is a broken file. A wrong
+/// value used to load and then never match, which silently drops the rule.
+#[test]
+fn direction_must_be_c2s_or_s2c() {
+    let base = r#"
+enabled = true
+[[rule]]
+id = "r"
+layer = ["mcp"]
+action = "deny"
+"#;
+    let ok_c2s = format!("{base}match.direction = {{ exact = \"c2s\" }}\n");
+    assert!(load_str(&ok_c2s).is_ok(), "c2s was refused");
+    let ok_s2c = format!("{base}match.direction = {{ exact = \"s2c\" }}\n");
+    assert!(load_str(&ok_s2c).is_ok(), "s2c was refused");
+
+    for bad in [
+        "match.direction = \"s2c\"\n",
+        "match.direction = { exact = \"S2C\" }\n",
+        "match.direction = { exact = \"x2y\" }\n",
+        "match.direction = { exact = \"s2c \" }\n",
+        "match.direction = { exact = \" c2s\" }\n",
+        "match.direction = { prefix = \"s2c\" }\n",
+        "match.direction = { regex = \"s2c\" }\n",
+        "match.direction = { glob = \"s2c\" }\n",
+    ] {
+        let text = format!("{base}{bad}");
+        let err = load_str(&text).expect_err(&text);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("direction"),
+            "{bad:?} loaded or did not name the field: {rendered}"
+        );
+    }
+}
+
+/// `match.direction` names an MCP frame. A hook or proxy rule that sets it is
+/// naming a field that layer does not have, so the file is broken.
+#[test]
+fn direction_only_on_an_mcp_rule() {
+    for layer in ["hook", "proxy"] {
+        let text = format!(
+            "enabled = true\n[[rule]]\nid = \"r\"\nlayer = [\"{layer}\"]\n\
+             match.direction = {{ exact = \"c2s\" }}\naction = \"deny\"\n"
+        );
+        let err = load_str(&text).expect_err(layer);
+        assert!(
+            err.to_string().contains("direction"),
+            "{layer} accepted direction: {err}"
+        );
+    }
+    // No layer list means every layer, which includes hook and proxy.
+    let text = "enabled = true\n[[rule]]\nid = \"r\"\n\
+                match.direction = { exact = \"s2c\" }\naction = \"deny\"\n";
+    let err = load_str(text).expect_err("no layer");
+    assert!(err.to_string().contains("direction"), "{err}");
+}
+
+/// A rule that does not name a direction matches a request only. The same text
+/// on a response used to hit, and a deny there was recorded for a result that
+/// was forwarded.
+#[test]
+fn direction_defaults_to_the_request() {
+    let text = r#"
+enabled = true
+[[rule]]
+id = "no-rm"
+layer = ["mcp"]
+match.command = { regex = "rm" }
+action = "deny"
+reason = "不允许"
+"#;
+    let PolicyState::On(policy) = load_str(text).unwrap() else {
+        panic!("on");
+    };
+    let request = Subject {
+        layer: Layer::Mcp,
+        event: Some("c2s".to_owned()),
+        command: Some("rm -rf /".to_owned()),
+        ..Subject::default()
+    };
+    let denied = decide(&policy, &request).unwrap();
+    assert_eq!(denied.effective, Action::Deny);
+    assert_eq!(denied.rule_id.as_deref(), Some("no-rm"));
+
+    let response = Subject {
+        layer: Layer::Mcp,
+        event: Some("s2c".to_owned()),
+        command: Some("rm -rf /".to_owned()),
+        ..Subject::default()
+    };
+    let forwarded = decide(&policy, &response).unwrap();
+    assert_eq!(forwarded.effective, Action::Allow);
+    assert!(forwarded.rule_id.is_none(), "{forwarded:?}");
+}
+
+#[test]
+fn two_hits_keep_the_stricter_one() {
+    let policy = policy();
+    let push = decide(&policy, &bash("git push")).unwrap();
+    assert_eq!(push.action, Action::Ask);
+    assert_eq!(push.rule_id.as_deref(), Some("ask-before-push"));
+}
+
+#[test]
+fn rewrite_that_lands_on_deny_becomes_deny() {
+    let text = r#"
+enabled = true
+[[rule]]
+id = "edit"
+tool = ["Bash"]
+layer = ["hook"]
+match.command = { prefix = "echo " }
+action = "rewrite"
+rewrite.command = { replace = ["echo ", "rm -rf "] }
+
+[[rule]]
+id = "no-rm"
+tool = ["Bash"]
+layer = ["hook"]
+match.command = { regex = '\brm\s+-rf\b' }
+action = "deny"
+reason = "不允许递归删除"
+"#;
+    let PolicyState::On(policy) = load_str(text).unwrap() else {
+        panic!("on");
+    };
+    let decision = decide(&policy, &bash("echo /tmp/x")).unwrap();
+    assert_eq!(decision.effective, Action::Deny);
+    assert_eq!(decision.rule_id.as_deref(), Some("no-rm"));
+    assert!(decision.fields.is_empty());
+}
+
+#[test]
+fn codex_ask_downgrades_to_deny() {
+    let policy = policy();
+    let mut subject = bash("git push");
+    subject.agent = Some("codex".to_owned());
+    let decision = downgrade_codex_ask(&decide(&policy, &subject).unwrap());
+    assert_eq!(decision.action, Action::Ask);
+    assert_eq!(decision.effective, Action::Deny);
+    assert!(decision.downgraded);
+    assert!(decision.reason.unwrap().contains("确认"));
+}
+
+#[test]
+fn proxy_rewrite_and_ask_downgrade_to_deny() {
+    let text = r#"
+enabled = true
+[[rule]]
+id = "rw"
+layer = ["proxy"]
+match.host = { exact = "example.test" }
+action = "rewrite"
+rewrite.host = { replace = ["example.test", "other.test"] }
+"#;
+    let PolicyState::On(policy) = load_str(text).unwrap() else {
+        panic!("on");
+    };
+    let subject = Subject {
+        layer: Layer::Proxy,
+        host: Some("example.test".to_owned()),
+        ..Subject::default()
+    };
+    let decision = decide(&policy, &subject).unwrap();
+    assert_eq!(decision.action, Action::Rewrite);
+    assert_eq!(decision.effective, Action::Deny);
+    assert!(decision.downgraded);
+    assert!(decision.fields.is_empty());
+}
+
+#[test]
+fn glob_host_and_other_agent_do_not_cross() {
+    let policy = policy();
+    let host = Subject {
+        layer: Layer::Proxy,
+        host: Some("x.pastebin.com".to_owned()),
+        ..Subject::default()
+    };
+    assert_eq!(decide(&policy, &host).unwrap().effective, Action::Deny);
+    let other = Subject {
+        layer: Layer::Proxy,
+        host: Some("pastebin.com".to_owned()),
+        ..Subject::default()
+    };
+    assert_eq!(decide(&policy, &other).unwrap().effective, Action::Allow);
+
+    let mut aider = bash("rm -rf /tmp/x");
+    aider.agent = Some("aider".to_owned());
+    assert_eq!(decide(&policy, &aider).unwrap().rule_id, None);
+}
+
+#[test]
+fn arg_exact_and_prefix() {
+    let text = r#"
+enabled = true
+[[rule]]
+id = "arg"
+layer = ["mcp"]
+match.mcp_method = { exact = "tools/call" }
+match.arg.command = { prefix = "sudo " }
+action = "deny"
+reason = "不允许"
+"#;
+    let PolicyState::On(policy) = load_str(text).unwrap() else {
+        panic!("on");
+    };
+    let subject = Subject {
+        layer: Layer::Mcp,
+        method: Some("tools/call".to_owned()),
+        mcp_method: Some("tools/call".to_owned()),
+        args: vec![("command".to_owned(), "sudo rm".to_owned())],
+        ..Subject::default()
+    };
+    assert_eq!(decide(&policy, &subject).unwrap().effective, Action::Deny);
+}
+
+#[test]
+fn on_error_tokens_parse() {
+    let PolicyState::On(deny) = load_str("enabled = true\n").unwrap() else {
+        panic!("on");
+    };
+    assert_eq!(deny.on_error(), super::OnError::Deny);
+    let PolicyState::On(allow) = load_str("enabled = true\non_error = \"allow\"\n").unwrap() else {
+        panic!("on");
+    };
+    assert_eq!(allow.on_error(), super::OnError::Allow);
+    assert!(load_str("enabled = true\non_error = \"drop\"\n").is_err());
+}

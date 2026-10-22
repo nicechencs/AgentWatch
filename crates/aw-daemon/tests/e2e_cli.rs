@@ -853,6 +853,15 @@ fn no_daemon_run_relays_sigterm_to_the_target_process_group() {
     );
 }
 
+/// The shell backgrounds a `setsid` grandchild and then exits. The watchdog
+/// is a child subreaper, so that grandchild is reparented to it and cleaned
+/// up the moment the shell exits — including a grandchild that has not
+/// reached `echo $$` yet. On a slow runner that window used to close before
+/// the pid was published, and the test reported "did not publish 1 pids"
+/// for a process that had already been reaped. The shell waits until the
+/// marker is non-empty (or 2.5 s) and only then exits, so the published pid
+/// is one the cleanup actually had to reap. The watchdog itself is unchanged
+/// from dev; the old script exited before the pid existed.
 #[test]
 fn linux_default_run_normal_exit_reaps_setsid_grandchild() {
     let root = watchdog_test_root("default-normal");
@@ -867,21 +876,32 @@ fn linux_default_run_normal_exit_reaps_setsid_grandchild() {
         "--",
         "sh",
         "-c",
-        "setsid sh -c 'echo $$ >> \"$AW_E2E_GRANDCHILD_PID\"; while :; do sleep 1; done' & exit 17",
+        "setsid sh -c 'echo $$ >> \"$AW_E2E_GRANDCHILD_PID\"; while :; do sleep 1; done' & \
+         i=0; while [ ! -s \"$AW_E2E_GRANDCHILD_PID\" ] && [ \"$i\" -lt 50 ]; do sleep 0.05; i=$((i+1)); done; \
+         exit 17",
     ]);
-    assert_eq!(out.status.code(), Some(17));
+    assert_eq!(
+        out.status.code(),
+        Some(17),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     wait_for_marker_pids(&marker, 1);
     assert_marked_descendants_reaped(&marker);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
+/// Same race as [`linux_default_run_normal_exit_reaps_setsid_grandchild`]:
+/// the shell must not exit before the grandchild has published its pid.
 fn linux_no_daemon_normal_exit_reaps_setsid_grandchild() {
     let root = watchdog_test_root("no-daemon-normal");
     let marker = root.join("descendants.pid");
     let child = start_no_daemon_watchdog_run(
         &marker,
-        "setsid sh -c 'echo $$ >> \"$AW_E2E_GRANDCHILD_PID\"; while :; do sleep 1; done' & exit 17",
+        "setsid sh -c 'echo $$ >> \"$AW_E2E_GRANDCHILD_PID\"; while :; do sleep 1; done' & \
+         i=0; while [ ! -s \"$AW_E2E_GRANDCHILD_PID\" ] && [ \"$i\" -lt 50 ]; do sleep 0.05; i=$((i+1)); done; \
+         exit 17",
     );
     let output = child.wait_with_output().expect("wait local aw run");
     assert_eq!(output.status.code(), Some(17));

@@ -24,7 +24,7 @@ use std::time::Duration;
 use aw_core::{RawEvent, SessionId};
 
 pub use backend::{Accepted, BackendError, BackendOutput, MetadataBackend, ProxyBackend};
-pub use mitm::{MitmError, MitmOutput, MitmProxy};
+pub use mitm::{preview_proxy_decision, MitmError, MitmOutput, MitmProxy, ProxyPreview};
 
 use crate::inject::ProxyOnReject;
 

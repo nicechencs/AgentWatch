@@ -366,9 +366,14 @@ pub fn host_process_table() -> Option<Vec<HostProcess>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::keep_subtrees;
-    use crate::source::{ProcessRow, ProcessSource, ProcessStartTime, SourceFailure};
+    // Only the Windows netstat tests name this. On Linux and macOS the import
+    // is unused, and clippy -D warnings fails the lib tests there.
+    #[cfg(windows)]
+    use crate::source::SourceFailure;
+    use crate::source::{ProcessRow, ProcessSource, ProcessStartTime};
 
     /// A non-zero `netstat` used to be recorded as `permission` whatever the
     /// exit was. Only access denied (exit 5) is a refusal; the rest failed.

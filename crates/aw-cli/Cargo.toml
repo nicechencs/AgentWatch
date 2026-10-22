@@ -10,6 +10,26 @@ description = "aw: command-line client. Talks to the daemon over its API."
 name = "aw"
 path = "src/main.rs"
 
+# Test stand-in for an MCP stdio server (`tests/mcp_tap_cli.rs`). Cargo builds
+# every `[[bin]]` for `cargo test` once an integration test names it through
+# `CARGO_BIN_EXE`, and also for `cargo build --bins`. `test = false` only
+# skips a unit-test harness for this file. It is not a product command.
+[[bin]]
+name = "mcp_echo"
+path = "tests/fixtures/mcp_echo.rs"
+test = false
+bench = false
+doc = false
+
+# Same kind of stand-in, but the `tools/call` result is a fixed `text` field
+# so a response rewrite can be seen (`tests/mcp_tap_cli.rs`).
+[[bin]]
+name = "mcp_result"
+path = "tests/fixtures/mcp_result.rs"
+test = false
+bench = false
+doc = false
+
 # P1-LNX-04. A lib target so `launch/unix_linux.rs` compiles and its tests run
 # before P1-CLI-02 adds `mod unix_linux` to `launch/mod.rs` (that file is owned
 # by the other card and must not gain a `mod` line from this one). The `aw` bin
